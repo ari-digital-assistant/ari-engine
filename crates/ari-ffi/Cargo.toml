@@ -1,0 +1,15 @@
+[package]
+name = "ari-ffi"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "ari_ffi"
+
+[dependencies]
+ari-core = { path = "../ari-core" }
+ari-engine = { path = "../ari-engine" }
+ari-skills = { path = "../ari-skills" }
+serde_json = { workspace = true }
+uniffi = { workspace = true, features = ["cli"] }

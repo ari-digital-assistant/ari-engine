@@ -1,0 +1,11 @@
+[package]
+name = "ari-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ari-core = { path = "../ari-core" }
+
+[dev-dependencies]
+ari-skills = { path = "../ari-skills" }
+serde_json = { workspace = true }
