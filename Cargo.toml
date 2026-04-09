@@ -4,6 +4,9 @@ members = [
     "crates/ari-core",
     "crates/ari-engine",
     "crates/ari-skills",
+    "crates/ari-skill-loader",
+    "crates/ari-skill-validate",
+    "crates/ari-sign-bundle",
     "crates/ari-cli",
     "crates/ari-ffi",
 ]

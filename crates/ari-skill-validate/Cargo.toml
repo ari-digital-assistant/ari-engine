@@ -1,0 +1,11 @@
+[package]
+name = "ari-skill-validate"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ari-skill-validate"
+path = "src/main.rs"
+
+[dependencies]
+ari-skill-loader = { path = "../ari-skill-loader" }

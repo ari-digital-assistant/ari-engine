@@ -7,4 +7,11 @@ edition = "2024"
 ari-core = { path = "../ari-core" }
 ari-engine = { path = "../ari-engine" }
 ari-skills = { path = "../ari-skills" }
+ari-skill-loader = { path = "../ari-skill-loader" }
 serde_json = { workspace = true }
+sha2 = "0.11.0"
+
+[dev-dependencies]
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std"] }
+flate2 = "1.1.9"
+tar = "0.4.45"

@@ -11,5 +11,7 @@ name = "ari_ffi"
 ari-core = { path = "../ari-core" }
 ari-engine = { path = "../ari-engine" }
 ari-skills = { path = "../ari-skills" }
+ari-skill-loader = { path = "../ari-skill-loader" }
 serde_json = { workspace = true }
+thiserror = "2.0.18"
 uniffi = { workspace = true, features = ["cli"] }

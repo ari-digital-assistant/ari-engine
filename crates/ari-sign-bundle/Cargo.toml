@@ -1,0 +1,13 @@
+[package]
+name = "ari-sign-bundle"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ari-sign-bundle"
+path = "src/main.rs"
+
+[dependencies]
+ari-skill-loader = { path = "../ari-skill-loader" }
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std"] }
+sha2 = "0.11.0"

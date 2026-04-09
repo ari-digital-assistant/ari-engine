@@ -1,0 +1,24 @@
+[package]
+name = "ari-skill-loader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ari-core = { path = "../ari-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = "0.10.0"
+thiserror = "2.0.18"
+regex = "1.12.3"
+wasmtime = { version = "43.0.0", default-features = false, features = ["cranelift", "runtime"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "rustls", "http2", "charset"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+webpki-roots = "1.0"
+url = "2.5.8"
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std"] }
+sha2 = "0.11.0"
+tar = "0.4.45"
+flate2 = "1.1.9"
+
+[dev-dependencies]
+wat = "1.246.2"

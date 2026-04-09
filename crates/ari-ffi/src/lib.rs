@@ -5,6 +5,10 @@ use ari_skills::{
     CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill,
 };
 
+mod skill_registry;
+
+pub use skill_registry::{FfiInstalledSkill, FfiRegistryError, FfiSkillUpdate, SkillRegistry};
+
 uniffi::setup_scaffolding!();
 
 #[derive(uniffi::Enum)]
