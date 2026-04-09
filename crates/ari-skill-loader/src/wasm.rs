@@ -346,8 +346,7 @@ impl WasmSkill {
         config.consume_fuel(true);
         let engine = Engine::new(&config).map_err(|e| WasmError::Compile(e.to_string()))?;
 
-        let module =
-            Module::new(&engine, bytes).map_err(|e| WasmError::Compile(e.to_string()))?;
+        let module = compile_module_on_big_stack(&engine, bytes)?;
 
         let memory_limit_bytes = wasm.memory_limit_mb.max(1) as usize * 1024 * 1024;
         let scorer = PatternScorer::compile(&ari.matching)?;
@@ -667,6 +666,36 @@ fn validate_module_imports(
         }
     }
     Ok(())
+}
+
+/// Compile a WASM module on a dedicated thread with an 8 MB stack.
+///
+/// **Why:** `wasmtime::Module::new` runs cranelift synchronously on the
+/// calling thread. Cranelift allocates significant stack frames for its IR
+/// transforms — desktop threads have ~8 MB and handle it fine, but Android
+/// coroutine workers (`Dispatchers.IO` etc.) can have as little as a few
+/// hundred KB and blow the stack with SIGSEGV / "stack pointer is not in
+/// a rw map". We hit this trying to install a WASM skill through the
+/// Android UI and it killed the app instantly.
+///
+/// Rather than telling every caller to be mindful of their stack, we
+/// always compile on a fresh `std::thread` sized to match desktop. The
+/// overhead is one thread spawn + join per WasmSkill construction, which
+/// is measured in microseconds — cranelift itself dominates by orders of
+/// magnitude, so the wrapper cost is invisible.
+fn compile_module_on_big_stack(engine: &Engine, bytes: &[u8]) -> Result<Module, WasmError> {
+    let engine_clone = engine.clone();
+    let bytes_vec = bytes.to_vec();
+    let handle = std::thread::Builder::new()
+        .name("ari-wasm-compile".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            Module::new(&engine_clone, &bytes_vec).map_err(|e| WasmError::Compile(e.to_string()))
+        })
+        .map_err(|e| WasmError::Compile(format!("could not spawn wasm compile thread: {e}")))?;
+    handle
+        .join()
+        .map_err(|_| WasmError::Compile("wasm compile thread panicked".to_string()))?
 }
 
 fn build_reqwest_client(config: &HttpConfig) -> Result<reqwest::blocking::Client, WasmError> {

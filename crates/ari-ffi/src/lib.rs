@@ -1,13 +1,42 @@
 #![allow(clippy::new_without_default)]
 
 use ari_engine::Engine;
+use ari_skill_loader::{
+    load_skill_directory_with, Capability, HostCapabilities, HttpConfig, LoadOptions,
+    NullLogSink, StorageConfig,
+};
 use ari_skills::{
     CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill,
 };
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 mod skill_registry;
 
-pub use skill_registry::{FfiInstalledSkill, FfiRegistryError, FfiSkillUpdate, SkillRegistry};
+pub use skill_registry::{
+    FfiBrowseEntry, FfiInstalledSkill, FfiRegistryError, FfiSkillUpdate, SkillRegistry,
+};
+
+/// Build the [`LoadOptions`] the Android host uses for every install and
+/// every reload. Grants `pure_frontend` caps (frontend-mediated actions),
+/// `http` (backed by reqwest with bundled webpki-roots — see `tls.rs`),
+/// and `storage_kv` (backed by per-skill JSON files under `storage_dir`).
+///
+/// Keep this in one place so every loader entry point in the FFI crate
+/// sees the same grants. A mismatch — e.g. install granting `http` but
+/// reload not — would let a skill install cleanly and then silently drop
+/// off the conversation engine on the next app start.
+pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
+    let host_caps = HostCapabilities::pure_frontend()
+        .with(Capability::Http)
+        .with(Capability::StorageKv);
+    LoadOptions {
+        log_sink: Arc::new(NullLogSink),
+        host_capabilities: host_caps,
+        http_config: HttpConfig::strict(),
+        storage_config: StorageConfig::new(PathBuf::from(storage_dir)),
+    }
+}
 
 uniffi::setup_scaffolding!();
 
@@ -20,31 +49,81 @@ pub enum FfiResponse {
 
 #[derive(uniffi::Object)]
 pub struct AriEngine {
-    inner: Engine,
+    // Wrapped in Mutex because `reload_community_skills` mutates the
+    // skill set after construction. `process_input` only needs a shared
+    // lock in practice but the Engine trait takes `&self` anyway.
+    inner: Mutex<Engine>,
+}
+
+fn build_engine_with_builtins() -> Engine {
+    let mut engine = Engine::new();
+    engine.register_skill(Box::new(CurrentTimeSkill::new()));
+    engine.register_skill(Box::new(DateSkill::new()));
+    engine.register_skill(Box::new(CalculatorSkill::new()));
+    engine.register_skill(Box::new(GreetingSkill::new()));
+    engine.register_skill(Box::new(OpenSkill::new()));
+    engine.register_skill(Box::new(SearchSkill::new()));
+    engine
 }
 
 #[uniffi::export]
 impl AriEngine {
     #[uniffi::constructor]
     pub fn new() -> Self {
-        let mut engine = Engine::new();
-        engine.register_skill(Box::new(CurrentTimeSkill::new()));
-        engine.register_skill(Box::new(DateSkill::new()));
-        engine.register_skill(Box::new(CalculatorSkill::new()));
-        engine.register_skill(Box::new(GreetingSkill::new()));
-        engine.register_skill(Box::new(OpenSkill::new()));
-        engine.register_skill(Box::new(SearchSkill::new()));
-        Self { inner: engine }
+        Self {
+            inner: Mutex::new(build_engine_with_builtins()),
+        }
     }
 
     pub fn process_input(&self, input: String) -> FfiResponse {
-        match self.inner.process_input(&input) {
+        let engine = self.inner.lock().expect("engine mutex poisoned");
+        match engine.process_input(&input) {
             ari_core::Response::Text(s) => FfiResponse::Text { body: s },
             ari_core::Response::Action(v) => FfiResponse::Action {
                 json: serde_json::to_string(&v).unwrap_or_default(),
             },
             ari_core::Response::Binary { mime, data } => FfiResponse::Binary { mime, data },
         }
+    }
+
+    /// Rebuild the engine's skill set from scratch: the 6 built-in Rust
+    /// skills plus every community skill on disk under `skill_store_dir`.
+    ///
+    /// `storage_dir` is where per-skill `storage_kv` JSON files live —
+    /// must match what `SkillRegistry` was constructed with, otherwise a
+    /// skill's installed state (on-disk JSON) will be invisible at
+    /// conversation time. Both dirs should sit under the app's private
+    /// files directory on Android (`context.filesDir`).
+    ///
+    /// Call once at app startup (after constructing `SkillRegistry` so the
+    /// store dir exists) and again after every successful install / update
+    /// / uninstall so the next `process_input` can see the new state.
+    ///
+    /// Silently ignores skills that fail to load — individual failures are
+    /// recorded in the loader's `LoadReport.failures`, which we currently
+    /// discard at this boundary. A broken skill should not take the
+    /// conversation engine down with it. Returns the number of community
+    /// skills successfully registered so the caller can log / surface it.
+    pub fn reload_community_skills(
+        &self,
+        skill_store_dir: String,
+        storage_dir: String,
+    ) -> u32 {
+        let mut fresh = build_engine_with_builtins();
+        let options = android_load_options(&storage_dir);
+        let loaded: u32 =
+            match load_skill_directory_with(&PathBuf::from(&skill_store_dir), &options) {
+                Ok(report) => {
+                    let n = report.skills.len() as u32;
+                    for skill in report.skills {
+                        fresh.register_skill(skill);
+                    }
+                    n
+                }
+                Err(_) => 0,
+            };
+        *self.inner.lock().expect("engine mutex poisoned") = fresh;
+        loaded
     }
 }
 

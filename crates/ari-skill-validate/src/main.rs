@@ -20,8 +20,8 @@
 //! Exit codes: 0 = all good, 1 = at least one skill failed, 2 = bad CLI usage.
 
 use ari_skill_loader::{
-    load_single_skill_dir_with, load_skill_directory_with, HostCapabilities, LoadFailure,
-    LoadOptions, LoadReport, Skillfile,
+    capability_name, load_single_skill_dir_with, load_skill_directory_with, HostCapabilities,
+    LoadFailure, LoadOptions, LoadReport, Skillfile,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -170,6 +170,10 @@ struct Row {
     name: Option<String>,
     description: Option<String>,
     license: Option<String>,
+    author: Option<String>,
+    homepage: Option<String>,
+    capabilities: Vec<String>,
+    languages: Vec<String>,
     failures: Vec<String>,
 }
 
@@ -183,6 +187,10 @@ impl Row {
             name: None,
             description: None,
             license: None,
+            author: None,
+            homepage: None,
+            capabilities: Vec::new(),
+            languages: Vec::new(),
             failures: vec!["path does not exist".to_string()],
         }
     }
@@ -195,6 +203,10 @@ impl Row {
             name: None,
             description: None,
             license: None,
+            author: None,
+            homepage: None,
+            capabilities: Vec::new(),
+            languages: Vec::new(),
             failures: vec![msg.to_string()],
         }
     }
@@ -207,15 +219,19 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
     //   (c) nothing (valid AgentSkills doc with no metadata.ari — not an
     //       Ari skill, silently skipped by the loader)
     if let Some(skill) = report.skills.first() {
-        let (name, description, license, version) = read_manifest_fields(path);
+        let fields = read_manifest_fields(path);
         out.push(Row {
             path: path.to_path_buf(),
             ok: true,
             id: Some(skill.id().to_string()),
-            version,
-            name,
-            description,
-            license,
+            version: fields.version,
+            name: fields.name,
+            description: fields.description,
+            license: fields.license,
+            author: fields.author,
+            homepage: fields.homepage,
+            capabilities: fields.capabilities,
+            languages: fields.languages,
             failures: Vec::new(),
         });
         return;
@@ -229,6 +245,10 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             name: None,
             description: None,
             license: None,
+            author: None,
+            homepage: None,
+            capabilities: Vec::new(),
+            languages: Vec::new(),
             failures: report.failures.iter().map(LoadFailure::to_string).collect(),
         });
         return;
@@ -243,28 +263,53 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
         name: None,
         description: None,
         license: None,
+        author: None,
+        homepage: None,
+        capabilities: Vec::new(),
+        languages: Vec::new(),
         failures: vec!["SKILL.md has no metadata.ari extension (not an Ari skill)".to_string()],
     });
 }
 
-/// Re-parse SKILL.md to pull name/description/license/version for the rows
-/// that the loader returned successfully. The loader returns `Box<dyn Skill>`
-/// which only exposes id/specificity — the rest of the frontmatter isn't on
-/// the trait. Cheap to re-parse; we've already loaded the file once.
-fn read_manifest_fields(
-    skill_dir: &Path,
-) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+/// Re-parse SKILL.md to pull the descriptive frontmatter fields for rows
+/// the loader accepted. The loader returns `Box<dyn Skill>` which only
+/// exposes id/specificity — the rest of the frontmatter isn't on the
+/// trait. Cheap to re-parse; we've already loaded the file once.
+#[derive(Default)]
+struct ManifestFields {
+    version: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
+    license: Option<String>,
+    author: Option<String>,
+    homepage: Option<String>,
+    capabilities: Vec<String>,
+    languages: Vec<String>,
+}
+
+fn read_manifest_fields(skill_dir: &Path) -> ManifestFields {
     let path = skill_dir.join("SKILL.md");
     let Ok(sf) = Skillfile::parse_file(&path) else {
-        return (None, None, None, None);
+        return ManifestFields::default();
     };
-    let version = sf.ari_extension.as_ref().map(|a| a.version.clone());
-    (
-        Some(sf.name),
-        Some(sf.description),
-        sf.license,
-        version,
-    )
+    let mut out = ManifestFields {
+        name: Some(sf.name),
+        description: Some(sf.description),
+        license: sf.license,
+        ..ManifestFields::default()
+    };
+    if let Some(ext) = sf.ari_extension {
+        out.version = Some(ext.version);
+        out.author = ext.author;
+        out.homepage = ext.homepage;
+        out.capabilities = ext
+            .capabilities
+            .into_iter()
+            .map(|c| capability_name(c).to_string())
+            .collect();
+        out.languages = ext.languages;
+    }
+    out
 }
 
 fn render_text(rows: &[Row], ok: usize, failed: usize, quiet: bool) {
@@ -341,6 +386,10 @@ fn render_json(rows: &[Row]) {
         push_json_opt(&mut out, "name", row.name.as_deref(), true);
         push_json_opt(&mut out, "description", row.description.as_deref(), true);
         push_json_opt(&mut out, "license", row.license.as_deref(), true);
+        push_json_opt(&mut out, "author", row.author.as_deref(), true);
+        push_json_opt(&mut out, "homepage", row.homepage.as_deref(), true);
+        push_json_str_array(&mut out, "capabilities", &row.capabilities, true);
+        push_json_str_array(&mut out, "languages", &row.languages, true);
         // failures array
         out.push_str("    \"failures\": [");
         for (j, f) in row.failures.iter().enumerate() {
@@ -375,6 +424,23 @@ fn push_json_opt(out: &mut String, key: &str, value: Option<&str>, trailing_comm
         Some(v) => out.push_str(&json_string(v)),
         None => out.push_str("null"),
     }
+    if trailing_comma {
+        out.push(',');
+    }
+    out.push('\n');
+}
+
+fn push_json_str_array(out: &mut String, key: &str, values: &[String], trailing_comma: bool) {
+    out.push_str("    \"");
+    out.push_str(key);
+    out.push_str("\": [");
+    for (i, v) in values.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&json_string(v));
+    }
+    out.push(']');
     if trailing_comma {
         out.push(',');
     }

@@ -26,8 +26,8 @@ pub use manifest::{
     Matching, ResponseSpec, Skillfile, SpecificityLevel, WasmBehaviour,
 };
 pub use registry::{
-    check_updates, install_update, AvailableUpdate, Index, IndexEntry, RegistryClient,
-    RegistryError, REGISTRY_BASE_URL, REGISTRY_INDEX_URL, REGISTRY_TRUST_KEY,
+    check_updates, install_by_id, install_update, AvailableUpdate, Index, IndexEntry,
+    RegistryClient, RegistryError, REGISTRY_BASE_URL, REGISTRY_INDEX_URL, REGISTRY_TRUST_KEY,
 };
 pub use storage_config::StorageConfig;
 pub use store::{InstalledSkill, SkillStore, StoreError};

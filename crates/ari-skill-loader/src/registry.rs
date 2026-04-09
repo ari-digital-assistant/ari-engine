@@ -83,6 +83,9 @@ pub enum RegistryError {
         actual: String,
     },
 
+    #[error("skill id {id} is not present in the registry index")]
+    NotFound { id: String },
+
     #[error(transparent)]
     Install(#[from] BundleError),
 }
@@ -100,6 +103,13 @@ pub struct Index {
 }
 
 /// One row of `index.json`.
+///
+/// All of the descriptive fields after `description` are optional with
+/// `#[serde(default)]`. This keeps the schema **additively** extensible
+/// without needing to bump [`SUPPORTED_INDEX_VERSION`]: old clients
+/// ignore fields they don't understand, and new clients reading an old
+/// index just see empty / `None` values. That's why the browse UI has
+/// to tolerate missing metadata gracefully.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexEntry {
     pub id: String,
@@ -108,6 +118,22 @@ pub struct IndexEntry {
     pub description: String,
     #[serde(default)]
     pub license: Option<String>,
+    /// Free-text author / maintainer string from SKILL.md frontmatter.
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Optional homepage or source URL. UI should treat this as
+    /// unverified — the client doesn't validate the scheme.
+    #[serde(default)]
+    pub homepage: Option<String>,
+    /// Stable capability names the skill declares (e.g. `http`,
+    /// `storage_kv`). Useful so the browse detail view can surface what
+    /// a skill will be allowed to do *before* the user commits to
+    /// installing it.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// BCP-47-ish language tags the skill ships matcher patterns for.
+    #[serde(default)]
+    pub languages: Vec<String>,
     /// Path to the bundle relative to [`REGISTRY_BASE_URL`].
     pub bundle: String,
     /// Path to the detached signature relative to [`REGISTRY_BASE_URL`].
@@ -321,6 +347,36 @@ pub fn install_update(
         .cloned()
         .ok_or_else(|| RegistryError::Parse(format!("install succeeded but {} not in index after rescan", entry.id)))?;
     Ok(installed)
+}
+
+/// Look up `id` in the provided `index` and install that entry into `store`,
+/// regardless of whether the skill is already installed locally. Used by
+/// the "Browse registry → tap install" path where the user is installing a
+/// skill for the first time, as opposed to [`install_update`] which is
+/// called after a diff via [`check_updates`].
+///
+/// Reinstalls of the currently-installed version are allowed — the store's
+/// install pipeline overwrites in place. Installing an *older* version than
+/// what's currently on disk is a no-op from the perspective of the user but
+/// succeeds silently; downgrade protection is a TODO on the store side.
+///
+/// Returns [`RegistryError::NotFound`] if `id` isn't in the index at all,
+/// which is distinct from every other error mode so the FFI layer can
+/// surface a "registry no longer carries that skill" message cleanly.
+pub fn install_by_id(
+    client: &RegistryClient,
+    index: &Index,
+    id: &str,
+    store: &mut SkillStore,
+    trust_root: &TrustRoot,
+    load_options: &LoadOptions,
+) -> Result<InstalledSkill, RegistryError> {
+    let entry = index
+        .skills
+        .iter()
+        .find(|e| e.id == id)
+        .ok_or_else(|| RegistryError::NotFound { id: id.to_string() })?;
+    install_update(client, entry, store, trust_root, load_options)
 }
 
 #[cfg(test)]
@@ -584,6 +640,10 @@ metadata:
                     name: "coin-flip".into(),
                     description: "".into(),
                     license: None,
+                    author: None,
+                    homepage: None,
+                    capabilities: Vec::new(),
+                    languages: Vec::new(),
                     bundle: "bundles/dev.heyari.coinflip-0.2.0.tar.gz".into(),
                     signature: "bundles/dev.heyari.coinflip-0.2.0.tar.gz.sig".into(),
                     sha256: "deadbeef".into(),
@@ -594,6 +654,10 @@ metadata:
                     name: "counter".into(),
                     description: "".into(),
                     license: None,
+                    author: None,
+                    homepage: None,
+                    capabilities: Vec::new(),
+                    languages: Vec::new(),
                     bundle: "bundles/dev.heyari.counter-5.0.0.tar.gz".into(),
                     signature: "bundles/dev.heyari.counter-5.0.0.tar.gz.sig".into(),
                     sha256: "cafe".into(),
@@ -634,6 +698,10 @@ metadata:
             name: "coin-flip".into(),
             description: "".into(),
             license: None,
+            author: None,
+            homepage: None,
+            capabilities: Vec::new(),
+            languages: Vec::new(),
             bundle: "x".into(),
             signature: "x".into(),
             sha256: "x".into(),
@@ -798,6 +866,118 @@ metadata:
         )
         .unwrap_err();
         assert!(matches!(err, RegistryError::ShaMismatch { .. }));
+
+        let _ = std::fs::remove_dir_all(&store_root);
+        let _ = std::fs::remove_dir_all(&storage_root);
+    }
+
+    #[test]
+    fn install_by_id_installs_skill_not_previously_present() {
+        // Full wire-level e2e for the discovery path: store starts empty,
+        // registry serves one entry, install_by_id fetches/verifies/installs
+        // and the store reflects the new skill.
+        let sk = SigningKey::from_bytes(&[99u8; 32]);
+        let trust = TrustRoot::single(sk.verifying_key().as_bytes()).unwrap();
+
+        let bundle = make_bundle("coin-flip", &coin_md("0.1.0"));
+        let bundle_hash = sha256_hex(&bundle);
+        let mut h = Sha256::new();
+        h.update(&bundle);
+        let sig = sk.sign(&h.finalize()).to_bytes().to_vec();
+
+        let index_json = format!(
+            r#"{{"index_version":1,"generated_at":"t","skills":[{{
+                "id":"dev.heyari.coinflip","version":"0.1.0","name":"coin-flip",
+                "description":"","bundle":"bundles/v1.tar.gz",
+                "signature":"bundles/v1.tar.gz.sig","sha256":"{}"
+            }}]}}"#,
+            bundle_hash
+        );
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/index.json".to_string(),
+            http_response(index_json.as_bytes(), "application/json"),
+        );
+        routes.insert(
+            "/bundles/v1.tar.gz".to_string(),
+            http_response(&bundle, "application/gzip"),
+        );
+        routes.insert(
+            "/bundles/v1.tar.gz.sig".to_string(),
+            http_response(&sig, "application/octet-stream"),
+        );
+        let server = TestServer::start(routes);
+
+        let store_root = unique_dir("discover-store");
+        let storage_root = unique_dir("discover-storage");
+        let mut store = SkillStore::open(
+            &store_root,
+            StorageConfig::new(&storage_root),
+            trust.clone(),
+        )
+        .unwrap();
+        assert!(store.get("dev.heyari.coinflip").is_none(), "store should start empty");
+
+        let client = RegistryClient::new()
+            .with_index_url(server.url("/index.json"))
+            .with_base_url(server.base());
+        let index = client.fetch_index().unwrap();
+
+        let installed = install_by_id(
+            &client,
+            &index,
+            "dev.heyari.coinflip",
+            &mut store,
+            &trust,
+            &LoadOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(installed.id, "dev.heyari.coinflip");
+        assert_eq!(installed.version, "0.1.0");
+        assert_eq!(store.get("dev.heyari.coinflip").unwrap().version, "0.1.0");
+
+        let _ = std::fs::remove_dir_all(&store_root);
+        let _ = std::fs::remove_dir_all(&storage_root);
+    }
+
+    #[test]
+    fn install_by_id_returns_not_found_for_unknown_id() {
+        // No server, no network. Hand a caller-built index with zero
+        // entries and confirm we get the precise NotFound variant rather
+        // than a generic parse/http error — the FFI layer relies on this
+        // discriminant to show a "registry no longer carries that skill"
+        // message distinct from connectivity failures.
+        let sk = SigningKey::from_bytes(&[44u8; 32]);
+        let trust = TrustRoot::single(sk.verifying_key().as_bytes()).unwrap();
+
+        let store_root = unique_dir("notfound-store");
+        let storage_root = unique_dir("notfound-storage");
+        let mut store = SkillStore::open(
+            &store_root,
+            StorageConfig::new(&storage_root),
+            trust.clone(),
+        )
+        .unwrap();
+
+        let empty_index = Index {
+            index_version: 1,
+            generated_at: "t".to_string(),
+            skills: vec![],
+        };
+        let client = RegistryClient::new();
+        let err = install_by_id(
+            &client,
+            &empty_index,
+            "dev.heyari.nosuchthing",
+            &mut store,
+            &trust,
+            &LoadOptions::default(),
+        )
+        .unwrap_err();
+        match err {
+            RegistryError::NotFound { id } => assert_eq!(id, "dev.heyari.nosuchthing"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&store_root);
         let _ = std::fs::remove_dir_all(&storage_root);

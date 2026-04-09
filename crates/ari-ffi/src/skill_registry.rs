@@ -14,9 +14,12 @@
 //! problem, not the generator's.
 
 use ari_skill_loader::{
-    check_updates, install_update, LoadOptions, RegistryClient, SkillStore, StorageConfig,
-    TrustRoot, REGISTRY_TRUST_KEY,
+    capability_name, check_updates, install_by_id, install_update, ManifestError, RegistryClient,
+    RegistryError, Skillfile, SkillStore, StorageConfig, StoreError, TrustRoot,
+    REGISTRY_TRUST_KEY,
 };
+
+use crate::android_load_options;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -41,6 +44,48 @@ pub struct FfiSkillUpdate {
     pub description: String,
 }
 
+/// One row for the "Browse registry" screen — every skill the registry
+/// carries, with an `installed` flag so the UI can mark rows for skills
+/// the user already has on disk. `version` is the registry's version,
+/// which may be ahead of the installed one; the UI can decide whether
+/// to render that as "update available" or just "installed".
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiBrowseEntry {
+    pub id: String,
+    pub version: String,
+    pub name: String,
+    pub description: String,
+    pub installed: bool,
+    pub license: Option<String>,
+    pub author: Option<String>,
+    pub homepage: Option<String>,
+    pub capabilities: Vec<String>,
+    pub languages: Vec<String>,
+}
+
+/// Rich manifest details for an already-installed skill, parsed from the
+/// on-disk SKILL.md. Used by the detail screen to show fields that don't
+/// fit on a list row: author, homepage, capabilities the skill requires,
+/// supported languages, and the full SKILL.md body (which typically
+/// contains the human-readable long description / usage examples).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSkillManifest {
+    pub id: String,
+    pub version: String,
+    pub name: String,
+    pub description: String,
+    pub author: Option<String>,
+    pub homepage: Option<String>,
+    pub license: Option<String>,
+    /// Capability names as they appear in the manifest (e.g. `http`,
+    /// `storage_kv`). Stable strings — see
+    /// [`ari_skill_loader::capability_name`].
+    pub capabilities: Vec<String>,
+    pub languages: Vec<String>,
+    /// Full SKILL.md body after the frontmatter — markdown, verbatim.
+    pub body: String,
+}
+
 #[derive(Debug, Error, uniffi::Error)]
 #[uniffi(flat_error)]
 pub enum FfiRegistryError {
@@ -53,6 +98,12 @@ pub enum FfiRegistryError {
     #[error("skill not found in registry: {id}")]
     NotFound { id: String },
 
+    #[error("skill not installed: {id}")]
+    NotInstalled { id: String },
+
+    #[error("manifest: {message}")]
+    Manifest { message: String },
+
     #[error("trust key: {message}")]
     TrustKey { message: String },
 }
@@ -64,10 +115,13 @@ fn trust_root() -> Result<TrustRoot, FfiRegistryError> {
 }
 
 /// Thread-safe handle to a skill store. One instance per process, created
-/// at app startup and injected wherever it's needed.
+/// at app startup and injected wherever it's needed. `storage_dir` is
+/// retained so install calls can rebuild [`LoadOptions`] with the same
+/// `storage_kv` root the store was opened with.
 #[derive(uniffi::Object)]
 pub struct SkillRegistry {
     store: Mutex<SkillStore>,
+    storage_dir: String,
 }
 
 #[uniffi::export]
@@ -92,6 +146,7 @@ impl SkillRegistry {
         })?;
         Ok(Arc::new(Self {
             store: Mutex::new(store),
+            storage_dir,
         }))
     }
 
@@ -157,16 +212,147 @@ impl SkillRegistry {
             .ok_or_else(|| FfiRegistryError::NotFound { id: id.clone() })?;
 
         let trust = trust_root()?;
+        let options = android_load_options(&self.storage_dir);
         let mut store = self.store.lock().expect("skill store mutex poisoned");
-        let installed =
-            install_update(&client, &entry, &mut store, &trust, &LoadOptions::default())
-                .map_err(|e| FfiRegistryError::Registry {
-                    message: e.to_string(),
-                })?;
+        let installed = install_update(&client, &entry, &mut store, &trust, &options)
+            .map_err(|e| FfiRegistryError::Registry {
+                message: e.to_string(),
+            })?;
         Ok(FfiInstalledSkill {
             id: installed.id,
             version: installed.version,
             install_dir: installed.install_dir.to_string_lossy().into_owned(),
+        })
+    }
+
+    /// Fetch the registry index and return every entry as a [`FfiBrowseEntry`],
+    /// with `installed` set for skills that already exist in the local store.
+    /// Powers the "Browse registry" screen where the user picks skills to
+    /// install for the first time.
+    ///
+    /// Blocks on the network — callers must run this off the main thread.
+    pub fn browse_registry(&self) -> Result<Vec<FfiBrowseEntry>, FfiRegistryError> {
+        let client = RegistryClient::new();
+        let index = client.fetch_index().map_err(|e| FfiRegistryError::Registry {
+            message: e.to_string(),
+        })?;
+        let store = self.store.lock().expect("skill store mutex poisoned");
+        let mut out: Vec<FfiBrowseEntry> = index
+            .skills
+            .into_iter()
+            .map(|entry| FfiBrowseEntry {
+                installed: store.get(&entry.id).is_some(),
+                id: entry.id,
+                version: entry.version,
+                name: entry.name,
+                description: entry.description,
+                license: entry.license,
+                author: entry.author,
+                homepage: entry.homepage,
+                capabilities: entry.capabilities,
+                languages: entry.languages,
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    /// Download and install the registry's current version of `id`, even
+    /// if the skill isn't already installed locally. This is the "Browse →
+    /// tap install" path, complementing [`install_skill_update`] which is
+    /// for already-installed skills.
+    ///
+    /// Blocks on the network — callers must run this off the main thread.
+    pub fn install_skill_by_id(
+        &self,
+        id: String,
+    ) -> Result<FfiInstalledSkill, FfiRegistryError> {
+        let client = RegistryClient::new();
+        let index = client.fetch_index().map_err(|e| FfiRegistryError::Registry {
+            message: e.to_string(),
+        })?;
+        let trust = trust_root()?;
+        let options = android_load_options(&self.storage_dir);
+        let mut store = self.store.lock().expect("skill store mutex poisoned");
+        let installed = install_by_id(
+            &client,
+            &index,
+            &id,
+            &mut store,
+            &trust,
+            &options,
+        )
+        .map_err(|e| match e {
+            RegistryError::NotFound { id } => FfiRegistryError::NotFound { id },
+            other => FfiRegistryError::Registry {
+                message: other.to_string(),
+            },
+        })?;
+        Ok(FfiInstalledSkill {
+            id: installed.id,
+            version: installed.version,
+            install_dir: installed.install_dir.to_string_lossy().into_owned(),
+        })
+    }
+
+    /// Read the on-disk `SKILL.md` for an already-installed skill and
+    /// return the rich manifest the list/row view doesn't have room for —
+    /// author, homepage, capabilities, supported languages, full body.
+    ///
+    /// Returns [`FfiRegistryError::NotInstalled`] if `id` isn't in the
+    /// store, or [`FfiRegistryError::Manifest`] if the file is missing
+    /// or fails to parse (shouldn't happen for skills we installed
+    /// ourselves but possible if the user's tampered with the dir).
+    pub fn read_installed_manifest(
+        &self,
+        id: String,
+    ) -> Result<FfiSkillManifest, FfiRegistryError> {
+        let store = self.store.lock().expect("skill store mutex poisoned");
+        let entry = store
+            .get(&id)
+            .ok_or_else(|| FfiRegistryError::NotInstalled { id: id.clone() })?;
+
+        let manifest_path = entry.install_dir.join("SKILL.md");
+        let skillfile = Skillfile::parse_file(&manifest_path).map_err(|e: ManifestError| {
+            FfiRegistryError::Manifest {
+                message: e.to_string(),
+            }
+        })?;
+
+        let ext = skillfile.ari_extension.ok_or_else(|| FfiRegistryError::Manifest {
+            message: "SKILL.md is missing the ari extension metadata".to_string(),
+        })?;
+
+        Ok(FfiSkillManifest {
+            id: ext.id,
+            version: ext.version,
+            name: skillfile.name,
+            description: skillfile.description,
+            author: ext.author,
+            homepage: ext.homepage,
+            license: skillfile.license,
+            capabilities: ext
+                .capabilities
+                .into_iter()
+                .map(|c| capability_name(c).to_string())
+                .collect(),
+            languages: ext.languages,
+            body: skillfile.body,
+        })
+    }
+
+    /// Remove an installed skill from disk and wipe its `storage_kv`
+    /// state. Returns [`FfiRegistryError::NotInstalled`] if `id` isn't in
+    /// the local store. The caller should invoke
+    /// [`AriEngine::reload_community_skills`] afterwards so the next
+    /// `process_input` sees the updated skill set.
+    pub fn uninstall_skill_by_id(&self, id: String) -> Result<(), FfiRegistryError> {
+        let mut store = self.store.lock().expect("skill store mutex poisoned");
+        store.uninstall(&id).map_err(|e| match e {
+            StoreError::NotInstalled { id } => FfiRegistryError::NotInstalled { id },
+            other => FfiRegistryError::Store {
+                message: other.to_string(),
+            },
         })
     }
 }
