@@ -189,18 +189,20 @@ pub fn install_from_bytes(
         let _ = std::fs::remove_dir_all(&staging);
         return Err(BundleError::Validation(msg));
     }
-    let skill = match report.skills.first() {
-        Some(s) => s,
-        None => {
-            // The bundle had a SKILL.md but it didn't yield an Ari skill
-            // (e.g. it was a plain AgentSkills doc with no `metadata.ari`).
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(BundleError::Validation(
-                "bundle contains a SKILL.md but no metadata.ari extension".to_string(),
-            ));
-        }
+    // The loaded skill could be a regular skill (in report.skills) or an
+    // assistant provider (in report.assistants). Either is valid.
+    let skill_id = if let Some(s) = report.skills.first() {
+        s.id().to_string()
+    } else if let Some(a) = report.assistants.first() {
+        a.id.clone()
+    } else {
+        // The bundle had a SKILL.md but it didn't yield an Ari skill
+        // (e.g. it was a plain AgentSkills doc with no `metadata.ari`).
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(BundleError::Validation(
+            "bundle contains a SKILL.md but no metadata.ari extension".to_string(),
+        ));
     };
-    let skill_id = skill.id().to_string();
     drop(report); // releases the loaded skill instance
 
     // Step 5: atomic swap. The bundle root inside staging is named after
