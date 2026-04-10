@@ -68,7 +68,7 @@ impl Skill for CalculatorSkill {
     }
 
     fn description(&self) -> &str {
-        "Evaluates math expressions. Use when the user asks to calculate or compute something."
+        "Evaluates math expressions. Use when the user asks to calculate, compute, or figure out any mathematical expression, percentage, division, multiplication, addition, subtraction, or arithmetic."
     }
 
     fn specificity(&self) -> Specificity {

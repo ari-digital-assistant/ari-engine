@@ -37,7 +37,7 @@ impl Skill for OpenSkill {
     }
 
     fn description(&self) -> &str {
-        "Opens apps by name. Use when the user asks to open or launch something."
+        "Opens or launches apps by name. Use when the user asks to open, launch, start, run, or fire up an application or app."
     }
 
     fn specificity(&self) -> Specificity {

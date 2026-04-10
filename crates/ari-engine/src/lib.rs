@@ -3,6 +3,34 @@ use ari_skill_loader::assistant::ConfigStore;
 use ari_skill_loader::manifest::ApiConfig;
 use std::sync::Arc;
 
+// ── Skill router (FunctionGemma) ──────────────────────────────────────
+
+/// What the skill router decided.
+pub enum RouteResult {
+    /// Route to a registered skill by id.
+    Skill(String),
+    /// Route to a system action (Android intent). The JSON value carries
+    /// the action type and parameters for the frontend to dispatch.
+    Action(serde_json::Value),
+    /// No match — fall through to the assistant.
+    NoMatch,
+}
+
+/// Trait for an LLM-based skill router that runs after the keyword
+/// matcher fails. The router sees the user input and the list of
+/// available skills, and either picks one, suggests a system action,
+/// or declines.
+///
+/// Optional — if no router is set on the engine, the flow skips
+/// straight from keyword scoring to the assistant.
+pub trait SkillRouter: Send + Sync {
+    fn route(
+        &self,
+        input: &str,
+        skills: &[(String, String)], // (id, description) pairs
+    ) -> RouteResult;
+}
+
 /// The text the engine returns when no skill matches the input. Exposed
 /// publicly so the FFI layer can detect this exact response and convert it
 /// into the dedicated `FfiResponse::NotUnderstood` variant — the Android
@@ -55,6 +83,7 @@ pub struct Engine {
     #[cfg(feature = "llm")]
     llm: Option<Box<dyn ari_llm::Fallback>>,
     active_assistant: Option<ActiveAssistant>,
+    router: Option<Box<dyn SkillRouter>>,
 }
 
 impl Engine {
@@ -66,6 +95,7 @@ impl Engine {
             #[cfg(feature = "llm")]
             llm: None,
             active_assistant: None,
+            router: None,
         }
     }
 
@@ -94,6 +124,13 @@ impl Engine {
     /// Set the active assistant provider.
     pub fn set_active_assistant(&mut self, assistant: Option<ActiveAssistant>) {
         self.active_assistant = assistant;
+    }
+
+    /// Set the skill router (e.g. FunctionGemma). When set, the engine
+    /// consults the router after keyword scoring fails, before falling
+    /// through to the assistant. Pass `None` to disable.
+    pub fn set_router(&mut self, router: Option<Box<dyn SkillRouter>>) {
+        self.router = router;
     }
 
     pub fn process_input(&self, input: &str) -> Response {
@@ -162,6 +199,30 @@ impl Engine {
 
                 let response = skill.execute(&normalized, &self.ctx);
                 return (response, Some(trace));
+            }
+        }
+
+        // No keyword match. Try the skill router (FunctionGemma) if available.
+        if let Some(ref router) = self.router {
+            let skill_catalog: Vec<(String, String)> = self
+                .skills
+                .iter()
+                .map(|s| (s.id().to_string(), s.description().to_string()))
+                .collect();
+
+            match router.route(&normalized, &skill_catalog) {
+                RouteResult::Skill(ref id) => {
+                    if let Some(skill) = self.skills.iter().find(|s| s.id() == id) {
+                        trace.winner = Some(format!("router:{id}"));
+                        let response = skill.execute(&normalized, &self.ctx);
+                        return (response, Some(trace));
+                    }
+                }
+                RouteResult::Action(action) => {
+                    trace.winner = Some("router:action".to_string());
+                    return (Response::Action(action), Some(trace));
+                }
+                RouteResult::NoMatch => {}
             }
         }
 

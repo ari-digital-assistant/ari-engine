@@ -67,7 +67,7 @@ impl Skill for SearchSkill {
     }
 
     fn description(&self) -> &str {
-        "Searches the web. Use when the user asks to search for something."
+        "Searches the web. Use when the user asks to search, look up, find information about something, or google something."
     }
 
     fn specificity(&self) -> Specificity {

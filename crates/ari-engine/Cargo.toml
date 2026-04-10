@@ -10,7 +10,7 @@ llm = ["dep:ari-llm"]
 ari-core = { path = "../ari-core" }
 ari-llm = { path = "../ari-llm", optional = true }
 ari-skill-loader = { path = "../ari-skill-loader" }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 ari-skills = { path = "../ari-skills" }
-serde_json = { workspace = true }

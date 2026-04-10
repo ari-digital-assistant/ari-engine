@@ -41,7 +41,7 @@ impl Skill for GreetingSkill {
     }
 
     fn description(&self) -> &str {
-        "Responds to greetings. Use when the user says hello, hi, or asks how Ari is doing."
+        "Responds to greetings. Use when the user says hello, hi, hey, good morning, good evening, howdy, what's up, or asks how Ari is doing."
     }
 
     fn specificity(&self) -> Specificity {

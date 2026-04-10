@@ -29,7 +29,7 @@ impl Skill for DateSkill {
     }
 
     fn description(&self) -> &str {
-        "Tells today's date. Use when the user asks what day or date it is."
+        "Tells today's date. Use when the user asks what day it is, what date it is, which day of the week it is, or anything about today's date."
     }
 
     fn specificity(&self) -> Specificity {
