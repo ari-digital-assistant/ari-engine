@@ -3,8 +3,13 @@ name = "ari-engine"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+llm = ["dep:ari-llm"]
+
 [dependencies]
 ari-core = { path = "../ari-core" }
+ari-llm = { path = "../ari-llm", optional = true }
+ari-skill-loader = { path = "../ari-skill-loader" }
 
 [dev-dependencies]
 ari-skills = { path = "../ari-skills" }

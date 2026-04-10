@@ -1,0 +1,9 @@
+[package]
+name = "ari-llm"
+version = "0.1.0"
+edition = "2021"
+description = "On-device LLM fallback for Ari — skill rerouting and general QA when no skill matches"
+license = "MIT"
+
+[dependencies]
+llama-cpp-2 = "0.1.143"

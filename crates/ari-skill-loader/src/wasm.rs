@@ -243,6 +243,7 @@ struct StorageCtx {
 /// the configuration needed to instantiate it on demand.
 pub struct WasmSkill {
     id: String,
+    description: String,
     specificity: Specificity,
     custom_score: bool,
     /// Native pattern scorer used when `custom_score = false`. Same code path
@@ -293,11 +294,12 @@ impl WasmSkill {
     ) -> Result<Self, WasmError> {
         let ari = sf.ari_extension.as_ref().ok_or(WasmError::NotAnAriSkill)?;
         let wasm = match &ari.behaviour {
-            Behaviour::Wasm(w) => w,
-            Behaviour::Declarative(_) => return Err(WasmError::NotWasm),
+            Some(Behaviour::Wasm(w)) => w,
+            Some(Behaviour::Declarative(_)) | None => return Err(WasmError::NotWasm),
         };
         Self::build(
             ari,
+            &sf.description,
             wasm,
             skill_dir,
             log_sink,
@@ -309,6 +311,7 @@ impl WasmSkill {
 
     fn build(
         ari: &AriExtension,
+        description: &str,
         wasm: &WasmBehaviour,
         skill_dir: &Path,
         log_sink: Arc<dyn LogSink>,
@@ -323,6 +326,7 @@ impl WasmSkill {
         })?;
         Self::from_module_bytes(
             ari,
+            description,
             wasm,
             &bytes,
             log_sink,
@@ -335,6 +339,7 @@ impl WasmSkill {
     /// Test seam: build directly from in-memory module bytes (WASM or WAT).
     pub fn from_module_bytes(
         ari: &AriExtension,
+        description: &str,
         wasm: &WasmBehaviour,
         bytes: &[u8],
         log_sink: Arc<dyn LogSink>,
@@ -349,7 +354,8 @@ impl WasmSkill {
         let module = compile_module_on_big_stack(&engine, bytes)?;
 
         let memory_limit_bytes = wasm.memory_limit_mb.max(1) as usize * 1024 * 1024;
-        let scorer = PatternScorer::compile(&ari.matching)?;
+        let matching = ari.matching.as_ref().ok_or(WasmError::NotWasm)?;
+        let scorer = PatternScorer::compile(matching)?;
 
         // Capability check at install time. The grant set is the intersection
         // of (declared) ∩ (host-provided). Anything declared but not provided
@@ -402,8 +408,9 @@ impl WasmSkill {
 
         let skill = WasmSkill {
             id: ari.id.clone(),
+            description: description.to_string(),
             specificity: ari.specificity.as_core(),
-            custom_score: ari.matching.custom_score,
+            custom_score: matching.custom_score,
             scorer,
             engine,
             module,
@@ -948,6 +955,10 @@ impl Skill for WasmSkill {
         &self.id
     }
 
+    fn description(&self) -> &str {
+        &self.description
+    }
+
     fn specificity(&self) -> Specificity {
         self.specificity
     }
@@ -1011,7 +1022,7 @@ impl Skill for WasmSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{Capability, MatchPattern, Matching, SpecificityLevel};
+    use crate::manifest::{Capability, MatchPattern, Matching, SkillType, SpecificityLevel};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A unique storage root per test invocation, so concurrent tests don't
@@ -1040,24 +1051,26 @@ mod tests {
             capabilities: Vec::<Capability>::new(),
             platforms: None,
             languages: vec!["en".to_string()],
+            skill_type: SkillType::Skill,
             specificity: SpecificityLevel::High,
-            matching: Matching {
+            matching: Some(Matching {
                 patterns: vec![MatchPattern::Keywords {
                     words: vec!["hex".to_string()],
                     weight: 0.9,
                 }],
                 custom_score,
-            },
-            behaviour: Behaviour::Wasm(WasmBehaviour {
+            }),
+            behaviour: Some(Behaviour::Wasm(WasmBehaviour {
                 module: "skill.wasm".to_string(),
                 memory_limit_mb: 1,
-            }),
+            })),
+            assistant: None,
         }
     }
 
     fn behaviour(ext: &AriExtension) -> &WasmBehaviour {
         match &ext.behaviour {
-            Behaviour::Wasm(w) => w,
+            Some(Behaviour::Wasm(w)) => w,
             _ => unreachable!(),
         }
     }
@@ -1116,6 +1129,7 @@ mod tests {
         let ari = fake_ari(custom_score);
         WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             sink,
@@ -1144,6 +1158,7 @@ mod tests {
         let ari = fake_ari(false);
         let err = WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),
@@ -1168,6 +1183,7 @@ mod tests {
         let ari = fake_ari(false);
         let err = WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),
@@ -1245,6 +1261,7 @@ mod tests {
         let ari = fake_ari(false);
         let skill = WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),
@@ -1267,6 +1284,7 @@ mod tests {
         let host = HostCapabilities::pure_frontend(); // grants notifications, not http
         let err = WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),
@@ -1290,6 +1308,7 @@ mod tests {
         ari.capabilities = vec![Capability::Notifications, Capability::LaunchApp];
         let skill = WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),
@@ -1350,6 +1369,7 @@ mod tests {
         ari.capabilities = declared;
         WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),
@@ -1420,6 +1440,7 @@ mod tests {
         let ari = fake_ari(false); // capabilities: []
         let err = WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),
@@ -1450,6 +1471,7 @@ mod tests {
         let ari = fake_ari(false);
         let err = WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),
@@ -1471,6 +1493,7 @@ mod tests {
         ari.capabilities = vec![Capability::Http];
         let skill = WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),
@@ -1502,6 +1525,7 @@ mod tests {
         ari.capabilities = vec![Capability::Http];
         let skill = WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),
@@ -1531,6 +1555,7 @@ mod tests {
         ari.capabilities = vec![Capability::Http];
         let skill = WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),
@@ -1567,6 +1592,7 @@ mod tests {
         config.max_body_bytes = 1024;
         let skill = WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),
@@ -1595,6 +1621,7 @@ mod tests {
         let ari = fake_ari(false);
         assert!(WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),
@@ -1716,6 +1743,7 @@ mod tests {
         ari.capabilities = vec![Capability::StorageKv];
         WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),
@@ -1767,6 +1795,7 @@ mod tests {
         let ari = fake_ari(false); // capabilities: []
         let err = WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),
@@ -1820,6 +1849,7 @@ mod tests {
         let storage = test_storage_config().with_max_value_bytes(10);
         let skill = WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),
@@ -1865,6 +1895,7 @@ mod tests {
         ari.capabilities = vec![Capability::StorageKv];
         let skill = WasmSkill::from_module_bytes(
             &ari,
+            "",
             behaviour(&ari),
             &bytes,
             Arc::new(NullLogSink),

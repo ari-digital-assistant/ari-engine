@@ -11,8 +11,12 @@ use ari_skills::{
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+mod assistant_registry;
 mod skill_registry;
 
+pub use assistant_registry::{
+    AssistantRegistry, FfiAssistantEntry, FfiConfigField, FfiSelectOption,
+};
 pub use skill_registry::{
     FfiBrowseEntry, FfiInstalledSkill, FfiRegistryError, FfiSkillUpdate, SkillRegistry,
 };
@@ -58,7 +62,7 @@ pub struct AriEngine {
     // Wrapped in Mutex because `reload_community_skills` mutates the
     // skill set after construction. `process_input` only needs a shared
     // lock in practice but the Engine trait takes `&self` anyway.
-    inner: Mutex<Engine>,
+    pub(crate) inner: Mutex<Engine>,
 }
 
 fn build_engine_with_builtins() -> Engine {
@@ -96,6 +100,32 @@ impl AriEngine {
             },
             ari_core::Response::Binary { mime, data } => FfiResponse::Binary { mime, data },
         }
+    }
+
+    /// Set the GGUF model path for the LLM fallback. The model is NOT
+    /// loaded immediately — it loads on demand when the first unmatched
+    /// query arrives, and unloads after 60 seconds of idle to free RAM.
+    ///
+    /// Returns `true` if the path exists, `false` otherwise.
+    /// Call at app startup if a model file is available on disk.
+    #[cfg(feature = "llm")]
+    pub fn load_llm_model(&self, model_path: String) -> bool {
+        let path = std::path::Path::new(&model_path);
+        if !path.is_file() {
+            return false;
+        }
+        let lazy = ari_llm::LazyLlmFallback::new(path);
+        let mut engine = self.inner.lock().expect("engine mutex poisoned");
+        engine.set_llm(Box::new(lazy));
+        true
+    }
+
+    /// Remove the LLM fallback. If a model is currently loaded in RAM,
+    /// it is dropped and the memory is freed.
+    #[cfg(feature = "llm")]
+    pub fn unload_llm_model(&self) {
+        let mut engine = self.inner.lock().expect("engine mutex poisoned");
+        engine.set_llm_none();
     }
 
     /// Rebuild the engine's skill set from scratch: the 6 built-in Rust
@@ -193,14 +223,14 @@ mod tests {
     }
 
     #[test]
-    fn engine_returns_fallback_for_gibberish() {
+    fn engine_returns_not_understood_for_gibberish() {
         let engine = AriEngine::new();
         let resp = engine.process_input("asdfghjkl".to_string());
         match resp {
-            FfiResponse::Text { body } => {
+            FfiResponse::NotUnderstood { body } => {
                 assert_eq!(body, "Sorry, I didn't understand that.");
             }
-            _ => panic!("expected Text fallback"),
+            _ => panic!("expected NotUnderstood fallback"),
         }
     }
 }

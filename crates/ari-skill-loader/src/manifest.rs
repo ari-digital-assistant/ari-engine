@@ -18,6 +18,118 @@ const FRONTMATTER_DELIM: &str = "---";
 const NAME_MAX_LEN: usize = 64;
 const DESCRIPTION_MAX_LEN: usize = 1024;
 
+// ── Skill type ────────────────────────────────────────────────────────
+
+/// Distinguishes regular skills (enter ranking rounds) from assistant
+/// providers (fire after all rounds fail).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillType {
+    /// Default — a regular skill that competes in ranking rounds.
+    Skill,
+    /// An assistant provider that answers when no skill matches.
+    Assistant,
+}
+
+impl Default for SkillType {
+    fn default() -> Self {
+        SkillType::Skill
+    }
+}
+
+// ── Assistant manifest types ──────────────────────────────────────────
+
+/// Parsed from `metadata.ari.assistant`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssistantManifest {
+    pub provider: AssistantProvider,
+    pub privacy: Privacy,
+    pub api: Option<ApiConfig>,
+    pub config: Vec<ConfigField>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantProvider {
+    Builtin,
+    Api,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Privacy {
+    Local,
+    Cloud,
+}
+
+/// Configuration for `provider: api` assistant skills.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApiConfig {
+    pub endpoint: Option<String>,
+    pub endpoint_config_key: Option<String>,
+    pub default_endpoint: Option<String>,
+    pub auth: AuthScheme,
+    pub auth_header: Option<String>,
+    pub auth_config_key: Option<String>,
+    pub model_config_key: Option<String>,
+    pub default_model: String,
+    pub system_prompt: String,
+    pub request_format: RequestFormat,
+    pub response_path: String,
+    pub api_version: Option<String>,
+    pub api_version_header: Option<String>,
+    pub max_tokens: u32,
+    pub temperature: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthScheme {
+    Bearer,
+    Header,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestFormat {
+    Openai,
+    Anthropic,
+}
+
+impl Default for RequestFormat {
+    fn default() -> Self {
+        RequestFormat::Openai
+    }
+}
+
+/// A user-configurable field rendered in Settings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigField {
+    pub key: String,
+    pub label: String,
+    pub field_type: ConfigFieldType,
+    pub required: bool,
+    pub default: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigFieldType {
+    Text,
+    Secret,
+    Select { options: Vec<SelectOption> },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectOption {
+    pub value: String,
+    pub label: String,
+    pub download_url: Option<String>,
+    pub download_bytes: Option<u64>,
+}
+
+// ── Errors ─────────────────────────────────────────────────────────────
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ManifestError {
     #[error("file is missing the opening `---` frontmatter delimiter")]
@@ -93,6 +205,51 @@ pub enum ManifestError {
         "`metadata.ari.matching.custom_score = true` is only valid for WASM skills"
     )]
     CustomScoreWithoutWasm,
+
+    #[error("`metadata.ari.assistant` is required when `type` is `assistant`")]
+    MissingAssistantBlock,
+
+    #[error("`metadata.ari.assistant` must not be present for regular skills")]
+    UnexpectedAssistantBlock,
+
+    #[error("assistant skill must not have `matching`, `declarative`, or `wasm` blocks")]
+    AssistantHasSkillFields,
+
+    #[error("`metadata.ari.assistant.provider` is required")]
+    MissingAssistantProvider,
+
+    #[error("`metadata.ari.assistant.privacy` is required")]
+    MissingAssistantPrivacy,
+
+    #[error("`metadata.ari.assistant.api` is required when provider is `api`")]
+    MissingApiBlock,
+
+    #[error("`metadata.ari.assistant.api` must not be present when provider is `builtin`")]
+    UnexpectedApiBlock,
+
+    #[error("`metadata.ari.assistant.api` must have either `endpoint` or `endpoint_config_key`")]
+    MissingEndpoint,
+
+    #[error("`metadata.ari.assistant.api` must not have both `endpoint` and `endpoint_config_key`")]
+    ConflictingEndpoint,
+
+    #[error("`metadata.ari.assistant.api.default_model` is required")]
+    MissingDefaultModel,
+
+    #[error("`metadata.ari.assistant.api.system_prompt` is required")]
+    MissingSystemPrompt,
+
+    #[error("`metadata.ari.assistant.api.response_path` is required")]
+    MissingResponsePath,
+
+    #[error("`metadata.ari.assistant.api.auth_config_key` is required when auth is not `none`")]
+    MissingAuthConfigKey,
+
+    #[error("config key `{key}` referenced by `{field}` not found in config array")]
+    ConfigKeyNotFound { key: String, field: String },
+
+    #[error("invalid response_path syntax: `{path}`")]
+    InvalidResponsePath { path: String },
 }
 
 /// A fully parsed `SKILL.md`. Holds both the raw AgentSkills frontmatter fields
@@ -118,9 +275,15 @@ pub struct AriExtension {
     pub capabilities: Vec<Capability>,
     pub platforms: Option<Vec<String>>,
     pub languages: Vec<String>,
+    pub skill_type: SkillType,
+    /// Present only for regular skills (`skill_type == Skill`).
     pub specificity: SpecificityLevel,
-    pub matching: Matching,
-    pub behaviour: Behaviour,
+    /// Present only for regular skills (`skill_type == Skill`).
+    pub matching: Option<Matching>,
+    /// Present only for regular skills (`skill_type == Skill`).
+    pub behaviour: Option<Behaviour>,
+    /// Present only for assistant skills (`skill_type == Assistant`).
+    pub assistant: Option<AssistantManifest>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,23 +435,53 @@ impl AriExtension {
             .filter(|s| !s.is_empty())
             .ok_or(ManifestError::MissingAriEngine)?;
 
-        let raw_matching = raw.matching.as_ref().ok_or(ManifestError::EmptyPatterns)?;
-        let matching = Matching::from_raw(raw_matching)?;
+        let skill_type = raw.skill_type.unwrap_or_default();
 
-        let behaviour = match (raw.declarative.as_ref(), raw.wasm.as_ref()) {
-            (Some(d), None) => Behaviour::Declarative(DeclarativeBehaviour::from_raw(d)?),
-            (None, Some(w)) => Behaviour::Wasm(WasmBehaviour::from_raw(w)),
-            (None, None) => {
-                return Err(ManifestError::BehaviourCardinality { found: "neither" })
+        let (matching, behaviour, assistant) = match skill_type {
+            SkillType::Skill => {
+                if raw.assistant.is_some() {
+                    return Err(ManifestError::UnexpectedAssistantBlock);
+                }
+                let raw_matching =
+                    raw.matching.as_ref().ok_or(ManifestError::EmptyPatterns)?;
+                let matching = Matching::from_raw(raw_matching)?;
+
+                let behaviour = match (raw.declarative.as_ref(), raw.wasm.as_ref()) {
+                    (Some(d), None) => {
+                        Behaviour::Declarative(DeclarativeBehaviour::from_raw(d)?)
+                    }
+                    (None, Some(w)) => Behaviour::Wasm(WasmBehaviour::from_raw(w)),
+                    (None, None) => {
+                        return Err(ManifestError::BehaviourCardinality {
+                            found: "neither",
+                        })
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(ManifestError::BehaviourCardinality { found: "both" })
+                    }
+                };
+
+                if matching.custom_score && !matches!(behaviour, Behaviour::Wasm(_)) {
+                    return Err(ManifestError::CustomScoreWithoutWasm);
+                }
+
+                (Some(matching), Some(behaviour), None)
             }
-            (Some(_), Some(_)) => {
-                return Err(ManifestError::BehaviourCardinality { found: "both" })
+            SkillType::Assistant => {
+                if raw.matching.is_some()
+                    || raw.declarative.is_some()
+                    || raw.wasm.is_some()
+                {
+                    return Err(ManifestError::AssistantHasSkillFields);
+                }
+                let raw_asst = raw
+                    .assistant
+                    .as_ref()
+                    .ok_or(ManifestError::MissingAssistantBlock)?;
+                let assistant = AssistantManifest::from_raw(raw_asst)?;
+                (None, None, Some(assistant))
             }
         };
-
-        if matching.custom_score && !matches!(behaviour, Behaviour::Wasm(_)) {
-            return Err(ManifestError::CustomScoreWithoutWasm);
-        }
 
         Ok(AriExtension {
             id,
@@ -299,9 +492,11 @@ impl AriExtension {
             capabilities: raw.capabilities.clone().unwrap_or_default(),
             platforms: raw.platforms.clone(),
             languages: raw.languages.clone().unwrap_or_default(),
+            skill_type,
             specificity: raw.specificity.unwrap_or(SpecificityLevel::Medium),
             matching,
             behaviour,
+            assistant,
         })
     }
 }
@@ -379,6 +574,265 @@ impl WasmBehaviour {
     }
 }
 
+impl AssistantManifest {
+    fn from_raw(raw: &RawAssistant) -> Result<Self, ManifestError> {
+        let provider = raw.provider.ok_or(ManifestError::MissingAssistantProvider)?;
+        let privacy = raw.privacy.ok_or(ManifestError::MissingAssistantPrivacy)?;
+
+        let api = match provider {
+            AssistantProvider::Api => {
+                let raw_api = raw.api.as_ref().ok_or(ManifestError::MissingApiBlock)?;
+                Some(ApiConfig::from_raw(raw_api, &raw.config)?)
+            }
+            AssistantProvider::Builtin => {
+                if raw.api.is_some() {
+                    return Err(ManifestError::UnexpectedApiBlock);
+                }
+                None
+            }
+        };
+
+        let config = raw
+            .config
+            .iter()
+            .map(ConfigField::from_raw)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(AssistantManifest {
+            provider,
+            privacy,
+            api,
+            config,
+        })
+    }
+}
+
+impl ApiConfig {
+    fn from_raw(
+        raw: &RawApiConfig,
+        config_fields: &[RawConfigField],
+    ) -> Result<Self, ManifestError> {
+        // Endpoint: exactly one of fixed or config-key.
+        match (&raw.endpoint, &raw.endpoint_config_key) {
+            (None, None) => return Err(ManifestError::MissingEndpoint),
+            (Some(_), Some(_)) => return Err(ManifestError::ConflictingEndpoint),
+            _ => {}
+        }
+
+        let auth = raw.auth.unwrap_or(AuthScheme::None);
+
+        // Auth config key required when auth is not none.
+        if !matches!(auth, AuthScheme::None) && raw.auth_config_key.is_none() {
+            return Err(ManifestError::MissingAuthConfigKey);
+        }
+
+        let default_model = raw
+            .default_model
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or(ManifestError::MissingDefaultModel)?;
+
+        let system_prompt = raw
+            .system_prompt
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or(ManifestError::MissingSystemPrompt)?;
+
+        let response_path = raw
+            .response_path
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or(ManifestError::MissingResponsePath)?;
+
+        validate_response_path(&response_path)?;
+
+        // Validate that referenced config keys exist.
+        let config_keys: Vec<&str> = config_fields
+            .iter()
+            .filter_map(|f| f.key.as_deref())
+            .collect();
+
+        if let Some(ref key) = raw.auth_config_key {
+            if !config_keys.contains(&key.as_str()) {
+                return Err(ManifestError::ConfigKeyNotFound {
+                    key: key.clone(),
+                    field: "auth_config_key".to_string(),
+                });
+            }
+        }
+        if let Some(ref key) = raw.model_config_key {
+            if !config_keys.contains(&key.as_str()) {
+                return Err(ManifestError::ConfigKeyNotFound {
+                    key: key.clone(),
+                    field: "model_config_key".to_string(),
+                });
+            }
+        }
+        if let Some(ref key) = raw.endpoint_config_key {
+            if !config_keys.contains(&key.as_str()) {
+                return Err(ManifestError::ConfigKeyNotFound {
+                    key: key.clone(),
+                    field: "endpoint_config_key".to_string(),
+                });
+            }
+        }
+
+        Ok(ApiConfig {
+            endpoint: raw.endpoint.clone(),
+            endpoint_config_key: raw.endpoint_config_key.clone(),
+            default_endpoint: raw.default_endpoint.clone(),
+            auth,
+            auth_header: raw.auth_header.clone(),
+            auth_config_key: raw.auth_config_key.clone(),
+            model_config_key: raw.model_config_key.clone(),
+            default_model,
+            system_prompt,
+            request_format: raw.request_format.unwrap_or_default(),
+            response_path,
+            api_version: raw.api_version.clone(),
+            api_version_header: raw.api_version_header.clone(),
+            max_tokens: raw.max_tokens.unwrap_or(256),
+            temperature: raw.temperature.unwrap_or(0.7),
+        })
+    }
+}
+
+impl ConfigField {
+    fn from_raw(raw: &RawConfigField) -> Result<Self, ManifestError> {
+        let key = raw
+            .key
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or(ManifestError::YamlParse("config field missing `key`".into()))?;
+        let label = raw
+            .label
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or(ManifestError::YamlParse(
+                "config field missing `label`".into(),
+            ))?;
+        let field_type = match raw.field_type.as_deref() {
+            Some("text") => ConfigFieldType::Text,
+            Some("secret") => ConfigFieldType::Secret,
+            Some("select") => {
+                let options = raw
+                    .options
+                    .iter()
+                    .map(|o| {
+                        Ok(SelectOption {
+                            value: o
+                                .value
+                                .clone()
+                                .filter(|s| !s.is_empty())
+                                .ok_or(ManifestError::YamlParse(
+                                    "select option missing `value`".into(),
+                                ))?,
+                            label: o
+                                .label
+                                .clone()
+                                .filter(|s| !s.is_empty())
+                                .ok_or(ManifestError::YamlParse(
+                                    "select option missing `label`".into(),
+                                ))?,
+                            download_url: o.download_url.clone(),
+                            download_bytes: o.download_bytes,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ManifestError>>()?;
+                ConfigFieldType::Select { options }
+            }
+            Some(other) => {
+                return Err(ManifestError::YamlParse(format!(
+                    "unknown config field type: {other}"
+                )))
+            }
+            None => {
+                return Err(ManifestError::YamlParse(
+                    "config field missing `type`".into(),
+                ))
+            }
+        };
+        Ok(ConfigField {
+            key,
+            label,
+            field_type,
+            required: raw.required,
+            default: raw.default.clone(),
+        })
+    }
+}
+
+// ── Response path parsing ─────────────────────────────────────────────
+
+/// A segment of a parsed response path like `choices[0].message.content`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathSegment {
+    Field(String),
+    Index(usize),
+}
+
+/// Parse a response path string into segments. Supports `field`,
+/// `field[N]`, and dotted chains like `choices[0].message.content`.
+pub fn parse_response_path(path: &str) -> Result<Vec<PathSegment>, ManifestError> {
+    let mut segments = Vec::new();
+    for part in path.split('.') {
+        if part.is_empty() {
+            return Err(ManifestError::InvalidResponsePath {
+                path: path.to_string(),
+            });
+        }
+        if let Some(bracket) = part.find('[') {
+            let field = &part[..bracket];
+            if !field.is_empty() {
+                segments.push(PathSegment::Field(field.to_string()));
+            }
+            let rest = &part[bracket..];
+            if !rest.ends_with(']') {
+                return Err(ManifestError::InvalidResponsePath {
+                    path: path.to_string(),
+                });
+            }
+            let idx_str = &rest[1..rest.len() - 1];
+            let idx: usize =
+                idx_str
+                    .parse()
+                    .map_err(|_| ManifestError::InvalidResponsePath {
+                        path: path.to_string(),
+                    })?;
+            segments.push(PathSegment::Index(idx));
+        } else {
+            segments.push(PathSegment::Field(part.to_string()));
+        }
+    }
+    if segments.is_empty() {
+        return Err(ManifestError::InvalidResponsePath {
+            path: path.to_string(),
+        });
+    }
+    Ok(segments)
+}
+
+/// Extract a string value from a JSON value using a parsed path.
+pub fn extract_by_path(value: &serde_json::Value, segments: &[PathSegment]) -> Option<String> {
+    let mut current = value;
+    for seg in segments {
+        match seg {
+            PathSegment::Field(name) => {
+                current = current.get(name)?;
+            }
+            PathSegment::Index(idx) => {
+                current = current.get(idx)?;
+            }
+        }
+    }
+    current.as_str().map(|s| s.to_string())
+}
+
+fn validate_response_path(path: &str) -> Result<(), ManifestError> {
+    parse_response_path(path)?;
+    Ok(())
+}
+
 fn split_frontmatter(source: &str) -> Result<(&str, &str), ManifestError> {
     let trimmed = source.trim_start_matches('\u{feff}');
     let after_first = trimmed
@@ -452,10 +906,13 @@ struct RawAriExtension {
     capabilities: Option<Vec<Capability>>,
     platforms: Option<Vec<String>>,
     languages: Option<Vec<String>>,
+    #[serde(rename = "type")]
+    skill_type: Option<SkillType>,
     specificity: Option<SpecificityLevel>,
     matching: Option<RawMatching>,
     declarative: Option<RawDeclarative>,
     wasm: Option<RawWasm>,
+    assistant: Option<RawAssistant>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -483,6 +940,55 @@ struct RawDeclarative {
 struct RawWasm {
     module: String,
     memory_limit_mb: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAssistant {
+    provider: Option<AssistantProvider>,
+    privacy: Option<Privacy>,
+    api: Option<RawApiConfig>,
+    #[serde(default)]
+    config: Vec<RawConfigField>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawApiConfig {
+    endpoint: Option<String>,
+    endpoint_config_key: Option<String>,
+    default_endpoint: Option<String>,
+    auth: Option<AuthScheme>,
+    auth_header: Option<String>,
+    auth_config_key: Option<String>,
+    model_config_key: Option<String>,
+    default_model: Option<String>,
+    system_prompt: Option<String>,
+    request_format: Option<RequestFormat>,
+    response_path: Option<String>,
+    api_version: Option<String>,
+    api_version_header: Option<String>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawConfigField {
+    key: Option<String>,
+    label: Option<String>,
+    #[serde(rename = "type")]
+    field_type: Option<String>,
+    #[serde(default)]
+    required: bool,
+    default: Option<String>,
+    #[serde(default)]
+    options: Vec<RawSelectOption>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSelectOption {
+    value: Option<String>,
+    label: Option<String>,
+    download_url: Option<String>,
+    download_bytes: Option<u64>,
 }
 
 #[cfg(test)]
@@ -532,10 +1038,11 @@ Flips a virtual coin.
         assert_eq!(ari.specificity, SpecificityLevel::High);
         assert_eq!(ari.languages, vec!["en"]);
         assert!(ari.capabilities.is_empty());
-        assert_eq!(ari.matching.patterns.len(), 2);
-        assert!(!ari.matching.custom_score);
+        let matching = ari.matching.as_ref().expect("matching present for skill");
+        assert_eq!(matching.patterns.len(), 2);
+        assert!(!matching.custom_score);
 
-        match &ari.matching.patterns[0] {
+        match &matching.patterns[0] {
             MatchPattern::Keywords { words, weight } => {
                 assert_eq!(words, &vec!["flip".to_string(), "coin".to_string()]);
                 assert_eq!(*weight, 0.95);
@@ -544,10 +1051,10 @@ Flips a virtual coin.
         }
 
         match ari.behaviour {
-            Behaviour::Declarative(DeclarativeBehaviour {
+            Some(Behaviour::Declarative(DeclarativeBehaviour {
                 response: ResponseSpec::Pick(picks),
                 action: None,
-            }) => {
+            })) => {
                 assert_eq!(picks, vec!["Heads.".to_string(), "Tails.".to_string()]);
             }
             _ => panic!("expected declarative response_pick with no action"),
@@ -843,7 +1350,7 @@ metadata:
 "#;
         let sf = Skillfile::parse(src, None).unwrap();
         let ari = sf.ari_extension.unwrap();
-        match &ari.matching.patterns[0] {
+        match &ari.matching.as_ref().unwrap().patterns[0] {
             MatchPattern::Keywords { words, .. } => {
                 assert_eq!(words, &vec!["flip".to_string(), "coin".to_string()]);
             }
@@ -873,7 +1380,7 @@ metadata:
         let ari = sf.ari_extension.unwrap();
         assert_eq!(ari.capabilities, vec![Capability::Http]);
         match ari.behaviour {
-            Behaviour::Wasm(w) => {
+            Some(Behaviour::Wasm(w)) => {
                 assert_eq!(w.module, "skill.wasm");
                 assert_eq!(w.memory_limit_mb, 16);
             }
@@ -926,7 +1433,7 @@ metadata:
 "#;
         let sf = Skillfile::parse(src, None).unwrap();
         let ari = sf.ari_extension.unwrap();
-        assert_eq!(ari.matching.patterns[0].weight(), 1.0);
+        assert_eq!(ari.matching.as_ref().unwrap().patterns[0].weight(), 1.0);
     }
 
     #[test]
@@ -951,5 +1458,363 @@ metadata:
             sf.ari_extension.unwrap().specificity,
             SpecificityLevel::Medium
         );
+    }
+
+    // --- Assistant skill parsing ---
+
+    fn chatgpt_assistant_source() -> &'static str {
+        r#"---
+name: chatgpt
+description: Use OpenAI's ChatGPT to answer general questions.
+metadata:
+  ari:
+    id: dev.heyari.assistant.chatgpt
+    version: "0.1.0"
+    type: assistant
+    author: Ari Project
+    engine: ">=0.3"
+    languages: [en]
+    assistant:
+      provider: api
+      privacy: cloud
+      api:
+        endpoint: https://api.openai.com/v1/chat/completions
+        auth: bearer
+        auth_config_key: api_key
+        model_config_key: model
+        default_model: gpt-4o-mini
+        system_prompt: You are Ari, a helpful voice assistant. Answer in one short sentence.
+        response_path: "choices[0].message.content"
+      config:
+        - key: api_key
+          label: API Key
+          type: secret
+          required: true
+        - key: model
+          label: Model
+          type: text
+          default: gpt-4o-mini
+---
+Uses OpenAI's ChatGPT API.
+"#
+    }
+
+    fn builtin_assistant_source() -> &'static str {
+        r#"---
+name: local-llm
+description: On-device language model.
+metadata:
+  ari:
+    id: dev.heyari.assistant.local
+    version: "0.1.0"
+    type: assistant
+    engine: ">=0.3"
+    languages: [en]
+    assistant:
+      provider: builtin
+      privacy: local
+      config:
+        - key: model_tier
+          label: Model
+          type: select
+          options:
+            - value: small
+              label: "Gemma 3 1B"
+              download_url: "https://example.com/small.gguf"
+              download_bytes: 769000000
+---
+Runs locally.
+"#
+    }
+
+    #[test]
+    fn parses_api_assistant_skill() {
+        let sf = Skillfile::parse(chatgpt_assistant_source(), Some("chatgpt")).unwrap();
+        let ari = sf.ari_extension.expect("ari extension present");
+        assert_eq!(ari.skill_type, SkillType::Assistant);
+        assert!(ari.matching.is_none());
+        assert!(ari.behaviour.is_none());
+
+        let asst = ari.assistant.expect("assistant block present");
+        assert_eq!(asst.provider, AssistantProvider::Api);
+        assert_eq!(asst.privacy, Privacy::Cloud);
+        assert_eq!(asst.config.len(), 2);
+        assert_eq!(asst.config[0].key, "api_key");
+        assert!(matches!(asst.config[0].field_type, ConfigFieldType::Secret));
+        assert!(asst.config[0].required);
+        assert_eq!(asst.config[1].key, "model");
+        assert!(matches!(asst.config[1].field_type, ConfigFieldType::Text));
+        assert_eq!(asst.config[1].default.as_deref(), Some("gpt-4o-mini"));
+
+        let api = asst.api.expect("api block present");
+        assert_eq!(api.endpoint.as_deref(), Some("https://api.openai.com/v1/chat/completions"));
+        assert_eq!(api.auth, AuthScheme::Bearer);
+        assert_eq!(api.auth_config_key.as_deref(), Some("api_key"));
+        assert_eq!(api.default_model, "gpt-4o-mini");
+        assert_eq!(api.response_path, "choices[0].message.content");
+        assert_eq!(api.request_format, RequestFormat::Openai);
+        assert_eq!(api.max_tokens, 256);
+    }
+
+    #[test]
+    fn parses_builtin_assistant_skill() {
+        let sf = Skillfile::parse(builtin_assistant_source(), Some("local-llm")).unwrap();
+        let ari = sf.ari_extension.expect("ari extension present");
+        assert_eq!(ari.skill_type, SkillType::Assistant);
+
+        let asst = ari.assistant.expect("assistant block present");
+        assert_eq!(asst.provider, AssistantProvider::Builtin);
+        assert_eq!(asst.privacy, Privacy::Local);
+        assert!(asst.api.is_none());
+        assert_eq!(asst.config.len(), 1);
+        assert_eq!(asst.config[0].key, "model_tier");
+        match &asst.config[0].field_type {
+            ConfigFieldType::Select { options } => {
+                assert_eq!(options.len(), 1);
+                assert_eq!(options[0].value, "small");
+                assert_eq!(options[0].download_url.as_deref(), Some("https://example.com/small.gguf"));
+                assert_eq!(options[0].download_bytes, Some(769000000));
+            }
+            _ => panic!("expected select config field"),
+        }
+    }
+
+    #[test]
+    fn rejects_assistant_with_matching_block() {
+        let src = r#"---
+name: x
+description: x
+metadata:
+  ari:
+    id: a.b.c
+    version: "1"
+    engine: ">=0.3"
+    type: assistant
+    matching:
+      patterns:
+        - keywords: [foo]
+    assistant:
+      provider: builtin
+      privacy: local
+---
+"#;
+        assert_eq!(
+            Skillfile::parse(src, None).unwrap_err(),
+            ManifestError::AssistantHasSkillFields
+        );
+    }
+
+    #[test]
+    fn rejects_assistant_with_declarative_block() {
+        let src = r#"---
+name: x
+description: x
+metadata:
+  ari:
+    id: a.b.c
+    version: "1"
+    engine: ">=0.3"
+    type: assistant
+    declarative:
+      response: hi
+    assistant:
+      provider: builtin
+      privacy: local
+---
+"#;
+        assert_eq!(
+            Skillfile::parse(src, None).unwrap_err(),
+            ManifestError::AssistantHasSkillFields
+        );
+    }
+
+    #[test]
+    fn rejects_regular_skill_with_assistant_block() {
+        let src = r#"---
+name: x
+description: x
+metadata:
+  ari:
+    id: a.b.c
+    version: "1"
+    engine: ">=0.3"
+    matching:
+      patterns:
+        - keywords: [foo]
+    declarative:
+      response: hi
+    assistant:
+      provider: builtin
+      privacy: local
+---
+"#;
+        assert_eq!(
+            Skillfile::parse(src, None).unwrap_err(),
+            ManifestError::UnexpectedAssistantBlock
+        );
+    }
+
+    #[test]
+    fn rejects_api_assistant_missing_api_block() {
+        let src = r#"---
+name: x
+description: x
+metadata:
+  ari:
+    id: a.b.c
+    version: "1"
+    engine: ">=0.3"
+    type: assistant
+    assistant:
+      provider: api
+      privacy: cloud
+---
+"#;
+        assert_eq!(
+            Skillfile::parse(src, None).unwrap_err(),
+            ManifestError::MissingApiBlock
+        );
+    }
+
+    #[test]
+    fn rejects_builtin_assistant_with_api_block() {
+        let src = r#"---
+name: x
+description: x
+metadata:
+  ari:
+    id: a.b.c
+    version: "1"
+    engine: ">=0.3"
+    type: assistant
+    assistant:
+      provider: builtin
+      privacy: local
+      api:
+        endpoint: https://example.com
+        default_model: x
+        system_prompt: x
+        response_path: "x"
+---
+"#;
+        assert_eq!(
+            Skillfile::parse(src, None).unwrap_err(),
+            ManifestError::UnexpectedApiBlock
+        );
+    }
+
+    #[test]
+    fn rejects_api_assistant_with_missing_endpoint() {
+        let src = r#"---
+name: x
+description: x
+metadata:
+  ari:
+    id: a.b.c
+    version: "1"
+    engine: ">=0.3"
+    type: assistant
+    assistant:
+      provider: api
+      privacy: cloud
+      api:
+        default_model: x
+        system_prompt: x
+        response_path: "x"
+      config:
+        - key: api_key
+          label: Key
+          type: secret
+---
+"#;
+        assert_eq!(
+            Skillfile::parse(src, None).unwrap_err(),
+            ManifestError::MissingEndpoint
+        );
+    }
+
+    #[test]
+    fn rejects_api_assistant_with_bad_response_path() {
+        let src = r#"---
+name: x
+description: x
+metadata:
+  ari:
+    id: a.b.c
+    version: "1"
+    engine: ">=0.3"
+    type: assistant
+    assistant:
+      provider: api
+      privacy: cloud
+      api:
+        endpoint: https://example.com
+        default_model: x
+        system_prompt: x
+        response_path: "choices[abc].content"
+      config:
+        - key: api_key
+          label: Key
+          type: secret
+---
+"#;
+        let err = Skillfile::parse(src, None).unwrap_err();
+        assert!(matches!(err, ManifestError::InvalidResponsePath { .. }));
+    }
+
+    #[test]
+    fn rejects_api_with_auth_but_missing_config_key() {
+        let src = r#"---
+name: x
+description: x
+metadata:
+  ari:
+    id: a.b.c
+    version: "1"
+    engine: ">=0.3"
+    type: assistant
+    assistant:
+      provider: api
+      privacy: cloud
+      api:
+        endpoint: https://example.com
+        auth: bearer
+        auth_config_key: api_key
+        default_model: x
+        system_prompt: x
+        response_path: "x"
+---
+"#;
+        let err = Skillfile::parse(src, None).unwrap_err();
+        assert!(matches!(err, ManifestError::ConfigKeyNotFound { key, field } if key == "api_key" && field == "auth_config_key"));
+    }
+
+    #[test]
+    fn response_path_parse_simple_field() {
+        let segs = parse_response_path("result").unwrap();
+        assert_eq!(segs, vec![PathSegment::Field("result".into())]);
+    }
+
+    #[test]
+    fn response_path_parse_nested() {
+        let segs = parse_response_path("a.b.c").unwrap();
+        assert_eq!(
+            segs,
+            vec![
+                PathSegment::Field("a".into()),
+                PathSegment::Field("b".into()),
+                PathSegment::Field("c".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn response_path_rejects_empty() {
+        assert!(parse_response_path("").is_err());
+    }
+
+    #[test]
+    fn response_path_rejects_double_dot() {
+        assert!(parse_response_path("a..b").is_err());
     }
 }

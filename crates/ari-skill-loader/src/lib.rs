@@ -1,3 +1,4 @@
+pub mod assistant;
 pub mod bundle;
 pub mod declarative;
 pub mod host_capabilities;
@@ -12,6 +13,7 @@ pub mod store;
 mod tls;
 pub mod wasm;
 
+pub use assistant::{AssistantApiError, ConfigStore, MemoryConfigStore, call_assistant_api};
 pub use bundle::{install_from_bytes, sha256_hex, BundleError, InstalledBundle};
 pub use declarative::{AdapterError, DeclarativeSkill};
 pub use signature::{SignatureError, TrustRoot, VERIFYING_KEY_LENGTH};
@@ -19,11 +21,14 @@ pub use host_capabilities::{capability_name, parse_capability, HostCapabilities}
 pub use http_config::HttpConfig;
 pub use loader::{
     load_single_skill_dir, load_single_skill_dir_with, load_skill_directory,
-    load_skill_directory_with, LoadFailure, LoadFailureKind, LoadOptions, LoadReport,
+    load_skill_directory_with, AssistantEntry, LoadFailure, LoadFailureKind, LoadOptions,
+    LoadReport,
 };
 pub use manifest::{
-    AriExtension, Behaviour, Capability, DeclarativeBehaviour, ManifestError, MatchPattern,
-    Matching, ResponseSpec, Skillfile, SpecificityLevel, WasmBehaviour,
+    ApiConfig, AriExtension, AssistantManifest, AssistantProvider, AuthScheme, Behaviour,
+    Capability, ConfigField, ConfigFieldType, DeclarativeBehaviour, ManifestError, MatchPattern,
+    Matching, PathSegment, Privacy, RequestFormat, ResponseSpec, SelectOption, SkillType,
+    Skillfile, SpecificityLevel, WasmBehaviour, extract_by_path, parse_response_path,
 };
 pub use registry::{
     check_updates, install_by_id, install_update, AvailableUpdate, Index, IndexEntry,

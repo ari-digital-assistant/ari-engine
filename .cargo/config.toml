@@ -1,0 +1,7 @@
+# bindgen needs libclang to generate Rust bindings for llama.cpp.
+# llama-cpp-sys-2 needs the NDK to cross-compile C++ for Android.
+# The Android NDK ships both — point at it so builds work from any
+# environment (terminal, Android Studio, CI).
+[env]
+LIBCLANG_PATH = "/home/keith/Android/Sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/linux-x86_64/lib"
+ANDROID_NDK = "/home/keith/Android/Sdk/ndk/28.0.13004108"

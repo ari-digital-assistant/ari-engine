@@ -67,6 +67,10 @@ impl Skill for CalculatorSkill {
         "calculator"
     }
 
+    fn description(&self) -> &str {
+        "Evaluates math expressions. Use when the user asks to calculate or compute something."
+    }
+
     fn specificity(&self) -> Specificity {
         Specificity::High
     }

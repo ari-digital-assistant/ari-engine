@@ -28,6 +28,10 @@ impl Skill for DateSkill {
         "current_date"
     }
 
+    fn description(&self) -> &str {
+        "Tells today's date. Use when the user asks what day or date it is."
+    }
+
     fn specificity(&self) -> Specificity {
         Specificity::High
     }

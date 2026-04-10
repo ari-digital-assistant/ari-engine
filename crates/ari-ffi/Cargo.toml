@@ -7,9 +7,14 @@ edition = "2024"
 crate-type = ["cdylib", "lib"]
 name = "ari_ffi"
 
+[features]
+default = ["llm"]
+llm = ["ari-engine/llm", "dep:ari-llm"]
+
 [dependencies]
 ari-core = { path = "../ari-core" }
 ari-engine = { path = "../ari-engine" }
+ari-llm = { path = "../ari-llm", optional = true }
 ari-skills = { path = "../ari-skills" }
 ari-skill-loader = { path = "../ari-skill-loader" }
 serde_json = { workspace = true }

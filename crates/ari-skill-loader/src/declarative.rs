@@ -34,6 +34,7 @@ pub enum AdapterError {
 #[derive(Debug)]
 pub struct DeclarativeSkill {
     id: String,
+    description: String,
     specificity: Specificity,
     scorer: PatternScorer,
     response: ResponseSpec,
@@ -47,16 +48,18 @@ pub struct DeclarativeSkill {
 impl DeclarativeSkill {
     pub fn from_skillfile(sf: &Skillfile) -> Result<Self, AdapterError> {
         let ari = sf.ari_extension.as_ref().ok_or(AdapterError::NotAnAriSkill)?;
-        Self::from_extension(&ari.id, ari)
+        Self::from_extension(&ari.id, &sf.description, ari)
     }
 
-    fn from_extension(id: &str, ari: &AriExtension) -> Result<Self, AdapterError> {
+    fn from_extension(id: &str, description: &str, ari: &AriExtension) -> Result<Self, AdapterError> {
         let decl = match &ari.behaviour {
-            Behaviour::Declarative(d) => d,
-            Behaviour::Wasm(_) => return Err(AdapterError::NotDeclarative),
+            Some(Behaviour::Declarative(d)) => d,
+            Some(Behaviour::Wasm(_)) => return Err(AdapterError::NotDeclarative),
+            None => return Err(AdapterError::NotDeclarative),
         };
 
-        let scorer = PatternScorer::compile(&ari.matching)?;
+        let matching = ari.matching.as_ref().ok_or(AdapterError::NotDeclarative)?;
+        let scorer = PatternScorer::compile(matching)?;
 
         // Seed the pick counter from system time so successive process
         // launches don't all start at index 0. Within a single process the
@@ -69,6 +72,7 @@ impl DeclarativeSkill {
 
         Ok(DeclarativeSkill {
             id: id.to_string(),
+            description: description.to_string(),
             specificity: ari.specificity.as_core(),
             scorer,
             response: decl.response.clone(),
@@ -111,6 +115,10 @@ impl DeclarativeSkill {
 impl Skill for DeclarativeSkill {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn description(&self) -> &str {
+        &self.description
     }
 
     fn specificity(&self) -> Specificity {

@@ -40,6 +40,10 @@ impl Skill for GreetingSkill {
         "greeting"
     }
 
+    fn description(&self) -> &str {
+        "Responds to greetings. Use when the user says hello, hi, or asks how Ari is doing."
+    }
+
     fn specificity(&self) -> Specificity {
         Specificity::Low
     }

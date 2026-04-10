@@ -36,6 +36,10 @@ impl Skill for OpenSkill {
         "open"
     }
 
+    fn description(&self) -> &str {
+        "Opens apps by name. Use when the user asks to open or launch something."
+    }
+
     fn specificity(&self) -> Specificity {
         Specificity::Medium
     }

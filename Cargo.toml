@@ -9,6 +9,7 @@ members = [
     "crates/ari-sign-bundle",
     "crates/ari-cli",
     "crates/ari-ffi",
+    "crates/ari-llm",
 ]
 
 [workspace.dependencies]

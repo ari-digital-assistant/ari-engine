@@ -1,4 +1,7 @@
 use ari_core::{normalize_input, Response, Skill, SkillContext, Specificity};
+use ari_skill_loader::assistant::ConfigStore;
+use ari_skill_loader::manifest::ApiConfig;
+use std::sync::Arc;
 
 /// The text the engine returns when no skill matches the input. Exposed
 /// publicly so the FFI layer can detect this exact response and convert it
@@ -33,10 +36,25 @@ pub struct DebugTrace {
     pub round: Option<usize>,
 }
 
+/// Which assistant is currently active and how to call it.
+pub enum ActiveAssistant {
+    /// Use the built-in on-device LLM (routes to `self.llm`).
+    Builtin,
+    /// Use a cloud API via the generic adapter.
+    Api {
+        skill_id: String,
+        config: ApiConfig,
+        config_store: Arc<dyn ConfigStore>,
+    },
+}
+
 pub struct Engine {
     skills: Vec<Box<dyn Skill>>,
     ctx: SkillContext,
     debug: bool,
+    #[cfg(feature = "llm")]
+    llm: Option<Box<dyn ari_llm::Fallback>>,
+    active_assistant: Option<ActiveAssistant>,
 }
 
 impl Engine {
@@ -45,6 +63,9 @@ impl Engine {
             skills: Vec::new(),
             ctx: SkillContext::default(),
             debug: false,
+            #[cfg(feature = "llm")]
+            llm: None,
+            active_assistant: None,
         }
     }
 
@@ -54,6 +75,25 @@ impl Engine {
 
     pub fn register_skill(&mut self, skill: Box<dyn Skill>) {
         self.skills.push(skill);
+    }
+
+    /// Set the LLM fallback. When set, the engine will consult the LLM
+    /// before returning the fallback response, attempting skill rerouting
+    /// or direct answers for unmatched input.
+    #[cfg(feature = "llm")]
+    pub fn set_llm(&mut self, llm: Box<dyn ari_llm::Fallback>) {
+        self.llm = Some(llm);
+    }
+
+    /// Remove the LLM fallback, freeing its memory.
+    #[cfg(feature = "llm")]
+    pub fn set_llm_none(&mut self) {
+        self.llm = None;
+    }
+
+    /// Set the active assistant provider.
+    pub fn set_active_assistant(&mut self, assistant: Option<ActiveAssistant>) {
+        self.active_assistant = assistant;
     }
 
     pub fn process_input(&self, input: &str) -> Response {
@@ -123,6 +163,49 @@ impl Engine {
                 let response = skill.execute(&normalized, &self.ctx);
                 return (response, Some(trace));
             }
+        }
+
+        // No skill matched. Delegate to the active assistant, if any.
+        match &self.active_assistant {
+            Some(ActiveAssistant::Builtin) => {
+                #[cfg(feature = "llm")]
+                if let Some(ref llm) = self.llm {
+                    let catalog: Vec<ari_llm::SkillInfo> = self
+                        .skills
+                        .iter()
+                        .map(|s| ari_llm::SkillInfo {
+                            id: s.id().to_string(),
+                            description: s.description().to_string(),
+                        })
+                        .collect();
+
+                    if let Some(ari_llm::FallbackResult::DirectAnswer { text }) =
+                        llm.try_answer(&normalized, &catalog)
+                    {
+                        trace.winner = Some("assistant:builtin".to_string());
+                        return (Response::Text(text), Some(trace));
+                    }
+                }
+            }
+            Some(ActiveAssistant::Api {
+                skill_id,
+                config,
+                config_store,
+            }) => {
+                match ari_skill_loader::call_assistant_api(
+                    config,
+                    skill_id,
+                    config_store.as_ref(),
+                    &normalized,
+                ) {
+                    Ok(text) if !text.is_empty() => {
+                        trace.winner = Some(format!("assistant:{skill_id}"));
+                        return (Response::Text(text), Some(trace));
+                    }
+                    _ => {}
+                }
+            }
+            None => {}
         }
 
         (Response::Text(FALLBACK_RESPONSE.to_string()), Some(trace))

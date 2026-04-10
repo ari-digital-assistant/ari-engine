@@ -101,6 +101,25 @@ fn main() -> ExitCode {
         }
     }
 
+    #[cfg(feature = "llm")]
+    if let Some(ref model_path) = parsed.llm_model {
+        if parsed.debug {
+            eprintln!("[ari] loading LLM model: {}", model_path.display());
+        }
+        match ari_llm::LlmFallback::load(model_path) {
+            Ok(llm) => {
+                engine.set_llm(Box::new(llm));
+                if parsed.debug {
+                    eprintln!("[ari] LLM model loaded");
+                }
+            }
+            Err(e) => {
+                eprintln!("ari: failed to load LLM model: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
     if !parsed.utterance.is_empty() {
         let response = engine.process_input(&parsed.utterance);
         print_response(&response);
@@ -131,6 +150,8 @@ struct ParsedArgs {
     host_capabilities_explicit: Vec<String>,
     storage_dir: Option<PathBuf>,
     skill_store: Option<PathBuf>,
+    #[cfg(feature = "llm")]
+    llm_model: Option<PathBuf>,
 }
 
 impl Default for ParsedArgs {
@@ -143,6 +164,8 @@ impl Default for ParsedArgs {
             host_capabilities_explicit: Vec::new(),
             storage_dir: None,
             skill_store: None,
+            #[cfg(feature = "llm")]
+            llm_model: None,
         }
     }
 }
@@ -229,6 +252,21 @@ fn parse_args(args: Vec<String>) -> Result<ParsedArgs, String> {
                 }
                 parsed.skill_store = Some(PathBuf::from(value));
             }
+            #[cfg(feature = "llm")]
+            "--llm-model" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--llm-model requires a path to a GGUF model".to_string())?;
+                parsed.llm_model = Some(PathBuf::from(value));
+            }
+            #[cfg(feature = "llm")]
+            other_llm if other_llm.starts_with("--llm-model=") => {
+                let value = &other_llm["--llm-model=".len()..];
+                if value.is_empty() {
+                    return Err("--llm-model requires a path to a GGUF model".to_string());
+                }
+                parsed.llm_model = Some(PathBuf::from(value));
+            }
             other if other.starts_with("--") => {
                 return Err(format!("unknown option: {other}"));
             }
@@ -267,7 +305,7 @@ fn has_skill_md(path: &std::path::Path) -> bool {
 
 fn print_usage() {
     eprintln!(
-        "usage: ari-cli [--debug] [--extra-skill-dir <path>]... \
+        "usage: ari-cli [--debug] [--llm-model <path>] [--extra-skill-dir <path>]... \
          [--host-capabilities <list>|--no-host-capabilities] [utterance...]"
     );
     eprintln!();
@@ -284,6 +322,9 @@ fn print_usage() {
     eprintln!("                                   (notifications, launch_app, clipboard, tts).");
     eprintln!("  --no-host-capabilities           grant the empty capability set; any skill with");
     eprintln!("                                   declared capabilities will be rejected at load.");
+    eprintln!("  --llm-model <path>               load a GGUF model for the LLM fallback.");
+    eprintln!("                                   when loaded, unmatched input is sent to the model");
+    eprintln!("                                   for skill rerouting or direct QA before giving up.");
     eprintln!("  --storage-dir <path>             directory used for the WASM storage_kv per-skill");
     eprintln!("                                   key-value files. Defaults to a system-temp dir,");
     eprintln!("                                   which is fine for sideloading but not persistent");

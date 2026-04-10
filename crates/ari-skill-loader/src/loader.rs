@@ -26,7 +26,9 @@
 use crate::declarative::{AdapterError, DeclarativeSkill};
 use crate::host_capabilities::HostCapabilities;
 use crate::http_config::HttpConfig;
-use crate::manifest::{Behaviour, Capability, ManifestError, Skillfile};
+use crate::manifest::{
+    AssistantManifest, Behaviour, Capability, ManifestError, SkillType, Skillfile,
+};
 use crate::storage_config::StorageConfig;
 use crate::wasm::{LogSink, NullLogSink, WasmError, WasmSkill};
 use ari_core::Skill;
@@ -81,9 +83,19 @@ impl std::fmt::Display for LoadFailure {
 
 impl std::error::Error for LoadFailure {}
 
+/// An installed assistant skill discovered by the loader.
+pub struct AssistantEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub manifest: AssistantManifest,
+    pub body: String,
+}
+
 /// What came back from a load operation.
 pub struct LoadReport {
     pub skills: Vec<Box<dyn Skill>>,
+    pub assistants: Vec<AssistantEntry>,
     pub failures: Vec<LoadFailure>,
 }
 
@@ -91,12 +103,14 @@ impl LoadReport {
     fn new() -> Self {
         Self {
             skills: Vec::new(),
+            assistants: Vec::new(),
             failures: Vec::new(),
         }
     }
 
     fn merge(&mut self, other: LoadReport) {
         self.skills.extend(other.skills);
+        self.assistants.extend(other.assistants);
         self.failures.extend(other.failures);
     }
 }
@@ -180,6 +194,21 @@ pub fn load_single_skill_dir_with(skill_dir: &Path, options: &LoadOptions) -> Lo
         return report;
     };
 
+    // Assistant-type skills don't enter the ranking pipeline — they're
+    // collected separately and surfaced to the frontend for settings UI.
+    if ari.skill_type == SkillType::Assistant {
+        if let Some(ref assistant) = ari.assistant {
+            report.assistants.push(AssistantEntry {
+                id: ari.id.clone(),
+                name: sf.name.clone(),
+                description: sf.description.clone(),
+                manifest: assistant.clone(),
+                body: sf.body.clone(),
+            });
+        }
+        return report;
+    }
+
     // Capability check applies to BOTH declarative and WASM skills. A
     // declarative skill that promises `notifications` is making the same
     // user-consent claim as a WASM one — we honour or reject identically.
@@ -193,14 +222,14 @@ pub fn load_single_skill_dir_with(skill_dir: &Path, options: &LoadOptions) -> Lo
     }
 
     match &ari.behaviour {
-        Behaviour::Declarative(_) => match DeclarativeSkill::from_skillfile(&sf) {
+        Some(Behaviour::Declarative(_)) => match DeclarativeSkill::from_skillfile(&sf) {
             Ok(skill) => report.skills.push(Box::new(skill)),
             Err(e) => report.failures.push(LoadFailure {
                 path: manifest_path,
                 kind: LoadFailureKind::Adapter(e),
             }),
         },
-        Behaviour::Wasm(_) => match WasmSkill::from_skillfile(
+        Some(Behaviour::Wasm(_)) => match WasmSkill::from_skillfile(
             &sf,
             skill_dir,
             options.log_sink.clone(),
@@ -214,6 +243,7 @@ pub fn load_single_skill_dir_with(skill_dir: &Path, options: &LoadOptions) -> Lo
                 kind: LoadFailureKind::Wasm(e),
             }),
         },
+        None => {}
     }
 
     report
@@ -556,6 +586,61 @@ metadata:
             Response::Text(t) => assert!(t == "Heads." || t == "Tails."),
             _ => panic!(),
         }
+    }
+
+    fn chatgpt_assistant_md() -> &'static str {
+        r#"---
+name: chatgpt
+description: Use OpenAI's ChatGPT to answer general questions.
+metadata:
+  ari:
+    id: dev.heyari.assistant.chatgpt
+    version: "0.1.0"
+    type: assistant
+    engine: ">=0.3"
+    assistant:
+      provider: api
+      privacy: cloud
+      api:
+        endpoint: https://api.openai.com/v1/chat/completions
+        auth: bearer
+        auth_config_key: api_key
+        default_model: gpt-4o-mini
+        system_prompt: You are Ari.
+        response_path: "choices[0].message.content"
+      config:
+        - key: api_key
+          label: API Key
+          type: secret
+          required: true
+---
+ChatGPT assistant.
+"#
+    }
+
+    #[test]
+    fn assistant_skill_goes_into_assistants_not_skills() {
+        let dir = tmpdir();
+        write(&dir.path().join("chatgpt/SKILL.md"), chatgpt_assistant_md());
+        write(&dir.path().join("greet/SKILL.md"), greet_md());
+
+        let report = load_skill_directory(dir.path()).unwrap();
+        assert_eq!(report.skills.len(), 1, "regular skill count");
+        assert_eq!(report.assistants.len(), 1, "assistant count");
+        assert_eq!(report.failures.len(), 0, "failure count");
+        assert_eq!(report.skills[0].id(), "ai.example.greet");
+        assert_eq!(report.assistants[0].id, "dev.heyari.assistant.chatgpt");
+        assert_eq!(report.assistants[0].name, "chatgpt");
+    }
+
+    #[test]
+    fn assistant_skill_does_not_enter_ranking_pipeline() {
+        let dir = tmpdir();
+        write(&dir.path().join("chatgpt/SKILL.md"), chatgpt_assistant_md());
+
+        let report = load_skill_directory(dir.path()).unwrap();
+        assert_eq!(report.skills.len(), 0);
+        assert_eq!(report.assistants.len(), 1);
     }
 }
 

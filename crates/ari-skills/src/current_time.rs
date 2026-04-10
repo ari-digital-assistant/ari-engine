@@ -27,6 +27,10 @@ impl Skill for CurrentTimeSkill {
         "current_time"
     }
 
+    fn description(&self) -> &str {
+        "Tells the current time. Use when the user asks what time it is."
+    }
+
     fn specificity(&self) -> Specificity {
         Specificity::High
     }

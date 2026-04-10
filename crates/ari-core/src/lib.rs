@@ -28,6 +28,7 @@ impl Default for SkillContext {
 
 pub trait Skill: Send + Sync {
     fn id(&self) -> &str;
+    fn description(&self) -> &str { "" }
     fn specificity(&self) -> Specificity;
     fn score(&self, input: &str, ctx: &SkillContext) -> f32;
     fn execute(&self, input: &str, ctx: &SkillContext) -> Response;
