@@ -1,6 +1,10 @@
 use ari_core::{normalize_input, Response, Skill, SkillContext, Specificity};
 
-const FALLBACK_RESPONSE: &str = "Sorry, I didn't understand that.";
+/// The text the engine returns when no skill matches the input. Exposed
+/// publicly so the FFI layer can detect this exact response and convert it
+/// into the dedicated `FfiResponse::NotUnderstood` variant — the Android
+/// host uses that signal to trigger an STT retry path.
+pub const FALLBACK_RESPONSE: &str = "Sorry, I didn't understand that.";
 
 struct RankingRound {
     high_threshold: f32,

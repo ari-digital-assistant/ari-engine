@@ -1,6 +1,6 @@
 #![allow(clippy::new_without_default)]
 
-use ari_engine::Engine;
+use ari_engine::{Engine, FALLBACK_RESPONSE};
 use ari_skill_loader::{
     load_skill_directory_with, Capability, HostCapabilities, HttpConfig, LoadOptions,
     NullLogSink, StorageConfig,
@@ -45,6 +45,12 @@ pub enum FfiResponse {
     Text { body: String },
     Action { json: String },
     Binary { mime: String, data: Vec<u8> },
+    /// The engine couldn't match any skill to the input. The host can use
+    /// this signal to retry the upstream STT (e.g. with a fresh sherpa
+    /// stream on the buffered audio) before falling back to the apology.
+    /// `body` carries the apology text the host should say if the retry
+    /// also fails — kept here so the host doesn't have to hardcode it.
+    NotUnderstood { body: String },
 }
 
 #[derive(uniffi::Object)]
@@ -78,7 +84,13 @@ impl AriEngine {
     pub fn process_input(&self, input: String) -> FfiResponse {
         let engine = self.inner.lock().expect("engine mutex poisoned");
         match engine.process_input(&input) {
-            ari_core::Response::Text(s) => FfiResponse::Text { body: s },
+            ari_core::Response::Text(s) => {
+                if s == FALLBACK_RESPONSE {
+                    FfiResponse::NotUnderstood { body: s }
+                } else {
+                    FfiResponse::Text { body: s }
+                }
+            }
             ari_core::Response::Action(v) => FfiResponse::Action {
                 json: serde_json::to_string(&v).unwrap_or_default(),
             },
