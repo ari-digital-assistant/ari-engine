@@ -214,7 +214,8 @@ impl Row {
 
 fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
     // A report here is one of:
-    //   (a) one success (skill loaded)
+    //   (a) one success (regular skill loaded)
+    //   (a') one success (assistant skill loaded)
     //   (b) one failure (couldn't load)
     //   (c) nothing (valid AgentSkills doc with no metadata.ari — not an
     //       Ari skill, silently skipped by the loader)
@@ -227,6 +228,26 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             version: fields.version,
             name: fields.name,
             description: fields.description,
+            license: fields.license,
+            author: fields.author,
+            homepage: fields.homepage,
+            capabilities: fields.capabilities,
+            languages: fields.languages,
+            failures: Vec::new(),
+        });
+        return;
+    }
+    // Assistant skills don't enter `report.skills` — they go into
+    // `report.assistants`. Treat them as valid if they parsed.
+    if let Some(entry) = report.assistants.first() {
+        let fields = read_manifest_fields(path);
+        out.push(Row {
+            path: path.to_path_buf(),
+            ok: true,
+            id: Some(entry.id.clone()),
+            version: fields.version,
+            name: Some(entry.name.clone()),
+            description: Some(entry.description.clone()),
             license: fields.license,
             author: fields.author,
             homepage: fields.homepage,

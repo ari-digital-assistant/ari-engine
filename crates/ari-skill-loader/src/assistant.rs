@@ -452,6 +452,58 @@ mod tests {
     }
 
     #[test]
+    fn loads_chatgpt_skill_from_disk() {
+        let skill_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ari-skills/skills");
+        let chatgpt_dir = skill_dir.join("chatgpt");
+        if !chatgpt_dir.exists() {
+            // Skill not present in this checkout — skip.
+            return;
+        }
+        let report = crate::loader::load_single_skill_dir(&chatgpt_dir);
+        assert_eq!(report.skills.len(), 0, "assistant should not be in skills");
+        assert_eq!(report.failures.len(), 0, "no failures: {:?}", report.failures);
+        assert_eq!(report.assistants.len(), 1);
+        let entry = &report.assistants[0];
+        assert_eq!(entry.id, "dev.heyari.assistant.chatgpt");
+        assert_eq!(entry.name, "chatgpt");
+        let api = entry.manifest.api.as_ref().expect("api config present");
+        assert_eq!(api.endpoint.as_deref(), Some("https://api.openai.com/v1/chat/completions"));
+        assert_eq!(api.default_model, "gpt-4o-mini");
+        assert_eq!(api.response_path, "choices[0].message.content");
+    }
+
+    #[test]
+    #[ignore] // requires OPENAI_API_KEY env var
+    fn chatgpt_real_api_call() {
+        let api_key = match std::env::var("OPENAI_API_KEY") {
+            Ok(k) if !k.is_empty() => k,
+            _ => {
+                eprintln!("OPENAI_API_KEY not set, skipping");
+                return;
+            }
+        };
+
+        let skill_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ari-skills/skills/chatgpt");
+        let report = crate::loader::load_single_skill_dir(&skill_dir);
+        let entry = &report.assistants[0];
+        let api = entry.manifest.api.as_ref().unwrap();
+
+        let mut store = MemoryConfigStore::new();
+        store.set(&entry.id, "api_key", &api_key);
+
+        let result = call_assistant_api(api, &entry.id, &store, "what is the capital of malta");
+        match result {
+            Ok(text) => {
+                eprintln!("ChatGPT response: {text}");
+                assert!(text.to_lowercase().contains("valletta"), "expected Valletta in: {text}");
+            }
+            Err(e) => panic!("API call failed: {e}"),
+        }
+    }
+
+    #[test]
     fn resolve_config_missing_api_key_errors() {
         let store = MemoryConfigStore::new();
         let config = ApiConfig {
