@@ -26,33 +26,98 @@ impl Default for SkillContext {
     }
 }
 
-/// One example user utterance for FunctionGemma training. `args` is a
-/// JSON object literal — `"{}"` for parameterless skills, or e.g.
-/// `r#"{"app_name": "Spotify"}"#` for parameterised ones.
+/// One example user utterance that should trigger a skill, paired with the
+/// JSON arguments the function call should produce.
+///
+/// Used as training data for the FunctionGemma skill router. The router is
+/// the optional second layer of skill matching: when the keyword/regex
+/// scorer fails to find a match, the router (a small fine-tuned LLM) gets
+/// a chance to pick a skill based on the user's intent rather than literal
+/// keywords. The training data teaches it which natural-language phrasings
+/// correspond to which skill.
+///
+/// `text` is the literal user utterance. `args` is a JSON object literal —
+/// `"{}"` for parameterless skills, or `r#"{"app_name": "Spotify"}"#` for
+/// parameterised ones. The args literal must be valid JSON; the export
+/// pipeline parses it directly.
 pub struct ExampleUtterance {
     pub text: &'static str,
     pub args: &'static str,
 }
 
+/// The core skill trait. Every skill — built-in Rust, declarative, WASM —
+/// implements this at the engine boundary.
+///
+/// # The two layers of skill matching
+///
+/// 1. **Keyword scorer (always on, fast, free).** Reads `score()`. The
+///    engine asks every skill "how confident are you about this input?",
+///    runs three ranking rounds with specificity-based thresholds, and
+///    executes the winner. This is the baseline that handles most
+///    everyday utterances.
+///
+/// 2. **FunctionGemma router (optional, ~250MB on-device LLM).** Reads
+///    `description()`, `parameters_schema()`, and `example_utterances()`.
+///    Fires only when the keyword scorer found nothing. Catches
+///    paraphrases the keyword patterns missed (e.g. "is it morning or
+///    afternoon" routes to `current_time` even though "current_time"
+///    doesn't appear in the input).
+///
+/// You always have to implement `score()` and `execute()`. The router
+/// methods are optional but strongly recommended for built-in skills:
+/// they cost nothing if the router is disabled, and they massively
+/// improve coverage when it's enabled.
+///
+/// # Implementing for the router
+///
+/// - **`description()`** — write two sentences. First: what the skill
+///   does. Second: when to use it, with semantic keywords. Example:
+///   "Tells the current time. Use when the user asks what time it is,
+///   what hour it is, whether it is morning or afternoon, or anything
+///   about the current time of day." The router pattern-matches on
+///   semantic similarity, so the more natural language you put in the
+///   description, the better the routing.
+///
+/// - **`example_utterances()`** — return 20-30 varied phrasings. Cover
+///   paraphrases, indirect language, conversational filler ("can you",
+///   "please", "I need"). For parameterised skills, include the args
+///   the model should produce. These feed directly into the
+///   FunctionGemma fine-tuning dataset.
+///
+/// - **`parameters_schema()`** — for parameterised skills, override
+///   this with an OpenAI-style JSON schema. Default is the
+///   parameterless `{"type": "object", "properties": {}}`.
 pub trait Skill: Send + Sync {
+    /// Stable, unique identifier (e.g. `"current_time"`). This is what
+    /// the router emits as the function name.
     fn id(&self) -> &str;
+
+    /// Human-readable description. Critical for the FunctionGemma router
+    /// — see the trait-level docs.
     fn description(&self) -> &str { "" }
+
     fn specificity(&self) -> Specificity;
     fn score(&self, input: &str, ctx: &SkillContext) -> f32;
     fn execute(&self, input: &str, ctx: &SkillContext) -> Response;
 
-    /// Example user utterances that should trigger this skill, paired with
-    /// the JSON arguments the function call should produce. Used as
+    /// Example user utterances that should trigger this skill, paired
+    /// with the JSON arguments the function call should produce. Used as
     /// training data for the FunctionGemma router fine-tune. Skills that
     /// don't override this contribute nothing to training — keyword
-    /// matching still works for them, but the LLM router won't learn
+    /// matching still works for them, but the router won't learn
     /// paraphrases for them.
+    ///
+    /// Aim for 20-30 varied phrasings. Cover paraphrases, indirect
+    /// language, and conversational filler. The point is to teach the
+    /// router that all the natural ways a user might phrase a request
+    /// should land on this skill, not just the rigid ones the keyword
+    /// patterns catch.
     fn example_utterances(&self) -> &[ExampleUtterance] { &[] }
 
     /// JSON schema describing this skill's parameters in OpenAI tool
-    /// format. Used by the FunctionGemma router both for training data
-    /// and at inference time. Default is `{"type": "object", "properties": {}}`
-    /// for parameterless skills.
+    /// format. Used by the FunctionGemma router for both training data
+    /// and inference. Default is `{"type": "object", "properties": {}}`
+    /// for parameterless skills. Override for skills that take args.
     fn parameters_schema(&self) -> &'static str {
         r#"{"type": "object", "properties": {}}"#
     }
