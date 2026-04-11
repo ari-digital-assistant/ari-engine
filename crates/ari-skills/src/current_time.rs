@@ -1,4 +1,4 @@
-use ari_core::{Response, Skill, SkillContext, Specificity};
+use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 use chrono::Local;
 
 const TRIGGER_PHRASES: &[&[&str]] = &[
@@ -33,6 +33,40 @@ impl Skill for CurrentTimeSkill {
 
     fn specificity(&self) -> Specificity {
         Specificity::High
+    }
+
+    fn example_utterances(&self) -> &[ExampleUtterance] {
+        &[
+            ExampleUtterance { text: "what time is it", args: "{}" },
+            ExampleUtterance { text: "what's the time", args: "{}" },
+            ExampleUtterance { text: "tell me the time", args: "{}" },
+            ExampleUtterance { text: "what time do you have", args: "{}" },
+            ExampleUtterance { text: "do you know what time it is", args: "{}" },
+            ExampleUtterance { text: "what hour is it", args: "{}" },
+            ExampleUtterance { text: "can you tell me the time", args: "{}" },
+            ExampleUtterance { text: "what's the current time", args: "{}" },
+            ExampleUtterance { text: "is it morning or afternoon", args: "{}" },
+            ExampleUtterance { text: "how late is it", args: "{}" },
+            ExampleUtterance { text: "what time is it right now", args: "{}" },
+            ExampleUtterance { text: "got the time", args: "{}" },
+            ExampleUtterance { text: "what's the time now", args: "{}" },
+            ExampleUtterance { text: "could you tell me the time please", args: "{}" },
+            ExampleUtterance { text: "I need to know what time it is", args: "{}" },
+            ExampleUtterance { text: "time please", args: "{}" },
+            ExampleUtterance { text: "what time have you got", args: "{}" },
+            ExampleUtterance { text: "is it late", args: "{}" },
+            ExampleUtterance { text: "am or pm right now", args: "{}" },
+            ExampleUtterance { text: "check the time for me", args: "{}" },
+            ExampleUtterance { text: "I wonder what time it is", args: "{}" },
+            ExampleUtterance { text: "any idea what time it is", args: "{}" },
+            ExampleUtterance { text: "do you have the time", args: "{}" },
+            ExampleUtterance { text: "quick, what time is it", args: "{}" },
+            ExampleUtterance { text: "is it still early", args: "{}" },
+            ExampleUtterance { text: "how early is it", args: "{}" },
+            ExampleUtterance { text: "tell me the current time", args: "{}" },
+            ExampleUtterance { text: "what's the clock say", args: "{}" },
+            ExampleUtterance { text: "current time please", args: "{}" },
+        ]
     }
 
     fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {

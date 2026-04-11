@@ -1,4 +1,4 @@
-use ari_core::{Response, Skill, SkillContext, Specificity};
+use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 
 const TRIGGER_WORDS: &[&str] = &[
     "calculate", "compute", "eval", "solve",
@@ -73,6 +73,45 @@ impl Skill for CalculatorSkill {
 
     fn specificity(&self) -> Specificity {
         Specificity::High
+    }
+
+    fn parameters_schema(&self) -> &'static str {
+        r#"{"type": "object", "properties": {"expression": {"type": "string", "description": "The math expression to evaluate."}}, "required": ["expression"]}"#
+    }
+
+    fn example_utterances(&self) -> &[ExampleUtterance] {
+        &[
+            ExampleUtterance { text: "calculate 5 + 3", args: r#"{"expression": "5 + 3"}"# },
+            ExampleUtterance { text: "what's 99 divided by 3", args: r#"{"expression": "99 / 3"}"# },
+            ExampleUtterance { text: "how much is fifteen percent of two hundred", args: r#"{"expression": "15% of 200"}"# },
+            ExampleUtterance { text: "compute 12 times 8", args: r#"{"expression": "12 * 8"}"# },
+            ExampleUtterance { text: "what's 100 minus 37", args: r#"{"expression": "100 - 37"}"# },
+            ExampleUtterance { text: "figure out 2 to the power of 10", args: r#"{"expression": "2^10"}"# },
+            ExampleUtterance { text: "what is 144 divided by 12", args: r#"{"expression": "144 / 12"}"# },
+            ExampleUtterance { text: "25 plus 75", args: r#"{"expression": "25 + 75"}"# },
+            ExampleUtterance { text: "multiply 9 by 6", args: r#"{"expression": "9 * 6"}"# },
+            ExampleUtterance { text: "what's the square root of 81", args: r#"{"expression": "sqrt(81)"}"# },
+            ExampleUtterance { text: "how much is 20 percent of 50", args: r#"{"expression": "20% of 50"}"# },
+            ExampleUtterance { text: "subtract 15 from 100", args: r#"{"expression": "100 - 15"}"# },
+            ExampleUtterance { text: "what does 7 times 7 equal", args: r#"{"expression": "7 * 7"}"# },
+            ExampleUtterance { text: "divide 200 by 8", args: r#"{"expression": "200 / 8"}"# },
+            ExampleUtterance { text: "add 33 and 67", args: r#"{"expression": "33 + 67"}"# },
+            ExampleUtterance { text: "what's 10 percent of 500", args: r#"{"expression": "10% of 500"}"# },
+            ExampleUtterance { text: "calculate the sum of 14 and 28", args: r#"{"expression": "14 + 28"}"# },
+            ExampleUtterance { text: "how much is 3.14 times 2", args: r#"{"expression": "3.14 * 2"}"# },
+            ExampleUtterance { text: "what is 1000 divided by 7", args: r#"{"expression": "1000 / 7"}"# },
+            ExampleUtterance { text: "compute 50 plus 50", args: r#"{"expression": "50 + 50"}"# },
+            ExampleUtterance { text: "figure out 8 squared", args: r#"{"expression": "8^2"}"# },
+            ExampleUtterance { text: "what's half of 246", args: r#"{"expression": "246 / 2"}"# },
+            ExampleUtterance { text: "9 plus 10", args: r#"{"expression": "9 + 10"}"# },
+            ExampleUtterance { text: "how much is a quarter of 80", args: r#"{"expression": "80 / 4"}"# },
+            ExampleUtterance { text: "what's 5 factorial", args: r#"{"expression": "5!"}"# },
+            ExampleUtterance { text: "calculate 999 minus 1", args: r#"{"expression": "999 - 1"}"# },
+            ExampleUtterance { text: "what is 45 times 3", args: r#"{"expression": "45 * 3"}"# },
+            ExampleUtterance { text: "18 divided by 3", args: r#"{"expression": "18 / 3"}"# },
+            ExampleUtterance { text: "what's 75 plus 25", args: r#"{"expression": "75 + 25"}"# },
+            ExampleUtterance { text: "do the math on 6 times 9", args: r#"{"expression": "6 * 9"}"# },
+        ]
     }
 
     fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {

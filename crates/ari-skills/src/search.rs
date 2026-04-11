@@ -1,4 +1,4 @@
-use ari_core::{Response, Skill, SkillContext, Specificity};
+use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 
 const TRIGGER_PHRASES: &[&[&str]] = &[
     &["search", "for"],
@@ -72,6 +72,45 @@ impl Skill for SearchSkill {
 
     fn specificity(&self) -> Specificity {
         Specificity::Low
+    }
+
+    fn parameters_schema(&self) -> &'static str {
+        r#"{"type": "object", "properties": {"query": {"type": "string", "description": "The search query."}}, "required": ["query"]}"#
+    }
+
+    fn example_utterances(&self) -> &[ExampleUtterance] {
+        &[
+            ExampleUtterance { text: "search for python tutorials", args: r#"{"query": "python tutorials"}"# },
+            ExampleUtterance { text: "look up the weather in London", args: r#"{"query": "weather in London"}"# },
+            ExampleUtterance { text: "google how to make pasta", args: r#"{"query": "how to make pasta"}"# },
+            ExampleUtterance { text: "find information about black holes", args: r#"{"query": "black holes"}"# },
+            ExampleUtterance { text: "search for nearby restaurants", args: r#"{"query": "nearby restaurants"}"# },
+            ExampleUtterance { text: "look up who won the world cup", args: r#"{"query": "who won the world cup"}"# },
+            ExampleUtterance { text: "find me a recipe for brownies", args: r#"{"query": "recipe for brownies"}"# },
+            ExampleUtterance { text: "search how tall is mount everest", args: r#"{"query": "how tall is mount everest"}"# },
+            ExampleUtterance { text: "google the latest news", args: r#"{"query": "latest news"}"# },
+            ExampleUtterance { text: "look up train times to London", args: r#"{"query": "train times to London"}"# },
+            ExampleUtterance { text: "find out about the Mars rover", args: r#"{"query": "Mars rover"}"# },
+            ExampleUtterance { text: "search for cheap flights to Tokyo", args: r#"{"query": "cheap flights to Tokyo"}"# },
+            ExampleUtterance { text: "I need to look something up about batteries", args: r#"{"query": "batteries"}"# },
+            ExampleUtterance { text: "can you google that for me", args: r#"{"query": "that"}"# },
+            ExampleUtterance { text: "search the web for Ari digital assistant", args: r#"{"query": "Ari digital assistant"}"# },
+            ExampleUtterance { text: "find directions to the airport", args: r#"{"query": "directions to the airport"}"# },
+            ExampleUtterance { text: "look up symptoms of a cold", args: r#"{"query": "symptoms of a cold"}"# },
+            ExampleUtterance { text: "google how to change a tyre", args: r#"{"query": "how to change a tyre"}"# },
+            ExampleUtterance { text: "search for best programming languages 2026", args: r#"{"query": "best programming languages 2026"}"# },
+            ExampleUtterance { text: "find reviews for the pixel phone", args: r#"{"query": "reviews for the pixel phone"}"# },
+            ExampleUtterance { text: "look up the population of Malta", args: r#"{"query": "population of Malta"}"# },
+            ExampleUtterance { text: "search for hiking trails near me", args: r#"{"query": "hiking trails near me"}"# },
+            ExampleUtterance { text: "google what time the shops close", args: r#"{"query": "what time the shops close"}"# },
+            ExampleUtterance { text: "find out when the next bus is", args: r#"{"query": "when the next bus is"}"# },
+            ExampleUtterance { text: "search for the meaning of serendipity", args: r#"{"query": "meaning of serendipity"}"# },
+            ExampleUtterance { text: "look up how to tie a tie", args: r#"{"query": "how to tie a tie"}"# },
+            ExampleUtterance { text: "find me a good pizza place", args: r#"{"query": "good pizza place"}"# },
+            ExampleUtterance { text: "google who invented the telephone", args: r#"{"query": "who invented the telephone"}"# },
+            ExampleUtterance { text: "search for free online courses", args: r#"{"query": "free online courses"}"# },
+            ExampleUtterance { text: "look up currency exchange rates", args: r#"{"query": "currency exchange rates"}"# },
+        ]
     }
 
     fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {

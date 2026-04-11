@@ -1,4 +1,4 @@
-use ari_core::{Response, Skill, SkillContext, Specificity};
+use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 
 const GREETINGS: &[&str] = &[
     "hello", "hi", "hey", "heya", "howdy", "greetings", "good morning",
@@ -46,6 +46,41 @@ impl Skill for GreetingSkill {
 
     fn specificity(&self) -> Specificity {
         Specificity::Low
+    }
+
+    fn example_utterances(&self) -> &[ExampleUtterance] {
+        &[
+            ExampleUtterance { text: "hello", args: "{}" },
+            ExampleUtterance { text: "hi", args: "{}" },
+            ExampleUtterance { text: "hey", args: "{}" },
+            ExampleUtterance { text: "hey there", args: "{}" },
+            ExampleUtterance { text: "howdy", args: "{}" },
+            ExampleUtterance { text: "good morning", args: "{}" },
+            ExampleUtterance { text: "good afternoon", args: "{}" },
+            ExampleUtterance { text: "good evening", args: "{}" },
+            ExampleUtterance { text: "yo", args: "{}" },
+            ExampleUtterance { text: "sup", args: "{}" },
+            ExampleUtterance { text: "what's up", args: "{}" },
+            ExampleUtterance { text: "hiya", args: "{}" },
+            ExampleUtterance { text: "heya", args: "{}" },
+            ExampleUtterance { text: "hello ari", args: "{}" },
+            ExampleUtterance { text: "hi ari", args: "{}" },
+            ExampleUtterance { text: "hey ari", args: "{}" },
+            ExampleUtterance { text: "good morning ari", args: "{}" },
+            ExampleUtterance { text: "greetings", args: "{}" },
+            ExampleUtterance { text: "how are you", args: "{}" },
+            ExampleUtterance { text: "how are you doing", args: "{}" },
+            ExampleUtterance { text: "how's it going", args: "{}" },
+            ExampleUtterance { text: "what's going on", args: "{}" },
+            ExampleUtterance { text: "how do you do", args: "{}" },
+            ExampleUtterance { text: "nice to meet you", args: "{}" },
+            ExampleUtterance { text: "hey there ari", args: "{}" },
+            ExampleUtterance { text: "morning", args: "{}" },
+            ExampleUtterance { text: "evening", args: "{}" },
+            ExampleUtterance { text: "how are things", args: "{}" },
+            ExampleUtterance { text: "how you doing", args: "{}" },
+            ExampleUtterance { text: "what's happening", args: "{}" },
+        ]
     }
 
     fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {

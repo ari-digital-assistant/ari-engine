@@ -1,4 +1,4 @@
-use ari_core::{Response, Skill, SkillContext, Specificity};
+use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 use chrono::Local;
 
 const TRIGGER_PHRASES: &[&[&str]] = &[
@@ -34,6 +34,41 @@ impl Skill for DateSkill {
 
     fn specificity(&self) -> Specificity {
         Specificity::High
+    }
+
+    fn example_utterances(&self) -> &[ExampleUtterance] {
+        &[
+            ExampleUtterance { text: "what's the date today", args: "{}" },
+            ExampleUtterance { text: "what day is it", args: "{}" },
+            ExampleUtterance { text: "what's today's date", args: "{}" },
+            ExampleUtterance { text: "which day of the week is it", args: "{}" },
+            ExampleUtterance { text: "what date is it", args: "{}" },
+            ExampleUtterance { text: "tell me today's date", args: "{}" },
+            ExampleUtterance { text: "what day are we on", args: "{}" },
+            ExampleUtterance { text: "is it Monday today", args: "{}" },
+            ExampleUtterance { text: "what's the date", args: "{}" },
+            ExampleUtterance { text: "do you know today's date", args: "{}" },
+            ExampleUtterance { text: "can you tell me the date", args: "{}" },
+            ExampleUtterance { text: "what day of the week is it today", args: "{}" },
+            ExampleUtterance { text: "I need to know the date", args: "{}" },
+            ExampleUtterance { text: "the date please", args: "{}" },
+            ExampleUtterance { text: "is today a weekday", args: "{}" },
+            ExampleUtterance { text: "what's today", args: "{}" },
+            ExampleUtterance { text: "which day is today", args: "{}" },
+            ExampleUtterance { text: "tell me what day it is", args: "{}" },
+            ExampleUtterance { text: "date please", args: "{}" },
+            ExampleUtterance { text: "current date", args: "{}" },
+            ExampleUtterance { text: "what is today's date", args: "{}" },
+            ExampleUtterance { text: "is it the weekend", args: "{}" },
+            ExampleUtterance { text: "what day is today", args: "{}" },
+            ExampleUtterance { text: "do you know what day it is", args: "{}" },
+            ExampleUtterance { text: "I forgot what day it is", args: "{}" },
+            ExampleUtterance { text: "is it still Tuesday", args: "{}" },
+            ExampleUtterance { text: "what's the day today", args: "{}" },
+            ExampleUtterance { text: "today's date please", args: "{}" },
+            ExampleUtterance { text: "check the date for me", args: "{}" },
+            ExampleUtterance { text: "could you tell me the date", args: "{}" },
+        ]
     }
 
     fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {

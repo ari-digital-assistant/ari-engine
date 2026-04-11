@@ -26,12 +26,36 @@ impl Default for SkillContext {
     }
 }
 
+/// One example user utterance for FunctionGemma training. `args` is a
+/// JSON object literal — `"{}"` for parameterless skills, or e.g.
+/// `r#"{"app_name": "Spotify"}"#` for parameterised ones.
+pub struct ExampleUtterance {
+    pub text: &'static str,
+    pub args: &'static str,
+}
+
 pub trait Skill: Send + Sync {
     fn id(&self) -> &str;
     fn description(&self) -> &str { "" }
     fn specificity(&self) -> Specificity;
     fn score(&self, input: &str, ctx: &SkillContext) -> f32;
     fn execute(&self, input: &str, ctx: &SkillContext) -> Response;
+
+    /// Example user utterances that should trigger this skill, paired with
+    /// the JSON arguments the function call should produce. Used as
+    /// training data for the FunctionGemma router fine-tune. Skills that
+    /// don't override this contribute nothing to training — keyword
+    /// matching still works for them, but the LLM router won't learn
+    /// paraphrases for them.
+    fn example_utterances(&self) -> &[ExampleUtterance] { &[] }
+
+    /// JSON schema describing this skill's parameters in OpenAI tool
+    /// format. Used by the FunctionGemma router both for training data
+    /// and at inference time. Default is `{"type": "object", "properties": {}}`
+    /// for parameterless skills.
+    fn parameters_schema(&self) -> &'static str {
+        r#"{"type": "object", "properties": {}}"#
+    }
 }
 
 pub fn words_to_number(word: &str) -> Option<i64> {

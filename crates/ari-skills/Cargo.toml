@@ -3,6 +3,10 @@ name = "ari-skills"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "export-utterances"
+path = "src/bin/export_utterances.rs"
+
 [dependencies]
 ari-core = { path = "../ari-core" }
 chrono = { workspace = true }

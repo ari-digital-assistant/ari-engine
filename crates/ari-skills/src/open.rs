@@ -1,4 +1,4 @@
-use ari_core::{Response, Skill, SkillContext, Specificity};
+use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 
 const TRIGGER_WORDS: &[&str] = &["open", "launch", "start", "run"];
 
@@ -42,6 +42,45 @@ impl Skill for OpenSkill {
 
     fn specificity(&self) -> Specificity {
         Specificity::Medium
+    }
+
+    fn parameters_schema(&self) -> &'static str {
+        r#"{"type": "object", "properties": {"app_name": {"type": "string", "description": "Name of the app to open."}}, "required": ["app_name"]}"#
+    }
+
+    fn example_utterances(&self) -> &[ExampleUtterance] {
+        &[
+            ExampleUtterance { text: "open spotify", args: r#"{"app_name": "Spotify"}"# },
+            ExampleUtterance { text: "launch the camera", args: r#"{"app_name": "Camera"}"# },
+            ExampleUtterance { text: "start the browser", args: r#"{"app_name": "Browser"}"# },
+            ExampleUtterance { text: "open youtube", args: r#"{"app_name": "YouTube"}"# },
+            ExampleUtterance { text: "can you open settings", args: r#"{"app_name": "Settings"}"# },
+            ExampleUtterance { text: "launch maps", args: r#"{"app_name": "Maps"}"# },
+            ExampleUtterance { text: "fire up the music player", args: r#"{"app_name": "Music Player"}"# },
+            ExampleUtterance { text: "run chrome", args: r#"{"app_name": "Chrome"}"# },
+            ExampleUtterance { text: "open my email", args: r#"{"app_name": "Email"}"# },
+            ExampleUtterance { text: "start whatsapp", args: r#"{"app_name": "WhatsApp"}"# },
+            ExampleUtterance { text: "open the calculator app", args: r#"{"app_name": "Calculator"}"# },
+            ExampleUtterance { text: "launch instagram", args: r#"{"app_name": "Instagram"}"# },
+            ExampleUtterance { text: "can you start the camera app", args: r#"{"app_name": "Camera"}"# },
+            ExampleUtterance { text: "open netflix", args: r#"{"app_name": "Netflix"}"# },
+            ExampleUtterance { text: "fire up spotify", args: r#"{"app_name": "Spotify"}"# },
+            ExampleUtterance { text: "launch my music player", args: r#"{"app_name": "Music Player"}"# },
+            ExampleUtterance { text: "run the gallery", args: r#"{"app_name": "Gallery"}"# },
+            ExampleUtterance { text: "open telegram", args: r#"{"app_name": "Telegram"}"# },
+            ExampleUtterance { text: "start firefox", args: r#"{"app_name": "Firefox"}"# },
+            ExampleUtterance { text: "open the clock app", args: r#"{"app_name": "Clock"}"# },
+            ExampleUtterance { text: "launch the phone app", args: r#"{"app_name": "Phone"}"# },
+            ExampleUtterance { text: "open messages", args: r#"{"app_name": "Messages"}"# },
+            ExampleUtterance { text: "can you open twitter", args: r#"{"app_name": "Twitter"}"# },
+            ExampleUtterance { text: "start the notes app", args: r#"{"app_name": "Notes"}"# },
+            ExampleUtterance { text: "open slack", args: r#"{"app_name": "Slack"}"# },
+            ExampleUtterance { text: "launch the calendar", args: r#"{"app_name": "Calendar"}"# },
+            ExampleUtterance { text: "fire up the weather app", args: r#"{"app_name": "Weather"}"# },
+            ExampleUtterance { text: "open reddit", args: r#"{"app_name": "Reddit"}"# },
+            ExampleUtterance { text: "run discord", args: r#"{"app_name": "Discord"}"# },
+            ExampleUtterance { text: "open the files app", args: r#"{"app_name": "Files"}"# },
+        ]
     }
 
     fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {
