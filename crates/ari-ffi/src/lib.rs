@@ -128,6 +128,29 @@ impl AriEngine {
         engine.set_llm_none();
     }
 
+    /// Set the FunctionGemma router model path. Like the LLM fallback,
+    /// the model loads lazily on first use and unloads after 60s idle.
+    /// Returns `true` if the path exists, `false` otherwise.
+    #[cfg(feature = "llm")]
+    pub fn load_router_model(&self, model_path: String) -> bool {
+        let path = std::path::Path::new(&model_path);
+        if !path.is_file() {
+            return false;
+        }
+        let router = ari_llm::FunctionGemmaRouter::new(path);
+        let mut engine = self.inner.lock().expect("engine mutex poisoned");
+        engine.set_router(Some(Box::new(router)));
+        true
+    }
+
+    /// Remove the FunctionGemma router. Keyword scoring still works;
+    /// unmatched queries go straight to the assistant.
+    #[cfg(feature = "llm")]
+    pub fn unload_router_model(&self) {
+        let mut engine = self.inner.lock().expect("engine mutex poisoned");
+        engine.set_router(None);
+    }
+
     /// Rebuild the engine's skill set from scratch: the 6 built-in Rust
     /// skills plus every community skill on disk under `skill_store_dir`.
     ///

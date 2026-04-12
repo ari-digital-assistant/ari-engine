@@ -6,4 +6,7 @@ description = "On-device LLM fallback for Ari — skill rerouting and general QA
 license = "MIT"
 
 [dependencies]
+ari-core = { path = "../ari-core" }
 llama-cpp-2 = "0.1.143"
+regex = "1"
+serde_json = { workspace = true }

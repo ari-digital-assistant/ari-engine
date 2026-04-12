@@ -1,5 +1,30 @@
 use serde::{Deserialize, Serialize};
 
+// ── Skill router ──────────────────────────────────────────────────────
+
+/// What the skill router decided.
+pub enum RouteResult {
+    /// Route to a registered skill by id.
+    Skill(String),
+    /// Route to a system action (Android intent). The JSON value carries
+    /// the action type and parameters for the frontend to dispatch.
+    Action(serde_json::Value),
+    /// No match — fall through to the assistant.
+    NoMatch,
+}
+
+/// Trait for an LLM-based skill router that runs after the keyword
+/// matcher fails. The router sees the user input and the list of
+/// available skills, and either picks one, suggests a system action,
+/// or declines.
+pub trait SkillRouter: Send + Sync {
+    fn route(
+        &self,
+        input: &str,
+        skills: &[(String, String)],
+    ) -> RouteResult;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Specificity {
     High,

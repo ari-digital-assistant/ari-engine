@@ -374,6 +374,218 @@ fn parse_output(output: &str, _skills: &[SkillInfo]) -> Option<FallbackResult> {
     })
 }
 
+// ── FunctionGemma skill router ─────────────────────────────────────────
+
+use ari_core::{RouteResult, SkillRouter};
+
+const ROUTER_MAX_TOKENS: usize = 60;
+
+/// Lazy-loading FunctionGemma router. Same lifecycle pattern as
+/// `LazyLlmFallback`: stays on disk until the first keyword-miss,
+/// loads on demand, unloads after idle timeout.
+pub struct FunctionGemmaRouter {
+    model_path: PathBuf,
+    inner: Mutex<LazyState>,
+}
+
+unsafe impl Send for FunctionGemmaRouter {}
+unsafe impl Sync for FunctionGemmaRouter {}
+
+impl FunctionGemmaRouter {
+    pub fn new(model_path: &Path) -> Self {
+        FunctionGemmaRouter {
+            model_path: model_path.to_path_buf(),
+            inner: Mutex::new(LazyState {
+                loaded: None,
+                last_used: None,
+            }),
+        }
+    }
+
+    pub fn unload(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.loaded = None;
+            state.last_used = None;
+        }
+    }
+}
+
+impl SkillRouter for FunctionGemmaRouter {
+    fn route(
+        &self,
+        input: &str,
+        skills: &[(String, String)],
+    ) -> RouteResult {
+        let mut state = match self.inner.lock() {
+            Ok(s) => s,
+            Err(_) => return RouteResult::NoMatch,
+        };
+
+        // Evict if idle too long.
+        if let Some(last) = state.last_used {
+            if last.elapsed().as_secs() >= IDLE_TIMEOUT_SECS {
+                state.loaded = None;
+            }
+        }
+
+        // Load on demand.
+        if state.loaded.is_none() {
+            match LoadedModel::load(&self.model_path) {
+                Ok(m) => state.loaded = Some(m),
+                Err(_) => return RouteResult::NoMatch,
+            }
+        }
+
+        let now = Instant::now();
+        state.last_used = Some(now);
+
+        let prompt = build_router_prompt(input, skills);
+        let model = state.loaded.as_ref().unwrap();
+
+        let output = match model.run_router_inference(&prompt) {
+            Ok(text) => text,
+            Err(_) => return RouteResult::NoMatch,
+        };
+
+        state.last_used = Some(Instant::now());
+
+        // Schedule idle eviction (same pattern as LazyLlmFallback).
+        let last_used_at = Instant::now();
+        let idle_timeout = std::time::Duration::from_secs(IDLE_TIMEOUT_SECS);
+        drop(state);
+
+        let inner = &self.inner as *const Mutex<LazyState> as usize;
+        std::thread::spawn(move || {
+            std::thread::sleep(idle_timeout);
+            let mutex = unsafe { &*(inner as *const Mutex<LazyState>) };
+            if let Ok(mut state) = mutex.lock() {
+                if let Some(last) = state.last_used {
+                    if last == last_used_at {
+                        state.loaded = None;
+                        state.last_used = None;
+                    }
+                }
+            }
+        });
+
+        parse_router_output(&output, skills)
+    }
+}
+
+impl LoadedModel {
+    fn run_router_inference(&self, prompt: &str) -> Result<String, LlmError> {
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(std::num::NonZeroU32::new(2048));
+
+        let mut ctx = self
+            .model
+            .new_context(&self.backend, ctx_params)
+            .map_err(|e| LlmError::Context(e.to_string()))?;
+
+        let tokens = self
+            .model
+            .str_to_token(prompt, llama_cpp_2::model::AddBos::Always)
+            .map_err(|e| LlmError::Context(e.to_string()))?;
+
+        let mut batch = LlamaBatch::new(tokens.len() + ROUTER_MAX_TOKENS, 1);
+        for (i, &token) in tokens.iter().enumerate() {
+            let is_last = i == tokens.len() - 1;
+            batch
+                .add(token, i as i32, &[0], is_last)
+                .map_err(|e| LlmError::Context(format!("batch add: {e}")))?;
+        }
+
+        ctx.decode(&mut batch)
+            .map_err(|e| LlmError::Context(format!("decode prompt: {e}")))?;
+
+        let mut sampler = LlamaSampler::chain_simple([
+            LlamaSampler::temp(0.0),
+            LlamaSampler::greedy(),
+        ]);
+
+        let mut output = String::new();
+        let mut n_cur = tokens.len() as i32;
+
+        for _ in 0..ROUTER_MAX_TOKENS {
+            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+            sampler.accept(token);
+
+            if self.model.is_eog_token(token) {
+                break;
+            }
+
+            let bytes = self
+                .model
+                .token_to_piece_bytes(token, 128, false, None)
+                .unwrap_or_default();
+            let piece = String::from_utf8_lossy(&bytes);
+            output.push_str(&piece);
+
+            // Stop at end_of_turn or start_function_response (FunctionGemma stop tokens)
+            if output.contains("<end_of_turn>") || output.contains("<start_function_response>") {
+                break;
+            }
+
+            // Stop after the first complete function call
+            if output.contains("<end_function_call>") {
+                break;
+            }
+
+            batch.clear();
+            batch
+                .add(token, n_cur, &[0], true)
+                .map_err(|e| LlmError::Context(format!("batch add gen: {e}")))?;
+            n_cur += 1;
+
+            ctx.decode(&mut batch)
+                .map_err(|e| LlmError::Context(format!("decode gen: {e}")))?;
+        }
+
+        Ok(output)
+    }
+}
+
+/// Build the FunctionGemma prompt with tool declarations.
+fn build_router_prompt(input: &str, skills: &[(String, String)]) -> String {
+    let e = "<escape>";
+    let mut declarations = String::new();
+    for (id, description) in skills {
+        declarations.push_str(&format!(
+            "<start_function_declaration>declaration:{id}{{description:{e}{description}{e},parameters:{{type:{e}OBJECT{e}}}}}<end_function_declaration>"
+        ));
+    }
+    format!(
+        "<start_of_turn>developer\n\
+         You are a model that can do function calling with the following functions\
+         {declarations}<end_of_turn>\n\
+         <start_of_turn>user\n\
+         {input}<end_of_turn>\n\
+         <start_of_turn>model\n"
+    )
+}
+
+/// Parse FunctionGemma's output into a RouteResult.
+fn parse_router_output(output: &str, skills: &[(String, String)]) -> RouteResult {
+    let skill_names: std::collections::HashSet<&str> =
+        skills.iter().map(|(id, _)| id.as_str()).collect();
+
+    // Look for the first <start_function_call>call:name{...}<end_function_call>
+    let re = regex::Regex::new(r"<start_function_call>call:(\w+)\{").unwrap();
+    if let Some(caps) = re.captures(output) {
+        let name = caps.get(1).unwrap().as_str();
+        if skill_names.contains(name) {
+            return RouteResult::Skill(name.to_string());
+        }
+        // Function name not in our skill list — could be a mobile action
+        // or a hallucination. For now, treat unknown names as NoMatch.
+        // TODO: map known mobile action names to RouteResult::Action
+        return RouteResult::NoMatch;
+    }
+
+    // No function call — model declined.
+    RouteResult::NoMatch
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]

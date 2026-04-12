@@ -1,35 +1,9 @@
-use ari_core::{normalize_input, Response, Skill, SkillContext, Specificity};
+use ari_core::{
+    normalize_input, Response, RouteResult, Skill, SkillContext, SkillRouter, Specificity,
+};
 use ari_skill_loader::assistant::ConfigStore;
 use ari_skill_loader::manifest::ApiConfig;
 use std::sync::Arc;
-
-// ── Skill router (FunctionGemma) ──────────────────────────────────────
-
-/// What the skill router decided.
-pub enum RouteResult {
-    /// Route to a registered skill by id.
-    Skill(String),
-    /// Route to a system action (Android intent). The JSON value carries
-    /// the action type and parameters for the frontend to dispatch.
-    Action(serde_json::Value),
-    /// No match — fall through to the assistant.
-    NoMatch,
-}
-
-/// Trait for an LLM-based skill router that runs after the keyword
-/// matcher fails. The router sees the user input and the list of
-/// available skills, and either picks one, suggests a system action,
-/// or declines.
-///
-/// Optional — if no router is set on the engine, the flow skips
-/// straight from keyword scoring to the assistant.
-pub trait SkillRouter: Send + Sync {
-    fn route(
-        &self,
-        input: &str,
-        skills: &[(String, String)], // (id, description) pairs
-    ) -> RouteResult;
-}
 
 /// The text the engine returns when no skill matches the input. Exposed
 /// publicly so the FFI layer can detect this exact response and convert it
