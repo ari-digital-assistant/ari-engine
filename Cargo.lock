@@ -112,7 +112,10 @@ dependencies = [
 name = "ari-llm"
 version = "0.1.0"
 dependencies = [
+ "ari-core",
  "llama-cpp-2",
+ "regex",
+ "serde_json",
 ]
 
 [[package]]
