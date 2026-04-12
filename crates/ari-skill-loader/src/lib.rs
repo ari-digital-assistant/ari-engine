@@ -27,8 +27,8 @@ pub use loader::{
 pub use manifest::{
     ApiConfig, AriExtension, AssistantManifest, AssistantProvider, AuthScheme, Behaviour,
     Capability, ConfigField, ConfigFieldType, DeclarativeBehaviour, ManifestError, MatchPattern,
-    Matching, PathSegment, Privacy, RequestFormat, ResponseSpec, SelectOption, SkillType,
-    Skillfile, SpecificityLevel, WasmBehaviour, extract_by_path, parse_response_path,
+    Matching, PathSegment, Privacy, RequestFormat, ResponseSpec, SelectOption, SkillExample,
+    SkillType, Skillfile, SpecificityLevel, WasmBehaviour, extract_by_path, parse_response_path,
 };
 pub use registry::{
     check_updates, install_by_id, install_update, AvailableUpdate, Index, IndexEntry,

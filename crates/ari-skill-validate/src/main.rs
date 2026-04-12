@@ -174,7 +174,9 @@ struct Row {
     homepage: Option<String>,
     capabilities: Vec<String>,
     languages: Vec<String>,
+    examples: usize,
     failures: Vec<String>,
+    warnings: Vec<String>,
 }
 
 impl Row {
@@ -191,7 +193,9 @@ impl Row {
             homepage: None,
             capabilities: Vec::new(),
             languages: Vec::new(),
+            examples: 0,
             failures: vec!["path does not exist".to_string()],
+            warnings: Vec::new(),
         }
     }
     fn dir_error(path: &Path, msg: &str) -> Self {
@@ -207,7 +211,9 @@ impl Row {
             homepage: None,
             capabilities: Vec::new(),
             languages: Vec::new(),
+            examples: 0,
             failures: vec![msg.to_string()],
+            warnings: Vec::new(),
         }
     }
 }
@@ -233,7 +239,9 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             homepage: fields.homepage,
             capabilities: fields.capabilities,
             languages: fields.languages,
+            examples: fields.examples,
             failures: Vec::new(),
+            warnings: fields.warnings,
         });
         return;
     }
@@ -253,7 +261,9 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             homepage: fields.homepage,
             capabilities: fields.capabilities,
             languages: fields.languages,
+            examples: fields.examples,
             failures: Vec::new(),
+            warnings: fields.warnings,
         });
         return;
     }
@@ -270,12 +280,12 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             homepage: None,
             capabilities: Vec::new(),
             languages: Vec::new(),
+            examples: 0,
             failures: report.failures.iter().map(LoadFailure::to_string).collect(),
+            warnings: Vec::new(),
         });
         return;
     }
-    // (c): AgentSkills doc but no Ari extension. Flag it as a non-Ari skill
-    // so nothing silently disappears from validator output.
     out.push(Row {
         path: path.to_path_buf(),
         ok: false,
@@ -288,7 +298,9 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
         homepage: None,
         capabilities: Vec::new(),
         languages: Vec::new(),
+        examples: 0,
         failures: vec!["SKILL.md has no metadata.ari extension (not an Ari skill)".to_string()],
+        warnings: Vec::new(),
     });
 }
 
@@ -306,6 +318,8 @@ struct ManifestFields {
     homepage: Option<String>,
     capabilities: Vec<String>,
     languages: Vec<String>,
+    examples: usize,
+    warnings: Vec<String>,
 }
 
 fn read_manifest_fields(skill_dir: &Path) -> ManifestFields {
@@ -320,6 +334,10 @@ fn read_manifest_fields(skill_dir: &Path) -> ManifestFields {
         ..ManifestFields::default()
     };
     if let Some(ext) = sf.ari_extension {
+        out.examples = ext.examples.len();
+        if let Err(e) = ext.validate_examples() {
+            out.warnings.push(e.to_string());
+        }
         out.version = Some(ext.version);
         out.author = ext.author;
         out.homepage = ext.homepage;
@@ -338,7 +356,10 @@ fn render_text(rows: &[Row], ok: usize, failed: usize, quiet: bool) {
         if row.ok {
             if !quiet {
                 let id = row.id.as_deref().unwrap_or("?");
-                println!("✓ {}: {}", row.path.display(), id);
+                println!("✓ {}: {} ({} examples)", row.path.display(), id, row.examples);
+                for w in &row.warnings {
+                    eprintln!("  ⚠ {}: {}", row.path.display(), w);
+                }
             }
         } else {
             for f in &row.failures {
@@ -360,18 +381,19 @@ fn render_pr_comment(rows: &[Row], ok: usize, failed: usize) {
         "**{ok}** skill(s) validated, **{failed}** failure(s).",
     );
     println!();
-    println!("| Status | Path | ID | Version |");
-    println!("| --- | --- | --- | --- |");
+    println!("| Status | Path | ID | Version | Examples |");
+    println!("| --- | --- | --- | --- | --- |");
     for row in rows {
         let status = if row.ok { "✅" } else { "❌" };
         let id = row.id.as_deref().unwrap_or("—");
         let version = row.version.as_deref().unwrap_or("—");
         println!(
-            "| {} | `{}` | `{}` | `{}` |",
+            "| {} | `{}` | `{}` | `{}` | {} |",
             status,
             row.path.display(),
             escape_pipe(id),
             escape_pipe(version),
+            row.examples,
         );
     }
     let failing: Vec<&Row> = rows.iter().filter(|r| !r.ok).collect();
@@ -383,6 +405,18 @@ fn render_pr_comment(rows: &[Row], ok: usize, failed: usize) {
             println!("- **`{}`**", row.path.display());
             for f in &row.failures {
                 println!("  - {}", escape_markdown(f));
+            }
+        }
+    }
+    let warned: Vec<&Row> = rows.iter().filter(|r| !r.warnings.is_empty()).collect();
+    if !warned.is_empty() {
+        println!();
+        println!("### Warnings");
+        println!();
+        for row in warned {
+            let id = row.id.as_deref().unwrap_or("?");
+            for w in &row.warnings {
+                println!("- ⚠️ **`{id}`**: {}", escape_markdown(w));
             }
         }
     }
@@ -411,7 +445,8 @@ fn render_json(rows: &[Row]) {
         push_json_opt(&mut out, "homepage", row.homepage.as_deref(), true);
         push_json_str_array(&mut out, "capabilities", &row.capabilities, true);
         push_json_str_array(&mut out, "languages", &row.languages, true);
-        // failures array
+        push_json_kv(&mut out, "examples", &row.examples.to_string(), true);
+        push_json_str_array(&mut out, "warnings", &row.warnings, true);
         out.push_str("    \"failures\": [");
         for (j, f) in row.failures.iter().enumerate() {
             if j > 0 {

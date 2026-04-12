@@ -128,6 +128,18 @@ pub struct SelectOption {
     pub download_bytes: Option<u64>,
 }
 
+// ── Skill examples (for FunctionGemma training) ──────────────────────
+
+/// One example utterance in a SKILL.md manifest. Used as training data
+/// for the FunctionGemma skill router.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillExample {
+    pub text: String,
+    pub args: Option<serde_json::Value>,
+}
+
+const MIN_EXAMPLES: usize = 5;
+
 // ── Errors ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -250,6 +262,12 @@ pub enum ManifestError {
 
     #[error("invalid response_path syntax: `{path}`")]
     InvalidResponsePath { path: String },
+
+    #[error("`metadata.ari.examples` must contain at least {MIN_EXAMPLES} entries (found {found})")]
+    TooFewExamples { found: usize },
+
+    #[error("example utterance missing `text` field")]
+    ExampleMissingText,
 }
 
 /// A fully parsed `SKILL.md`. Holds both the raw AgentSkills frontmatter fields
@@ -284,6 +302,9 @@ pub struct AriExtension {
     pub behaviour: Option<Behaviour>,
     /// Present only for assistant skills (`skill_type == Assistant`).
     pub assistant: Option<AssistantManifest>,
+    /// Example utterances for FunctionGemma training. Required for
+    /// regular skills (minimum 5), optional for assistant skills.
+    pub examples: Vec<SkillExample>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -418,6 +439,18 @@ impl Skillfile {
 }
 
 impl AriExtension {
+    /// Check that the skill has enough example utterances. Called by
+    /// the validator at PR review time, not at install time — existing
+    /// skills without examples must still load.
+    pub fn validate_examples(&self) -> Result<(), ManifestError> {
+        if self.skill_type == SkillType::Skill && self.examples.len() < MIN_EXAMPLES {
+            return Err(ManifestError::TooFewExamples {
+                found: self.examples.len(),
+            });
+        }
+        Ok(())
+    }
+
     fn from_raw(raw: &RawAriExtension) -> Result<Self, ManifestError> {
         let id = raw
             .id
@@ -483,6 +516,23 @@ impl AriExtension {
             }
         };
 
+        // Parse examples.
+        let examples: Vec<SkillExample> = raw
+            .examples
+            .iter()
+            .map(|e| {
+                let text = e
+                    .text
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .ok_or(ManifestError::ExampleMissingText)?;
+                Ok(SkillExample {
+                    text,
+                    args: e.args.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, ManifestError>>()?;
+
         Ok(AriExtension {
             id,
             version,
@@ -497,6 +547,7 @@ impl AriExtension {
             matching,
             behaviour,
             assistant,
+            examples,
         })
     }
 }
@@ -913,6 +964,15 @@ struct RawAriExtension {
     declarative: Option<RawDeclarative>,
     wasm: Option<RawWasm>,
     assistant: Option<RawAssistant>,
+    #[serde(default)]
+    examples: Vec<RawExample>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawExample {
+    text: Option<String>,
+    #[serde(default)]
+    args: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]

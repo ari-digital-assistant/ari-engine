@@ -1065,6 +1065,7 @@ mod tests {
                 memory_limit_mb: 1,
             })),
             assistant: None,
+            examples: Vec::new(),
         }
     }
 
