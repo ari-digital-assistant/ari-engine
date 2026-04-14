@@ -268,6 +268,9 @@ pub enum ManifestError {
 
     #[error("example utterance missing `text` field")]
     ExampleMissingText,
+
+    #[error("`metadata.ari.wasm.memory_limit_mb` must be 1..=16 (found {found})")]
+    MemoryLimitOutOfRange { found: u32 },
 }
 
 /// A fully parsed `SKILL.md`. Holds both the raw AgentSkills frontmatter fields
@@ -483,7 +486,7 @@ impl AriExtension {
                     (Some(d), None) => {
                         Behaviour::Declarative(DeclarativeBehaviour::from_raw(d)?)
                     }
-                    (None, Some(w)) => Behaviour::Wasm(WasmBehaviour::from_raw(w)),
+                    (None, Some(w)) => Behaviour::Wasm(WasmBehaviour::from_raw(w)?),
                     (None, None) => {
                         return Err(ManifestError::BehaviourCardinality {
                             found: "neither",
@@ -617,11 +620,15 @@ impl DeclarativeBehaviour {
 }
 
 impl WasmBehaviour {
-    fn from_raw(raw: &RawWasm) -> Self {
-        WasmBehaviour {
-            module: raw.module.clone(),
-            memory_limit_mb: raw.memory_limit_mb.unwrap_or(16),
+    fn from_raw(raw: &RawWasm) -> Result<Self, ManifestError> {
+        let mem = raw.memory_limit_mb.unwrap_or(16);
+        if !(1..=16).contains(&mem) {
+            return Err(ManifestError::MemoryLimitOutOfRange { found: mem });
         }
+        Ok(WasmBehaviour {
+            module: raw.module.clone(),
+            memory_limit_mb: mem,
+        })
     }
 }
 

@@ -1,6 +1,6 @@
 //! WASM skill adapter (step 5a).
 //!
-//! ## ABI v1
+//! ## ABI
 //!
 //! A skill module **must** export:
 //!
@@ -11,9 +11,20 @@
 //! - `score(input_ptr: i32, input_len: i32) -> f32` — return a score in
 //!   [0.0, 1.0] for the given UTF-8 input.
 //! - `execute(input_ptr: i32, input_len: i32) -> i64` — return a packed
-//!   `(ptr << 32) | len` pointing to a UTF-8 response string in the skill's
-//!   linear memory. The host wraps the result in `Response::Text`. Richer
-//!   response variants will arrive in a later ABI revision.
+//!   response value:
+//!
+//!   ```text
+//!   bits 63..56  tag   0x00 = Text, 0x01 = Action (UTF-8 JSON), others reserved
+//!   bits 55..32  ptr   24-bit pointer into the skill's linear memory
+//!   bits 31..0   len   32-bit byte length of the payload
+//!   ```
+//!
+//!   The 24-bit pointer field caps skill memory at 16 MiB, which matches the
+//!   default `memory_limit_mb` and is enforced by the install-time validator.
+//!   For `tag = 0`, the payload is UTF-8 text and the host wraps it in
+//!   `Response::Text`. For `tag = 1`, the payload is UTF-8 JSON parsed into
+//!   a `serde_json::Value` and wrapped in `Response::Action`. Any other tag
+//!   returns `(skill error)` — this is a contract, not a guess.
 //!
 //! A skill module **may** import:
 //!
@@ -25,6 +36,12 @@
 //!   cannot use this to detect undeclared capabilities — the loader checks
 //!   declared caps against the host set at install time, and `get_capability`
 //!   only ever answers truthfully for caps the skill is allowed to know about.
+//! - `ari::now_ms() -> i64` — current Unix time in milliseconds. Unconditional;
+//!   skills that track timers, schedule actions, or timestamp persisted state
+//!   all need this and it leaks no more than wall-clock already visible.
+//! - `ari::rand_u64() -> i64` — 64 bits of cryptographically-random entropy.
+//!   Unconditional; needed for generating ids and other non-predictable tokens
+//!   without a DIY PRNG seeded from wall-clock.
 //! - `ari::http_fetch(url_ptr: i32, url_len: i32) -> i64` — perform a GET
 //!   request. The url must use a scheme allowed by the host's [`HttpConfig`]
 //!   (default: `https` only). Response is encoded as a JSON string written
@@ -86,11 +103,13 @@ use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, StoreLimits, Store
 /// must declare in order to use it. The install-time sneak guard scans the
 /// module's imports against this table.
 const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
-    // log and get_capability are unconditional — every skill is allowed to
-    // log and to query its own capabilities. Marked `None` so they pass the
+    // Unconditional imports — every skill may log, query its own capabilities,
+    // read wall-clock time, and get entropy. Marked `None` so they pass the
     // sneak guard without requiring any declaration.
     ("log", None),
     ("get_capability", None),
+    ("now_ms", None),
+    ("rand_u64", None),
     ("http_fetch", Some(Capability::Http)),
     ("storage_get", Some(Capability::StorageKv)),
     ("storage_set", Some(Capability::StorageKv)),
@@ -512,6 +531,16 @@ impl WasmSkill {
                 },
             )
             .map_err(|e| WasmError::Compile(e.to_string()))?;
+        linker
+            .func_wrap("ari", "now_ms", |_caller: Caller<'_, StoreData>| -> i64 {
+                now_ms_impl()
+            })
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+        linker
+            .func_wrap("ari", "rand_u64", |_caller: Caller<'_, StoreData>| -> i64 {
+                rand_u64_impl()
+            })
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
 
         // Wire up http_fetch only if the skill is allowed to use it. The
         // sneak guard already rejected at install time any module that
@@ -629,6 +658,37 @@ fn read_utf8(memory: &Memory, store: &impl wasmtime::AsContext, ptr: i32, len: i
     std::str::from_utf8(&data[start..end])
         .ok()
         .map(|s| s.to_string())
+}
+
+/// Response tag bytes from `execute`'s packed return value.
+const RESPONSE_TAG_TEXT: u8 = 0x00;
+const RESPONSE_TAG_ACTION: u8 = 0x01;
+
+/// Decode the packed `i64` that `execute` returns into `(tag, ptr, len)`.
+/// See the ABI docs at the top of this module for the layout.
+fn decode_execute_return(packed: i64) -> (u8, i32, i32) {
+    let tag = ((packed as u64) >> 56) as u8;
+    let ptr = (((packed as u64) >> 32) & 0x00FF_FFFF) as i32;
+    let len = (packed as u64 & 0xFFFF_FFFF) as i32;
+    (tag, ptr, len)
+}
+
+fn now_ms_impl() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn rand_u64_impl() -> i64 {
+    let mut buf = [0u8; 8];
+    if getrandom::getrandom(&mut buf).is_err() {
+        // Extremely unlikely on any real host; fall back to wall-clock so we
+        // don't hand out a constant. Still-bad entropy is still entropy.
+        let t = now_ms_impl() as u64;
+        buf.copy_from_slice(&t.to_le_bytes());
+    }
+    i64::from_le_bytes(buf)
 }
 
 /// Scan the WASM module's `ari::*` imports and verify each one is satisfied
@@ -1007,11 +1067,17 @@ impl Skill for WasmSkill {
                     Ok(v) => v,
                     Err(_) => return fallback(),
                 };
-                let resp_ptr = (packed >> 32) as i32;
-                let resp_len = (packed & 0xffff_ffff) as i32;
-                match read_utf8(&memory, &*store, resp_ptr, resp_len) {
-                    Some(text) => Response::Text(text),
-                    None => fallback(),
+                let (tag, resp_ptr, resp_len) = decode_execute_return(packed);
+                let Some(payload) = read_utf8(&memory, &*store, resp_ptr, resp_len) else {
+                    return fallback();
+                };
+                match tag {
+                    RESPONSE_TAG_TEXT => Response::Text(payload),
+                    RESPONSE_TAG_ACTION => match serde_json::from_str(&payload) {
+                        Ok(value) => Response::Action(value),
+                        Err(_) => fallback(),
+                    },
+                    _ => fallback(),
                 }
             },
             fallback(),
@@ -1225,6 +1291,157 @@ mod tests {
         match skill.execute("convert ff to decimal", &ctx) {
             Response::Text(t) => assert_eq!(t, "hello from wasm"),
             _ => panic!("expected text response"),
+        }
+    }
+
+    #[test]
+    fn execute_decode_return_unpacks_tag_ptr_len() {
+        // Text: tag = 0, ptr = 2048, len = 15 — the exact shape every legacy
+        // WAT fixture in this file produces. Top byte is zero by construction
+        // so legacy skills transparently continue to return Response::Text.
+        let packed = (2048_i64 << 32) | 15;
+        assert_eq!(decode_execute_return(packed), (0x00, 2048, 15));
+
+        // Action: tag = 1, ptr = 4096, len = 42
+        let packed = (1_i64 << 56) | (4096_i64 << 32) | 42;
+        assert_eq!(decode_execute_return(packed), (0x01, 4096, 42));
+
+        // A ptr that would overflow 24 bits: tag 0, ptr = 0x00FFFFFF (max)
+        let packed = (0x00FF_FFFF_i64 << 32) | 7;
+        assert_eq!(decode_execute_return(packed), (0x00, 0x00FF_FFFF, 7));
+    }
+
+    /// WAT fixture that emits an action response: tag byte 0x01 in the high
+    /// byte of the packed return, pointing at a canned JSON payload.
+    fn action_wat() -> &'static str {
+        r#"(module
+  (memory (export "memory") 1)
+  (data (i32.const 2048) "{\"action\":\"debug.echo\",\"speak\":\"ok\"}")
+  (global $bump (mut i32) (i32.const 1024))
+  (func (export "ari_alloc") (param $size i32) (result i32)
+    (local $p i32)
+    global.get $bump
+    local.set $p
+    global.get $bump
+    local.get $size
+    i32.add
+    global.set $bump
+    local.get $p)
+  (func (export "score") (param i32 i32) (result f32) f32.const 0.95)
+  (func (export "execute") (param i32 i32) (result i64)
+    ;; (1 << 56) | (2048 << 32) | 36  — JSON is 36 bytes
+    i64.const 1
+    i64.const 56
+    i64.shl
+    i64.const 2048
+    i64.const 32
+    i64.shl
+    i64.or
+    i64.const 36
+    i64.or)
+)"#
+    }
+
+    #[test]
+    fn execute_returns_action_from_wasm_memory_via_tag_byte() {
+        let bytes = wat::parse_str(action_wat()).unwrap();
+        let ari = fake_ari(false);
+        let skill = WasmSkill::from_module_bytes(
+            &ari,
+            "",
+            behaviour(&ari),
+            &bytes,
+            Arc::new(NullLogSink),
+            &HostCapabilities::all(),
+            &HttpConfig::strict(),
+            &test_storage_config(),
+        )
+        .unwrap();
+        match skill.execute("whatever", &SkillContext::default()) {
+            Response::Action(value) => {
+                assert_eq!(value["action"], "debug.echo");
+                assert_eq!(value["speak"], "ok");
+            }
+            other => panic!("expected Action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_unknown_tag_is_fallback() {
+        // Fixture whose high byte is 0xFF — reserved. Host must not silently
+        // reinterpret as text; it must return the (skill error) fallback.
+        let wat = r#"(module
+          (memory (export "memory") 1)
+          (data (i32.const 2048) "doesnt matter")
+          (func (export "ari_alloc") (param i32) (result i32) i32.const 0)
+          (func (export "score") (param i32 i32) (result f32) f32.const 0)
+          (func (export "execute") (param i32 i32) (result i64)
+            i64.const 0x7F00000000000000
+            i64.const 0x7F00000000000000
+            i64.or
+            i64.const 2048 i64.const 32 i64.shl i64.or
+            i64.const 13 i64.or))"#;
+        let bytes = wat::parse_str(wat).unwrap();
+        let ari = fake_ari(false);
+        let skill = WasmSkill::from_module_bytes(
+            &ari,
+            "",
+            behaviour(&ari),
+            &bytes,
+            Arc::new(NullLogSink),
+            &HostCapabilities::all(),
+            &HttpConfig::strict(),
+            &test_storage_config(),
+        )
+        .unwrap();
+        match skill.execute("x", &SkillContext::default()) {
+            Response::Text(t) => assert_eq!(t, "(skill error)"),
+            other => panic!("expected fallback, got {other:?}"),
+        }
+    }
+
+    /// WAT that calls ari::now_ms and ari::rand_u64 and returns them as
+    /// space-separated decimal digits. Used to verify the unconditional
+    /// imports are wired and reachable without declaring any capability.
+    fn time_and_rand_wat() -> &'static str {
+        r#"(module
+  (import "ari" "now_ms" (func $now (result i64)))
+  (import "ari" "rand_u64" (func $rnd (result i64)))
+  (memory (export "memory") 1)
+  (data (i32.const 4096) "ok")
+  (global $bump (mut i32) (i32.const 1024))
+  (func (export "ari_alloc") (param $size i32) (result i32)
+    (local $p i32)
+    global.get $bump local.set $p
+    global.get $bump local.get $size i32.add global.set $bump local.get $p)
+  (func (export "score") (param i32 i32) (result f32) f32.const 0.95)
+  (func (export "execute") (param i32 i32) (result i64)
+    ;; Force both imports to be called so wasmtime actually instantiates them.
+    call $now drop
+    call $rnd drop
+    ;; Tag 0, ptr 4096, len 2
+    i64.const 4096 i64.const 32 i64.shl i64.const 2 i64.or)
+)"#
+    }
+
+    #[test]
+    fn now_ms_and_rand_u64_imports_are_unconditional() {
+        let bytes = wat::parse_str(time_and_rand_wat()).unwrap();
+        let ari = fake_ari(false); // no caps declared
+        let skill = WasmSkill::from_module_bytes(
+            &ari,
+            "",
+            behaviour(&ari),
+            &bytes,
+            Arc::new(NullLogSink),
+            &HostCapabilities::pure_frontend(), // doesn't grant http / storage
+            &HttpConfig::strict(),
+            &test_storage_config(),
+        )
+        .unwrap();
+        match skill.execute("x", &SkillContext::default()) {
+            Response::Text(t) => assert_eq!(t, "ok"),
+            _ => panic!(),
         }
     }
 

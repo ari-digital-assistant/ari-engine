@@ -134,6 +134,7 @@ dependencies = [
  "ari-core",
  "ed25519-dalek",
  "flate2",
+ "getrandom 0.2.17",
  "regex",
  "reqwest",
  "rustls",

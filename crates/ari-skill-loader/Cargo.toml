@@ -19,6 +19,7 @@ ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std"
 sha2 = "0.11.0"
 tar = "0.4.45"
 flate2 = "1.1.9"
+getrandom = "0.2"
 
 [dev-dependencies]
 wat = "1.246.2"
