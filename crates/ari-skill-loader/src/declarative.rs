@@ -104,10 +104,20 @@ impl DeclarativeSkill {
 
         match &self.action {
             None => Response::Text(text),
-            Some(action) => Response::Action(serde_json::json!({
-                "text": text,
-                "action": action,
-            })),
+            Some(action) => {
+                // The manifest's `action:` block is a presentation-envelope
+                // fragment (see docs/action-responses.md). Overlay `v` and
+                // `speak` onto it — those are protocol-level concerns the
+                // manifest author doesn't need to repeat. Any `speak` the
+                // author did set wins over the `response`-derived text.
+                let mut env = action.clone();
+                if let Some(obj) = env.as_object_mut() {
+                    obj.insert("v".into(), serde_json::json!(1));
+                    obj.entry("speak".to_string())
+                        .or_insert_with(|| serde_json::json!(text));
+                }
+                Response::Action(env)
+            }
         }
     }
 }
@@ -256,6 +266,9 @@ metadata:
 
     #[test]
     fn declarative_with_action_returns_action_response() {
+        // Declarative skill authors write the presentation-envelope fragment
+        // directly under `action:`. The adapter overlays `v` and `speak`
+        // onto it from the `response` field.
         let src = r#"---
 name: open-spotify
 description: Opens Spotify. Use when the user wants to open Spotify.
@@ -271,17 +284,16 @@ metadata:
     declarative:
       response: "Opening Spotify."
       action:
-        type: launch_app
-        target: spotify
+        launch_app: spotify
 ---
 "#;
         let s = DeclarativeSkill::from_skillfile(&parse(src)).unwrap();
         let ctx = SkillContext::default();
         match s.execute("open spotify", &ctx) {
             Response::Action(v) => {
-                assert_eq!(v["text"], "Opening Spotify.");
-                assert_eq!(v["action"]["type"], "launch_app");
-                assert_eq!(v["action"]["target"], "spotify");
+                assert_eq!(v["v"], 1);
+                assert_eq!(v["speak"], "Opening Spotify.");
+                assert_eq!(v["launch_app"], "spotify");
             }
             _ => panic!("expected action response"),
         }

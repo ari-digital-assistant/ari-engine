@@ -100,9 +100,13 @@ impl Skill for OpenSkill {
 
     fn execute(&self, input: &str, _ctx: &SkillContext) -> Response {
         match extract_target(input) {
+            // `speak` is omitted deliberately — the frontend owns the
+            // platform-appropriate phrasing ("Opening Spotify" on Android,
+            // possibly a different verb on Linux) and can override with a
+            // failure message if the launch doesn't work.
             Some(target) => Response::Action(serde_json::json!({
-                "action": "open",
-                "target": target,
+                "v": 1,
+                "launch_app": target,
             })),
             None => Response::Text("What would you like me to open?".to_string()),
         }
@@ -148,8 +152,10 @@ mod tests {
         let skill = OpenSkill::new();
         match skill.execute("open spotify", &ctx()) {
             Response::Action(v) => {
-                assert_eq!(v["action"], "open");
-                assert_eq!(v["target"], "spotify");
+                assert_eq!(v["v"], 1);
+                assert_eq!(v["launch_app"], "spotify");
+                // speak is intentionally absent — frontend produces the text.
+                assert!(v.get("speak").is_none());
             }
             other => panic!("expected Action, got {other:?}"),
         }
@@ -160,8 +166,8 @@ mod tests {
         let skill = OpenSkill::new();
         match skill.execute("open file manager", &ctx()) {
             Response::Action(v) => {
-                assert_eq!(v["action"], "open");
-                assert_eq!(v["target"], "file manager");
+                assert_eq!(v["v"], 1);
+                assert_eq!(v["launch_app"], "file manager");
             }
             other => panic!("expected Action, got {other:?}"),
         }
@@ -171,7 +177,7 @@ mod tests {
     fn execute_takes_everything_after_trigger() {
         let skill = OpenSkill::new();
         match skill.execute("launch the camera app", &ctx()) {
-            Response::Action(v) => assert_eq!(v["target"], "the camera app"),
+            Response::Action(v) => assert_eq!(v["launch_app"], "the camera app"),
             other => panic!("expected Action, got {other:?}"),
         }
     }

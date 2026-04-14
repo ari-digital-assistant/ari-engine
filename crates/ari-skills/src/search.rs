@@ -149,9 +149,11 @@ impl Skill for SearchSkill {
             input.to_string()
         };
 
+        // `speak` omitted deliberately — the frontend produces the
+        // platform-appropriate "Searching for X." phrase itself.
         Response::Action(serde_json::json!({
-            "action": "search",
-            "query": query,
+            "v": 1,
+            "search": query,
         }))
     }
 }
@@ -266,8 +268,9 @@ mod tests {
         let skill = SearchSkill::new();
         match skill.execute("search for best rust crates", &ctx()) {
             Response::Action(v) => {
-                assert_eq!(v["action"], "search");
-                assert_eq!(v["query"], "best rust crates");
+                assert_eq!(v["v"], 1);
+                assert_eq!(v["search"], "best rust crates");
+                assert!(v.get("speak").is_none());
             }
             other => panic!("expected Action, got {other:?}"),
         }
@@ -278,8 +281,8 @@ mod tests {
         let skill = SearchSkill::new();
         match skill.execute("where can i get pizza in malta", &ctx()) {
             Response::Action(v) => {
-                assert_eq!(v["action"], "search");
-                assert_eq!(v["query"], "where can i get pizza in malta");
+                assert_eq!(v["v"], 1);
+                assert_eq!(v["search"], "where can i get pizza in malta");
             }
             other => panic!("expected Action, got {other:?}"),
         }
@@ -289,7 +292,7 @@ mod tests {
     fn execute_google_strips_trigger() {
         let skill = SearchSkill::new();
         match skill.execute("google cats", &ctx()) {
-            Response::Action(v) => assert_eq!(v["query"], "cats"),
+            Response::Action(v) => assert_eq!(v["search"], "cats"),
             other => panic!("expected Action, got {other:?}"),
         }
     }

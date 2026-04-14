@@ -47,7 +47,13 @@ uniffi::setup_scaffolding!();
 #[derive(uniffi::Enum)]
 pub enum FfiResponse {
     Text { body: String },
-    Action { json: String },
+    /// `skill_id` is the manifest id of the emitting skill (e.g.
+    /// `dev.heyari.timer`), used by the frontend to resolve `asset:<path>`
+    /// references back to the skill's bundle directory. Empty string if
+    /// the engine couldn't attribute the response to a specific skill
+    /// (router-direct actions, fallbacks) — treat that as "no bundle,
+    /// asset references will fail to resolve".
+    Action { json: String, skill_id: String },
     Binary { mime: String, data: Vec<u8> },
     /// The engine couldn't match any skill to the input. The host can use
     /// this signal to retry the upstream STT (e.g. with a fresh sherpa
@@ -87,7 +93,8 @@ impl AriEngine {
 
     pub fn process_input(&self, input: String) -> FfiResponse {
         let engine = self.inner.lock().expect("engine mutex poisoned");
-        match engine.process_input(&input) {
+        let (response, skill_id) = engine.process_input_with_skill(&input);
+        match response {
             ari_core::Response::Text(s) => {
                 if s == FALLBACK_RESPONSE {
                     FfiResponse::NotUnderstood { body: s }
@@ -97,6 +104,7 @@ impl AriEngine {
             }
             ari_core::Response::Action(v) => FfiResponse::Action {
                 json: serde_json::to_string(&v).unwrap_or_default(),
+                skill_id: skill_id.unwrap_or_default(),
             },
             ari_core::Response::Binary { mime, data } => FfiResponse::Binary { mime, data },
         }
@@ -236,10 +244,11 @@ mod tests {
         let engine = AriEngine::new();
         let resp = engine.process_input("open spotify".to_string());
         match resp {
-            FfiResponse::Action { json } => {
+            FfiResponse::Action { json, skill_id } => {
                 let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-                assert_eq!(parsed["action"], "open");
-                assert_eq!(parsed["target"], "spotify");
+                assert_eq!(parsed["v"], 1);
+                assert_eq!(parsed["launch_app"], "spotify");
+                assert_eq!(skill_id, "open");
             }
             _ => panic!("expected Action response for open"),
         }

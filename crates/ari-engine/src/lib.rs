@@ -108,9 +108,19 @@ impl Engine {
     }
 
     pub fn process_input(&self, input: &str) -> Response {
+        self.process_input_with_skill(input).0
+    }
+
+    /// Like [`process_input`] but also returns the id of the skill whose
+    /// `execute` produced the response, or `None` if the response came from
+    /// a non-skill path (empty input, generic fallback, router-direct
+    /// action, or assistant API). The Android frontend uses this to resolve
+    /// `asset:<path>` references in action envelopes back to the emitting
+    /// skill's bundle directory.
+    pub fn process_input_with_skill(&self, input: &str) -> (Response, Option<String>) {
         let (response, trace) = self.process_input_traced(input);
         if self.debug
-            && let Some(trace) = trace
+            && let Some(ref trace) = trace
         {
             eprintln!("[ari] input: {:?}", trace.normalized_input);
             for s in &trace.scores {
@@ -121,7 +131,23 @@ impl Engine {
                 _ => eprintln!("[ari] no match"),
             }
         }
-        response
+        let skill_id = trace.and_then(|t| {
+            // Strip routing-path prefixes so the returned id is always the
+            // raw emitting-skill id (e.g. "dev.heyari.timer"), never a
+            // synthetic marker like "router:action" or "assistant:...".
+            t.winner.and_then(|w| {
+                if w == "router:action" {
+                    None
+                } else if let Some(rest) = w.strip_prefix("router:") {
+                    Some(rest.to_string())
+                } else if let Some(rest) = w.strip_prefix("assistant:") {
+                    Some(rest.to_string())
+                } else {
+                    Some(w)
+                }
+            })
+        });
+        (response, skill_id)
     }
 
     pub fn process_input_traced(&self, input: &str) -> (Response, Option<DebugTrace>) {

@@ -124,8 +124,8 @@ fn open_returns_action_json() {
     let engine = full_engine();
     let resp = engine.process_input("open spotify");
     let v = action(&resp);
-    assert_eq!(v["action"], "open");
-    assert_eq!(v["target"], "spotify");
+    assert_eq!(v["v"], 1);
+    assert_eq!(v["launch_app"], "spotify");
 }
 
 #[test]
@@ -144,7 +144,8 @@ fn search_handles_natural_question() {
     let engine = full_engine();
     let resp = engine.process_input("where can i get pizza in malta");
     let v = action(&resp);
-    assert_eq!(v["action"], "search");
+    assert_eq!(v["v"], 1);
+    assert_eq!(v["search"], "where can i get pizza in malta");
 }
 
 #[test]
@@ -152,8 +153,8 @@ fn search_explicit_trigger() {
     let engine = full_engine();
     let resp = engine.process_input("search for rust tutorials");
     let v = action(&resp);
-    assert_eq!(v["action"], "search");
-    assert_eq!(v["query"], "rust tutorials");
+    assert_eq!(v["v"], 1);
+    assert_eq!(v["search"], "rust tutorials");
 }
 
 // --- Fallback ---
