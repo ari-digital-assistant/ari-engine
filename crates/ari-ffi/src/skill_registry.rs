@@ -14,8 +14,8 @@
 //! problem, not the generator's.
 
 use ari_skill_loader::{
-    capability_name, check_updates, install_by_id, install_update, ManifestError, RegistryClient,
-    RegistryError, Skillfile, SkillStore, StorageConfig, StoreError, TrustRoot,
+    capability_name, check_updates, install_by_id, install_update, IndexEntry, ManifestError,
+    RegistryClient, RegistryError, Skillfile, SkillStore, StorageConfig, StoreError, TrustRoot,
     REGISTRY_TRUST_KEY,
 };
 
@@ -103,6 +103,13 @@ pub enum FfiRegistryError {
 
     #[error("manifest: {message}")]
     Manifest { message: String },
+
+    /// The registry knows about this skill but doesn't carry a preview
+    /// manifest sidecar — typically an index row generated before the
+    /// sidecar pipeline was introduced. UI should fall back to the
+    /// lightweight [`FfiBrowseEntry`] fields rather than showing an error.
+    #[error("no preview manifest available for skill: {id}")]
+    ManifestUnavailable { id: String },
 
     #[error("trust key: {message}")]
     TrustKey { message: String },
@@ -292,6 +299,78 @@ impl SkillRegistry {
             id: installed.id,
             version: installed.version,
             install_dir: installed.install_dir.to_string_lossy().into_owned(),
+        })
+    }
+
+    /// Download the registry's preview manifest sidecar for `id` and
+    /// return it as a rich [`FfiSkillManifest`] — same shape as
+    /// [`Self::read_installed_manifest`], but sourced from the registry
+    /// instead of the local store, so the Browse → detail view can
+    /// render the full SKILL.md body *before* the user commits to an
+    /// install.
+    ///
+    /// The sidecar is a verbatim copy of the skill's SKILL.md published
+    /// alongside the signed bundle. It is **not** covered by the bundle
+    /// signature — good enough for a read-only preview, not suitable for
+    /// anything load-bearing. Install still goes through the full
+    /// signature + sha256 pipeline.
+    ///
+    /// Errors:
+    ///   * [`FfiRegistryError::NotFound`] — the id isn't in the registry.
+    ///   * [`FfiRegistryError::ManifestUnavailable`] — the index row has
+    ///     no sidecar (older index format); UI should fall back to the
+    ///     lightweight browse entry.
+    ///   * [`FfiRegistryError::Registry`] — network / HTTP failure.
+    ///   * [`FfiRegistryError::Manifest`] — the sidecar doesn't parse as
+    ///     a valid Skillfile.
+    ///
+    /// Blocks on the network — callers must run this off the main thread.
+    pub fn fetch_manifest_preview(
+        &self,
+        id: String,
+    ) -> Result<FfiSkillManifest, FfiRegistryError> {
+        let client = RegistryClient::new();
+        let index = client.fetch_index().map_err(|e| FfiRegistryError::Registry {
+            message: e.to_string(),
+        })?;
+        let entry: IndexEntry = index
+            .skills
+            .into_iter()
+            .find(|e| e.id == id)
+            .ok_or_else(|| FfiRegistryError::NotFound { id: id.clone() })?;
+        let source = client.fetch_manifest(&entry).map_err(|e| match e {
+            RegistryError::ManifestUnavailable { id } => {
+                FfiRegistryError::ManifestUnavailable { id }
+            }
+            other => FfiRegistryError::Registry {
+                message: other.to_string(),
+            },
+        })?;
+        // parent_dir_name = None: the sidecar sits at manifests/<id>-<version>.md,
+        // not in a directory named after the skill, so the AgentSkills
+        // name-must-match-parent-dir check doesn't apply here.
+        let skillfile =
+            Skillfile::parse(&source, None).map_err(|e: ManifestError| FfiRegistryError::Manifest {
+                message: e.to_string(),
+            })?;
+        let ext = skillfile.ari_extension.ok_or_else(|| FfiRegistryError::Manifest {
+            message: "preview manifest is missing the ari extension metadata".to_string(),
+        })?;
+        Ok(FfiSkillManifest {
+            id: ext.id,
+            version: ext.version,
+            name: skillfile.name,
+            description: skillfile.description,
+            author: ext.author,
+            homepage: ext.homepage,
+            license: skillfile.license,
+            capabilities: ext
+                .capabilities
+                .into_iter()
+                .map(|c| capability_name(c).to_string())
+                .collect(),
+            languages: ext.languages,
+            body: skillfile.body,
         })
     }
 

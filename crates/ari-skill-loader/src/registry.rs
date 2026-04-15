@@ -59,6 +59,12 @@ const MAX_INDEX_BYTES: usize = 4 * 1024 * 1024;
 /// enormous for a voice-assistant skill.
 const MAX_BUNDLE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Maximum size of a preview manifest sidecar (`SKILL.md`) the client
+/// will download. A real SKILL.md is a few KB; 256 KiB is a generous
+/// ceiling that still keeps a hostile registry from streaming megabytes
+/// of garbage into the detail view.
+const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Error)]
 pub enum RegistryError {
     #[error("http error: {0}")]
@@ -85,6 +91,9 @@ pub enum RegistryError {
 
     #[error("skill id {id} is not present in the registry index")]
     NotFound { id: String },
+
+    #[error("registry index has no preview manifest for {id}")]
+    ManifestUnavailable { id: String },
 
     #[error(transparent)]
     Install(#[from] BundleError),
@@ -140,6 +149,18 @@ pub struct IndexEntry {
     pub signature: String,
     /// Hex-encoded SHA-256 of the bundle bytes.
     pub sha256: String,
+    /// Path to a verbatim copy of the skill's `SKILL.md` (frontmatter +
+    /// body), relative to [`REGISTRY_BASE_URL`]. Lets clients render the
+    /// full detail page before committing to an install, without having
+    /// to download and extract the signed bundle. Optional so that older
+    /// index versions (which predate the sidecar pipeline) still parse.
+    ///
+    /// Note: the sidecar is **not** covered by the bundle signature. It's
+    /// safe to trust only as far as you trust the registry host — if you
+    /// need signed docs, pull the real bundle. For a preview screen this
+    /// is the right tradeoff because install still verifies everything.
+    #[serde(default)]
+    pub manifest: Option<String>,
 }
 
 /// One available update for an already-installed skill, as reported by
@@ -222,6 +243,28 @@ impl RegistryClient {
             });
         }
         Ok(index)
+    }
+
+    /// Download the preview `SKILL.md` sidecar for one index entry and
+    /// return it as a UTF-8 string. Callers feed this into
+    /// [`crate::manifest::Skillfile::parse`] to render the detail screen
+    /// before an install is committed.
+    ///
+    /// Returns [`RegistryError::ManifestUnavailable`] if the index entry
+    /// predates the sidecar pipeline (i.e. has no `manifest` field) —
+    /// distinct from the other variants so the UI can fall back to the
+    /// lightweight `IndexEntry` fields without surfacing a "network
+    /// error" to the user.
+    pub fn fetch_manifest(&self, entry: &IndexEntry) -> Result<String, RegistryError> {
+        let path = entry
+            .manifest
+            .as_deref()
+            .ok_or_else(|| RegistryError::ManifestUnavailable {
+                id: entry.id.clone(),
+            })?;
+        let url = self.resolve(path);
+        let bytes = self.get_bytes(&url, MAX_MANIFEST_BYTES)?;
+        String::from_utf8(bytes).map_err(|e| RegistryError::Parse(format!("{url}: {e}")))
     }
 
     /// Download the bundle and its detached signature for one index entry.
@@ -647,6 +690,7 @@ metadata:
                     bundle: "bundles/dev.heyari.coinflip-0.2.0.tar.gz".into(),
                     signature: "bundles/dev.heyari.coinflip-0.2.0.tar.gz.sig".into(),
                     sha256: "deadbeef".into(),
+                    manifest: None,
                 },
                 IndexEntry {
                     id: "dev.heyari.counter".into(),
@@ -661,6 +705,7 @@ metadata:
                     bundle: "bundles/dev.heyari.counter-5.0.0.tar.gz".into(),
                     signature: "bundles/dev.heyari.counter-5.0.0.tar.gz.sig".into(),
                     sha256: "cafe".into(),
+                    manifest: None,
                 },
             ],
         };
@@ -705,6 +750,7 @@ metadata:
             bundle: "x".into(),
             signature: "x".into(),
             sha256: "x".into(),
+            manifest: None,
         };
         let mut index = Index {
             index_version: 1,
@@ -1004,5 +1050,82 @@ metadata:
     fn with_base_url_forces_trailing_slash() {
         let c = RegistryClient::new().with_base_url("http://example.test/prefix");
         assert!(c.base_url().ends_with('/'));
+    }
+
+    #[test]
+    fn fetch_manifest_returns_sidecar_body_verbatim() {
+        let md = coin_md("0.3.0");
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/manifests/dev.heyari.coinflip-0.3.0.md".to_string(),
+            http_response(md.as_bytes(), "text/markdown"),
+        );
+        let server = TestServer::start(routes);
+        let client = RegistryClient::new().with_base_url(server.base());
+
+        let entry = IndexEntry {
+            id: "dev.heyari.coinflip".into(),
+            version: "0.3.0".into(),
+            name: "coin-flip".into(),
+            description: "".into(),
+            license: None,
+            author: None,
+            homepage: None,
+            capabilities: Vec::new(),
+            languages: Vec::new(),
+            bundle: "bundles/dev.heyari.coinflip-0.3.0.tar.gz".into(),
+            signature: "bundles/dev.heyari.coinflip-0.3.0.tar.gz.sig".into(),
+            sha256: "deadbeef".into(),
+            manifest: Some("manifests/dev.heyari.coinflip-0.3.0.md".into()),
+        };
+        let got = client.fetch_manifest(&entry).unwrap();
+        assert_eq!(got, md, "fetched sidecar must be byte-identical to served");
+    }
+
+    #[test]
+    fn fetch_manifest_errors_when_entry_has_no_sidecar_path() {
+        let client = RegistryClient::new().with_base_url("http://unused.test/");
+        let entry = IndexEntry {
+            id: "dev.heyari.legacy".into(),
+            version: "0.1.0".into(),
+            name: "legacy".into(),
+            description: "".into(),
+            license: None,
+            author: None,
+            homepage: None,
+            capabilities: Vec::new(),
+            languages: Vec::new(),
+            bundle: "bundles/legacy.tar.gz".into(),
+            signature: "bundles/legacy.tar.gz.sig".into(),
+            sha256: "x".into(),
+            manifest: None,
+        };
+        let err = client.fetch_manifest(&entry).unwrap_err();
+        match err {
+            RegistryError::ManifestUnavailable { id } => assert_eq!(id, "dev.heyari.legacy"),
+            other => panic!("expected ManifestUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_entry_round_trips_with_and_without_manifest_field() {
+        // New-format row: manifest present.
+        let with = r#"{
+            "id":"a","version":"0.1.0","name":"a","description":"",
+            "bundle":"b","signature":"s","sha256":"h",
+            "manifest":"manifests/a-0.1.0.md"
+        }"#;
+        let parsed: IndexEntry = serde_json::from_str(with).unwrap();
+        assert_eq!(parsed.manifest.as_deref(), Some("manifests/a-0.1.0.md"));
+
+        // Legacy row from a pre-sidecar index: manifest absent. Must still
+        // deserialize so we don't break upgrade paths when the registry
+        // hasn't been republished yet.
+        let without = r#"{
+            "id":"a","version":"0.1.0","name":"a","description":"",
+            "bundle":"b","signature":"s","sha256":"h"
+        }"#;
+        let parsed: IndexEntry = serde_json::from_str(without).unwrap();
+        assert!(parsed.manifest.is_none());
     }
 }
