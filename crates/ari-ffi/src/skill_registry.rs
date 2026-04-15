@@ -13,11 +13,15 @@
 //! blocking Kotlin methods so the thread discipline is the caller's
 //! problem, not the generator's.
 
+use ari_skill_loader::manifest::ConfigFieldType;
 use ari_skill_loader::{
     capability_name, check_updates, install_by_id, install_update, IndexEntry, ManifestError,
     RegistryClient, RegistryError, Skillfile, SkillStore, StorageConfig, StoreError, TrustRoot,
     REGISTRY_TRUST_KEY,
 };
+
+use crate::assistant_registry::{FfiConfigField, FfiSelectOption};
+use crate::settings_store::SkillSettingsStore;
 
 use crate::android_load_options;
 use std::sync::{Arc, Mutex};
@@ -129,6 +133,10 @@ fn trust_root() -> Result<TrustRoot, FfiRegistryError> {
 pub struct SkillRegistry {
     store: Mutex<SkillStore>,
     storage_dir: String,
+    /// Process-wide settings store, shared with [`crate::AssistantRegistry`]
+    /// so per-skill settings written through either path land in the same
+    /// HashMap and the engine's runtime API call path sees them.
+    settings_store: Arc<SkillSettingsStore>,
 }
 
 #[uniffi::export]
@@ -136,11 +144,14 @@ impl SkillRegistry {
     /// Open (or create) a skill store rooted at `skill_store_dir`, with
     /// per-skill `storage_kv` files living under `storage_dir`. Both
     /// paths should be inside the app's private files directory on
-    /// Android (`context.filesDir`).
+    /// Android (`context.filesDir`). `settings_store` is the shared
+    /// in-memory mirror of per-skill settings — typically the same
+    /// instance also handed to [`crate::AssistantRegistry::new`].
     #[uniffi::constructor]
     pub fn new(
         skill_store_dir: String,
         storage_dir: String,
+        settings_store: Arc<SkillSettingsStore>,
     ) -> Result<Arc<Self>, FfiRegistryError> {
         let trust = trust_root()?;
         let store = SkillStore::open(
@@ -154,6 +165,7 @@ impl SkillRegistry {
         Ok(Arc::new(Self {
             store: Mutex::new(store),
             storage_dir,
+            settings_store,
         }))
     }
 
@@ -420,6 +432,96 @@ impl SkillRegistry {
         })
     }
 
+    /// Read the user-configurable settings schema for an installed
+    /// skill, with current values from the shared [`SkillSettingsStore`]
+    /// merged in. Empty list if the skill declares no settings.
+    ///
+    /// Used by the per-skill detail page on Android to render an inline
+    /// settings panel above the (collapsible) about/manifest section.
+    /// Mirrors the shape of
+    /// [`crate::AssistantRegistry::get_assistant_config`] so the same
+    /// renderer composable works for both call sites — the only
+    /// difference is the source of the schema (top-level
+    /// `metadata.ari.settings` here, vs the assistant manifest there;
+    /// after the migration both resolve to the same field, but we keep
+    /// the dual entry points so neither caller has to know about the
+    /// other's existence).
+    ///
+    /// Returns [`FfiRegistryError::NotInstalled`] if `id` isn't in the
+    /// store, or [`FfiRegistryError::Manifest`] if SKILL.md fails to
+    /// parse (shouldn't happen for skills we installed ourselves).
+    pub fn get_skill_settings(
+        &self,
+        id: String,
+    ) -> Result<Vec<FfiConfigField>, FfiRegistryError> {
+        let store = self.store.lock().expect("skill store mutex poisoned");
+        let entry = store
+            .get(&id)
+            .ok_or_else(|| FfiRegistryError::NotInstalled { id: id.clone() })?;
+        let manifest_path = entry.install_dir.join("SKILL.md");
+        let skillfile = Skillfile::parse_file(&manifest_path).map_err(|e: ManifestError| {
+            FfiRegistryError::Manifest {
+                message: e.to_string(),
+            }
+        })?;
+        let ext = skillfile.ari_extension.ok_or_else(|| FfiRegistryError::Manifest {
+            message: "SKILL.md is missing the ari extension metadata".to_string(),
+        })?;
+
+        Ok(ext
+            .settings
+            .iter()
+            .map(|field| {
+                let current_value = if matches!(field.field_type, ConfigFieldType::Secret) {
+                    // Never round-trip secret values across the FFI
+                    // boundary — Android already has them in encrypted
+                    // storage, so we just signal "set" via the bullet
+                    // placeholder and let the UI mask the input field.
+                    if self.settings_store.inner.get_value(&id, &field.key).is_some() {
+                        Some("••••••••".to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    self.settings_store.inner.get_value(&id, &field.key)
+                };
+
+                FfiConfigField {
+                    key: field.key.clone(),
+                    label: field.label.clone(),
+                    field_type: match &field.field_type {
+                        ConfigFieldType::Text => "text".to_string(),
+                        ConfigFieldType::Secret => "secret".to_string(),
+                        ConfigFieldType::Select { .. } => "select".to_string(),
+                    },
+                    required: field.required,
+                    default_value: field.default.clone(),
+                    current_value,
+                    options: match &field.field_type {
+                        ConfigFieldType::Select { options } => options
+                            .iter()
+                            .map(|o| FfiSelectOption {
+                                value: o.value.clone(),
+                                label: o.label.clone(),
+                                download_url: o.download_url.clone(),
+                                download_bytes: o.download_bytes,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    },
+                }
+            })
+            .collect())
+    }
+
+    /// Write a single setting value to the shared store. Equivalent to
+    /// calling [`SkillSettingsStore::set_value`] directly — kept on this
+    /// struct so the per-skill settings UI can flow through one
+    /// dependency.
+    pub fn set_skill_setting(&self, skill_id: String, key: String, value: String) {
+        self.settings_store.set_value(skill_id, key, value);
+    }
+
     /// Remove an installed skill from disk and wipe its `storage_kv`
     /// state. Returns [`FfiRegistryError::NotInstalled`] if `id` isn't in
     /// the local store. The caller should invoke
@@ -462,6 +564,7 @@ mod tests {
         let reg = SkillRegistry::new(
             root.to_string_lossy().into_owned(),
             storage.to_string_lossy().into_owned(),
+            SkillSettingsStore::new(),
         )
         .unwrap();
         assert!(reg.list_installed().is_empty());
@@ -478,6 +581,7 @@ mod tests {
         let result = SkillRegistry::new(
             root.to_string_lossy().into_owned(),
             storage.to_string_lossy().into_owned(),
+            SkillSettingsStore::new(),
         );
         match result {
             Ok(_) => panic!("expected store error when root is a file"),
@@ -502,10 +606,42 @@ mod tests {
         let reg = SkillRegistry::new(
             root.to_string_lossy().into_owned(),
             storage.to_string_lossy().into_owned(),
+            SkillSettingsStore::new(),
         )
         .unwrap();
         // Just confirm the method is present and the lock path is sound.
         let _ = reg.list_installed();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    #[test]
+    fn set_skill_setting_round_trips_through_shared_store() {
+        // Verify the writes done via SkillRegistry are visible via the
+        // shared SkillSettingsStore — that's the contract that lets
+        // assistant config and per-skill settings co-exist on the same
+        // backing map.
+        let root = unique_dir("setting-root");
+        let storage = unique_dir("setting-storage");
+        let store = SkillSettingsStore::new();
+        let reg = SkillRegistry::new(
+            root.to_string_lossy().into_owned(),
+            storage.to_string_lossy().into_owned(),
+            store.clone(),
+        )
+        .unwrap();
+        reg.set_skill_setting(
+            "dev.heyari.reminder".into(),
+            "default_calendar".into(),
+            "Personal".into(),
+        );
+        assert_eq!(
+            store
+                .inner
+                .get_value("dev.heyari.reminder", "default_calendar")
+                .as_deref(),
+            Some("Personal"),
+        );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&storage);
     }

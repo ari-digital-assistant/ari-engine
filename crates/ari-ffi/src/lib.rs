@@ -12,11 +12,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 mod assistant_registry;
+mod settings_store;
 mod skill_registry;
 
 pub use assistant_registry::{
     AssistantRegistry, FfiAssistantEntry, FfiConfigField, FfiSelectOption,
 };
+pub use settings_store::SkillSettingsStore;
 pub use skill_registry::{
     FfiBrowseEntry, FfiInstalledSkill, FfiRegistryError, FfiSkillUpdate, SkillRegistry,
 };

@@ -6,16 +6,15 @@
 //! installed SKILL.md manifests with `type: assistant`.
 
 use ari_engine::ActiveAssistant;
-use ari_skill_loader::assistant::ConfigStore;
 use ari_skill_loader::manifest::{
     AssistantManifest, AssistantProvider, ConfigFieldType, Privacy, Skillfile,
 };
 use ari_skill_loader::{AssistantEntry, load_skill_directory_with};
 
 use crate::android_load_options;
-use std::collections::HashMap;
+use crate::settings_store::SkillSettingsStore;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 // ── Built-in local LLM assistant manifest ──────────────────────────────
 
@@ -33,27 +32,27 @@ metadata:
     homepage: https://github.com/ari-digital-assistant/ari
     engine: ">=0.3"
     languages: [en]
+    settings:
+      - key: model_tier
+        label: Model
+        type: select
+        required: true
+        options:
+          - value: small
+            label: "Gemma 3 1B (~769 MB)"
+            download_url: "https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf"
+            download_bytes: 806354944
+          - value: medium
+            label: "Gemma 4 E2B (~3.1 GB)"
+            download_url: "https://huggingface.co/unsloth/gemma-4-e2b-it-GGUF/resolve/main/gemma-4-e2b-it-Q4_K_M.gguf"
+            download_bytes: 3326083072
+          - value: large
+            label: "Gemma 4 E4B (~5.0 GB)"
+            download_url: "https://huggingface.co/unsloth/gemma-4-e4b-it-GGUF/resolve/main/gemma-4-e4b-it-Q4_K_M.gguf"
+            download_bytes: 5368709120
     assistant:
       provider: builtin
       privacy: local
-      config:
-        - key: model_tier
-          label: Model
-          type: select
-          required: true
-          options:
-            - value: small
-              label: "Gemma 3 1B (~769 MB)"
-              download_url: "https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf"
-              download_bytes: 806354944
-            - value: medium
-              label: "Gemma 4 E2B (~3.1 GB)"
-              download_url: "https://huggingface.co/unsloth/gemma-4-e2b-it-GGUF/resolve/main/gemma-4-e2b-it-Q4_K_M.gguf"
-              download_bytes: 3326083072
-            - value: large
-              label: "Gemma 4 E4B (~5.0 GB)"
-              download_url: "https://huggingface.co/unsloth/gemma-4-e4b-it-GGUF/resolve/main/gemma-4-e4b-it-Q4_K_M.gguf"
-              download_bytes: 5368709120
 ---
 Runs a language model entirely on your device. No data leaves your phone.
 Choose a model size based on your available storage and how much RAM
@@ -66,40 +65,6 @@ fn parse_builtin_assistant() -> (String, String, String, AssistantManifest, Stri
     let ari = sf.ari_extension.expect("built-in assistant must have ari extension");
     let assistant = ari.assistant.expect("built-in assistant must have assistant block");
     (ari.id, sf.name, sf.description, assistant, sf.body)
-}
-
-// ── FFI config store ──────────────────────────────────────────────────
-
-/// Thread-safe config store backed by in-memory HashMap. The Android
-/// frontend populates it from DataStore/EncryptedSharedPreferences at
-/// startup and after each config change.
-pub(crate) struct FfiConfigStore {
-    inner: RwLock<HashMap<(String, String), String>>,
-}
-
-impl FfiConfigStore {
-    pub fn new() -> Self {
-        Self {
-            inner: RwLock::new(HashMap::new()),
-        }
-    }
-
-    pub fn set(&self, skill_id: &str, key: &str, value: &str) {
-        self.inner
-            .write()
-            .expect("config store lock poisoned")
-            .insert((skill_id.to_string(), key.to_string()), value.to_string());
-    }
-}
-
-impl ConfigStore for FfiConfigStore {
-    fn get(&self, skill_id: &str, key: &str) -> Option<String> {
-        self.inner
-            .read()
-            .expect("config store lock poisoned")
-            .get(&(skill_id.to_string(), key.to_string()))
-            .cloned()
-    }
 }
 
 // ── FFI types ─────────────────────────────────────────────────────────
@@ -141,8 +106,12 @@ pub struct AssistantRegistry {
     builtin: (String, String, String, AssistantManifest, String),
     /// Community assistants loaded from the skill store.
     community: Mutex<Vec<AssistantEntry>>,
-    /// Config store shared with the engine.
-    config_store: Arc<FfiConfigStore>,
+    /// Process-wide settings store shared with [`crate::SkillRegistry`]
+    /// and (via [`apply_to_engine`]) with the engine's runtime API call
+    /// path. Constructed once in Android DI and injected into both
+    /// registries so writes from any path are immediately visible to
+    /// every reader.
+    settings_store: Arc<SkillSettingsStore>,
     /// Which assistant is active (skill ID or None).
     active_id: Mutex<Option<String>>,
     /// Paths for rescanning community assistants.
@@ -156,6 +125,7 @@ impl AssistantRegistry {
     pub fn new(
         skill_store_dir: String,
         storage_dir: String,
+        settings_store: Arc<SkillSettingsStore>,
     ) -> Arc<Self> {
         let builtin = parse_builtin_assistant();
 
@@ -171,7 +141,7 @@ impl AssistantRegistry {
         Arc::new(Self {
             builtin,
             community: Mutex::new(community),
-            config_store: Arc::new(FfiConfigStore::new()),
+            settings_store,
             active_id: Mutex::new(None),
             skill_store_dir,
             storage_dir,
@@ -244,7 +214,7 @@ impl AssistantRegistry {
                             ActiveAssistant::Api {
                                 skill_id: entry.id.clone(),
                                 config: api_config.clone(),
-                                config_store: self.config_store.clone() as Arc<dyn ConfigStore>,
+                                config_store: self.settings_store.as_config_store(),
                             }
                         })
                     })
@@ -268,13 +238,13 @@ impl AssistantRegistry {
             .map(|field| {
                 let current_value = if matches!(field.field_type, ConfigFieldType::Secret) {
                     // Never return secret values across FFI.
-                    if self.config_store.get(&id, &field.key).is_some() {
+                    if self.settings_store.inner.get_value(&id, &field.key).is_some() {
                         Some("••••••••".to_string())
                     } else {
                         None
                     }
                 } else {
-                    self.config_store.get(&id, &field.key)
+                    self.settings_store.inner.get_value(&id, &field.key)
                 };
 
                 FfiConfigField {
@@ -301,14 +271,17 @@ impl AssistantRegistry {
             .collect()
     }
 
-    /// Set a config value for an assistant skill.
+    /// Set a config value for an assistant skill. Equivalent to calling
+    /// [`SkillSettingsStore::set_value`] directly — kept on this struct
+    /// so the existing assistant settings UI doesn't need rewiring just
+    /// to read its own writes.
     pub fn set_assistant_config_value(
         &self,
         skill_id: String,
         key: String,
         value: String,
     ) {
-        self.config_store.set(&skill_id, &key, &value);
+        self.settings_store.set_value(skill_id, key, value);
     }
 
     /// Rescan the skill store for community assistant skills (call after
@@ -389,12 +362,12 @@ mod tests {
     }
 
     #[test]
-    fn ffi_config_store_round_trip() {
-        let store = FfiConfigStore::new();
-        assert!(store.get("a", "b").is_none());
-        store.set("a", "b", "val");
-        assert_eq!(store.get("a", "b").as_deref(), Some("val"));
-        store.set("a", "b", "updated");
-        assert_eq!(store.get("a", "b").as_deref(), Some("updated"));
+    fn settings_store_round_trip_via_assistant_registry_path() {
+        let store = SkillSettingsStore::new();
+        assert!(store.inner.get_value("a", "b").is_none());
+        store.set_value("a".into(), "b".into(), "val".into());
+        assert_eq!(store.inner.get_value("a", "b").as_deref(), Some("val"));
+        store.set_value("a".into(), "b".into(), "updated".into());
+        assert_eq!(store.inner.get_value("a", "b").as_deref(), Some("updated"));
     }
 }

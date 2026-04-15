@@ -308,6 +308,19 @@ pub struct AriExtension {
     /// Example utterances for FunctionGemma training. Required for
     /// regular skills (minimum 5), optional for assistant skills.
     pub examples: Vec<SkillExample>,
+    /// User-configurable fields for this skill, rendered as a settings
+    /// panel in the frontend. Any skill type may declare these —
+    /// WASM skills read current values at runtime via the `storage_kv`
+    /// host imports, declarative skills via `{{config.<key>}}` template
+    /// interpolation, and assistant skills via the `auth_config_key` /
+    /// `model_config_key` cross-references inside `assistant.api`.
+    ///
+    /// For legacy assistant manifests that still declare
+    /// `metadata.ari.assistant.config`, the parser copies those entries
+    /// into this field so old and new frontmatter produce the same
+    /// runtime shape. The deprecated sub-location stays readable but
+    /// new skills should put settings at the top level.
+    pub settings: Vec<ConfigField>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -473,6 +486,34 @@ impl AriExtension {
 
         let skill_type = raw.skill_type.unwrap_or_default();
 
+        // Resolve user-facing settings. Top-level `metadata.ari.settings`
+        // is the canonical location. For back-compat with pre-migration
+        // assistant manifests we also accept `metadata.ari.assistant.config`
+        // — but only when `settings` is empty. Mixing both is a bug we'd
+        // rather surface than silently merge, so if both are populated we
+        // error out.
+        let settings_raw: &[RawConfigField] = if !raw.settings.is_empty() {
+            if let Some(asst) = raw.assistant.as_ref() {
+                if !asst.config.is_empty() {
+                    return Err(ManifestError::YamlParse(
+                        "skill declares both top-level `settings` and legacy \
+                         `assistant.config` — pick one (prefer top-level `settings`)"
+                            .to_string(),
+                    ));
+                }
+            }
+            &raw.settings
+        } else {
+            raw.assistant
+                .as_ref()
+                .map(|a| a.config.as_slice())
+                .unwrap_or(&[])
+        };
+        let settings = settings_raw
+            .iter()
+            .map(ConfigField::from_raw)
+            .collect::<Result<Vec<_>, _>>()?;
+
         let (matching, behaviour, assistant) = match skill_type {
             SkillType::Skill => {
                 if raw.assistant.is_some() {
@@ -514,7 +555,7 @@ impl AriExtension {
                     .assistant
                     .as_ref()
                     .ok_or(ManifestError::MissingAssistantBlock)?;
-                let assistant = AssistantManifest::from_raw(raw_asst)?;
+                let assistant = AssistantManifest::from_raw(raw_asst, &settings)?;
                 (None, None, Some(assistant))
             }
         };
@@ -551,6 +592,7 @@ impl AriExtension {
             behaviour,
             assistant,
             examples,
+            settings,
         })
     }
 }
@@ -633,14 +675,20 @@ impl WasmBehaviour {
 }
 
 impl AssistantManifest {
-    fn from_raw(raw: &RawAssistant) -> Result<Self, ManifestError> {
+    /// `settings` is the already-merged settings list from
+    /// [`AriExtension::from_raw`] — the top-level `metadata.ari.settings`
+    /// (new) or the legacy `metadata.ari.assistant.config` (old),
+    /// whichever was present. This struct mirrors it into its own
+    /// `config` field so callers that still read `manifest.config`
+    /// stay working during the transition.
+    fn from_raw(raw: &RawAssistant, settings: &[ConfigField]) -> Result<Self, ManifestError> {
         let provider = raw.provider.ok_or(ManifestError::MissingAssistantProvider)?;
         let privacy = raw.privacy.ok_or(ManifestError::MissingAssistantPrivacy)?;
 
         let api = match provider {
             AssistantProvider::Api => {
                 let raw_api = raw.api.as_ref().ok_or(ManifestError::MissingApiBlock)?;
-                Some(ApiConfig::from_raw(raw_api, &raw.config)?)
+                Some(ApiConfig::from_raw(raw_api, settings)?)
             }
             AssistantProvider::Builtin => {
                 if raw.api.is_some() {
@@ -650,17 +698,11 @@ impl AssistantManifest {
             }
         };
 
-        let config = raw
-            .config
-            .iter()
-            .map(ConfigField::from_raw)
-            .collect::<Result<Vec<_>, _>>()?;
-
         Ok(AssistantManifest {
             provider,
             privacy,
             api,
-            config,
+            config: settings.to_vec(),
         })
     }
 }
@@ -668,7 +710,7 @@ impl AssistantManifest {
 impl ApiConfig {
     fn from_raw(
         raw: &RawApiConfig,
-        config_fields: &[RawConfigField],
+        settings: &[ConfigField],
     ) -> Result<Self, ManifestError> {
         // Endpoint: exactly one of fixed or config-key.
         match (&raw.endpoint, &raw.endpoint_config_key) {
@@ -704,11 +746,11 @@ impl ApiConfig {
 
         validate_response_path(&response_path)?;
 
-        // Validate that referenced config keys exist.
-        let config_keys: Vec<&str> = config_fields
-            .iter()
-            .filter_map(|f| f.key.as_deref())
-            .collect();
+        // Validate that referenced config keys exist. Resolves against
+        // the unified settings list (top-level `metadata.ari.settings` —
+        // or the legacy `assistant.config` location, since
+        // `AriExtension::from_raw` merges them before we get here).
+        let config_keys: Vec<&str> = settings.iter().map(|f| f.key.as_str()).collect();
 
         if let Some(ref key) = raw.auth_config_key {
             if !config_keys.contains(&key.as_str()) {
@@ -973,6 +1015,11 @@ struct RawAriExtension {
     assistant: Option<RawAssistant>,
     #[serde(default)]
     examples: Vec<RawExample>,
+    /// Top-level user-configurable fields. Replaces the legacy
+    /// `metadata.ari.assistant.config` location (which still parses
+    /// for back-compat — see [`AriExtension::from_raw`]).
+    #[serde(default)]
+    settings: Vec<RawConfigField>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1854,6 +1901,181 @@ metadata:
 "#;
         let err = Skillfile::parse(src, None).unwrap_err();
         assert!(matches!(err, ManifestError::ConfigKeyNotFound { key, field } if key == "api_key" && field == "auth_config_key"));
+    }
+
+    #[test]
+    fn top_level_settings_populates_extension_and_assistant_config_mirror() {
+        // New canonical location: settings live at metadata.ari.settings.
+        // The parser must surface them on AriExtension.settings AND mirror
+        // them onto AssistantManifest.config so the existing FFI code that
+        // reads manifest.config keeps working untouched.
+        let src = r#"---
+name: claude
+description: Talk to Claude
+metadata:
+  ari:
+    id: dev.heyari.assistant.claude
+    version: "0.1.0"
+    type: assistant
+    engine: ">=0.3"
+    settings:
+      - key: api_key
+        label: API Key
+        type: secret
+        required: true
+      - key: model
+        label: Model
+        type: select
+        options:
+          - { value: claude-sonnet-4-6, label: "Sonnet 4.6" }
+          - { value: claude-opus-4-6, label: "Opus 4.6" }
+    assistant:
+      provider: api
+      privacy: cloud
+      api:
+        endpoint: https://api.anthropic.com/v1/messages
+        auth: bearer
+        auth_config_key: api_key
+        model_config_key: model
+        default_model: claude-sonnet-4-6
+        system_prompt: "you are claude"
+        response_path: "content[0].text"
+---
+"#;
+        let sf = Skillfile::parse(src, None).expect("must parse");
+        let ari = sf.ari_extension.expect("ari extension required");
+        assert_eq!(ari.settings.len(), 2, "top-level settings must be populated");
+        assert_eq!(ari.settings[0].key, "api_key");
+        assert_eq!(ari.settings[1].key, "model");
+        let asst = ari.assistant.expect("assistant block required");
+        assert_eq!(
+            asst.config, ari.settings,
+            "AssistantManifest.config must mirror AriExtension.settings exactly"
+        );
+    }
+
+    #[test]
+    fn legacy_assistant_config_still_parses_for_back_compat() {
+        // Old manifests put settings under metadata.ari.assistant.config.
+        // We promote them to AriExtension.settings transparently so any
+        // skill that hasn't been migrated yet still works.
+        let src = r#"---
+name: claude
+description: Talk to Claude
+metadata:
+  ari:
+    id: dev.heyari.assistant.claude
+    version: "0.1.0"
+    type: assistant
+    engine: ">=0.3"
+    assistant:
+      provider: api
+      privacy: cloud
+      api:
+        endpoint: https://api.anthropic.com/v1/messages
+        auth: bearer
+        auth_config_key: api_key
+        default_model: claude-sonnet-4-6
+        system_prompt: "you are claude"
+        response_path: "content[0].text"
+      config:
+        - key: api_key
+          label: API Key
+          type: secret
+          required: true
+---
+"#;
+        let sf = Skillfile::parse(src, None).expect("legacy manifest must parse");
+        let ari = sf.ari_extension.unwrap();
+        assert_eq!(ari.settings.len(), 1);
+        assert_eq!(ari.settings[0].key, "api_key");
+        let asst = ari.assistant.unwrap();
+        assert_eq!(asst.config, ari.settings);
+    }
+
+    #[test]
+    fn rejects_skill_declaring_both_settings_locations() {
+        // Mixing top-level and legacy locations is almost certainly a
+        // mistake mid-migration — fail loudly rather than silently
+        // picking one.
+        let src = r#"---
+name: claude
+description: x
+metadata:
+  ari:
+    id: a.b.c
+    version: "1"
+    engine: ">=0.3"
+    type: assistant
+    settings:
+      - { key: api_key, label: API Key, type: secret }
+    assistant:
+      provider: api
+      privacy: cloud
+      api:
+        endpoint: https://x
+        auth: bearer
+        auth_config_key: api_key
+        default_model: x
+        system_prompt: x
+        response_path: "x"
+      config:
+        - { key: api_key, label: API Key, type: secret }
+---
+"#;
+        let err = Skillfile::parse(src, None).unwrap_err();
+        match err {
+            ManifestError::YamlParse(msg) => {
+                assert!(
+                    msg.contains("both") && msg.contains("settings"),
+                    "error message should explain the conflict, got: {msg}"
+                );
+            }
+            other => panic!("expected YamlParse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn top_level_settings_visible_for_regular_wasm_skills() {
+        // The whole point of moving settings out of `assistant.config` is
+        // that any skill type can declare them. Verify a WASM skill with
+        // settings parses cleanly and exposes them on AriExtension.
+        let src = r#"---
+name: reminder
+description: Sets reminders.
+metadata:
+  ari:
+    id: dev.heyari.reminder
+    version: "0.1.0"
+    engine: ">=0.3"
+    matching:
+      patterns:
+        - keywords: [remind]
+          weight: 0.95
+    examples:
+      - text: "remind me to feed the cat at 5pm"
+      - text: "remind me about laundry tomorrow"
+      - text: "remind me to call mum"
+      - text: "remind me to take out bins"
+      - text: "remind me to drink water"
+    settings:
+      - key: default_calendar
+        label: Default calendar
+        type: text
+    wasm:
+      module: skill.wasm
+      memory_limit_mb: 1
+---
+"#;
+        let sf = Skillfile::parse(src, None).expect("must parse");
+        let ari = sf.ari_extension.unwrap();
+        assert_eq!(ari.skill_type, SkillType::Skill);
+        assert_eq!(ari.settings.len(), 1);
+        assert_eq!(ari.settings[0].key, "default_calendar");
+        assert!(
+            ari.assistant.is_none(),
+            "non-assistant skill must not have assistant block"
+        );
     }
 
     #[test]
