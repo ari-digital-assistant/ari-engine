@@ -111,6 +111,23 @@ pub struct ConfigField {
     pub field_type: ConfigFieldType,
     pub required: bool,
     pub default: Option<String>,
+    /// Optional visibility gate: the field is only shown when another
+    /// field's effective value matches one of the listed values.
+    /// `None` means "always visible". Lets skills declare conditional
+    /// settings like "only show 'Default task list' when 'Save
+    /// reminders to' is `tasks` or `both`" without the frontend
+    /// needing skill-specific logic.
+    pub show_when: Option<ShowWhen>,
+}
+
+/// Declarative visibility gate on a [`ConfigField`]. The frontend
+/// looks up the field with `key`, resolves its effective value (stored
+/// value, or default if none stored), and renders the gated field
+/// only if that value appears in `equals`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowWhen {
+    pub key: String,
+    pub equals: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -536,6 +553,21 @@ impl AriExtension {
             .map(ConfigField::from_raw)
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Validate show_when cross-refs — each gated field must point
+        // at a real sibling. Failing loudly at parse time prevents
+        // invisible-settings bugs where a typo in `show_when.key`
+        // silently hides the field forever.
+        for field in &settings {
+            if let Some(sw) = &field.show_when {
+                if !settings.iter().any(|f| f.key == sw.key) {
+                    return Err(ManifestError::ConfigKeyNotFound {
+                        key: sw.key.clone(),
+                        field: format!("show_when on `{}`", field.key),
+                    });
+                }
+            }
+        }
+
         let (matching, behaviour, assistant) = match skill_type {
             SkillType::Skill => {
                 if raw.assistant.is_some() {
@@ -899,12 +931,36 @@ impl ConfigField {
                 ))
             }
         };
+        let show_when = match raw.show_when.as_ref() {
+            None => None,
+            Some(raw_sw) => {
+                let sw_key = raw_sw
+                    .key
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        ManifestError::YamlParse("show_when missing `key`".into())
+                    })?;
+                let equals = raw_sw.equals.0.clone();
+                if equals.is_empty() {
+                    return Err(ManifestError::YamlParse(
+                        "show_when `equals` must contain at least one value".into(),
+                    ));
+                }
+                Some(ShowWhen {
+                    key: sw_key,
+                    equals,
+                })
+            }
+        };
+
         Ok(ConfigField {
             key,
             label,
             field_type,
             required: raw.required,
             default: raw.default.clone(),
+            show_when,
         })
     }
 }
@@ -1141,6 +1197,8 @@ struct RawConfigField {
     required: bool,
     default: Option<String>,
     #[serde(default)]
+    show_when: Option<RawShowWhen>,
+    #[serde(default)]
     options: Vec<RawSelectOption>,
 }
 
@@ -1150,6 +1208,38 @@ struct RawSelectOption {
     label: Option<String>,
     download_url: Option<String>,
     download_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawShowWhen {
+    key: Option<String>,
+    /// Accept either a single string or a list — common YAML mistake
+    /// is `equals: tasks` instead of `equals: [tasks]`, and silently
+    /// accepting both keeps authors out of trouble. Modelled as a
+    /// custom deserialize target that handles both shapes.
+    #[serde(default)]
+    equals: RawShowWhenEquals,
+}
+
+#[derive(Debug, Default)]
+struct RawShowWhenEquals(Vec<String>);
+
+impl<'de> serde::Deserialize<'de> for RawShowWhenEquals {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum StringOrList {
+            One(String),
+            Many(Vec<String>),
+        }
+        Ok(match StringOrList::deserialize(d)? {
+            StringOrList::One(s) => RawShowWhenEquals(vec![s]),
+            StringOrList::Many(v) => RawShowWhenEquals(v),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2172,6 +2262,147 @@ metadata:
                     "error should explain the rule, got: {msg}"
                 );
             }
+            other => panic!("expected YamlParse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_when_accepts_list_and_scalar_equals() {
+        // `equals: [tasks, both]` (list form) and `equals: tasks`
+        // (scalar form) should both parse — the scalar form is a
+        // common YAML mistake and silently accepting it saves a
+        // confusing no-op debugging session for skill authors.
+        let src = r#"---
+name: reminder
+description: Sets reminders.
+metadata:
+  ari:
+    id: dev.heyari.reminder
+    version: "0.1.0"
+    engine: ">=0.3"
+    matching:
+      patterns: [{ keywords: [remind], weight: 1 }]
+    examples:
+      - text: "remind me one"
+      - text: "remind me two"
+      - text: "remind me three"
+      - text: "remind me four"
+      - text: "remind me five"
+    settings:
+      - key: destination
+        label: Destination
+        type: select
+        default: tasks
+        options:
+          - { value: tasks, label: Tasks }
+          - { value: calendar, label: Calendar }
+          - { value: both, label: Both }
+      - key: default_calendar
+        label: Default calendar
+        type: device_calendar
+        show_when:
+          key: destination
+          equals: [calendar, both]
+      - key: default_task_list
+        label: Default task list
+        type: device_task_list
+        show_when:
+          key: destination
+          equals: tasks
+    wasm:
+      module: skill.wasm
+      memory_limit_mb: 1
+---
+"#;
+        let sf = Skillfile::parse(src, None).expect("must parse");
+        let ari = sf.ari_extension.unwrap();
+        assert_eq!(ari.settings.len(), 3);
+        let cal_sw = ari.settings[1].show_when.as_ref().unwrap();
+        assert_eq!(cal_sw.key, "destination");
+        assert_eq!(cal_sw.equals, vec!["calendar".to_string(), "both".to_string()]);
+        let task_sw = ari.settings[2].show_when.as_ref().unwrap();
+        assert_eq!(task_sw.equals, vec!["tasks".to_string()]);
+    }
+
+    #[test]
+    fn show_when_rejects_reference_to_missing_sibling() {
+        // `show_when.key` must name a real sibling field; a typo
+        // would otherwise hide the gated field forever with no
+        // feedback. Surface it at parse time instead.
+        let src = r#"---
+name: x
+description: x
+metadata:
+  ari:
+    id: a.b.c
+    version: "0.1.0"
+    engine: ">=0.3"
+    matching:
+      patterns: [{ keywords: [x], weight: 1 }]
+    examples:
+      - text: "x one"
+      - text: "x two"
+      - text: "x three"
+      - text: "x four"
+      - text: "x five"
+    settings:
+      - key: gated
+        label: Gated
+        type: text
+        show_when:
+          key: typo_in_key_name
+          equals: [yes]
+    wasm:
+      module: skill.wasm
+      memory_limit_mb: 1
+---
+"#;
+        let err = Skillfile::parse(src, None).unwrap_err();
+        match err {
+            ManifestError::ConfigKeyNotFound { key, field } => {
+                assert_eq!(key, "typo_in_key_name");
+                assert!(field.contains("show_when"));
+            }
+            other => panic!("expected ConfigKeyNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_when_rejects_empty_equals() {
+        let src = r#"---
+name: x
+description: x
+metadata:
+  ari:
+    id: a.b.c
+    version: "0.1.0"
+    engine: ">=0.3"
+    matching:
+      patterns: [{ keywords: [x], weight: 1 }]
+    examples:
+      - text: "x one"
+      - text: "x two"
+      - text: "x three"
+      - text: "x four"
+      - text: "x five"
+    settings:
+      - key: controller
+        label: Controller
+        type: text
+      - key: gated
+        label: Gated
+        type: text
+        show_when:
+          key: controller
+          equals: []
+    wasm:
+      module: skill.wasm
+      memory_limit_mb: 1
+---
+"#;
+        let err = Skillfile::parse(src, None).unwrap_err();
+        match err {
+            ManifestError::YamlParse(msg) => assert!(msg.contains("equals"), "got: {msg}"),
             other => panic!("expected YamlParse error, got {other:?}"),
         }
     }

@@ -511,6 +511,12 @@ impl SkillRegistry {
                             .collect(),
                         _ => Vec::new(),
                     },
+                    show_when_key: field.show_when.as_ref().map(|s| s.key.clone()),
+                    show_when_equals: field
+                        .show_when
+                        .as_ref()
+                        .map(|s| s.equals.clone())
+                        .unwrap_or_default(),
                 }
             })
             .collect())

@@ -88,6 +88,14 @@ pub struct FfiConfigField {
     pub default_value: Option<String>,
     pub current_value: Option<String>,
     pub options: Vec<FfiSelectOption>,
+    /// Optional visibility gate — when non-null, the field should
+    /// only render if the field identified by [`show_when_key`] has a
+    /// current-or-default value matching one of [`show_when_equals`].
+    /// Null means "always visible". Flat-pair surface because uniffi
+    /// nested optional records are more awkward to consume than a
+    /// flag + a list.
+    pub show_when_key: Option<String>,
+    pub show_when_equals: Vec<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -266,6 +274,12 @@ impl AssistantRegistry {
                             .collect(),
                         _ => Vec::new(),
                     },
+                    show_when_key: field.show_when.as_ref().map(|s| s.key.clone()),
+                    show_when_equals: field
+                        .show_when
+                        .as_ref()
+                        .map(|s| s.equals.clone())
+                        .unwrap_or_default(),
                 }
             })
             .collect()
