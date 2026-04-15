@@ -48,6 +48,8 @@ impl HostCapabilities {
             Capability::Clipboard,
             Capability::Tts,
             Capability::StorageKv,
+            Capability::Calendar,
+            Capability::Tasks,
         ] {
             s.granted.insert(cap);
         }
@@ -58,12 +60,19 @@ impl HostCapabilities {
     /// import; the skill emits an `Action` response and the frontend handles
     /// it. Safe to claim from any frontend that intends to honour Action
     /// responses, even before any WASM host imports exist.
+    ///
+    /// `Calendar` and `Tasks` belong here too — the skill never touches
+    /// the platform provider directly, it just emits a `create_reminder`
+    /// action and the Android frontend does the `ContentResolver` insert
+    /// after enforcing the runtime permission grant.
     pub fn pure_frontend() -> Self {
         let mut s = Self::default();
         s.granted.insert(Capability::Notifications);
         s.granted.insert(Capability::LaunchApp);
         s.granted.insert(Capability::Clipboard);
         s.granted.insert(Capability::Tts);
+        s.granted.insert(Capability::Calendar);
+        s.granted.insert(Capability::Tasks);
         s
     }
 
@@ -105,6 +114,8 @@ pub fn parse_capability(s: &str) -> Option<Capability> {
         "clipboard" => Some(Capability::Clipboard),
         "tts" => Some(Capability::Tts),
         "storage_kv" => Some(Capability::StorageKv),
+        "calendar" => Some(Capability::Calendar),
+        "tasks" => Some(Capability::Tasks),
         _ => None,
     }
 }
@@ -119,6 +130,8 @@ pub fn capability_name(cap: Capability) -> &'static str {
         Capability::Clipboard => "clipboard",
         Capability::Tts => "tts",
         Capability::StorageKv => "storage_kv",
+        Capability::Calendar => "calendar",
+        Capability::Tasks => "tasks",
     }
 }
 
@@ -145,6 +158,12 @@ mod tests {
         assert!(h.provides(Capability::LaunchApp));
         assert!(h.provides(Capability::Clipboard));
         assert!(h.provides(Capability::Tts));
+        // Calendar / Tasks are also pure-frontend: the skill emits an
+        // action and the frontend does the ContentResolver insert. No
+        // WASM host import involved, so any frontend that honours
+        // actions can grant them safely.
+        assert!(h.provides(Capability::Calendar));
+        assert!(h.provides(Capability::Tasks));
         assert!(!h.provides(Capability::Http));
         assert!(!h.provides(Capability::Location));
         assert!(!h.provides(Capability::StorageKv));
@@ -192,9 +211,21 @@ mod tests {
             Capability::Clipboard,
             Capability::Tts,
             Capability::StorageKv,
+            Capability::Calendar,
+            Capability::Tasks,
         ] {
             assert_eq!(parse_capability(capability_name(cap)), Some(cap));
         }
+    }
+
+    #[test]
+    fn calendar_and_tasks_have_expected_canonical_names() {
+        // Stable wire names — these end up in SKILL.md frontmatter and
+        // in the published index.json. Any rename is a breaking change
+        // for every published bundle that declares them, so pin them
+        // explicitly rather than relying on the `Debug` impl.
+        assert_eq!(capability_name(Capability::Calendar), "calendar");
+        assert_eq!(capability_name(Capability::Tasks), "tasks");
     }
 
     #[test]

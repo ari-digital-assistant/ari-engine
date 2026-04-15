@@ -331,6 +331,8 @@ fn field_type_str(ft: &ConfigFieldType) -> String {
         ConfigFieldType::Text => "text".to_string(),
         ConfigFieldType::Secret => "secret".to_string(),
         ConfigFieldType::Select { .. } => "select".to_string(),
+        ConfigFieldType::DeviceCalendar => "device_calendar".to_string(),
+        ConfigFieldType::DeviceTaskList => "device_task_list".to_string(),
     }
 }
 

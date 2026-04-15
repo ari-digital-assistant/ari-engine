@@ -118,6 +118,18 @@ pub enum ConfigFieldType {
     Text,
     Secret,
     Select { options: Vec<SelectOption> },
+    /// Frontend-populated picker: options are the platform calendars
+    /// available at runtime (queried via `CalendarContract.Calendars`
+    /// on Android). Manifest declares the field with no `options:`
+    /// block; the renderer fills it in. Persisted value is the
+    /// platform calendar id as a string.
+    DeviceCalendar,
+    /// Frontend-populated picker: options are the platform task lists
+    /// available at runtime (OpenTasks `ContentProvider` on Android,
+    /// exposed by Tasks.org / jtx Board / etc). Same shape as
+    /// `DeviceCalendar` — manifest declares with no options, renderer
+    /// fills them in, persisted value is the task list id as a string.
+    DeviceTaskList,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -351,6 +363,16 @@ pub enum Capability {
     Clipboard,
     Tts,
     StorageKv,
+    /// Read/write access to the platform calendar provider
+    /// (`CalendarContract` on Android). Lets a skill enumerate the
+    /// user's calendars and insert VEVENTs — needed by the reminder
+    /// skill's "Calendar" / "Both" destination modes.
+    Calendar,
+    /// Read/write access to the platform task provider (OpenTasks
+    /// `ContentProvider` on Android, surfaced through Tasks.org / jtx
+    /// Board / etc). Lets a skill enumerate the user's task lists and
+    /// insert VTODOs — the default destination for the reminder skill.
+    Tasks,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -840,6 +862,31 @@ impl ConfigField {
                     })
                     .collect::<Result<Vec<_>, ManifestError>>()?;
                 ConfigFieldType::Select { options }
+            }
+            // Frontend-populated picker types — manifest must NOT
+            // declare `options:` because the runtime values come from
+            // the platform (CalendarContract / OpenTasks). Reject any
+            // attempt to bake static options in so authors don't write
+            // a manifest that silently shadows the device list.
+            Some("device_calendar") => {
+                if !raw.options.is_empty() {
+                    return Err(ManifestError::YamlParse(
+                        "device_calendar field must not declare `options:` — \
+                         the frontend populates them at runtime"
+                            .into(),
+                    ));
+                }
+                ConfigFieldType::DeviceCalendar
+            }
+            Some("device_task_list") => {
+                if !raw.options.is_empty() {
+                    return Err(ManifestError::YamlParse(
+                        "device_task_list field must not declare `options:` — \
+                         the frontend populates them at runtime"
+                            .into(),
+                    ));
+                }
+                ConfigFieldType::DeviceTaskList
             }
             Some(other) => {
                 return Err(ManifestError::YamlParse(format!(
@@ -2029,6 +2076,100 @@ metadata:
                 assert!(
                     msg.contains("both") && msg.contains("settings"),
                     "error message should explain the conflict, got: {msg}"
+                );
+            }
+            other => panic!("expected YamlParse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_calendar_and_device_task_list_field_types_parse_without_options() {
+        // The reminder skill (and any future picker-driven skill)
+        // declares these field types with no `options:` block — Android
+        // populates them at render time from CalendarContract /
+        // OpenTasks. Verify the parser accepts that shape and surfaces
+        // the right enum variants.
+        let src = r#"---
+name: reminder
+description: Sets reminders.
+metadata:
+  ari:
+    id: dev.heyari.reminder
+    version: "0.1.0"
+    engine: ">=0.3"
+    capabilities: [calendar, tasks]
+    matching:
+      patterns:
+        - keywords: [remind]
+          weight: 0.95
+    examples:
+      - text: "remind me to feed the cat at 5pm"
+      - text: "remind me about laundry tomorrow"
+      - text: "remind me to call mum"
+      - text: "remind me to take out bins"
+      - text: "remind me to drink water"
+    settings:
+      - key: default_calendar
+        label: Default calendar
+        type: device_calendar
+      - key: default_task_list
+        label: Default task list
+        type: device_task_list
+    wasm:
+      module: skill.wasm
+      memory_limit_mb: 1
+---
+"#;
+        let sf = Skillfile::parse(src, None).expect("must parse");
+        let ari = sf.ari_extension.unwrap();
+        assert_eq!(ari.settings.len(), 2);
+        assert_eq!(ari.settings[0].field_type, ConfigFieldType::DeviceCalendar);
+        assert_eq!(ari.settings[1].field_type, ConfigFieldType::DeviceTaskList);
+        assert_eq!(
+            ari.capabilities,
+            vec![Capability::Calendar, Capability::Tasks],
+        );
+    }
+
+    #[test]
+    fn device_calendar_with_static_options_is_rejected() {
+        // Authors who try to bake static options in are almost
+        // certainly making a mistake — those values would silently
+        // shadow the real device calendars at render time. Fail the
+        // parse so they catch it before publishing.
+        let src = r#"---
+name: x
+description: x
+metadata:
+  ari:
+    id: a.b.c
+    version: "0.1.0"
+    engine: ">=0.3"
+    matching:
+      patterns: [{ keywords: [x], weight: 1 }]
+    examples:
+      - text: "x one"
+      - text: "x two"
+      - text: "x three"
+      - text: "x four"
+      - text: "x five"
+    settings:
+      - key: cal
+        label: Calendar
+        type: device_calendar
+        options:
+          - { value: "1", label: "Personal" }
+    wasm:
+      module: skill.wasm
+      memory_limit_mb: 1
+---
+"#;
+        let err = Skillfile::parse(src, None).unwrap_err();
+        match err {
+            ManifestError::YamlParse(msg) => {
+                assert!(
+                    msg.contains("device_calendar") && msg.contains("options"),
+                    "error should explain the rule, got: {msg}"
                 );
             }
             other => panic!("expected YamlParse error, got {other:?}"),
