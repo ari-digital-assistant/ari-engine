@@ -151,36 +151,36 @@ pub trait Skill: Send + Sync {
 pub fn words_to_number(word: &str) -> Option<i64> {
     match word {
         "zero" => Some(0),
-        "one" => Some(1),
-        "two" => Some(2),
-        "three" => Some(3),
-        "four" => Some(4),
-        "five" => Some(5),
-        "six" => Some(6),
-        "seven" => Some(7),
-        "eight" => Some(8),
-        "nine" => Some(9),
-        "ten" => Some(10),
-        "eleven" => Some(11),
-        "twelve" => Some(12),
-        "thirteen" => Some(13),
-        "fourteen" => Some(14),
-        "fifteen" => Some(15),
-        "sixteen" => Some(16),
-        "seventeen" => Some(17),
-        "eighteen" => Some(18),
-        "nineteen" => Some(19),
-        "twenty" => Some(20),
-        "thirty" => Some(30),
-        "forty" => Some(40),
-        "fifty" => Some(50),
-        "sixty" => Some(60),
-        "seventy" => Some(70),
-        "eighty" => Some(80),
-        "ninety" => Some(90),
-        "hundred" => Some(100),
-        "thousand" => Some(1000),
-        "million" => Some(1_000_000),
+        "one" | "first" => Some(1),
+        "two" | "second" => Some(2),
+        "three" | "third" => Some(3),
+        "four" | "fourth" => Some(4),
+        "five" | "fifth" => Some(5),
+        "six" | "sixth" => Some(6),
+        "seven" | "seventh" => Some(7),
+        "eight" | "eighth" => Some(8),
+        "nine" | "ninth" => Some(9),
+        "ten" | "tenth" => Some(10),
+        "eleven" | "eleventh" => Some(11),
+        "twelve" | "twelfth" => Some(12),
+        "thirteen" | "thirteenth" => Some(13),
+        "fourteen" | "fourteenth" => Some(14),
+        "fifteen" | "fifteenth" => Some(15),
+        "sixteen" | "sixteenth" => Some(16),
+        "seventeen" | "seventeenth" => Some(17),
+        "eighteen" | "eighteenth" => Some(18),
+        "nineteen" | "nineteenth" => Some(19),
+        "twenty" | "twentieth" => Some(20),
+        "thirty" | "thirtieth" => Some(30),
+        "forty" | "fortieth" => Some(40),
+        "fifty" | "fiftieth" => Some(50),
+        "sixty" | "sixtieth" => Some(60),
+        "seventy" | "seventieth" => Some(70),
+        "eighty" | "eightieth" => Some(80),
+        "ninety" | "ninetieth" => Some(90),
+        "hundred" | "hundredth" => Some(100),
+        "thousand" | "thousandth" => Some(1000),
+        "million" | "millionth" => Some(1_000_000),
         _ => None,
     }
 }
@@ -519,5 +519,42 @@ mod tests {
         // "nine-thirty" isn't a valid compound either; the whole word
         // is rejected so the outer replacer leaves it untouched.
         assert_eq!(parse_number_words(&["nine-thirty"]), None);
+    }
+
+    // ── Ordinal number words ──────────────────────────────────────────
+    // Ordinals ("first", "twenty-seventh", "thirtieth") map to the same
+    // numeric value as their cardinal counterparts — users writing dates
+    // say "the 27th of April" as readily as "April 27", and the
+    // normaliser should smooth over that difference before skills see it.
+
+    #[test]
+    fn ordinals_resolve_like_cardinals() {
+        assert_eq!(words_to_number("first"), Some(1));
+        assert_eq!(words_to_number("second"), Some(2));
+        assert_eq!(words_to_number("third"), Some(3));
+        assert_eq!(words_to_number("fifth"), Some(5));
+        assert_eq!(words_to_number("eighth"), Some(8));
+        assert_eq!(words_to_number("ninth"), Some(9));
+        assert_eq!(words_to_number("twelfth"), Some(12));
+        assert_eq!(words_to_number("twentieth"), Some(20));
+        assert_eq!(words_to_number("thirtieth"), Some(30));
+        assert_eq!(words_to_number("hundredth"), Some(100));
+    }
+
+    #[test]
+    fn ordinal_compound_day_of_month() {
+        // "twenty seventh" is the English month-day ordinal compound.
+        // Existing tens+ones compound rule applies when "seventh" maps
+        // to 7, so the normaliser returns a single integer just like
+        // it does for the cardinal "twenty seven".
+        assert_eq!(parse_number_words(&["twenty", "seventh"]), Some((27, 2)));
+        assert_eq!(parse_number_words(&["thirty", "first"]), Some((31, 2)));
+        assert_eq!(replace_number_words("the twenty seventh of april"), "the 27 of april");
+    }
+
+    #[test]
+    fn ordinal_hyphenated_day_of_month() {
+        assert_eq!(parse_number_words(&["twenty-seventh"]), Some((27, 1)));
+        assert_eq!(parse_number_words(&["thirty-first"]), Some((31, 1)));
     }
 }
