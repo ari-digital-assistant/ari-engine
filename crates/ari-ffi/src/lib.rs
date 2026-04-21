@@ -2,8 +2,8 @@
 
 use ari_engine::{Engine, FALLBACK_RESPONSE};
 use ari_skill_loader::{
-    load_skill_directory_with, Capability, HostCapabilities, HttpConfig, LoadOptions,
-    NullLogSink, StorageConfig,
+    load_skill_directory_with, Capability, HostCapabilities, HttpConfig, LoadOptions, LogLevel,
+    LogSink, NullLogSink, StorageConfig,
 };
 use ari_skills::{
     CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill,
@@ -46,6 +46,53 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
 
 uniffi::setup_scaffolding!();
 
+/// WASM-skill log level, mirrored from [`ari_skill_loader::LogLevel`] for
+/// the UniFFI boundary. The engine's own `LogLevel` isn't exportable
+/// directly because UniFFI types can't derive outside the FFI crate.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FfiLogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl From<LogLevel> for FfiLogLevel {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Trace => FfiLogLevel::Trace,
+            LogLevel::Debug => FfiLogLevel::Debug,
+            LogLevel::Info => FfiLogLevel::Info,
+            LogLevel::Warn => FfiLogLevel::Warn,
+            LogLevel::Error => FfiLogLevel::Error,
+        }
+    }
+}
+
+/// Callback interface the host implements to receive log lines from WASM
+/// skills. Rust calls `log` whenever a skill invokes `ari::log(...)` via
+/// the SDK's `host_log` import. On Android this is wired to
+/// `android.util.Log`; on other hosts (CLI, tests) it defaults to a
+/// no-op sink constructed internally.
+#[uniffi::export(with_foreign)]
+pub trait FfiLogSink: Send + Sync {
+    fn log(&self, skill_id: String, level: FfiLogLevel, message: String);
+}
+
+/// Wraps a foreign [`FfiLogSink`] so it can satisfy the engine's internal
+/// [`LogSink`] trait. The engine's trait takes borrowed `&str`s; we own
+/// them across the FFI boundary, so the adapter copies into `String` on
+/// every call. Logging isn't on the hot path, so the allocation is fine.
+struct ForeignLogSinkAdapter(Arc<dyn FfiLogSink>);
+
+impl LogSink for ForeignLogSinkAdapter {
+    fn log(&self, skill_id: &str, level: LogLevel, message: &str) {
+        self.0
+            .log(skill_id.to_string(), level.into(), message.to_string());
+    }
+}
+
 #[derive(uniffi::Enum)]
 pub enum FfiResponse {
     Text { body: String },
@@ -71,6 +118,11 @@ pub struct AriEngine {
     // skill set after construction. `process_input` only needs a shared
     // lock in practice but the Engine trait takes `&self` anyway.
     pub(crate) inner: Mutex<Engine>,
+    // Log sink handed to every WASM skill loaded via `reload_community_skills`.
+    // Defaults to NullLogSink for callers that use the no-arg constructor
+    // (tests, CLI). The Android host passes a real sink via `with_log_sink`
+    // so skill `ari::log(...)` calls surface in `adb logcat`.
+    pub(crate) log_sink: Arc<dyn LogSink>,
 }
 
 fn build_engine_with_builtins() -> Engine {
@@ -90,6 +142,19 @@ impl AriEngine {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(build_engine_with_builtins()),
+            log_sink: Arc::new(NullLogSink),
+        }
+    }
+
+    /// Construct with a host-supplied log sink for WASM skill output.
+    /// Android wires a sink that forwards to `android.util.Log`; callers
+    /// that don't care about skill logs (tests, CLI smoke tests) use
+    /// [`AriEngine::new`] instead.
+    #[uniffi::constructor]
+    pub fn with_log_sink(sink: Arc<dyn FfiLogSink>) -> Self {
+        Self {
+            inner: Mutex::new(build_engine_with_builtins()),
+            log_sink: Arc::new(ForeignLogSinkAdapter(sink)),
         }
     }
 
@@ -185,7 +250,14 @@ impl AriEngine {
         storage_dir: String,
     ) -> u32 {
         let mut fresh = build_engine_with_builtins();
-        let options = android_load_options(&storage_dir);
+        // Start from the shared default LoadOptions (host caps, HTTP, storage)
+        // and override the log sink with whatever the host installed at
+        // construction time. Install/validation paths elsewhere keep the
+        // NullLogSink default — those paths don't execute skills, so the
+        // sink there only ever sees load-time diagnostics the loader
+        // currently doesn't emit.
+        let mut options = android_load_options(&storage_dir);
+        options.log_sink = self.log_sink.clone();
         let loaded: u32 =
             match load_skill_directory_with(&PathBuf::from(&skill_store_dir), &options) {
                 Ok(report) => {
