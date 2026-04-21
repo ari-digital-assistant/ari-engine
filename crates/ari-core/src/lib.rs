@@ -201,40 +201,62 @@ pub fn parse_number_words(words: &[&str]) -> Option<(i64, usize)> {
     let mut found_any = false;
 
     for word in words {
-        // Handle hyphenated words like "twenty-five"
+        // Handle hyphenated words like "twenty-five". Apply the whole
+        // word tentatively so that a partially-invalid hyphenated word
+        // (e.g. "nine-thirty") gets rejected atomically rather than
+        // leaving half-mutated state.
         let parts: Vec<&str> = word.split('-').collect();
-        let mut matched_this_word = false;
+        let mut t_total = total;
+        let mut t_current = current;
+        let mut word_ok = false;
 
         for part in &parts {
-            if let Some(val) = words_to_number(part) {
-                found_any = true;
-                matched_this_word = true;
-                match val {
-                    1_000_000 => {
-                        current = if current == 0 { val } else { current * val };
-                        total += current;
-                        current = 0;
+            let Some(val) = words_to_number(part) else {
+                word_ok = false;
+                break;
+            };
+            word_ok = true;
+            match val {
+                1_000_000 => {
+                    t_current = if t_current == 0 { val } else { t_current * val };
+                    t_total += t_current;
+                    t_current = 0;
+                }
+                1000 => {
+                    t_current = if t_current == 0 { val } else { t_current * val };
+                    t_total += t_current;
+                    t_current = 0;
+                }
+                100 => {
+                    t_current = if t_current == 0 { val } else { t_current * val };
+                }
+                _ => {
+                    // English permits exactly one sub-hundred compound:
+                    // tens (20..=90 step 10) + ones (1..=9), e.g.
+                    // "twenty-five" = 25. Anything else ("nine thirty",
+                    // "five six", "ten five") is two separate numbers —
+                    // a clock time or adjacent numerals — and must not
+                    // be summed into a single value.
+                    let sub = t_current % 100;
+                    let is_tens_ones_compound =
+                        matches!(sub, 20 | 30 | 40 | 50 | 60 | 70 | 80 | 90)
+                            && (1..=9).contains(&val);
+                    if sub != 0 && !is_tens_ones_compound {
+                        word_ok = false;
+                        break;
                     }
-                    1000 => {
-                        current = if current == 0 { val } else { current * val };
-                        total += current;
-                        current = 0;
-                    }
-                    100 => {
-                        current = if current == 0 { val } else { current * val };
-                    }
-                    _ => {
-                        current += val;
-                    }
+                    t_current += val;
                 }
             }
         }
 
-        if matched_this_word {
-            consumed += 1;
-        } else {
+        if !word_ok {
             break;
         }
+        total = t_total;
+        current = t_current;
+        found_any = true;
+        consumed += 1;
     }
 
     if found_any {
@@ -447,5 +469,55 @@ mod tests {
     #[test]
     fn replace_handles_adjacent_number_groups() {
         assert_eq!(replace_number_words("twenty plus thirty"), "20 plus 30");
+    }
+
+    // Regression: "nine thirty" is a clock time, not a compound number.
+    // The greedy additive parser used to fold it into 39.
+    #[test]
+    fn replace_keeps_clock_time_as_two_numbers() {
+        assert_eq!(replace_number_words("at nine thirty"), "at 9 30");
+        assert_eq!(
+            replace_number_words("remind me to take out the trash at nine thirty"),
+            "remind me to take out the trash at 9 30",
+        );
+    }
+
+    #[test]
+    fn replace_does_not_merge_ones_and_ones() {
+        assert_eq!(replace_number_words("five six seven"), "5 6 7");
+    }
+
+    #[test]
+    fn replace_does_not_merge_teens_and_ones() {
+        assert_eq!(replace_number_words("ten five"), "10 5");
+    }
+
+    #[test]
+    fn replace_preserves_valid_tens_ones_compound() {
+        assert_eq!(replace_number_words("twenty five apples"), "25 apples");
+        assert_eq!(replace_number_words("thirty two"), "32");
+    }
+
+    #[test]
+    fn replace_preserves_hundred_tens_ones() {
+        assert_eq!(replace_number_words("two hundred thirty five"), "235");
+    }
+
+    #[test]
+    fn replace_preserves_thousand_compound() {
+        assert_eq!(replace_number_words("one thousand nine hundred"), "1900");
+    }
+
+    #[test]
+    fn parse_rejects_clock_time_compound() {
+        // "nine thirty" should be parsed as 9, stopping before "thirty".
+        assert_eq!(parse_number_words(&["nine", "thirty"]), Some((9, 1)));
+    }
+
+    #[test]
+    fn parse_rejects_hyphenated_clock_time() {
+        // "nine-thirty" isn't a valid compound either; the whole word
+        // is rejected so the outer replacer leaves it untouched.
+        assert_eq!(parse_number_words(&["nine-thirty"]), None);
     }
 }
