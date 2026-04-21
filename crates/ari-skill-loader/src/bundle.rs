@@ -405,7 +405,6 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use flate2::write::GzEncoder;
     use flate2::Compression;
-    use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static N: AtomicU64 = AtomicU64::new(0);
