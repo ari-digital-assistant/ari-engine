@@ -112,6 +112,7 @@ const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
     ("rand_u64", None),
     ("local_now_components", None),
     ("local_timezone_id", None),
+    ("setting_get", None),
     ("http_fetch", Some(Capability::Http)),
     ("storage_get", Some(Capability::StorageKv)),
     ("storage_set", Some(Capability::StorageKv)),
@@ -257,6 +258,8 @@ struct StoreData {
     calendar_provider: Option<Arc<dyn crate::platform_capabilities::CalendarProvider>>,
     /// Local clock — ungated; every skill can read the wall clock.
     local_clock: Arc<dyn crate::platform_capabilities::LocalClock>,
+    /// Config store — ungated; every skill can read its own settings.
+    config_store: Arc<dyn crate::assistant::ConfigStore>,
 }
 
 /// Bundle of (configured client, config) so the host import has everything it
@@ -311,6 +314,10 @@ pub struct WasmSkill {
     /// Wall-clock reader used for local-time host imports. Doesn't
     /// require any capability grant — every skill can read the clock.
     local_clock: Arc<dyn crate::platform_capabilities::LocalClock>,
+    /// Backing store for `ari::setting_get` — the skill's own
+    /// user-configurable settings declared in `metadata.ari.settings`.
+    /// Ungated; every skill can read its own settings.
+    config_store: Arc<dyn crate::assistant::ConfigStore>,
 }
 
 impl std::fmt::Debug for WasmSkill {
@@ -374,6 +381,7 @@ impl WasmSkill {
         let tasks_provider = options.tasks_provider.clone();
         let calendar_provider = options.calendar_provider.clone();
         let local_clock = options.local_clock.clone();
+        let config_store = options.config_store.clone();
 
         let mut config = wasmtime::Config::new();
         config.consume_fuel(true);
@@ -450,6 +458,7 @@ impl WasmSkill {
             tasks_provider,
             calendar_provider,
             local_clock,
+            config_store,
         };
         skill.validate_exports()?;
         Ok(skill)
@@ -504,6 +513,7 @@ impl WasmSkill {
                     None
                 },
                 local_clock: self.local_clock.clone(),
+                config_store: self.config_store.clone(),
             },
         );
         store.limiter(|data| &mut data.limits);
@@ -730,6 +740,21 @@ impl WasmSkill {
                 "local_timezone_id",
                 |mut caller: Caller<'_, StoreData>| -> i64 {
                     local_timezone_id_impl(&mut caller)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+
+        // Skill settings — ungated; every skill can read its own
+        // user-configurable settings (declared in SKILL.md under
+        // `metadata.ari.settings`, written by the frontend's
+        // settings UI). The store is scoped to the skill's id so a
+        // skill can't peek at another skill's values.
+        linker
+            .func_wrap(
+                "ari",
+                "setting_get",
+                |mut caller: Caller<'_, StoreData>, key_ptr: i32, key_len: i32| -> i64 {
+                    setting_get_impl(&mut caller, key_ptr, key_len)
                 },
             )
             .map_err(|e| WasmError::Compile(e.to_string()))?;
@@ -1308,6 +1333,23 @@ fn local_timezone_id_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
     write_response(caller, memory, &tz)
 }
 
+fn setting_get_impl(caller: &mut Caller<'_, StoreData>, key_ptr: i32, key_len: i32) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let key = match read_utf8(&memory, &*caller, key_ptr, key_len) {
+        Some(s) => s,
+        None => return 0,
+    };
+    let skill_id = caller.data().skill_id.clone();
+    let store = caller.data().config_store.clone();
+    match store.get(&skill_id, &key) {
+        Some(value) => write_response(caller, memory, &value),
+        None => 0,
+    }
+}
+
 fn write_response(caller: &mut Caller<'_, StoreData>, memory: Memory, s: &str) -> i64 {
     let alloc = match caller.get_export("ari_alloc") {
         Some(wasmtime::Extern::Func(f)) => f,
@@ -1447,6 +1489,7 @@ mod tests {
             tasks_provider: Arc::new(crate::NullTasksProvider),
             calendar_provider: Arc::new(crate::NullCalendarProvider),
             local_clock: Arc::new(crate::UtcLocalClock),
+            config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
         }
     }
 
@@ -2269,6 +2312,7 @@ mod tests {
                 tasks_provider: Arc::new(crate::NullTasksProvider),
                 calendar_provider: Arc::new(crate::NullCalendarProvider),
                 local_clock: Arc::new(crate::UtcLocalClock),
+                config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
             },
         )
         .unwrap()
@@ -2377,6 +2421,7 @@ mod tests {
                 tasks_provider: Arc::new(crate::NullTasksProvider),
                 calendar_provider: Arc::new(crate::NullCalendarProvider),
                 local_clock: Arc::new(crate::UtcLocalClock),
+                config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
             },
         )
         .unwrap();

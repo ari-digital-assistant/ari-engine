@@ -1,6 +1,7 @@
 #![allow(clippy::new_without_default)]
 
 use ari_engine::{Engine, FALLBACK_RESPONSE};
+use ari_skill_loader::assistant::{ConfigStore, MemoryConfigStore};
 use ari_skill_loader::{
     load_skill_directory_with, Calendar, CalendarProvider, Capability, HostCapabilities,
     HttpConfig, InsertCalendarEventParams, InsertTaskParams, LoadOptions, LocalClock,
@@ -48,6 +49,7 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
         tasks_provider: Arc::new(NullTasksProvider),
         calendar_provider: Arc::new(NullCalendarProvider),
         local_clock: Arc::new(UtcLocalClock),
+        config_store: Arc::new(MemoryConfigStore::new()),
     }
 }
 
@@ -322,6 +324,11 @@ pub struct AriEngine {
     pub(crate) tasks_provider: Arc<dyn TasksProvider>,
     pub(crate) calendar_provider: Arc<dyn CalendarProvider>,
     pub(crate) local_clock: Arc<dyn LocalClock>,
+    /// Config store backing `ari::setting_get` in WASM skills.
+    /// Defaults to an empty in-memory map; the Android host passes
+    /// the shared `SkillSettingsStore`'s inner map so skills see
+    /// live UI-written values.
+    pub(crate) config_store: Arc<dyn ConfigStore>,
 }
 
 fn build_engine_with_builtins() -> Engine {
@@ -345,6 +352,7 @@ impl AriEngine {
             tasks_provider: Arc::new(NullTasksProvider),
             calendar_provider: Arc::new(NullCalendarProvider),
             local_clock: Arc::new(UtcLocalClock),
+            config_store: Arc::new(MemoryConfigStore::new()),
         }
     }
 
@@ -360,6 +368,7 @@ impl AriEngine {
             tasks_provider: Arc::new(NullTasksProvider),
             calendar_provider: Arc::new(NullCalendarProvider),
             local_clock: Arc::new(UtcLocalClock),
+            config_store: Arc::new(MemoryConfigStore::new()),
         }
     }
 
@@ -376,6 +385,7 @@ impl AriEngine {
         tasks: Option<Arc<dyn FfiTasksProvider>>,
         calendar: Option<Arc<dyn FfiCalendarProvider>>,
         clock: Option<Arc<dyn FfiLocalClock>>,
+        settings: Option<Arc<SkillSettingsStore>>,
     ) -> Self {
         let log_sink: Arc<dyn LogSink> = match sink {
             Some(s) => Arc::new(ForeignLogSinkAdapter(s)),
@@ -393,12 +403,17 @@ impl AriEngine {
             Some(c) => Arc::new(ForeignLocalClockAdapter(c)),
             None => Arc::new(UtcLocalClock),
         };
+        let config_store: Arc<dyn ConfigStore> = match settings {
+            Some(s) => s.as_config_store(),
+            None => Arc::new(MemoryConfigStore::new()),
+        };
         Self {
             inner: Mutex::new(build_engine_with_builtins()),
             log_sink,
             tasks_provider,
             calendar_provider,
             local_clock,
+            config_store,
         }
     }
 
@@ -505,6 +520,7 @@ impl AriEngine {
         options.tasks_provider = self.tasks_provider.clone();
         options.calendar_provider = self.calendar_provider.clone();
         options.local_clock = self.local_clock.clone();
+        options.config_store = self.config_store.clone();
         let loaded: u32 =
             match load_skill_directory_with(&PathBuf::from(&skill_store_dir), &options) {
                 Ok(report) => {

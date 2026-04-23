@@ -135,6 +135,13 @@ pub struct LoadOptions {
     /// the CLI engine have something deterministic; real hosts wire
     /// their platform timezone database.
     pub local_clock: Arc<dyn crate::platform_capabilities::LocalClock>,
+    /// Config store backing `ari::setting_get` — the skill's own
+    /// user-configurable settings (as declared in SKILL.md's
+    /// `metadata.ari.settings`). Defaults to an empty store. The
+    /// FFI crate plugs in the shared in-memory map that the Android
+    /// settings UI writes to, so a skill reading
+    /// `ari::setting_get("destination")` sees the live value.
+    pub config_store: Arc<dyn crate::assistant::ConfigStore>,
 }
 
 impl Default for LoadOptions {
@@ -147,6 +154,7 @@ impl Default for LoadOptions {
             tasks_provider: Arc::new(crate::platform_capabilities::NullTasksProvider),
             calendar_provider: Arc::new(crate::platform_capabilities::NullCalendarProvider),
             local_clock: Arc::new(crate::platform_capabilities::UtcLocalClock),
+            config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
         }
     }
 }
