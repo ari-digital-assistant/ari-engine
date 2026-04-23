@@ -2,8 +2,10 @@
 
 use ari_engine::{Engine, FALLBACK_RESPONSE};
 use ari_skill_loader::{
-    load_skill_directory_with, Capability, HostCapabilities, HttpConfig, LoadOptions, LogLevel,
-    LogSink, NullLogSink, StorageConfig,
+    load_skill_directory_with, Calendar, CalendarProvider, Capability, HostCapabilities,
+    HttpConfig, InsertCalendarEventParams, InsertTaskParams, LoadOptions, LocalClock,
+    LocalTimeComponents, LogLevel, LogSink, NullCalendarProvider, NullLogSink, NullTasksProvider,
+    StorageConfig, TaskList, TasksProvider, UtcLocalClock,
 };
 use ari_skills::{
     CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill,
@@ -35,12 +37,17 @@ pub use skill_registry::{
 pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
     let host_caps = HostCapabilities::pure_frontend()
         .with(Capability::Http)
-        .with(Capability::StorageKv);
+        .with(Capability::StorageKv)
+        .with(Capability::Tasks)
+        .with(Capability::Calendar);
     LoadOptions {
         log_sink: Arc::new(NullLogSink),
         host_capabilities: host_caps,
         http_config: HttpConfig::strict(),
         storage_config: StorageConfig::new(PathBuf::from(storage_dir)),
+        tasks_provider: Arc::new(NullTasksProvider),
+        calendar_provider: Arc::new(NullCalendarProvider),
+        local_clock: Arc::new(UtcLocalClock),
     }
 }
 
@@ -93,6 +100,191 @@ impl LogSink for ForeignLogSinkAdapter {
     }
 }
 
+// ── Platform capability FFI surface ─────────────────────────────────
+//
+// Android (and, in future, the Linux frontend) implement these traits
+// to expose the platform's tasks / calendar / clock APIs to skills.
+// No skill-specific knowledge lives on either side of the boundary —
+// every skill that declares the right capability can use the whole
+// surface.
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiTaskList {
+    pub id: u64,
+    pub display_name: String,
+    pub account_name: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiInsertTaskParams {
+    pub list_id: u64,
+    pub title: String,
+    pub due_ms: Option<i64>,
+    pub due_all_day: bool,
+    pub tz_id: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCalendar {
+    pub id: u64,
+    pub display_name: String,
+    pub account_name: String,
+    pub color_argb: Option<i32>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiInsertCalendarEventParams {
+    pub calendar_id: u64,
+    pub title: String,
+    pub start_ms: i64,
+    pub duration_minutes: u32,
+    pub reminder_minutes_before: u32,
+    pub tz_id: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiLocalTimeComponents {
+    pub year: i32,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+    /// 0=Monday..6=Sunday
+    pub weekday: u8,
+    pub tz_id: String,
+}
+
+/// Foreign-implemented tasks provider. The host wraps whatever
+/// platform API gives it read/write access to user tasks — on Android,
+/// the OpenTasks ContentResolver; on Linux, EDS.
+#[uniffi::export(with_foreign)]
+pub trait FfiTasksProvider: Send + Sync {
+    fn is_provider_installed(&self) -> bool;
+    fn list_lists(&self) -> Vec<FfiTaskList>;
+    /// Returns 0 on failure; the provider row id otherwise. UniFFI
+    /// over JNI marshals `Option<u64>` awkwardly, so the sentinel-0
+    /// convention matches what the host-side WASM ABI already uses.
+    fn insert(&self, params: FfiInsertTaskParams) -> u64;
+    fn delete(&self, id: u64) -> bool;
+}
+
+/// Foreign-implemented calendar provider.
+#[uniffi::export(with_foreign)]
+pub trait FfiCalendarProvider: Send + Sync {
+    fn has_write_permission(&self) -> bool;
+    fn list_calendars(&self) -> Vec<FfiCalendar>;
+    fn insert(&self, params: FfiInsertCalendarEventParams) -> u64;
+    fn delete(&self, id: u64) -> bool;
+}
+
+/// Foreign-implemented wall-clock reader. Needed so skills can
+/// resolve weekdays / "today" / local dates — WASM has no TZ
+/// database, the host does.
+#[uniffi::export(with_foreign)]
+pub trait FfiLocalClock: Send + Sync {
+    fn now_components(&self) -> FfiLocalTimeComponents;
+    fn timezone_id(&self) -> String;
+}
+
+// Adapters from the foreign FFI traits to the engine's internal
+// traits. Engine code only sees the internal trait object; these
+// adapters handle the `Arc<dyn FfiFoo>` → `Arc<dyn Foo>` conversion
+// so the engine doesn't need to know UniFFI exists.
+
+struct ForeignTasksProviderAdapter(Arc<dyn FfiTasksProvider>);
+
+impl TasksProvider for ForeignTasksProviderAdapter {
+    fn is_provider_installed(&self) -> bool {
+        self.0.is_provider_installed()
+    }
+    fn list_lists(&self) -> Vec<TaskList> {
+        self.0
+            .list_lists()
+            .into_iter()
+            .map(|l| TaskList {
+                id: l.id,
+                display_name: l.display_name,
+                account_name: l.account_name,
+            })
+            .collect()
+    }
+    fn insert(&self, params: InsertTaskParams) -> Option<u64> {
+        let ffi = FfiInsertTaskParams {
+            list_id: params.list_id,
+            title: params.title,
+            due_ms: params.due_ms,
+            due_all_day: params.due_all_day,
+            tz_id: params.tz_id,
+        };
+        match self.0.insert(ffi) {
+            0 => None,
+            id => Some(id),
+        }
+    }
+    fn delete(&self, id: u64) -> bool {
+        self.0.delete(id)
+    }
+}
+
+struct ForeignCalendarProviderAdapter(Arc<dyn FfiCalendarProvider>);
+
+impl CalendarProvider for ForeignCalendarProviderAdapter {
+    fn has_write_permission(&self) -> bool {
+        self.0.has_write_permission()
+    }
+    fn list_calendars(&self) -> Vec<Calendar> {
+        self.0
+            .list_calendars()
+            .into_iter()
+            .map(|c| Calendar {
+                id: c.id,
+                display_name: c.display_name,
+                account_name: c.account_name,
+                color_argb: c.color_argb,
+            })
+            .collect()
+    }
+    fn insert(&self, params: InsertCalendarEventParams) -> Option<u64> {
+        let ffi = FfiInsertCalendarEventParams {
+            calendar_id: params.calendar_id,
+            title: params.title,
+            start_ms: params.start_ms,
+            duration_minutes: params.duration_minutes,
+            reminder_minutes_before: params.reminder_minutes_before,
+            tz_id: params.tz_id,
+        };
+        match self.0.insert(ffi) {
+            0 => None,
+            id => Some(id),
+        }
+    }
+    fn delete(&self, id: u64) -> bool {
+        self.0.delete(id)
+    }
+}
+
+struct ForeignLocalClockAdapter(Arc<dyn FfiLocalClock>);
+
+impl LocalClock for ForeignLocalClockAdapter {
+    fn now_components(&self) -> LocalTimeComponents {
+        let c = self.0.now_components();
+        LocalTimeComponents {
+            year: c.year,
+            month: c.month,
+            day: c.day,
+            hour: c.hour,
+            minute: c.minute,
+            second: c.second,
+            weekday: c.weekday,
+            tz_id: c.tz_id,
+        }
+    }
+    fn timezone_id(&self) -> String {
+        self.0.timezone_id()
+    }
+}
+
 #[derive(uniffi::Enum)]
 pub enum FfiResponse {
     Text { body: String },
@@ -123,6 +315,13 @@ pub struct AriEngine {
     // (tests, CLI). The Android host passes a real sink via `with_log_sink`
     // so skill `ari::log(...)` calls surface in `adb logcat`.
     pub(crate) log_sink: Arc<dyn LogSink>,
+    // Platform capability providers. Defaults to the Null/UTC impls
+    // from ari_skill_loader for callers that don't supply real ones
+    // (tests, CLI). The Android host supplies real implementations
+    // via [`AriEngine::with_platform_providers`].
+    pub(crate) tasks_provider: Arc<dyn TasksProvider>,
+    pub(crate) calendar_provider: Arc<dyn CalendarProvider>,
+    pub(crate) local_clock: Arc<dyn LocalClock>,
 }
 
 fn build_engine_with_builtins() -> Engine {
@@ -143,6 +342,9 @@ impl AriEngine {
         Self {
             inner: Mutex::new(build_engine_with_builtins()),
             log_sink: Arc::new(NullLogSink),
+            tasks_provider: Arc::new(NullTasksProvider),
+            calendar_provider: Arc::new(NullCalendarProvider),
+            local_clock: Arc::new(UtcLocalClock),
         }
     }
 
@@ -155,6 +357,48 @@ impl AriEngine {
         Self {
             inner: Mutex::new(build_engine_with_builtins()),
             log_sink: Arc::new(ForeignLogSinkAdapter(sink)),
+            tasks_provider: Arc::new(NullTasksProvider),
+            calendar_provider: Arc::new(NullCalendarProvider),
+            local_clock: Arc::new(UtcLocalClock),
+        }
+    }
+
+    /// Construct with the full set of host-supplied platform
+    /// providers. This is the constructor the Android frontend uses
+    /// at startup so any skill that declares the `tasks`, `calendar`
+    /// or clock capabilities gets real implementations rather than
+    /// the Null defaults. Any provider argument can be left `None`
+    /// to fall back to the corresponding Null/UTC default — useful
+    /// for frontends that only wire up part of the surface.
+    #[uniffi::constructor]
+    pub fn with_platform_providers(
+        sink: Option<Arc<dyn FfiLogSink>>,
+        tasks: Option<Arc<dyn FfiTasksProvider>>,
+        calendar: Option<Arc<dyn FfiCalendarProvider>>,
+        clock: Option<Arc<dyn FfiLocalClock>>,
+    ) -> Self {
+        let log_sink: Arc<dyn LogSink> = match sink {
+            Some(s) => Arc::new(ForeignLogSinkAdapter(s)),
+            None => Arc::new(NullLogSink),
+        };
+        let tasks_provider: Arc<dyn TasksProvider> = match tasks {
+            Some(t) => Arc::new(ForeignTasksProviderAdapter(t)),
+            None => Arc::new(NullTasksProvider),
+        };
+        let calendar_provider: Arc<dyn CalendarProvider> = match calendar {
+            Some(c) => Arc::new(ForeignCalendarProviderAdapter(c)),
+            None => Arc::new(NullCalendarProvider),
+        };
+        let local_clock: Arc<dyn LocalClock> = match clock {
+            Some(c) => Arc::new(ForeignLocalClockAdapter(c)),
+            None => Arc::new(UtcLocalClock),
+        };
+        Self {
+            inner: Mutex::new(build_engine_with_builtins()),
+            log_sink,
+            tasks_provider,
+            calendar_provider,
+            local_clock,
         }
     }
 
@@ -258,6 +502,9 @@ impl AriEngine {
         // currently doesn't emit.
         let mut options = android_load_options(&storage_dir);
         options.log_sink = self.log_sink.clone();
+        options.tasks_provider = self.tasks_provider.clone();
+        options.calendar_provider = self.calendar_provider.clone();
+        options.local_clock = self.local_clock.clone();
         let loaded: u32 =
             match load_skill_directory_with(&PathBuf::from(&skill_store_dir), &options) {
                 Ok(report) => {

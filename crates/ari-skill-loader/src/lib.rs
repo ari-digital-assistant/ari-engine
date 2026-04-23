@@ -5,6 +5,7 @@ pub mod host_capabilities;
 pub mod http_config;
 pub mod loader;
 pub mod manifest;
+pub mod platform_capabilities;
 pub mod scoring;
 pub mod registry;
 pub mod signature;
@@ -33,6 +34,11 @@ pub use manifest::{
 pub use registry::{
     check_updates, install_by_id, install_update, AvailableUpdate, Index, IndexEntry,
     RegistryClient, RegistryError, REGISTRY_BASE_URL, REGISTRY_INDEX_URL, REGISTRY_TRUST_KEY,
+};
+pub use platform_capabilities::{
+    Calendar, CalendarProvider, InsertCalendarEventParams, InsertTaskParams,
+    LocalClock, LocalTimeComponents, NullCalendarProvider, NullTasksProvider,
+    TaskList, TasksProvider, UtcLocalClock,
 };
 pub use storage_config::StorageConfig;
 pub use store::{InstalledSkill, SkillStore, StoreError};

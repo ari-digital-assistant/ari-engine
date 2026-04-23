@@ -122,6 +122,19 @@ pub struct LoadOptions {
     pub host_capabilities: HostCapabilities,
     pub http_config: HttpConfig,
     pub storage_config: StorageConfig,
+    /// Tasks provider implementation. Defaults to [`NullTasksProvider`]
+    /// (reports no provider installed) so skills that declare the
+    /// `Capability::Tasks` capability degrade gracefully on hosts
+    /// that don't supply one. Android supplies a real impl via the
+    /// FFI callback adapter; Linux will do the same via EDS.
+    pub tasks_provider: Arc<dyn crate::platform_capabilities::TasksProvider>,
+    /// Calendar provider implementation. Defaults to
+    /// [`NullCalendarProvider`]; same rationale as `tasks_provider`.
+    pub calendar_provider: Arc<dyn crate::platform_capabilities::CalendarProvider>,
+    /// Wall-clock reader. Defaults to [`UtcLocalClock`] so tests and
+    /// the CLI engine have something deterministic; real hosts wire
+    /// their platform timezone database.
+    pub local_clock: Arc<dyn crate::platform_capabilities::LocalClock>,
 }
 
 impl Default for LoadOptions {
@@ -131,6 +144,9 @@ impl Default for LoadOptions {
             host_capabilities: HostCapabilities::pure_frontend(),
             http_config: HttpConfig::strict(),
             storage_config: StorageConfig::ephemeral_default(),
+            tasks_provider: Arc::new(crate::platform_capabilities::NullTasksProvider),
+            calendar_provider: Arc::new(crate::platform_capabilities::NullCalendarProvider),
+            local_clock: Arc::new(crate::platform_capabilities::UtcLocalClock),
         }
     }
 }
@@ -229,14 +245,7 @@ pub fn load_single_skill_dir_with(skill_dir: &Path, options: &LoadOptions) -> Lo
                 kind: LoadFailureKind::Adapter(e),
             }),
         },
-        Some(Behaviour::Wasm(_)) => match WasmSkill::from_skillfile(
-            &sf,
-            skill_dir,
-            options.log_sink.clone(),
-            &options.host_capabilities,
-            &options.http_config,
-            &options.storage_config,
-        ) {
+        Some(Behaviour::Wasm(_)) => match WasmSkill::from_skillfile(&sf, skill_dir, options) {
             Ok(skill) => report.skills.push(Box::new(skill)),
             Err(e) => report.failures.push(LoadFailure {
                 path: manifest_path,

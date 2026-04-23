@@ -87,7 +87,7 @@
 //!
 //! Anything else (capabilities, http, persistent storage) is **not** in 5a.
 
-use crate::host_capabilities::{capability_name, HostCapabilities};
+use crate::host_capabilities::capability_name;
 use crate::http_config::HttpConfig;
 use crate::manifest::{AriExtension, Behaviour, Capability, Skillfile, WasmBehaviour};
 use crate::scoring::{PatternScorer, ScorerError};
@@ -104,15 +104,25 @@ use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, StoreLimits, Store
 /// module's imports against this table.
 const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
     // Unconditional imports — every skill may log, query its own capabilities,
-    // read wall-clock time, and get entropy. Marked `None` so they pass the
-    // sneak guard without requiring any declaration.
+    // read wall-clock time (UTC + local components), and get entropy. Marked
+    // `None` so they pass the sneak guard without requiring any declaration.
     ("log", None),
     ("get_capability", None),
     ("now_ms", None),
     ("rand_u64", None),
+    ("local_now_components", None),
+    ("local_timezone_id", None),
     ("http_fetch", Some(Capability::Http)),
     ("storage_get", Some(Capability::StorageKv)),
     ("storage_set", Some(Capability::StorageKv)),
+    ("tasks_provider_installed", Some(Capability::Tasks)),
+    ("tasks_list_lists", Some(Capability::Tasks)),
+    ("tasks_insert", Some(Capability::Tasks)),
+    ("tasks_delete", Some(Capability::Tasks)),
+    ("calendar_has_write_permission", Some(Capability::Calendar)),
+    ("calendar_list_calendars", Some(Capability::Calendar)),
+    ("calendar_insert", Some(Capability::Calendar)),
+    ("calendar_delete", Some(Capability::Calendar)),
 ];
 
 /// Default fuel budget per call. Tuned for "tens of milliseconds of compute
@@ -239,6 +249,14 @@ struct StoreData {
     /// Per-skill key-value storage context. Only present when the skill has
     /// the storage_kv capability granted.
     storage: Option<Arc<StorageCtx>>,
+    /// Tasks provider — `Some` when the skill has been granted the
+    /// `Capability::Tasks` cap. The WasmSkill-level provider is always
+    /// present (possibly Null); here we gate it on the capability so
+    /// skills that didn't declare the cap can't invoke the imports.
+    tasks_provider: Option<Arc<dyn crate::platform_capabilities::TasksProvider>>,
+    calendar_provider: Option<Arc<dyn crate::platform_capabilities::CalendarProvider>>,
+    /// Local clock — ungated; every skill can read the wall clock.
+    local_clock: Arc<dyn crate::platform_capabilities::LocalClock>,
 }
 
 /// Bundle of (configured client, config) so the host import has everything it
@@ -283,6 +301,16 @@ pub struct WasmSkill {
     /// Per-skill kv storage context. Only `Some` when the skill has the
     /// `storage_kv` capability granted.
     storage: Option<Arc<StorageCtx>>,
+    /// Platform tasks capability. Always present (Null impl when the
+    /// host didn't supply one); the linker only wires the `ari::tasks_*`
+    /// imports when the `Tasks` capability is actually granted to the
+    /// skill.
+    tasks_provider: Arc<dyn crate::platform_capabilities::TasksProvider>,
+    /// Platform calendar capability. Same pattern as `tasks_provider`.
+    calendar_provider: Arc<dyn crate::platform_capabilities::CalendarProvider>,
+    /// Wall-clock reader used for local-time host imports. Doesn't
+    /// require any capability grant — every skill can read the clock.
+    local_clock: Arc<dyn crate::platform_capabilities::LocalClock>,
 }
 
 impl std::fmt::Debug for WasmSkill {
@@ -306,26 +334,14 @@ impl WasmSkill {
     pub fn from_skillfile(
         sf: &Skillfile,
         skill_dir: &Path,
-        log_sink: Arc<dyn LogSink>,
-        host_caps: &HostCapabilities,
-        http_config: &HttpConfig,
-        storage_config: &StorageConfig,
+        options: &crate::LoadOptions,
     ) -> Result<Self, WasmError> {
         let ari = sf.ari_extension.as_ref().ok_or(WasmError::NotAnAriSkill)?;
         let wasm = match &ari.behaviour {
             Some(Behaviour::Wasm(w)) => w,
             Some(Behaviour::Declarative(_)) | None => return Err(WasmError::NotWasm),
         };
-        Self::build(
-            ari,
-            &sf.description,
-            wasm,
-            skill_dir,
-            log_sink,
-            host_caps,
-            http_config,
-            storage_config,
-        )
+        Self::build(ari, &sf.description, wasm, skill_dir, options)
     }
 
     fn build(
@@ -333,26 +349,14 @@ impl WasmSkill {
         description: &str,
         wasm: &WasmBehaviour,
         skill_dir: &Path,
-        log_sink: Arc<dyn LogSink>,
-        host_caps: &HostCapabilities,
-        http_config: &HttpConfig,
-        storage_config: &StorageConfig,
+        options: &crate::LoadOptions,
     ) -> Result<Self, WasmError> {
         let module_path = skill_dir.join(&wasm.module);
         let bytes = std::fs::read(&module_path).map_err(|source| WasmError::ReadModule {
             path: module_path.clone(),
             source,
         })?;
-        Self::from_module_bytes(
-            ari,
-            description,
-            wasm,
-            &bytes,
-            log_sink,
-            host_caps,
-            http_config,
-            storage_config,
-        )
+        Self::from_module_bytes(ari, description, wasm, &bytes, options)
     }
 
     /// Test seam: build directly from in-memory module bytes (WASM or WAT).
@@ -361,11 +365,16 @@ impl WasmSkill {
         description: &str,
         wasm: &WasmBehaviour,
         bytes: &[u8],
-        log_sink: Arc<dyn LogSink>,
-        host_caps: &HostCapabilities,
-        http_config: &HttpConfig,
-        storage_config: &StorageConfig,
+        options: &crate::LoadOptions,
     ) -> Result<Self, WasmError> {
+        let log_sink = options.log_sink.clone();
+        let host_caps = &options.host_capabilities;
+        let http_config = &options.http_config;
+        let storage_config = &options.storage_config;
+        let tasks_provider = options.tasks_provider.clone();
+        let calendar_provider = options.calendar_provider.clone();
+        let local_clock = options.local_clock.clone();
+
         let mut config = wasmtime::Config::new();
         config.consume_fuel(true);
         let engine = Engine::new(&config).map_err(|e| WasmError::Compile(e.to_string()))?;
@@ -438,6 +447,9 @@ impl WasmSkill {
             granted_capabilities: Arc::new(granted),
             http_client,
             storage,
+            tasks_provider,
+            calendar_provider,
+            local_clock,
         };
         skill.validate_exports()?;
         Ok(skill)
@@ -481,6 +493,17 @@ impl WasmSkill {
                 granted_capabilities: self.granted_capabilities.clone(),
                 http_client: self.http_client.clone(),
                 storage: self.storage.clone(),
+                tasks_provider: if self.granted_capabilities.contains(&Capability::Tasks) {
+                    Some(self.tasks_provider.clone())
+                } else {
+                    None
+                },
+                calendar_provider: if self.granted_capabilities.contains(&Capability::Calendar) {
+                    Some(self.calendar_provider.clone())
+                } else {
+                    None
+                },
+                local_clock: self.local_clock.clone(),
             },
         );
         store.limiter(|data| &mut data.limits);
@@ -590,6 +613,127 @@ impl WasmSkill {
                 )
                 .map_err(|e| WasmError::Compile(e.to_string()))?;
         }
+
+        // Tasks host imports — gated on the Tasks capability. The
+        // provider itself is always present at the WasmSkill level
+        // (Null when the host didn't supply one); capability gating
+        // here prevents skills that never declared the cap from
+        // importing the symbols at all.
+        if self.granted_capabilities.contains(&Capability::Tasks) {
+            linker
+                .func_wrap(
+                    "ari",
+                    "tasks_provider_installed",
+                    |caller: Caller<'_, StoreData>| -> i32 {
+                        let p = match caller.data().tasks_provider.as_ref() {
+                            Some(p) => p.clone(),
+                            None => return 0,
+                        };
+                        if p.is_provider_installed() { 1 } else { 0 }
+                    },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
+            linker
+                .func_wrap(
+                    "ari",
+                    "tasks_list_lists",
+                    |mut caller: Caller<'_, StoreData>| -> i64 {
+                        tasks_list_lists_impl(&mut caller)
+                    },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
+            linker
+                .func_wrap(
+                    "ari",
+                    "tasks_insert",
+                    |mut caller: Caller<'_, StoreData>, ptr: i32, len: i32| -> i64 {
+                        tasks_insert_impl(&mut caller, ptr, len)
+                    },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
+            linker
+                .func_wrap(
+                    "ari",
+                    "tasks_delete",
+                    |caller: Caller<'_, StoreData>, id: i64| -> i32 {
+                        let p = match caller.data().tasks_provider.as_ref() {
+                            Some(p) => p.clone(),
+                            None => return 0,
+                        };
+                        if p.delete(id as u64) { 1 } else { 0 }
+                    },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
+        }
+
+        // Calendar host imports — gated on the Calendar capability.
+        if self.granted_capabilities.contains(&Capability::Calendar) {
+            linker
+                .func_wrap(
+                    "ari",
+                    "calendar_has_write_permission",
+                    |caller: Caller<'_, StoreData>| -> i32 {
+                        let p = match caller.data().calendar_provider.as_ref() {
+                            Some(p) => p.clone(),
+                            None => return 0,
+                        };
+                        if p.has_write_permission() { 1 } else { 0 }
+                    },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
+            linker
+                .func_wrap(
+                    "ari",
+                    "calendar_list_calendars",
+                    |mut caller: Caller<'_, StoreData>| -> i64 {
+                        calendar_list_calendars_impl(&mut caller)
+                    },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
+            linker
+                .func_wrap(
+                    "ari",
+                    "calendar_insert",
+                    |mut caller: Caller<'_, StoreData>, ptr: i32, len: i32| -> i64 {
+                        calendar_insert_impl(&mut caller, ptr, len)
+                    },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
+            linker
+                .func_wrap(
+                    "ari",
+                    "calendar_delete",
+                    |caller: Caller<'_, StoreData>, id: i64| -> i32 {
+                        let p = match caller.data().calendar_provider.as_ref() {
+                            Some(p) => p.clone(),
+                            None => return 0,
+                        };
+                        if p.delete(id as u64) { 1 } else { 0 }
+                    },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
+        }
+
+        // Local clock — ungated; every skill can read the wall clock.
+        linker
+            .func_wrap(
+                "ari",
+                "local_now_components",
+                |mut caller: Caller<'_, StoreData>| -> i64 {
+                    local_now_components_impl(&mut caller)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+        linker
+            .func_wrap(
+                "ari",
+                "local_timezone_id",
+                |mut caller: Caller<'_, StoreData>| -> i64 {
+                    local_timezone_id_impl(&mut caller)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+
         Ok(linker)
     }
 
@@ -985,6 +1129,185 @@ fn save_storage_atomic(
 /// Allocate space in the skill's linear memory via its own `ari_alloc`
 /// export, copy `s` in, and return the packed `(ptr << 32) | len`. Returns
 /// 0 if the allocation or copy fails (the skill will read 0 as a sentinel).
+// ── Platform-capability host imports ──────────────────────────────
+//
+// Complex parameters and return values cross the WASM ABI as JSON
+// strings — same trade-off as the existing http_fetch / storage_get
+// marshalling (a little CPU cost in exchange for a schema the SDK
+// and host can evolve independently without breaking the ABI).
+//
+// Sentinel convention: 0 for "failure / nothing to return" on i64
+// return channels (matches the existing `unpack` helper in the Rust
+// SDK, which reads a 0 as None).
+
+fn tasks_list_lists_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let provider = match caller.data().tasks_provider.clone() {
+        Some(p) => p,
+        None => return 0,
+    };
+    let lists = provider.list_lists();
+    let json = serde_json::json!(
+        lists
+            .iter()
+            .map(|l| serde_json::json!({
+                "id": l.id,
+                "display_name": l.display_name,
+                "account_name": l.account_name,
+            }))
+            .collect::<Vec<_>>()
+    )
+    .to_string();
+    write_response(caller, memory, &json)
+}
+
+fn tasks_insert_impl(caller: &mut Caller<'_, StoreData>, ptr: i32, len: i32) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let params_json = match read_utf8(&memory, &*caller, ptr, len) {
+        Some(s) => s,
+        None => return 0,
+    };
+    let params: serde_json::Value = match serde_json::from_str(&params_json) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let provider = match caller.data().tasks_provider.clone() {
+        Some(p) => p,
+        None => return 0,
+    };
+    let insert_params = crate::platform_capabilities::InsertTaskParams {
+        list_id: params.get("list_id").and_then(|v| v.as_u64()).unwrap_or(0),
+        title: params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        due_ms: params.get("due_ms").and_then(|v| v.as_i64()),
+        due_all_day: params
+            .get("due_all_day")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        tz_id: params
+            .get("tz_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    };
+    provider.insert(insert_params).map(|id| id as i64).unwrap_or(0)
+}
+
+fn calendar_list_calendars_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let provider = match caller.data().calendar_provider.clone() {
+        Some(p) => p,
+        None => return 0,
+    };
+    let calendars = provider.list_calendars();
+    let json = serde_json::json!(
+        calendars
+            .iter()
+            .map(|c| serde_json::json!({
+                "id": c.id,
+                "display_name": c.display_name,
+                "account_name": c.account_name,
+                "color_argb": c.color_argb,
+            }))
+            .collect::<Vec<_>>()
+    )
+    .to_string();
+    write_response(caller, memory, &json)
+}
+
+fn calendar_insert_impl(caller: &mut Caller<'_, StoreData>, ptr: i32, len: i32) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let params_json = match read_utf8(&memory, &*caller, ptr, len) {
+        Some(s) => s,
+        None => return 0,
+    };
+    let params: serde_json::Value = match serde_json::from_str(&params_json) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let provider = match caller.data().calendar_provider.clone() {
+        Some(p) => p,
+        None => return 0,
+    };
+    let insert_params = crate::platform_capabilities::InsertCalendarEventParams {
+        calendar_id: params
+            .get("calendar_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        title: params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        start_ms: params
+            .get("start_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        duration_minutes: params
+            .get("duration_minutes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30) as u32,
+        reminder_minutes_before: params
+            .get("reminder_minutes_before")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5) as u32,
+        tz_id: params
+            .get("tz_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UTC")
+            .to_string(),
+    };
+    provider
+        .insert(insert_params)
+        .map(|id| id as i64)
+        .unwrap_or(0)
+}
+
+fn local_now_components_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let clock = caller.data().local_clock.clone();
+    let c = clock.now_components();
+    let json = serde_json::json!({
+        "year": c.year,
+        "month": c.month,
+        "day": c.day,
+        "hour": c.hour,
+        "minute": c.minute,
+        "second": c.second,
+        "weekday": c.weekday,
+        "tz_id": c.tz_id,
+    })
+    .to_string();
+    write_response(caller, memory, &json)
+}
+
+fn local_timezone_id_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let clock = caller.data().local_clock.clone();
+    let tz = clock.timezone_id();
+    write_response(caller, memory, &tz)
+}
+
 fn write_response(caller: &mut Caller<'_, StoreData>, memory: Memory, s: &str) -> i64 {
     let alloc = match caller.get_export("ari_alloc") {
         Some(wasmtime::Extern::Func(f)) => f,
@@ -1088,6 +1411,7 @@ impl Skill for WasmSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_capabilities::HostCapabilities;
     use crate::manifest::{Capability, MatchPattern, Matching, SkillType, SpecificityLevel};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1104,6 +1428,26 @@ mod tests {
         let mut root = std::env::temp_dir();
         root.push(format!("ari-skill-loader-test-{nanos}-{n}"));
         StorageConfig::new(root)
+    }
+
+    /// Build a `LoadOptions` for test fixtures. Collapses the
+    /// (log_sink, host_caps, http_config, storage_config, tasks/calendar/clock)
+    /// septuplet into one call — most tests don't care about the platform
+    /// providers and accept the Null defaults.
+    fn test_options(
+        log_sink: Arc<dyn LogSink>,
+        host_caps: HostCapabilities,
+        http_config: HttpConfig,
+    ) -> crate::LoadOptions {
+        crate::LoadOptions {
+            log_sink,
+            host_capabilities: host_caps,
+            http_config,
+            storage_config: test_storage_config(),
+            tasks_provider: Arc::new(crate::NullTasksProvider),
+            calendar_provider: Arc::new(crate::NullCalendarProvider),
+            local_clock: Arc::new(crate::UtcLocalClock),
+        }
     }
 
     /// Build a minimal `AriExtension` for tests without going through YAML.
@@ -1200,10 +1544,7 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            sink,
-            &HostCapabilities::all(),
-            &HttpConfig::strict(),
-            &test_storage_config(),
+            &test_options(sink, HostCapabilities::all(), HttpConfig::strict()),
         )
         .unwrap()
     }
@@ -1229,10 +1570,7 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::all(),
-            &HttpConfig::strict(),
-            &test_storage_config(),
+            &test_options(Arc::new(NullLogSink), HostCapabilities::all(), HttpConfig::strict()),
         )
         .unwrap_err();
         assert!(matches!(err, WasmError::MissingExport("memory")));
@@ -1254,10 +1592,7 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::all(),
-            &HttpConfig::strict(),
-            &test_storage_config(),
+            &test_options(Arc::new(NullLogSink), HostCapabilities::all(), HttpConfig::strict()),
         )
         .unwrap_err();
         assert!(matches!(err, WasmError::BadExportSignature("score")));
@@ -1352,10 +1687,7 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::all(),
-            &HttpConfig::strict(),
-            &test_storage_config(),
+            &test_options(Arc::new(NullLogSink), HostCapabilities::all(), HttpConfig::strict()),
         )
         .unwrap();
         match skill.execute("whatever", &SkillContext::default()) {
@@ -1389,10 +1721,7 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::all(),
-            &HttpConfig::strict(),
-            &test_storage_config(),
+            &test_options(Arc::new(NullLogSink), HostCapabilities::all(), HttpConfig::strict()),
         )
         .unwrap();
         match skill.execute("x", &SkillContext::default()) {
@@ -1434,10 +1763,8 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::pure_frontend(), // doesn't grant http / storage
-            &HttpConfig::strict(),
-            &test_storage_config(),
+            // pure_frontend doesn't grant http / storage
+            &test_options(Arc::new(NullLogSink), HostCapabilities::pure_frontend(), HttpConfig::strict()),
         )
         .unwrap();
         match skill.execute("x", &SkillContext::default()) {
@@ -1483,10 +1810,7 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::all(),
-            &HttpConfig::strict(),
-            &test_storage_config(),
+            &test_options(Arc::new(NullLogSink), HostCapabilities::all(), HttpConfig::strict()),
         )
         .unwrap();
         match skill.execute("anything", &SkillContext::default()) {
@@ -1506,10 +1830,7 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &host,
-            &HttpConfig::strict(),
-            &test_storage_config(),
+            &test_options(Arc::new(NullLogSink), host.clone(), HttpConfig::strict()),
         )
         .unwrap_err();
         match err {
@@ -1530,10 +1851,7 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::pure_frontend(),
-            &HttpConfig::strict(),
-            &test_storage_config(),
+            &test_options(Arc::new(NullLogSink), HostCapabilities::pure_frontend(), HttpConfig::strict()),
         )
         .unwrap();
         let caps = skill.granted_capabilities();
@@ -1591,10 +1909,7 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &host,
-            &HttpConfig::strict(),
-            &test_storage_config(),
+            &test_options(Arc::new(NullLogSink), host.clone(), HttpConfig::strict()),
         )
         .unwrap()
     }
@@ -1662,10 +1977,7 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::all(),
-            &HttpConfig::strict(),
-            &test_storage_config(),
+            &test_options(Arc::new(NullLogSink), HostCapabilities::all(), HttpConfig::strict()),
         )
         .unwrap_err();
         match err {
@@ -1693,10 +2005,7 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::all(),
-            &HttpConfig::strict(),
-            &test_storage_config(),
+            &test_options(Arc::new(NullLogSink), HostCapabilities::all(), HttpConfig::strict()),
         )
         .unwrap_err();
         assert!(matches!(err, WasmError::UnknownHostImport(ref n) if n == "telepathy"));
@@ -1715,10 +2024,7 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::all(),
-            &HttpConfig::permissive_for_tests(),
-            &test_storage_config(),
+            &test_options(Arc::new(NullLogSink), HostCapabilities::all(), HttpConfig::permissive_for_tests()),
         )
         .unwrap();
 
@@ -1747,10 +2053,8 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::all(),
-            &HttpConfig::strict(), // https only
-            &test_storage_config(),
+            // https only
+            &test_options(Arc::new(NullLogSink), HostCapabilities::all(), HttpConfig::strict()),
         )
         .unwrap();
 
@@ -1777,10 +2081,7 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::all(),
-            &HttpConfig::permissive_for_tests(),
-            &test_storage_config(),
+            &test_options(Arc::new(NullLogSink), HostCapabilities::all(), HttpConfig::permissive_for_tests()),
         )
         .unwrap();
 
@@ -1814,10 +2115,7 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::all(),
-            &config,
-            &test_storage_config(),
+            &test_options(Arc::new(NullLogSink), HostCapabilities::all(), config.clone()),
         )
         .unwrap();
 
@@ -1843,10 +2141,8 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::pure_frontend(), // does not grant http
-            &HttpConfig::permissive_for_tests(),
-            &test_storage_config(),
+            // pure_frontend does not grant http
+            &test_options(Arc::new(NullLogSink), HostCapabilities::pure_frontend(), HttpConfig::permissive_for_tests()),
         )
         .is_err());
     }
@@ -1965,10 +2261,15 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::all(),
-            &HttpConfig::strict(),
-            &storage,
+            &crate::LoadOptions {
+                log_sink: Arc::new(NullLogSink),
+                host_capabilities: HostCapabilities::all(),
+                http_config: HttpConfig::strict(),
+                storage_config: storage.clone(),
+                tasks_provider: Arc::new(crate::NullTasksProvider),
+                calendar_provider: Arc::new(crate::NullCalendarProvider),
+                local_clock: Arc::new(crate::UtcLocalClock),
+            },
         )
         .unwrap()
     }
@@ -2017,10 +2318,7 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::all(),
-            &HttpConfig::strict(),
-            &test_storage_config(),
+            &test_options(Arc::new(NullLogSink), HostCapabilities::all(), HttpConfig::strict()),
         )
         .unwrap_err();
         match err {
@@ -2071,10 +2369,15 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::all(),
-            &HttpConfig::strict(),
-            &storage,
+            &crate::LoadOptions {
+                log_sink: Arc::new(NullLogSink),
+                host_capabilities: HostCapabilities::all(),
+                http_config: HttpConfig::strict(),
+                storage_config: storage.clone(),
+                tasks_provider: Arc::new(crate::NullTasksProvider),
+                calendar_provider: Arc::new(crate::NullCalendarProvider),
+                local_clock: Arc::new(crate::UtcLocalClock),
+            },
         )
         .unwrap();
         match skill.execute("x", &SkillContext::default()) {
@@ -2117,10 +2420,7 @@ mod tests {
             "",
             behaviour(&ari),
             &bytes,
-            Arc::new(NullLogSink),
-            &HostCapabilities::all(),
-            &HttpConfig::strict(),
-            &test_storage_config(),
+            &test_options(Arc::new(NullLogSink), HostCapabilities::all(), HttpConfig::strict()),
         )
         .unwrap();
         match skill.execute("x", &SkillContext::default()) {
