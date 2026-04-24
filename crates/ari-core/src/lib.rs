@@ -39,6 +39,7 @@ pub enum Response {
     Binary { mime: String, data: Vec<u8> },
 }
 
+#[derive(Clone)]
 pub struct SkillContext {
     pub locale: String,
 }
@@ -145,6 +146,39 @@ pub trait Skill: Send + Sync {
     /// for parameterless skills. Override for skills that take args.
     fn parameters_schema(&self) -> &'static str {
         r#"{"type": "object", "properties": {}}"#
+    }
+
+    /// Resume skill execution after a Layer C assistant round-trip
+    /// (see the `consult_assistant` envelope primitive). The engine
+    /// calls this from a background thread once the assistant has
+    /// replied.
+    ///
+    /// `context` is the opaque string the skill previously put in the
+    /// `consult_assistant.continuation_context` field — the skill uses
+    /// it to carry state (original utterance, settings snapshot, etc.)
+    /// into this second invocation. `assistant_response` is the raw
+    /// text returned by the assistant.
+    ///
+    /// Default implementation wraps the arguments in the reserved
+    /// `{"_ari_continuation": {...}}` JSON shape and routes through
+    /// [`execute`]. This bypasses `normalize_input` — the engine calls
+    /// `execute_continuation` directly, not via keyword routing —
+    /// so the skill's dispatch function can pattern-match on the
+    /// JSON prefix and fork to a continuation handler. Skills that
+    /// prefer an explicit second entry-point can override this.
+    fn execute_continuation(
+        &self,
+        context: &str,
+        assistant_response: &str,
+        ctx: &SkillContext,
+    ) -> Response {
+        let payload = serde_json::json!({
+            "_ari_continuation": {
+                "context": context,
+                "response": assistant_response,
+            }
+        });
+        self.execute(&payload.to_string(), ctx)
     }
 }
 

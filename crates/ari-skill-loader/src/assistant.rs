@@ -226,9 +226,14 @@ fn build_request_body(
 ) -> String {
     let body = match config.request_format {
         RequestFormat::Openai => {
+            // `max_completion_tokens` replaced `max_tokens` in the
+            // Chat Completions API; newer families (o1/o3/gpt-5) hard-
+            // reject `max_tokens` with HTTP 400, and the older ones
+            // (gpt-4o, gpt-4o-mini, gpt-3.5-turbo) silently accept the
+            // new name. One field name works across the current range.
             serde_json::json!({
                 "model": resolved.model,
-                "max_tokens": config.max_tokens,
+                "max_completion_tokens": config.max_tokens,
                 "temperature": config.temperature,
                 "messages": [
                     {"role": "system", "content": config.system_prompt},
@@ -347,7 +352,11 @@ mod tests {
         let body = build_request_body(&config, &resolved, "What is 2+2?");
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["model"], "gpt-4o-mini");
-        assert_eq!(parsed["max_tokens"], 256);
+        assert_eq!(parsed["max_completion_tokens"], 256);
+        // Newer OpenAI models reject `max_tokens`; field must NOT appear
+        // in the outgoing body even though `ApiConfig.max_tokens` is
+        // the source of the value.
+        assert!(parsed.get("max_tokens").is_none());
         assert_eq!(parsed["messages"][0]["role"], "system");
         assert_eq!(parsed["messages"][0]["content"], "You are Ari.");
         assert_eq!(parsed["messages"][1]["role"], "user");

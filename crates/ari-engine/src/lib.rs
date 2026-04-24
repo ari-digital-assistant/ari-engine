@@ -3,7 +3,30 @@ use ari_core::{
 };
 use ari_skill_loader::assistant::ConfigStore;
 use ari_skill_loader::manifest::ApiConfig;
+use ari_skill_loader::wasm::{LogLevel, LogSink};
 use std::sync::Arc;
+
+/// Pseudo skill-id used for engine-emitted log lines so they surface in
+/// `adb logcat -s AriSkill` alongside real skill traces without being
+/// mistaken for a registered skill.
+const ENGINE_LOG_TAG: &str = "ari-engine";
+
+/// Host-implemented sink that receives envelopes produced outside the
+/// synchronous `process_input` flow — currently only the phase-2
+/// envelope from a Layer C assistant round-trip. Implementations must
+/// be safe to call from any thread and are responsible for marshalling
+/// to the UI thread themselves.
+///
+/// Mirrors [`LogSink`] shape and is installed via
+/// [`Engine::set_envelope_sink`]. Pass `None` to keep the engine
+/// strictly synchronous (all `consult_assistant` directives become
+/// inert, skill's first envelope is returned unchanged).
+pub trait EnvelopeSink: Send + Sync {
+    /// Push a JSON-serialised envelope plus the emitting skill id (so
+    /// the frontend can resolve `asset:` references in it). Skill id
+    /// matches the value [`Engine::process_input_with_skill`] returns.
+    fn push(&self, envelope_json: &str, skill_id: Option<&str>);
+}
 
 /// The text the engine returns when no skill matches the input. Exposed
 /// publicly so the FFI layer can detect this exact response and convert it
@@ -39,6 +62,7 @@ pub struct DebugTrace {
 }
 
 /// Which assistant is currently active and how to call it.
+#[derive(Clone)]
 pub enum ActiveAssistant {
     /// Use the built-in on-device LLM (routes to `self.llm`).
     Builtin,
@@ -51,13 +75,27 @@ pub enum ActiveAssistant {
 }
 
 pub struct Engine {
-    skills: Vec<Box<dyn Skill>>,
+    /// Stored as `Arc<dyn Skill>` so Layer C's background thread can
+    /// clone a reference to the winning skill and invoke
+    /// [`Skill::execute_continuation`] on it after the assistant
+    /// round-trip. Skill trait is `Send + Sync`, so the clone is
+    /// safe to move across threads.
+    skills: Vec<Arc<dyn Skill>>,
     ctx: SkillContext,
     debug: bool,
     #[cfg(feature = "llm")]
     llm: Option<Box<dyn ari_llm::Fallback>>,
     active_assistant: Option<ActiveAssistant>,
     router: Option<Box<dyn SkillRouter>>,
+    /// Optional sink so engine-internal paths (currently Layer C) can
+    /// surface diagnostics in the same channel skills use. `None` means
+    /// those log calls are no-ops — no formatting cost either.
+    log_sink: Option<Arc<dyn LogSink>>,
+    /// Optional sink for asynchronously-produced envelopes — currently
+    /// only phase-2 of a Layer C round-trip. When `None`, the
+    /// `consult_assistant` directive is inert (skill's first envelope
+    /// is returned unchanged).
+    envelope_sink: Option<Arc<dyn EnvelopeSink>>,
 }
 
 impl Engine {
@@ -70,6 +108,32 @@ impl Engine {
             llm: None,
             active_assistant: None,
             router: None,
+            log_sink: None,
+            envelope_sink: None,
+        }
+    }
+
+    /// Install a log sink for engine-internal diagnostics. Currently only
+    /// Layer C (assistant consultation on low-confidence envelopes) uses
+    /// it. Pass `None` to silence. Separate from skill logging — the
+    /// skill-loader has its own sink threaded through `reload_*` helpers.
+    pub fn set_log_sink(&mut self, sink: Option<Arc<dyn LogSink>>) {
+        self.log_sink = sink;
+    }
+
+    /// Install an envelope sink so the engine can push phase-2 Layer C
+    /// envelopes (produced asynchronously after the assistant replies)
+    /// back to the host. When `None`, the `consult_assistant` directive
+    /// is inert: the skill's first envelope is returned unchanged and no
+    /// assistant round-trip runs. Set at startup before the first
+    /// `process_input` call.
+    pub fn set_envelope_sink(&mut self, sink: Option<Arc<dyn EnvelopeSink>>) {
+        self.envelope_sink = sink;
+    }
+
+    fn log(&self, level: LogLevel, message: &str) {
+        if let Some(ref sink) = self.log_sink {
+            sink.log(ENGINE_LOG_TAG, level, message);
         }
     }
 
@@ -78,7 +142,10 @@ impl Engine {
     }
 
     pub fn register_skill(&mut self, skill: Box<dyn Skill>) {
-        self.skills.push(skill);
+        // Box<dyn Skill> → Arc<dyn Skill> via the std From impl. Arc is
+        // needed so Layer C's background thread can hold a reference to
+        // the winning skill and drive its continuation.
+        self.skills.push(Arc::from(skill));
     }
 
     /// Set the LLM fallback. When set, the engine will consult the LLM
@@ -195,9 +262,11 @@ impl Engine {
                     .skills
                     .iter()
                     .find(|s| s.id() == winner.skill_id)
-                    .unwrap();
+                    .unwrap()
+                    .clone();
 
                 let response = skill.execute(&normalized, &self.ctx);
+                let response = self.maybe_intercept_consult(skill, response);
                 return (response, Some(trace));
             }
         }
@@ -212,9 +281,10 @@ impl Engine {
 
             match router.route(&normalized, &skill_catalog) {
                 RouteResult::Skill(ref id) => {
-                    if let Some(skill) = self.skills.iter().find(|s| s.id() == id) {
+                    if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
                         trace.winner = Some(format!("router:{id}"));
                         let response = skill.execute(&normalized, &self.ctx);
+                        let response = self.maybe_intercept_consult(skill, response);
                         return (response, Some(trace));
                     }
                 }
@@ -271,6 +341,231 @@ impl Engine {
 
         (Response::Text(FALLBACK_RESPONSE.to_string()), Some(trace))
     }
+
+    /// If the skill's response envelope carries a `consult_assistant`
+    /// directive (Layer C v2), split it out: strip the directive from
+    /// the phase-1 envelope we return synchronously, and spawn a
+    /// background thread that runs the assistant round-trip and pushes
+    /// the phase-2 envelope via [`EnvelopeSink`]. When anything is
+    /// missing (no sink, malformed directive, etc.) the skill's first
+    /// envelope is returned unchanged — no assistant call happens.
+    fn maybe_intercept_consult(
+        &self,
+        skill: Arc<dyn Skill>,
+        response: Response,
+    ) -> Response {
+        let mut action = match response {
+            Response::Action(v) => v,
+            other => return other,
+        };
+
+        let directive_value = match action
+            .as_object_mut()
+            .and_then(|obj| obj.remove("consult_assistant"))
+        {
+            Some(v) => v,
+            None => return Response::Action(action),
+        };
+
+        let directive = match parse_consult_directive(&directive_value) {
+            Some(d) => d,
+            None => {
+                self.log(
+                    LogLevel::Warn,
+                    "layer-c: consult_assistant directive malformed — ignoring, returning phase-1 envelope unchanged",
+                );
+                return Response::Action(action);
+            }
+        };
+
+        let sink = match self.envelope_sink.clone() {
+            Some(s) => s,
+            None => {
+                self.log(
+                    LogLevel::Warn,
+                    "layer-c: consult_assistant requested but no envelope sink installed — phase-2 suppressed",
+                );
+                return Response::Action(action);
+            }
+        };
+
+        let assistant = self.active_assistant.clone();
+        let log_sink = self.log_sink.clone();
+        let ctx = self.ctx.clone();
+        let skill_id = skill.id().to_string();
+
+        self.log(
+            LogLevel::Info,
+            &format!(
+                "layer-c: phase-1 returned, spawning phase-2 for skill={} prompt_len={}",
+                skill_id,
+                directive.prompt.len()
+            ),
+        );
+
+        std::thread::spawn(move || {
+            run_consult_phase_two(
+                skill,
+                skill_id,
+                directive,
+                assistant,
+                ctx,
+                sink,
+                log_sink,
+            );
+        });
+
+        Response::Action(action)
+    }
+}
+
+/// Parsed form of the `consult_assistant` envelope directive. Shape is
+/// stable — skills compose these JSON blobs and the engine extracts
+/// them at phase-1 interception time.
+#[derive(Debug, Clone)]
+struct ConsultDirective {
+    /// Final prompt the engine sends to the assistant verbatim. Skills
+    /// perform their own `{utterance}` / `{unparsed}` substitution
+    /// before assembling this string.
+    prompt: String,
+    /// Opaque string the skill uses to carry state into its
+    /// continuation invocation. Engine treats it as a black box.
+    continuation_context: String,
+}
+
+fn parse_consult_directive(v: &serde_json::Value) -> Option<ConsultDirective> {
+    let obj = v.as_object()?;
+    let prompt = obj.get("prompt").and_then(|p| p.as_str())?.to_string();
+    if prompt.is_empty() {
+        return None;
+    }
+    let continuation_context = obj
+        .get("continuation_context")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(ConsultDirective {
+        prompt,
+        continuation_context,
+    })
+}
+
+fn run_consult_phase_two(
+    skill: Arc<dyn Skill>,
+    skill_id: String,
+    directive: ConsultDirective,
+    assistant: Option<ActiveAssistant>,
+    ctx: SkillContext,
+    sink: Arc<dyn EnvelopeSink>,
+    log_sink: Option<Arc<dyn LogSink>>,
+) {
+    let log = |level: LogLevel, msg: &str| {
+        if let Some(ref s) = log_sink {
+            s.log(ENGINE_LOG_TAG, level, msg);
+        }
+    };
+
+    // Fetch the assistant's response (or an empty string on failure —
+    // the skill's continuation handler owns the fallback logic, since
+    // it's the only layer with enough context to produce a sensible
+    // recovery envelope).
+    let response_for_skill = match call_assistant_for_consult(&assistant, &directive.prompt) {
+        Ok(text) => {
+            log(
+                LogLevel::Info,
+                &format!("layer-c: assistant response ok ({} bytes)", text.len()),
+            );
+            text
+        }
+        Err(reason) => {
+            log(
+                LogLevel::Warn,
+                &format!("layer-c: assistant unavailable ({reason}) — invoking continuation with empty response so the skill can run its own fallback"),
+            );
+            String::new()
+        }
+    };
+
+    let continuation = skill.execute_continuation(
+        &directive.continuation_context,
+        &response_for_skill,
+        &ctx,
+    );
+
+    let envelope = match continuation {
+        Response::Action(v) => strip_nested_consult(v, &log),
+        Response::Text(s) => serde_json::json!({ "v": 1, "speak": s }),
+        Response::Binary { .. } => {
+            log(
+                LogLevel::Warn,
+                "layer-c: continuation returned Binary response — unsupported, emitting generic error",
+            );
+            serde_json::json!({ "v": 1, "speak": "Something went wrong with that request." })
+        }
+    };
+
+    let json = match serde_json::to_string(&envelope) {
+        Ok(s) => s,
+        Err(e) => {
+            log(LogLevel::Error, &format!("layer-c: envelope serialisation failed: {e}"));
+            return;
+        }
+    };
+    log(
+        LogLevel::Info,
+        &format!("layer-c: pushing phase-2 envelope ({} bytes)", json.len()),
+    );
+    sink.push(&json, Some(&skill_id));
+}
+
+fn call_assistant_for_consult(
+    assistant: &Option<ActiveAssistant>,
+    prompt: &str,
+) -> Result<String, String> {
+    match assistant {
+        Some(ActiveAssistant::Api {
+            skill_id,
+            config,
+            config_store,
+        }) => {
+            let text = ari_skill_loader::call_assistant_api(
+                config,
+                skill_id,
+                config_store.as_ref(),
+                prompt,
+            )
+            .map_err(|e| e.to_string())?;
+            if text.trim().is_empty() {
+                Err("assistant returned empty response".into())
+            } else {
+                Ok(text)
+            }
+        }
+        Some(ActiveAssistant::Builtin) => Err(
+            "Layer C round-trip requires a cloud (Api) assistant; Builtin on-device LLM is not \
+             reliable for structured JSON responses"
+                .into(),
+        ),
+        None => Err("no active assistant configured".into()),
+    }
+}
+
+/// Loop protection: strip any nested `consult_assistant` directive
+/// from a phase-2 envelope. Prevents a skill from initiating an
+/// unbounded chain of assistant round-trips per user utterance.
+fn strip_nested_consult(
+    mut action: serde_json::Value,
+    log: &dyn Fn(LogLevel, &str),
+) -> serde_json::Value {
+    if let Some(obj) = action.as_object_mut() {
+        if obj.remove("consult_assistant").is_some() {
+            log(
+                LogLevel::Warn,
+                "layer-c: continuation envelope carried a nested consult_assistant directive — stripped (loop protection caps round-trips at 1)",
+            );
+        }
+    }
+    action
 }
 
 impl Default for Engine {
@@ -482,4 +777,294 @@ mod tests {
         assert!(trace.round.is_none());
         assert_eq!(trace.scores.len(), 1);
     }
+
+    // --- Layer C v2: consult_assistant directive ---
+
+    struct ActionSkill {
+        id: &'static str,
+        action: serde_json::Value,
+    }
+
+    impl Skill for ActionSkill {
+        fn id(&self) -> &str { self.id }
+        fn specificity(&self) -> Specificity { Specificity::High }
+        fn score(&self, _input: &str, _ctx: &SkillContext) -> f32 { 0.95 }
+        fn execute(&self, _input: &str, _ctx: &SkillContext) -> Response {
+            Response::Action(self.action.clone())
+        }
+    }
+
+    #[test]
+    fn directive_parses_minimal_shape() {
+        let v = serde_json::json!({
+            "prompt": "what did they mean?",
+            "continuation_context": "ctx"
+        });
+        let d = parse_consult_directive(&v).unwrap();
+        assert_eq!(d.prompt, "what did they mean?");
+        assert_eq!(d.continuation_context, "ctx");
+    }
+
+    #[test]
+    fn directive_rejects_missing_prompt() {
+        // Prompt is the one mandatory field — no prompt, no round-trip.
+        let v = serde_json::json!({ "continuation_context": "x" });
+        assert!(parse_consult_directive(&v).is_none());
+    }
+
+    #[test]
+    fn directive_rejects_empty_prompt() {
+        let v = serde_json::json!({ "prompt": "", "continuation_context": "x" });
+        assert!(parse_consult_directive(&v).is_none());
+    }
+
+    #[test]
+    fn directive_defaults_empty_context_when_absent() {
+        let v = serde_json::json!({ "prompt": "anything" });
+        let d = parse_consult_directive(&v).unwrap();
+        assert_eq!(d.continuation_context, "");
+    }
+
+    #[test]
+    fn strip_nested_consult_removes_nested_directive() {
+        let silent = |_: LogLevel, _: &str| {};
+        let with_nested = serde_json::json!({
+            "v": 1,
+            "speak": "done",
+            "consult_assistant": { "prompt": "re-run", "continuation_context": "" }
+        });
+        let stripped = strip_nested_consult(with_nested, &silent);
+        assert!(stripped.get("consult_assistant").is_none());
+        assert_eq!(stripped["speak"], "done");
+    }
+
+    #[test]
+    fn strip_nested_consult_leaves_clean_envelope_alone() {
+        let silent = |_: LogLevel, _: &str| {};
+        let clean = serde_json::json!({ "v": 1, "speak": "ok" });
+        let out = strip_nested_consult(clean.clone(), &silent);
+        assert_eq!(out, clean);
+    }
+
+    #[test]
+    fn consult_directive_inert_without_envelope_sink() {
+        // When the skill emits a consult_assistant but no sink is
+        // installed, the engine returns the phase-1 envelope with the
+        // directive stripped — no thread spawned, no hang.
+        let mut engine = Engine::new();
+        let payload = serde_json::json!({
+            "v": 1,
+            "speak": "ack",
+            "consult_assistant": {
+                "prompt": "anything",
+                "continuation_context": "ctx"
+            }
+        });
+        engine.register_skill(Box::new(ActionSkill {
+            id: "test.consult",
+            action: payload,
+        }));
+        let (resp, _) = engine.process_input_traced("trigger");
+        match resp {
+            Response::Action(v) => {
+                assert_eq!(v["speak"], "ack");
+                assert!(
+                    v.get("consult_assistant").is_none(),
+                    "consult_assistant must be stripped even when sink is absent — frontend shouldn't see the engine-internal directive"
+                );
+            }
+            _ => panic!("expected Action response"),
+        }
+    }
+
+    #[test]
+    fn malformed_directive_returns_envelope_unchanged_without_field() {
+        // Malformed consult_assistant → engine logs a warning, strips
+        // the field, returns the remaining envelope. Skill's speak /
+        // cards still render.
+        let mut engine = Engine::new();
+        let payload = serde_json::json!({
+            "v": 1,
+            "speak": "ack",
+            "consult_assistant": {
+                // missing required "prompt" field
+                "continuation_context": "x"
+            }
+        });
+        engine.register_skill(Box::new(ActionSkill {
+            id: "test.malformed",
+            action: payload,
+        }));
+        let (resp, _) = engine.process_input_traced("trigger");
+        match resp {
+            Response::Action(v) => {
+                assert_eq!(v["speak"], "ack");
+                assert!(v.get("consult_assistant").is_none());
+            }
+            _ => panic!("expected Action response"),
+        }
+    }
+
+    #[test]
+    fn non_action_response_passes_through() {
+        // Text responses from skills bypass Layer C entirely — there's
+        // no envelope to check.
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(MockSkill {
+            id: "text.skill", specificity: Specificity::High, fixed_score: 0.95, response: "plain",
+        }));
+        let (resp, _) = engine.process_input_traced("anything");
+        assert!(matches!(resp, Response::Text(ref s) if s == "plain"));
+    }
+
+    /// Test EnvelopeSink implementation that records every push into
+    /// a shared `Vec`. Used by the integration-style tests below that
+    /// want to verify the phase-2 envelope contents after the round-
+    /// trip completes.
+    struct RecordingSink(Arc<Mutex<Vec<(String, Option<String>)>>>);
+
+    impl EnvelopeSink for RecordingSink {
+        fn push(&self, envelope_json: &str, skill_id: Option<&str>) {
+            self.0.lock().unwrap().push((
+                envelope_json.to_string(),
+                skill_id.map(|s| s.to_string()),
+            ));
+        }
+    }
+
+    /// Skill that emits a consult_assistant on first call and whose
+    /// continuation returns a canned final envelope. Lets tests cover
+    /// the full phase-1 → phase-2 round-trip without a real assistant.
+    struct ConsultingSkill {
+        id: &'static str,
+        first_envelope: serde_json::Value,
+        continuation_envelope: serde_json::Value,
+    }
+
+    impl Skill for ConsultingSkill {
+        fn id(&self) -> &str { self.id }
+        fn specificity(&self) -> Specificity { Specificity::High }
+        fn score(&self, _input: &str, _ctx: &SkillContext) -> f32 { 0.95 }
+        fn execute(&self, _input: &str, _ctx: &SkillContext) -> Response {
+            Response::Action(self.first_envelope.clone())
+        }
+        fn execute_continuation(
+            &self,
+            _context: &str,
+            _response: &str,
+            _ctx: &SkillContext,
+        ) -> Response {
+            Response::Action(self.continuation_envelope.clone())
+        }
+    }
+
+    use std::sync::Mutex;
+
+    #[test]
+    fn consult_without_assistant_pushes_fallback_via_skill_continuation() {
+        // No active_assistant → call_assistant_for_consult errors →
+        // skill.execute_continuation is still called (with empty
+        // response string) → skill emits its fallback envelope →
+        // engine pushes it. The thread we spawn is joined implicitly
+        // via the recording sink; poll the sink briefly for the push.
+        let recorded: Arc<Mutex<Vec<_>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink: Arc<dyn EnvelopeSink> = Arc::new(RecordingSink(recorded.clone()));
+
+        let mut engine = Engine::new();
+        engine.set_envelope_sink(Some(sink));
+        engine.register_skill(Box::new(ConsultingSkill {
+            id: "test.consulting",
+            first_envelope: serde_json::json!({
+                "v": 1,
+                "speak": "let me check",
+                "consult_assistant": {
+                    "prompt": "interpret",
+                    "continuation_context": "the utterance"
+                }
+            }),
+            continuation_envelope: serde_json::json!({
+                "v": 1,
+                "speak": "fallback written"
+            }),
+        }));
+
+        // Phase-1 return should have consult_assistant stripped.
+        let (resp, _) = engine.process_input_traced("go");
+        match resp {
+            Response::Action(v) => {
+                assert_eq!(v["speak"], "let me check");
+                assert!(v.get("consult_assistant").is_none());
+            }
+            _ => panic!("expected phase-1 Action"),
+        }
+
+        // Background thread should push the phase-2 envelope quickly
+        // — no real assistant call happens (no active_assistant), so
+        // the continuation fires immediately. Poll for up to 2s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if !recorded.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let pushed = recorded.lock().unwrap().clone();
+        assert_eq!(pushed.len(), 1, "expected exactly one phase-2 push");
+        let (json, skill_id) = &pushed[0];
+        assert_eq!(skill_id.as_deref(), Some("test.consulting"));
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(v["speak"], "fallback written");
+    }
+
+    #[test]
+    fn nested_consult_in_continuation_is_stripped() {
+        // Continuation envelope carrying its own consult_assistant
+        // directive must have that field stripped before being pushed,
+        // preventing an unbounded chain of assistant calls.
+        let recorded: Arc<Mutex<Vec<_>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink: Arc<dyn EnvelopeSink> = Arc::new(RecordingSink(recorded.clone()));
+
+        let mut engine = Engine::new();
+        engine.set_envelope_sink(Some(sink));
+        engine.register_skill(Box::new(ConsultingSkill {
+            id: "test.nested",
+            first_envelope: serde_json::json!({
+                "v": 1,
+                "speak": "ack",
+                "consult_assistant": {
+                    "prompt": "anything",
+                    "continuation_context": ""
+                }
+            }),
+            continuation_envelope: serde_json::json!({
+                "v": 1,
+                "speak": "phase-2",
+                "consult_assistant": {
+                    "prompt": "sneaky second round",
+                    "continuation_context": ""
+                }
+            }),
+        }));
+
+        let _ = engine.process_input_traced("go");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if !recorded.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let pushed = recorded.lock().unwrap().clone();
+        assert_eq!(pushed.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&pushed[0].0).unwrap();
+        assert_eq!(v["speak"], "phase-2");
+        assert!(
+            v.get("consult_assistant").is_none(),
+            "loop protection should strip nested consult_assistant"
+        );
+    }
+
 }

@@ -1,6 +1,6 @@
 #![allow(clippy::new_without_default)]
 
-use ari_engine::{Engine, FALLBACK_RESPONSE};
+use ari_engine::{Engine, EnvelopeSink, FALLBACK_RESPONSE};
 use ari_skill_loader::assistant::{ConfigStore, MemoryConfigStore};
 use ari_skill_loader::{
     load_skill_directory_with, Calendar, CalendarProvider, Capability, HostCapabilities,
@@ -99,6 +99,35 @@ impl LogSink for ForeignLogSinkAdapter {
     fn log(&self, skill_id: &str, level: LogLevel, message: &str) {
         self.0
             .log(skill_id.to_string(), level.into(), message.to_string());
+    }
+}
+
+/// Callback interface the host implements to receive envelopes the
+/// engine produces outside the synchronous `process_input` flow —
+/// currently only the phase-2 envelope from a Layer C assistant
+/// round-trip. Rust calls this from a background thread, so the host
+/// implementation must be safe to invoke off the UI thread and is
+/// responsible for dispatching back to the UI/conversation pipeline
+/// itself (e.g. by emitting on a `SharedFlow` the viewmodel observes).
+#[uniffi::export(with_foreign)]
+pub trait FfiEnvelopeSink: Send + Sync {
+    /// Push a JSON-serialised envelope plus the emitting skill id
+    /// (`None` for engine-origin envelopes). The skill id is what the
+    /// frontend uses to resolve `asset:<path>` references inside the
+    /// envelope back to the emitting skill's bundle directory — same
+    /// contract as synchronous `FfiResponse::Action.skill_id`.
+    fn push(&self, envelope_json: String, skill_id: Option<String>);
+}
+
+/// Wraps a foreign [`FfiEnvelopeSink`] so it satisfies the engine's
+/// internal [`EnvelopeSink`] trait. Same `&str`→`String` copy pattern
+/// as [`ForeignLogSinkAdapter`] — envelope push isn't on the hot path.
+struct ForeignEnvelopeSinkAdapter(Arc<dyn FfiEnvelopeSink>);
+
+impl EnvelopeSink for ForeignEnvelopeSinkAdapter {
+    fn push(&self, envelope_json: &str, skill_id: Option<&str>) {
+        self.0
+            .push(envelope_json.to_string(), skill_id.map(|s| s.to_string()));
     }
 }
 
@@ -329,6 +358,12 @@ pub struct AriEngine {
     /// the shared `SkillSettingsStore`'s inner map so skills see
     /// live UI-written values.
     pub(crate) config_store: Arc<dyn ConfigStore>,
+    /// Envelope sink the engine uses to push phase-2 Layer C envelopes
+    /// asynchronously. Stored here (not just on [`Engine`]) so
+    /// `reload_community_skills` can re-attach it to the fresh engine
+    /// it swaps in — otherwise the first community-skill reload would
+    /// silently disable Layer C for every session afterwards.
+    pub(crate) envelope_sink: Option<Arc<dyn EnvelopeSink>>,
 }
 
 fn build_engine_with_builtins() -> Engine {
@@ -353,6 +388,7 @@ impl AriEngine {
             calendar_provider: Arc::new(NullCalendarProvider),
             local_clock: Arc::new(UtcLocalClock),
             config_store: Arc::new(MemoryConfigStore::new()),
+            envelope_sink: None,
         }
     }
 
@@ -362,13 +398,17 @@ impl AriEngine {
     /// [`AriEngine::new`] instead.
     #[uniffi::constructor]
     pub fn with_log_sink(sink: Arc<dyn FfiLogSink>) -> Self {
+        let log_sink: Arc<dyn LogSink> = Arc::new(ForeignLogSinkAdapter(sink));
+        let mut engine = build_engine_with_builtins();
+        engine.set_log_sink(Some(log_sink.clone()));
         Self {
-            inner: Mutex::new(build_engine_with_builtins()),
-            log_sink: Arc::new(ForeignLogSinkAdapter(sink)),
+            inner: Mutex::new(engine),
+            log_sink,
             tasks_provider: Arc::new(NullTasksProvider),
             calendar_provider: Arc::new(NullCalendarProvider),
             local_clock: Arc::new(UtcLocalClock),
             config_store: Arc::new(MemoryConfigStore::new()),
+            envelope_sink: None,
         }
     }
 
@@ -386,6 +426,7 @@ impl AriEngine {
         calendar: Option<Arc<dyn FfiCalendarProvider>>,
         clock: Option<Arc<dyn FfiLocalClock>>,
         settings: Option<Arc<SkillSettingsStore>>,
+        envelope_sink: Option<Arc<dyn FfiEnvelopeSink>>,
     ) -> Self {
         let log_sink: Arc<dyn LogSink> = match sink {
             Some(s) => Arc::new(ForeignLogSinkAdapter(s)),
@@ -407,13 +448,21 @@ impl AriEngine {
             Some(s) => s.as_config_store(),
             None => Arc::new(MemoryConfigStore::new()),
         };
+        let adapted_envelope_sink: Option<Arc<dyn EnvelopeSink>> = envelope_sink
+            .map(|es| Arc::new(ForeignEnvelopeSinkAdapter(es)) as Arc<dyn EnvelopeSink>);
+        let mut engine = build_engine_with_builtins();
+        engine.set_log_sink(Some(log_sink.clone()));
+        if let Some(ref es) = adapted_envelope_sink {
+            engine.set_envelope_sink(Some(es.clone()));
+        }
         Self {
-            inner: Mutex::new(build_engine_with_builtins()),
+            inner: Mutex::new(engine),
             log_sink,
             tasks_provider,
             calendar_provider,
             local_clock,
             config_store,
+            envelope_sink: adapted_envelope_sink,
         }
     }
 
@@ -509,6 +558,17 @@ impl AriEngine {
         storage_dir: String,
     ) -> u32 {
         let mut fresh = build_engine_with_builtins();
+        // Re-attach the engine-level sinks the host installed at
+        // construction time. Without this, the fresh Engine starts
+        // with `log_sink = None` and `envelope_sink = None`, which
+        // silently disables both the engine's diagnostic log stream
+        // and Layer C phase-2 push for every session after the first
+        // reload_community_skills call (that is: for every session
+        // at all on Android, since EngineModule always reloads).
+        fresh.set_log_sink(Some(self.log_sink.clone()));
+        if let Some(ref es) = self.envelope_sink {
+            fresh.set_envelope_sink(Some(es.clone()));
+        }
         // Start from the shared default LoadOptions (host caps, HTTP, storage)
         // and override the log sink with whatever the host installed at
         // construction time. Install/validation paths elsewhere keep the
