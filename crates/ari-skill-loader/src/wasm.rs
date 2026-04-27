@@ -120,10 +120,12 @@ const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
     ("tasks_list_lists", Some(Capability::Tasks)),
     ("tasks_insert", Some(Capability::Tasks)),
     ("tasks_delete", Some(Capability::Tasks)),
+    ("tasks_query_in_range", Some(Capability::Tasks)),
     ("calendar_has_write_permission", Some(Capability::Calendar)),
     ("calendar_list_calendars", Some(Capability::Calendar)),
     ("calendar_insert", Some(Capability::Calendar)),
     ("calendar_delete", Some(Capability::Calendar)),
+    ("calendar_query_in_range", Some(Capability::Calendar)),
 ];
 
 /// Default fuel budget per call. Tuned for "tens of milliseconds of compute
@@ -674,6 +676,19 @@ impl WasmSkill {
                     },
                 )
                 .map_err(|e| WasmError::Compile(e.to_string()))?;
+            linker
+                .func_wrap(
+                    "ari",
+                    "tasks_query_in_range",
+                    |mut caller: Caller<'_, StoreData>,
+                     start_ms: i64,
+                     end_ms: i64,
+                     limit: i32|
+                     -> i64 {
+                        tasks_query_in_range_impl(&mut caller, start_ms, end_ms, limit)
+                    },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
         }
 
         // Calendar host imports — gated on the Calendar capability.
@@ -719,6 +734,19 @@ impl WasmSkill {
                             None => return 0,
                         };
                         if p.delete(id as u64) { 1 } else { 0 }
+                    },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
+            linker
+                .func_wrap(
+                    "ari",
+                    "calendar_query_in_range",
+                    |mut caller: Caller<'_, StoreData>,
+                     start_ms: i64,
+                     end_ms: i64,
+                     limit: i32|
+                     -> i64 {
+                        calendar_query_in_range_impl(&mut caller, start_ms, end_ms, limit)
                     },
                 )
                 .map_err(|e| WasmError::Compile(e.to_string()))?;
@@ -1224,6 +1252,69 @@ fn tasks_insert_impl(caller: &mut Caller<'_, StoreData>, ptr: i32, len: i32) -> 
             .map(|s| s.to_string()),
     };
     provider.insert(insert_params).map(|id| id as i64).unwrap_or(0)
+}
+
+fn tasks_query_in_range_impl(
+    caller: &mut Caller<'_, StoreData>,
+    start_ms: i64,
+    end_ms: i64,
+    limit: i32,
+) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let provider = match caller.data().tasks_provider.clone() {
+        Some(p) => p,
+        None => return 0,
+    };
+    let limit = if limit < 0 { 0 } else { limit as u32 };
+    let rows = provider.query_in_range(start_ms, end_ms, limit);
+    let json = serde_json::json!(
+        rows.iter()
+            .map(|r| serde_json::json!({
+                "id": r.id,
+                "title": r.title,
+                "due_ms": r.due_ms,
+                "due_all_day": r.due_all_day,
+                "list_id": r.list_id,
+            }))
+            .collect::<Vec<_>>()
+    )
+    .to_string();
+    write_response(caller, memory, &json)
+}
+
+fn calendar_query_in_range_impl(
+    caller: &mut Caller<'_, StoreData>,
+    start_ms: i64,
+    end_ms: i64,
+    limit: i32,
+) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let provider = match caller.data().calendar_provider.clone() {
+        Some(p) => p,
+        None => return 0,
+    };
+    let limit = if limit < 0 { 0 } else { limit as u32 };
+    let rows = provider.query_in_range(start_ms, end_ms, limit);
+    let json = serde_json::json!(
+        rows.iter()
+            .map(|r| serde_json::json!({
+                "id": r.id,
+                "title": r.title,
+                "start_ms": r.start_ms,
+                "end_ms": r.end_ms,
+                "all_day": r.all_day,
+                "calendar_id": r.calendar_id,
+            }))
+            .collect::<Vec<_>>()
+    )
+    .to_string();
+    write_response(caller, memory, &json)
 }
 
 fn calendar_list_calendars_impl(caller: &mut Caller<'_, StoreData>) -> i64 {

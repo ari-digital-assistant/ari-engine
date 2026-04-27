@@ -61,6 +61,24 @@ pub struct InsertTaskParams {
     pub tz_id: Option<String>,
 }
 
+/// One row from a `query_in_range` lookup. Strict subset of the
+/// info `insert` puts in: enough to render a "what's on my list"
+/// summary, not enough to round-trip back into another insert. If a
+/// future skill needs richer data (notes, recurrence info, …) it goes
+/// on a sibling row type, not this one — kept narrow so the host
+/// query stays cheap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRow {
+    /// Provider row id (same identifier `delete` accepts).
+    pub id: u64,
+    pub title: String,
+    /// UTC epoch ms for the task's due time.
+    pub due_ms: i64,
+    /// True when only the date portion of `due_ms` is meaningful.
+    pub due_all_day: bool,
+    pub list_id: u64,
+}
+
 /// Host-supplied access to the platform's task provider. On Android
 /// this wraps the OpenTasks `ContentResolver`; on Linux it'll wrap EDS.
 pub trait TasksProvider: Send + Sync {
@@ -80,6 +98,18 @@ pub trait TasksProvider: Send + Sync {
     /// Hard-delete a task by its row id. Returns true if the row
     /// existed and was removed.
     fn delete(&self, id: u64) -> bool;
+
+    /// Tasks with a due time in `[start_ms, end_ms)`, ordered by due
+    /// time ascending and capped at `limit` rows. Untimed tasks (no
+    /// due date) are deliberately excluded — they don't fit a date-
+    /// range query. Returns an empty Vec when the provider isn't
+    /// installed or the range is empty.
+    fn query_in_range(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        limit: u32,
+    ) -> Vec<TaskRow>;
 }
 
 /// No-op default used by the CLI engine and tests. Reports no provider
@@ -98,6 +128,9 @@ impl TasksProvider for NullTasksProvider {
     }
     fn delete(&self, _id: u64) -> bool {
         false
+    }
+    fn query_in_range(&self, _start_ms: i64, _end_ms: i64, _limit: u32) -> Vec<TaskRow> {
+        Vec::new()
     }
 }
 
@@ -131,6 +164,23 @@ pub struct InsertCalendarEventParams {
     pub tz_id: String,
 }
 
+/// One event instance from a `query_in_range` lookup. Recurring
+/// events expand into multiple rows — one per concrete instance whose
+/// start falls within the queried window — matching the way
+/// `CalendarContract.Instances` works on Android.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalendarEventRow {
+    pub id: u64,
+    pub title: String,
+    /// UTC epoch ms the instance starts at.
+    pub start_ms: i64,
+    /// UTC epoch ms the instance ends at. May equal `start_ms` for
+    /// providers that don't store a duration.
+    pub end_ms: i64,
+    pub all_day: bool,
+    pub calendar_id: u64,
+}
+
 /// Host-supplied access to the platform's calendar provider.
 pub trait CalendarProvider: Send + Sync {
     /// Has the host been granted WRITE access? Implementations that
@@ -150,6 +200,17 @@ pub trait CalendarProvider: Send + Sync {
     /// rows where applicable (CalendarContract does this
     /// automatically). Returns true if the row existed.
     fn delete(&self, id: u64) -> bool;
+
+    /// Event instances starting in `[start_ms, end_ms)`, ordered by
+    /// start time ascending and capped at `limit`. Recurring events
+    /// expand to one row per instance in range. Returns an empty Vec
+    /// when read permission is missing or the range is empty.
+    fn query_in_range(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        limit: u32,
+    ) -> Vec<CalendarEventRow>;
 }
 
 /// No-op default used by the CLI engine and tests.
@@ -167,6 +228,14 @@ impl CalendarProvider for NullCalendarProvider {
     }
     fn delete(&self, _id: u64) -> bool {
         false
+    }
+    fn query_in_range(
+        &self,
+        _start_ms: i64,
+        _end_ms: i64,
+        _limit: u32,
+    ) -> Vec<CalendarEventRow> {
+        Vec::new()
     }
 }
 

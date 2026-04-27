@@ -3,10 +3,10 @@
 use ari_engine::{Engine, EnvelopeSink, FALLBACK_RESPONSE};
 use ari_skill_loader::assistant::{ConfigStore, MemoryConfigStore};
 use ari_skill_loader::{
-    load_skill_directory_with, Calendar, CalendarProvider, Capability, HostCapabilities,
-    HttpConfig, InsertCalendarEventParams, InsertTaskParams, LoadOptions, LocalClock,
-    LocalTimeComponents, LogLevel, LogSink, NullCalendarProvider, NullLogSink, NullTasksProvider,
-    StorageConfig, TaskList, TasksProvider, UtcLocalClock,
+    load_skill_directory_with, Calendar, CalendarEventRow, CalendarProvider, Capability,
+    HostCapabilities, HttpConfig, InsertCalendarEventParams, InsertTaskParams, LoadOptions,
+    LocalClock, LocalTimeComponents, LogLevel, LogSink, NullCalendarProvider, NullLogSink,
+    NullTasksProvider, StorageConfig, TaskList, TaskRow, TasksProvider, UtcLocalClock,
 };
 use ari_skills::{
     CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill,
@@ -173,6 +173,29 @@ pub struct FfiInsertCalendarEventParams {
     pub tz_id: String,
 }
 
+/// Row returned by [`FfiTasksProvider::query_in_range`]. Mirrors
+/// [`ari_skill_loader::TaskRow`] across the UniFFI boundary.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiTaskRow {
+    pub id: u64,
+    pub title: String,
+    pub due_ms: i64,
+    pub due_all_day: bool,
+    pub list_id: u64,
+}
+
+/// Row returned by [`FfiCalendarProvider::query_in_range`]. Mirrors
+/// [`ari_skill_loader::CalendarEventRow`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCalendarEventRow {
+    pub id: u64,
+    pub title: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub all_day: bool,
+    pub calendar_id: u64,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiLocalTimeComponents {
     pub year: i32,
@@ -198,6 +221,15 @@ pub trait FfiTasksProvider: Send + Sync {
     /// convention matches what the host-side WASM ABI already uses.
     fn insert(&self, params: FfiInsertTaskParams) -> u64;
     fn delete(&self, id: u64) -> bool;
+    /// Tasks with due time in `[start_ms, end_ms)`, ordered by due
+    /// time ascending and capped at `limit`. Implementers must
+    /// exclude untimed tasks (no due date set).
+    fn query_in_range(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        limit: u32,
+    ) -> Vec<FfiTaskRow>;
 }
 
 /// Foreign-implemented calendar provider.
@@ -207,6 +239,15 @@ pub trait FfiCalendarProvider: Send + Sync {
     fn list_calendars(&self) -> Vec<FfiCalendar>;
     fn insert(&self, params: FfiInsertCalendarEventParams) -> u64;
     fn delete(&self, id: u64) -> bool;
+    /// Event instances starting in `[start_ms, end_ms)`, ordered by
+    /// start time ascending and capped at `limit`. Recurring events
+    /// expand to one row per instance whose start lands in range.
+    fn query_in_range(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        limit: u32,
+    ) -> Vec<FfiCalendarEventRow>;
 }
 
 /// Foreign-implemented wall-clock reader. Needed so skills can
@@ -256,6 +297,19 @@ impl TasksProvider for ForeignTasksProviderAdapter {
     fn delete(&self, id: u64) -> bool {
         self.0.delete(id)
     }
+    fn query_in_range(&self, start_ms: i64, end_ms: i64, limit: u32) -> Vec<TaskRow> {
+        self.0
+            .query_in_range(start_ms, end_ms, limit)
+            .into_iter()
+            .map(|r| TaskRow {
+                id: r.id,
+                title: r.title,
+                due_ms: r.due_ms,
+                due_all_day: r.due_all_day,
+                list_id: r.list_id,
+            })
+            .collect()
+    }
 }
 
 struct ForeignCalendarProviderAdapter(Arc<dyn FfiCalendarProvider>);
@@ -292,6 +346,20 @@ impl CalendarProvider for ForeignCalendarProviderAdapter {
     }
     fn delete(&self, id: u64) -> bool {
         self.0.delete(id)
+    }
+    fn query_in_range(&self, start_ms: i64, end_ms: i64, limit: u32) -> Vec<CalendarEventRow> {
+        self.0
+            .query_in_range(start_ms, end_ms, limit)
+            .into_iter()
+            .map(|r| CalendarEventRow {
+                id: r.id,
+                title: r.title,
+                start_ms: r.start_ms,
+                end_ms: r.end_ms,
+                all_day: r.all_day,
+                calendar_id: r.calendar_id,
+            })
+            .collect()
     }
 }
 
