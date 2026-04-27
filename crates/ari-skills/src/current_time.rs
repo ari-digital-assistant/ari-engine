@@ -77,7 +77,7 @@ impl Skill for CurrentTimeSkill {
         for phrase in TRIGGER_PHRASES {
             let matched = phrase
                 .iter()
-                .filter(|keyword| words.iter().any(|w| w.contains(**keyword)))
+                .filter(|keyword| words.iter().any(|w| w == *keyword))
                 .count();
 
             if matched == phrase.len() {
@@ -153,6 +153,21 @@ mod tests {
         let skill = CurrentTimeSkill::new();
         // "what" alone doesn't trigger — needs "what" AND "time"
         assert_eq!(skill.score("what is up", &ctx()), 0.0);
+    }
+
+    #[test]
+    fn score_zero_when_keyword_is_substring_of_other_word() {
+        // Regression: scorer used `w.contains(**keyword)` which
+        // false-positived on words containing the keyword as a
+        // substring — "runtimes" tripped "time", "lifetime" likewise.
+        // Word-equality is the right test.
+        let skill = CurrentTimeSkill::new();
+        assert_eq!(
+            skill.score("what does the internet say about async runtimes in rust", &ctx()),
+            0.0,
+        );
+        assert_eq!(skill.score("what is my lifetime achievement", &ctx()), 0.0);
+        assert_eq!(skill.score("what about overtime pay", &ctx()), 0.0);
     }
 
     #[test]

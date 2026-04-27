@@ -37,7 +37,7 @@ impl Skill for OpenSkill {
     }
 
     fn description(&self) -> &str {
-        "Opens or launches apps by name. Use when the user asks to open, launch, start, run, or fire up an application or app."
+        "Opens or launches apps by name. Use when the user asks to open, launch, start, run, fire up, or boot up an application — but ALSO when they want to use, get to, bring up, or jump into an app without naming a launch verb. Phrases like 'I want to use spotify', 'show me the camera', 'bring up the calculator', 'I need maps', 'jump into telegram', 'get me to the weather app', 'switch to chrome' all belong here. The app_name parameter is the app the user wants to interact with."
     }
 
     fn specificity(&self) -> Specificity {
@@ -80,6 +80,19 @@ impl Skill for OpenSkill {
             ExampleUtterance { text: "open reddit", args: r#"{"app_name": "Reddit"}"# },
             ExampleUtterance { text: "run discord", args: r#"{"app_name": "Discord"}"# },
             ExampleUtterance { text: "open the files app", args: r#"{"app_name": "Files"}"# },
+            // Paraphrases without explicit open/launch/start/run/fire-up triggers —
+            // teach the router that any "I want to use / get to / show me X" maps
+            // to opening that app.
+            ExampleUtterance { text: "I want to use spotify", args: r#"{"app_name": "Spotify"}"# },
+            ExampleUtterance { text: "show me the camera", args: r#"{"app_name": "Camera"}"# },
+            ExampleUtterance { text: "bring up the calculator", args: r#"{"app_name": "Calculator"}"# },
+            ExampleUtterance { text: "I need maps", args: r#"{"app_name": "Maps"}"# },
+            ExampleUtterance { text: "jump into telegram", args: r#"{"app_name": "Telegram"}"# },
+            ExampleUtterance { text: "get me to the weather app", args: r#"{"app_name": "Weather"}"# },
+            ExampleUtterance { text: "switch to chrome", args: r#"{"app_name": "Chrome"}"# },
+            ExampleUtterance { text: "I want to check whatsapp", args: r#"{"app_name": "WhatsApp"}"# },
+            ExampleUtterance { text: "boot up the music player", args: r#"{"app_name": "Music Player"}"# },
+            ExampleUtterance { text: "take me to settings", args: r#"{"app_name": "Settings"}"# },
         ]
     }
 

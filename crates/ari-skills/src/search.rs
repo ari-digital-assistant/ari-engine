@@ -67,7 +67,7 @@ impl Skill for SearchSkill {
     }
 
     fn description(&self) -> &str {
-        "Searches the web. Use when the user asks to search, look up, find information about something, or google something."
+        "Searches the web. Use when the user asks to search, look up, google, or find information about something, but ALSO when they want to know about a topic without naming a search verb — phrases like 'what does the internet say about X', 'what's online about Y', 'tell me about Z', 'what is X', 'I want to know about Y', 'I'm curious about Z', 'fill me in on X', 'what's the latest on Y'. Anything that's a request for information about a topic Ari doesn't already know — route here. The query parameter captures whatever the user wants to know about."
     }
 
     fn specificity(&self) -> Specificity {
@@ -110,6 +110,18 @@ impl Skill for SearchSkill {
             ExampleUtterance { text: "google who invented the telephone", args: r#"{"query": "who invented the telephone"}"# },
             ExampleUtterance { text: "search for free online courses", args: r#"{"query": "free online courses"}"# },
             ExampleUtterance { text: "look up currency exchange rates", args: r#"{"query": "currency exchange rates"}"# },
+            // Paraphrases without explicit search/look-up/google/find triggers —
+            // teach the router that information-seeking phrases also belong here.
+            ExampleUtterance { text: "what does the internet say about async runtimes in rust", args: r#"{"query": "async runtimes in rust"}"# },
+            ExampleUtterance { text: "tell me about the history of jazz", args: r#"{"query": "history of jazz"}"# },
+            ExampleUtterance { text: "I want to know about black holes", args: r#"{"query": "black holes"}"# },
+            ExampleUtterance { text: "what is quantum computing", args: r#"{"query": "quantum computing"}"# },
+            ExampleUtterance { text: "I'm curious about the mariana trench", args: r#"{"query": "the mariana trench"}"# },
+            ExampleUtterance { text: "what's online about climate change", args: r#"{"query": "climate change"}"# },
+            ExampleUtterance { text: "fill me in on the london marathon", args: r#"{"query": "london marathon"}"# },
+            ExampleUtterance { text: "what's the latest on the mars rover", args: r#"{"query": "the mars rover"}"# },
+            ExampleUtterance { text: "what does the web say about kubernetes", args: r#"{"query": "kubernetes"}"# },
+            ExampleUtterance { text: "tell me about the great barrier reef", args: r#"{"query": "the great barrier reef"}"# },
         ]
     }
 

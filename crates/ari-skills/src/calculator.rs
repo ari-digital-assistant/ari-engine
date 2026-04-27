@@ -111,6 +111,13 @@ impl Skill for CalculatorSkill {
             ExampleUtterance { text: "18 divided by 3", args: r#"{"expression": "18 / 3"}"# },
             ExampleUtterance { text: "what's 75 plus 25", args: r#"{"expression": "75 + 25"}"# },
             ExampleUtterance { text: "do the math on 6 times 9", args: r#"{"expression": "6 * 9"}"# },
+            // Paraphrases with implicit math intent — no calculate/compute/figure
+            // trigger, just bare arithmetic phrasing the keyword scorer might miss.
+            ExampleUtterance { text: "twenty three plus seventeen", args: r#"{"expression": "23 + 17"}"# },
+            ExampleUtterance { text: "what would 12 multiplied by 7 give me", args: r#"{"expression": "12 * 7"}"# },
+            ExampleUtterance { text: "I need the result of 200 minus 47", args: r#"{"expression": "200 - 47"}"# },
+            ExampleUtterance { text: "give me 15 percent off 80", args: r#"{"expression": "80 - (80 * 15%)"}"# },
+            ExampleUtterance { text: "what does 42 over 6 come to", args: r#"{"expression": "42 / 6"}"# },
         ]
     }
 

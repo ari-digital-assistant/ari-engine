@@ -84,7 +84,7 @@ impl Skill for DateSkill {
         for phrase in TRIGGER_PHRASES {
             let matched = phrase
                 .iter()
-                .filter(|keyword| words.iter().any(|w| w.contains(**keyword)))
+                .filter(|keyword| words.iter().any(|w| w == *keyword))
                 .count();
 
             if matched == phrase.len() {
@@ -150,6 +150,21 @@ mod tests {
         let skill = DateSkill::new();
         assert_eq!(skill.score("hello there", &ctx()), 0.0);
         assert_eq!(skill.score("open spotify", &ctx()), 0.0);
+    }
+
+    #[test]
+    fn score_zero_when_keyword_is_substring_of_other_word() {
+        // Regression: scorer used `w.contains(**keyword)` which
+        // false-positived on words containing the keyword as a
+        // substring — "today" tripped "today" inside "todays" etc.
+        let skill = DateSkill::new();
+        assert_eq!(
+            skill.score("what is sundays special at the deli", &ctx()),
+            0.0,
+        );
+        assert_eq!(skill.score("what is the holiday discount", &ctx()), 0.0);
+        // "what" and "today" both as standalone words still trigger.
+        assert!(skill.score("what is the date today", &ctx()) > 0.0);
     }
 
     #[test]
