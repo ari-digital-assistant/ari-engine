@@ -17,12 +17,29 @@ pub enum RouteResult {
 /// matcher fails. The router sees the user input and the list of
 /// available skills, and either picks one, suggests a system action,
 /// or declines.
+///
+/// Each skill entry is `(id, description, parameters_schema_json)`.
+/// The schema is the same OpenAI-style JSON the skill declares via
+/// [`Skill::parameters_schema`] — the router embeds it in the
+/// inference prompt so the model can produce typed args matching
+/// the schema. Callers should pass the schema verbatim; the router
+/// trusts it as already-valid JSON.
 pub trait SkillRouter: Send + Sync {
     fn route(
         &self,
         input: &str,
-        skills: &[(String, String)],
+        skills: &[(String, String, String)],
     ) -> RouteResult;
+
+    /// Return the raw inference output from the most recent `route()`
+    /// call, if the router cares to expose one. Used by the engine for
+    /// diagnostic logging — letting us see what the underlying model
+    /// emitted before parsing kicked in (function name, args JSON,
+    /// stop tokens, hallucinations, etc.). Default returns `None` so
+    /// non-introspectable impls and test mocks need no override.
+    fn last_raw_output(&self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

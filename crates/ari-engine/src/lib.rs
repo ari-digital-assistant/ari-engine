@@ -278,13 +278,32 @@ impl Engine {
 
         // No keyword match. Try the skill router (FunctionGemma) if available.
         if let Some(ref router) = self.router {
-            let skill_catalog: Vec<(String, String)> = self
+            let skill_catalog: Vec<(String, String, String)> = self
                 .skills
                 .iter()
-                .map(|s| (s.id().to_string(), s.description().to_string()))
+                .map(|s| (
+                    s.id().to_string(),
+                    s.description().to_string(),
+                    s.parameters_schema().to_string(),
+                ))
                 .collect();
 
-            match router.route(&normalized, &skill_catalog) {
+            let route_result = router.route(&normalized, &skill_catalog);
+
+            // Diagnostic: log the model's raw output so we can see what
+            // FunctionGemma actually emits — function name + args block +
+            // stop tokens. Useful for verifying whether the model is
+            // producing usable typed-args we can consume, or whether the
+            // training/inference prompt needs work before we plumb args
+            // through to skills.
+            if let Some(raw) = router.last_raw_output() {
+                self.log(
+                    LogLevel::Info,
+                    &format!("router: raw output ({} bytes): {raw:?}", raw.len()),
+                );
+            }
+
+            match route_result {
                 RouteResult::Skill(ref id) => {
                     if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
                         trace.winner = Some(format!("router:{id}"));

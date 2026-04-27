@@ -537,6 +537,12 @@ const ROUTER_MAX_TOKENS: usize = 60;
 pub struct FunctionGemmaRouter {
     model_path: PathBuf,
     inner: Mutex<LazyState>,
+    /// Raw output of the most recent `route()` call, exposed via
+    /// [`SkillRouter::last_raw_output`] so the engine can log what the
+    /// model actually emitted (function name + args block + stop
+    /// tokens). Useful when investigating whether the router is
+    /// producing typed-args we can consume downstream.
+    last_raw: Mutex<Option<String>>,
 }
 
 unsafe impl Send for FunctionGemmaRouter {}
@@ -550,6 +556,7 @@ impl FunctionGemmaRouter {
                 loaded: None,
                 last_used: None,
             }),
+            last_raw: Mutex::new(None),
         }
     }
 
@@ -565,7 +572,7 @@ impl SkillRouter for FunctionGemmaRouter {
     fn route(
         &self,
         input: &str,
-        skills: &[(String, String)],
+        skills: &[(String, String, String)],
     ) -> RouteResult {
         let mut state = match self.inner.lock() {
             Ok(s) => s,
@@ -598,6 +605,15 @@ impl SkillRouter for FunctionGemmaRouter {
             Err(_) => return RouteResult::NoMatch,
         };
 
+        // Stash the raw output so the engine can log it after the call
+        // returns. The whole point of the diagnostic is seeing what the
+        // model actually emits — function name, args block, stop tokens,
+        // anything weird — so we can decide whether typed args are
+        // already viable or whether the prompt / training needs work.
+        if let Ok(mut last) = self.last_raw.lock() {
+            *last = Some(output.clone());
+        }
+
         state.last_used = Some(Instant::now());
 
         // Schedule idle eviction (same pattern as LazyLlmFallback).
@@ -620,6 +636,10 @@ impl SkillRouter for FunctionGemmaRouter {
         });
 
         parse_router_output(&output, skills)
+    }
+
+    fn last_raw_output(&self) -> Option<String> {
+        self.last_raw.lock().ok().and_then(|g| g.clone())
     }
 }
 
@@ -697,12 +717,27 @@ impl LoadedModel {
 }
 
 /// Build the FunctionGemma prompt with tool declarations.
-fn build_router_prompt(input: &str, skills: &[(String, String)]) -> String {
+///
+/// Each tool declaration embeds the skill's actual parameter schema
+/// (from [`Skill::parameters_schema`]) instead of the previous
+/// `parameters:{type:OBJECT}` placeholder — without the real schema,
+/// the model has no slot names to fill in and dutifully emits empty
+/// args even for parameterised skills. With the schema present, it
+/// can produce typed args matching what the training data taught it.
+fn build_router_prompt(input: &str, skills: &[(String, String, String)]) -> String {
     let e = "<escape>";
     let mut declarations = String::new();
-    for (id, description) in skills {
+    for (id, description, schema_json) in skills {
+        // The schema is JSON like `{"type":"object","properties":{...}}`.
+        // FunctionGemma's tool format wants Python-dict-ish keys
+        // wrapped in <escape>...<escape> rather than JSON quotes —
+        // close enough that we can transform a clean schema by simple
+        // substitution. The training pipeline does the equivalent via
+        // HuggingFace's apply_chat_template, but we reach the same
+        // place by shape here.
+        let schema_inline = json_schema_to_funcgemma(schema_json, e);
         declarations.push_str(&format!(
-            "<start_function_declaration>declaration:{id}{{description:{e}{description}{e},parameters:{{type:{e}OBJECT{e}}}}}<end_function_declaration>"
+            "<start_function_declaration>declaration:{id}{{description:{e}{description}{e},parameters:{schema_inline}}}<end_function_declaration>"
         ));
     }
     format!(
@@ -715,10 +750,74 @@ fn build_router_prompt(input: &str, skills: &[(String, String)]) -> String {
     )
 }
 
+/// Translate a JSON-format parameter schema into FunctionGemma's
+/// declaration syntax. The format swaps JSON's `"key"` for bare
+/// identifiers and wraps string values in `<escape>...<escape>`.
+/// Falls back to `{type:<escape>OBJECT<escape>}` if the schema
+/// can't be parsed — matching the previous placeholder, so a
+/// malformed schema isn't worse than the old behaviour.
+fn json_schema_to_funcgemma(schema_json: &str, e: &str) -> String {
+    let value: serde_json::Value = match serde_json::from_str(schema_json) {
+        Ok(v) => v,
+        Err(_) => return format!("{{type:{e}OBJECT{e}}}"),
+    };
+    render_funcgemma_value(&value, e)
+}
+
+fn render_funcgemma_value(v: &serde_json::Value, e: &str) -> String {
+    match v {
+        serde_json::Value::Object(obj) => {
+            let mut out = String::from("{");
+            let mut first = true;
+            for (k, val) in obj {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                // Bare identifier when the key is a typical schema key
+                // (alphanumeric + underscore); fall back to escape-
+                // wrapped if it has anything unusual.
+                if k.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    out.push_str(k);
+                } else {
+                    out.push_str(&format!("{e}{k}{e}"));
+                }
+                out.push(':');
+                out.push_str(&render_funcgemma_value(val, e));
+            }
+            out.push('}');
+            out
+        }
+        serde_json::Value::Array(arr) => {
+            let mut out = String::from("[");
+            let mut first = true;
+            for item in arr {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push_str(&render_funcgemma_value(item, e));
+            }
+            out.push(']');
+            out
+        }
+        serde_json::Value::String(s) => {
+            // Schema values like "object", "string", "number" are upper-
+            // cased by FunctionGemma's convention — mirror what training
+            // emitted via HF's tool template.
+            let upper = s.to_uppercase();
+            format!("{e}{upper}{e}")
+        }
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => format!("{e}NULL{e}"),
+    }
+}
+
 /// Parse FunctionGemma's output into a RouteResult.
-fn parse_router_output(output: &str, skills: &[(String, String)]) -> RouteResult {
+fn parse_router_output(output: &str, skills: &[(String, String, String)]) -> RouteResult {
     let skill_names: std::collections::HashSet<&str> =
-        skills.iter().map(|(id, _)| id.as_str()).collect();
+        skills.iter().map(|(id, _, _)| id.as_str()).collect();
 
     // Look for the first <start_function_call>call:name{...}<end_function_call>
     let re = regex::Regex::new(r"<start_function_call>call:(\w+)\{").unwrap();
