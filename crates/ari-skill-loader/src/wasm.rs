@@ -1418,31 +1418,59 @@ impl Skill for WasmSkill {
 
     fn execute(&self, input: &str, _ctx: &SkillContext) -> Response {
         let fallback = || Response::Text("(skill error)".to_string());
+        let log_sink = self.log_sink.clone();
+        let skill_id = self.id.clone();
+        let warn = |msg: &str| {
+            log_sink.log(&skill_id, LogLevel::Warn, msg);
+        };
         self.with_instance(
             |store, instance| {
                 let Some((memory, ptr, len)) = WasmSkill::write_input(store, instance, input) else {
+                    warn("execute: write_input failed");
                     return fallback();
                 };
                 let exec_fn = match instance.get_typed_func::<(i32, i32), i64>(&mut *store, "execute")
                 {
                     Ok(f) => f,
-                    Err(_) => return fallback(),
+                    Err(_) => {
+                        warn("execute: get_typed_func(execute) failed");
+                        return fallback();
+                    }
                 };
                 let packed = match exec_fn.call(&mut *store, (ptr, len)) {
                     Ok(v) => v,
-                    Err(_) => return fallback(),
+                    Err(e) => {
+                        warn(&format!("execute: WASM trap/panic: {e}"));
+                        return fallback();
+                    }
                 };
                 let (tag, resp_ptr, resp_len) = decode_execute_return(packed);
                 let Some(payload) = read_utf8(&memory, &*store, resp_ptr, resp_len) else {
+                    warn(&format!(
+                        "execute: read_utf8 failed (tag={tag:#x} ptr={resp_ptr} len={resp_len})"
+                    ));
                     return fallback();
                 };
                 match tag {
                     RESPONSE_TAG_TEXT => Response::Text(payload),
                     RESPONSE_TAG_ACTION => match serde_json::from_str(&payload) {
                         Ok(value) => Response::Action(value),
-                        Err(_) => fallback(),
+                        Err(e) => {
+                            // Log the exact parse error and a payload preview
+                            // (capped) so we can spot bad escapes / size cliffs
+                            // without burying logcat in 3 KB JSON dumps.
+                            let preview: String = payload.chars().take(200).collect();
+                            warn(&format!(
+                                "execute: action JSON parse failed: {e}; payload_len={} preview={preview:?}",
+                                payload.len()
+                            ));
+                            fallback()
+                        }
                     },
-                    _ => fallback(),
+                    _ => {
+                        warn(&format!("execute: unknown response tag {tag:#x}"));
+                        fallback()
+                    }
                 }
             },
             fallback(),

@@ -450,6 +450,34 @@ fn parse_consult_directive(v: &serde_json::Value) -> Option<ConsultDirective> {
     })
 }
 
+/// How long Layer C will wait for an assistant reply before pushing
+/// a "still working on it" delay phrase to the user. Most cloud
+/// round-trips finish well inside this; saying anything before then
+/// just gets in the way of the actual answer.
+const DELAY_PHRASE_AFTER: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Conversational filler the engine speaks when the assistant takes
+/// longer than [`DELAY_PHRASE_AFTER`]. One is picked per slow
+/// round-trip — no need for cryptographic randomness, just enough
+/// rotation that consecutive slow calls don't repeat the same line.
+const DELAY_PHRASES: &[&str] = &[
+    "Hang on...",
+    "One moment...",
+    "Just a sec...",
+    "Working...",
+    "Checking...",
+    "Be right with you...",
+];
+
+fn pick_delay_phrase() -> &'static str {
+    let idx = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0)
+        % DELAY_PHRASES.len();
+    DELAY_PHRASES[idx]
+}
+
 fn run_consult_phase_two(
     skill: Arc<dyn Skill>,
     skill_id: String,
@@ -465,11 +493,51 @@ fn run_consult_phase_two(
         }
     };
 
+    // Run the assistant call on its own thread so we can recv-with-
+    // timeout and push a "still working" phrase if the round-trip
+    // takes more than DELAY_PHRASE_AFTER. Most calls finish well
+    // before that threshold and the user sees a single bubble
+    // (the answer); slow calls produce two — the delay phrase, then
+    // the answer.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let prompt_for_thread = directive.prompt.clone();
+    let assistant_for_thread = assistant.clone();
+    std::thread::spawn(move || {
+        let result = call_assistant_for_consult(&assistant_for_thread, &prompt_for_thread);
+        let _ = tx.send(result);
+    });
+
+    let assistant_outcome = match rx.recv_timeout(DELAY_PHRASE_AFTER) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // Slow round-trip: tell the user we're still on it, then
+            // keep waiting (no further timeout — call_assistant_api
+            // has its own 30s ceiling, which is the real upper bound).
+            let phrase = pick_delay_phrase();
+            log(
+                LogLevel::Info,
+                &format!("layer-c: assistant slow (>{}s) — pushing delay phrase {phrase:?}",
+                    DELAY_PHRASE_AFTER.as_secs()),
+            );
+            let delay_envelope = serde_json::json!({ "v": 1, "speak": phrase });
+            if let Ok(delay_json) = serde_json::to_string(&delay_envelope) {
+                sink.push(&delay_json, Some(&skill_id));
+            }
+            match rx.recv() {
+                Ok(result) => result,
+                Err(_) => Err("assistant worker thread vanished before delivering a result".into()),
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("assistant worker thread vanished before delivering a result".into())
+        }
+    };
+
     // Fetch the assistant's response (or an empty string on failure —
     // the skill's continuation handler owns the fallback logic, since
     // it's the only layer with enough context to produce a sensible
     // recovery envelope).
-    let response_for_skill = match call_assistant_for_consult(&assistant, &directive.prompt) {
+    let response_for_skill = match assistant_outcome {
         Ok(text) => {
             log(
                 LogLevel::Info,
