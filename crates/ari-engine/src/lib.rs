@@ -64,8 +64,11 @@ pub struct DebugTrace {
 /// Which assistant is currently active and how to call it.
 #[derive(Clone)]
 pub enum ActiveAssistant {
-    /// Use the built-in on-device LLM (routes to `self.llm`).
-    Builtin,
+    /// Use the built-in on-device LLM (routes to `self.llm`). Carries
+    /// the size tier of the loaded model so Layer C can gate
+    /// consultation: small is too dim for structured JSON, medium and
+    /// large are eligible.
+    Builtin { tier: ari_llm::BuiltinTier },
     /// Use a cloud API via the generic adapter.
     Api {
         skill_id: String,
@@ -84,7 +87,7 @@ pub struct Engine {
     ctx: SkillContext,
     debug: bool,
     #[cfg(feature = "llm")]
-    llm: Option<Box<dyn ari_llm::Fallback>>,
+    llm: Option<Arc<dyn ari_llm::Fallback>>,
     active_assistant: Option<ActiveAssistant>,
     router: Option<Box<dyn SkillRouter>>,
     /// Optional sink so engine-internal paths (currently Layer C) can
@@ -150,9 +153,11 @@ impl Engine {
 
     /// Set the LLM fallback. When set, the engine will consult the LLM
     /// before returning the fallback response, attempting skill rerouting
-    /// or direct answers for unmatched input.
+    /// or direct answers for unmatched input. Stored as `Arc` so the
+    /// Layer C worker thread can clone a handle for on-device assistant
+    /// consultation.
     #[cfg(feature = "llm")]
-    pub fn set_llm(&mut self, llm: Box<dyn ari_llm::Fallback>) {
+    pub fn set_llm(&mut self, llm: Arc<dyn ari_llm::Fallback>) {
         self.llm = Some(llm);
     }
 
@@ -298,7 +303,7 @@ impl Engine {
 
         // No skill matched. Delegate to the active assistant, if any.
         match &self.active_assistant {
-            Some(ActiveAssistant::Builtin) => {
+            Some(ActiveAssistant::Builtin { .. }) => {
                 #[cfg(feature = "llm")]
                 if let Some(ref llm) = self.llm {
                     let catalog: Vec<ari_llm::SkillInfo> = self
@@ -390,6 +395,8 @@ impl Engine {
         };
 
         let assistant = self.active_assistant.clone();
+        #[cfg(feature = "llm")]
+        let llm = self.llm.clone();
         let log_sink = self.log_sink.clone();
         let ctx = self.ctx.clone();
         let skill_id = skill.id().to_string();
@@ -409,6 +416,8 @@ impl Engine {
                 skill_id,
                 directive,
                 assistant,
+                #[cfg(feature = "llm")]
+                llm,
                 ctx,
                 sink,
                 log_sink,
@@ -456,6 +465,21 @@ fn parse_consult_directive(v: &serde_json::Value) -> Option<ConsultDirective> {
 /// just gets in the way of the actual answer.
 const DELAY_PHRASE_AFTER: std::time::Duration = std::time::Duration::from_secs(4);
 
+/// Hard upper bound on a cloud Layer C round-trip. The cloud path's
+/// reqwest client carries its own 30s ceiling already; this is the
+/// outer guard. On timeout we abandon the worker and fall through to
+/// the skill's warn-and-commit continuation.
+const MAX_API_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hard upper bound on an on-device Layer C round-trip. Generous
+/// because thermally-throttled phones and software-emulated AVDs run
+/// inference much slower than a flagship — E2B at 12-20 tok/s on a
+/// real phone is ~10s for a typical reminder prompt, but on an x86_64
+/// emulator without GPU passthrough it can be 30-60s. Hard enough that
+/// truly stuck inference still bails, loose enough that the realistic
+/// slow path can complete.
+const MAX_ONDEVICE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Conversational filler the engine speaks when the assistant takes
 /// longer than [`DELAY_PHRASE_AFTER`]. One is picked per slow
 /// round-trip — no need for cryptographic randomness, just enough
@@ -483,6 +507,7 @@ fn run_consult_phase_two(
     skill_id: String,
     directive: ConsultDirective,
     assistant: Option<ActiveAssistant>,
+    #[cfg(feature = "llm")] llm: Option<Arc<dyn ari_llm::Fallback>>,
     ctx: SkillContext,
     sink: Arc<dyn EnvelopeSink>,
     log_sink: Option<Arc<dyn LogSink>>,
@@ -491,6 +516,14 @@ fn run_consult_phase_two(
         if let Some(ref s) = log_sink {
             s.log(ENGINE_LOG_TAG, level, msg);
         }
+    };
+
+    // Pick the wall-clock ceiling per assistant variant. On-device
+    // gets a more generous budget because emulators and thermally-
+    // throttled phones can run E2B/E4B much slower than a flagship.
+    let max_wait = match assistant {
+        Some(ActiveAssistant::Builtin { .. }) => MAX_ONDEVICE_WAIT,
+        _ => MAX_API_WAIT,
     };
 
     // Run the assistant call on its own thread so we can recv-with-
@@ -502,7 +535,16 @@ fn run_consult_phase_two(
     let (tx, rx) = std::sync::mpsc::channel();
     let prompt_for_thread = directive.prompt.clone();
     let assistant_for_thread = assistant.clone();
+    #[cfg(feature = "llm")]
+    let llm_for_thread = llm.clone();
     std::thread::spawn(move || {
+        #[cfg(feature = "llm")]
+        let result = call_assistant_for_consult(
+            &assistant_for_thread,
+            &llm_for_thread,
+            &prompt_for_thread,
+        );
+        #[cfg(not(feature = "llm"))]
         let result = call_assistant_for_consult(&assistant_for_thread, &prompt_for_thread);
         let _ = tx.send(result);
     });
@@ -511,8 +553,7 @@ fn run_consult_phase_two(
         Ok(result) => result,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             // Slow round-trip: tell the user we're still on it, then
-            // keep waiting (no further timeout — call_assistant_api
-            // has its own 30s ceiling, which is the real upper bound).
+            // wait up to max_wait total before giving up.
             let phrase = pick_delay_phrase();
             log(
                 LogLevel::Info,
@@ -523,8 +564,13 @@ fn run_consult_phase_two(
             if let Ok(delay_json) = serde_json::to_string(&delay_envelope) {
                 sink.push(&delay_json, Some(&skill_id));
             }
-            match rx.recv() {
+            let remaining = max_wait.saturating_sub(DELAY_PHRASE_AFTER);
+            match rx.recv_timeout(remaining) {
                 Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                    "assistant exceeded {}s wall-clock — abandoning",
+                    max_wait.as_secs()
+                )),
                 Err(_) => Err("assistant worker thread vanished before delivering a result".into()),
             }
         }
@@ -586,6 +632,68 @@ fn run_consult_phase_two(
     sink.push(&json, Some(&skill_id));
 }
 
+#[cfg(feature = "llm")]
+fn call_assistant_for_consult(
+    assistant: &Option<ActiveAssistant>,
+    llm: &Option<Arc<dyn ari_llm::Fallback>>,
+    prompt: &str,
+) -> Result<String, String> {
+    match assistant {
+        Some(ActiveAssistant::Api {
+            skill_id,
+            config,
+            config_store,
+        }) => {
+            let text = ari_skill_loader::call_assistant_api(
+                config,
+                skill_id,
+                config_store.as_ref(),
+                prompt,
+            )
+            .map_err(|e| e.to_string())?;
+            if text.trim().is_empty() {
+                Err("assistant returned empty response".into())
+            } else {
+                Ok(text)
+            }
+        }
+        Some(ActiveAssistant::Builtin {
+            tier: ari_llm::BuiltinTier::Small,
+        }) => Err(
+            "Layer C round-trip is gated to medium/large on-device tiers; \
+             small is too small for reliable structured JSON"
+                .into(),
+        ),
+        Some(ActiveAssistant::Builtin { tier: _ }) => {
+            let llm = llm
+                .as_ref()
+                .ok_or_else(|| "on-device LLM not loaded".to_string())?;
+            let raw = llm.run_prompt(prompt).map_err(|e| e.to_string())?;
+            let stripped = ari_llm::strip_thinking(&raw);
+            // Diagnostic: emit raw and stripped lengths + a preview so we
+            // can tell from logcat whether Gemma produced content that
+            // strip_thinking devoured (orphan <think> with no close,
+            // typical for runs that hit MAX_GENERATION_TOKENS mid-think)
+            // versus the model genuinely producing nothing.
+            // Diagnostic preview lets us see from logcat whether
+            // strip_thinking ate the answer (orphan <think> with no
+            // close → everything stripped) vs Gemma producing nothing.
+            // Returned via the Err string on the empty path.
+            if stripped.trim().is_empty() {
+                let raw_preview: String = raw.chars().take(200).collect();
+                Err(format!(
+                    "on-device LLM returned empty after strip_thinking (raw_len={}, raw_preview={raw_preview:?})",
+                    raw.len()
+                ))
+            } else {
+                Ok(stripped)
+            }
+        }
+        None => Err("no active assistant configured".into()),
+    }
+}
+
+#[cfg(not(feature = "llm"))]
 fn call_assistant_for_consult(
     assistant: &Option<ActiveAssistant>,
     prompt: &str,
@@ -609,10 +717,8 @@ fn call_assistant_for_consult(
                 Ok(text)
             }
         }
-        Some(ActiveAssistant::Builtin) => Err(
-            "Layer C round-trip requires a cloud (Api) assistant; Builtin on-device LLM is not \
-             reliable for structured JSON responses"
-                .into(),
+        Some(ActiveAssistant::Builtin { .. }) => Err(
+            "on-device LLM not compiled in (llm feature disabled)".into(),
         ),
         None => Err("no active assistant configured".into()),
     }
@@ -1083,6 +1189,59 @@ mod tests {
         assert_eq!(skill_id.as_deref(), Some("test.consulting"));
         let v: serde_json::Value = serde_json::from_str(json).unwrap();
         assert_eq!(v["speak"], "fallback written");
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn consult_with_builtin_small_tier_falls_through_to_warn_and_commit() {
+        // ActiveAssistant::Builtin { tier: Small } is rejected by
+        // call_assistant_for_consult — the engine falls through to the
+        // empty-string continuation path, same as no-assistant. Verifies
+        // the size gate is wired correctly and Small never reaches
+        // run_prompt (which would also fail because no LLM is loaded,
+        // but the gate fires first with a clearer error).
+        let recorded: Arc<Mutex<Vec<_>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink: Arc<dyn EnvelopeSink> = Arc::new(RecordingSink(recorded.clone()));
+
+        let mut engine = Engine::new();
+        engine.set_envelope_sink(Some(sink));
+        engine.set_active_assistant(Some(ActiveAssistant::Builtin {
+            tier: ari_llm::BuiltinTier::Small,
+        }));
+        engine.register_skill(Box::new(ConsultingSkill {
+            id: "test.tier_gated",
+            first_envelope: serde_json::json!({
+                "v": 1,
+                "speak": "let me check",
+                "consult_assistant": {
+                    "prompt": "interpret",
+                    "continuation_context": "ctx"
+                }
+            }),
+            continuation_envelope: serde_json::json!({
+                "v": 1,
+                "speak": "warn-and-commit fallback"
+            }),
+        }));
+
+        let _ = engine.process_input_traced("go");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if !recorded.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let pushed = recorded.lock().unwrap().clone();
+        assert_eq!(
+            pushed.len(),
+            1,
+            "Small-tier Builtin should be rejected and skill continuation should still fire"
+        );
+        let v: serde_json::Value = serde_json::from_str(&pushed[0].0).unwrap();
+        assert_eq!(v["speak"], "warn-and-commit fallback");
     }
 
     #[test]

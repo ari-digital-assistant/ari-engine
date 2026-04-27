@@ -108,7 +108,7 @@ fn main() -> ExitCode {
         }
         match ari_llm::LlmFallback::load(model_path) {
             Ok(llm) => {
-                engine.set_llm(Box::new(llm));
+                engine.set_llm(std::sync::Arc::new(llm));
                 if parsed.debug {
                     eprintln!("[ari] LLM model loaded");
                 }

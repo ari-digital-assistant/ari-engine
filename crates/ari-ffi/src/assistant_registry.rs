@@ -21,8 +21,9 @@ use std::sync::{Arc, Mutex};
 const BUILTIN_ASSISTANT_SKILL_MD: &str = r#"---
 name: local-llm
 description: >
-  On-device language model. Answers general questions privately
-  with no internet connection. Requires downloading a model.
+  Ari will use local AI models to understand your commands. Requires no
+  internet connection, but may have limited capabilities compared to cloud
+  assistants, depending on model chosen.
 metadata:
   ari:
     id: dev.heyari.assistant.local
@@ -54,9 +55,9 @@ metadata:
       provider: builtin
       privacy: local
 ---
-Runs a language model entirely on your device. No data leaves your phone.
-Choose a model size based on your available storage and how much RAM
-your device has. Smaller models are faster but less capable.
+Ari will use local AI models to understand your commands. Requires no
+internet connection, but may have limited capabilities compared to cloud
+assistants, depending on model chosen.
 "#;
 
 fn parse_builtin_assistant() -> (String, String, String, AssistantManifest, String) {
@@ -205,13 +206,25 @@ impl AssistantRegistry {
 
     /// Apply the current active assistant selection to the engine.
     /// Must be called after `set_active_assistant` and whenever the
-    /// engine is rebuilt (e.g. after `reload_community_skills`).
+    /// engine is rebuilt (e.g. after `reload_community_skills`). For
+    /// the built-in assistant, reads `model_tier` from the settings
+    /// store and threads it into [`ActiveAssistant::Builtin`] so Layer
+    /// C can gate consultation by tier. If `model_tier` is missing or
+    /// unparseable (fresh install before the user has picked a model),
+    /// the active assistant is set to `None` rather than silent-defaulting,
+    /// to avoid masking misconfiguration.
     pub fn apply_to_engine(&self, engine: &crate::AriEngine) {
         let active_id = self.active_id.lock().expect("active_id lock poisoned").clone();
 
         let assistant = match active_id {
             None => None,
-            Some(ref id) if id == &self.builtin.0 => Some(ActiveAssistant::Builtin),
+            Some(ref id) if id == &self.builtin.0 => {
+                let raw_tier = self.settings_store.inner.get_value(id, "model_tier");
+                match raw_tier.as_deref().and_then(ari_llm::BuiltinTier::parse) {
+                    Some(tier) => Some(ActiveAssistant::Builtin { tier }),
+                    None => None,
+                }
+            }
             Some(ref id) => {
                 let community = self.community.lock().expect("community lock poisoned");
                 community

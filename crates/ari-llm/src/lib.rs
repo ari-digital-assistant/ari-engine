@@ -37,6 +37,38 @@ pub enum FallbackResult {
 /// Trait so the engine can use a mock in tests.
 pub trait Fallback: Send + Sync {
     fn try_answer(&self, input: &str, skills: &[SkillInfo]) -> Option<FallbackResult>;
+
+    /// Run an arbitrary prompt and return the raw stripped output. Used
+    /// by Layer C to run on-device assistant consultation when the user
+    /// has chosen the built-in LLM at medium or large tier. Default impl
+    /// returns an error so test mocks and impls without a real model
+    /// don't have to override.
+    fn run_prompt(&self, _prompt: &str) -> Result<String, LlmError> {
+        Err(LlmError::Backend(
+            "run_prompt not supported by this Fallback".into(),
+        ))
+    }
+}
+
+/// Size classification of the loaded built-in model. Layer C uses this to
+/// gate consultation: small is too dim for structured JSON, medium and
+/// large are eligible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinTier {
+    Small,
+    Medium,
+    Large,
+}
+
+impl BuiltinTier {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "small" => Some(Self::Small),
+            "medium" => Some(Self::Medium),
+            "large" => Some(Self::Large),
+            _ => None,
+        }
+    }
 }
 
 // ── Errors ──────────────────────────────────────────────────────────────
@@ -70,7 +102,9 @@ struct LoadedModel {
 }
 
 /// Maximum number of tokens we allow the model to generate per call.
-const MAX_GENERATION_TOKENS: usize = 512;
+/// Generous enough to fit Gemma 4's optional thinking mode preamble
+/// plus the structured JSON output Layer C asks for.
+const MAX_GENERATION_TOKENS: usize = 1024;
 
 /// How long the model stays loaded after the last query.
 const IDLE_TIMEOUT_SECS: u64 = 60;
@@ -87,14 +121,22 @@ impl LoadedModel {
 
     fn build_chat_prompt(&self, system: &str, user: &str) -> Option<String> {
         let tmpl = self.model.chat_template(None).ok()?;
-        let messages = vec![
-            LlamaChatMessage::new("system".to_string(), system.to_string()).ok()?,
-            LlamaChatMessage::new("user".to_string(), user.to_string()).ok()?,
-        ];
+        // Some Gemma chat templates raise on the system role outright
+        // ("System role not supported") — drop the system message when
+        // it's empty so apply_chat_template doesn't fall through to the
+        // None branch and leave us sending an unwrapped prompt.
+        let messages = if system.is_empty() {
+            vec![LlamaChatMessage::new("user".to_string(), user.to_string()).ok()?]
+        } else {
+            vec![
+                LlamaChatMessage::new("system".to_string(), system.to_string()).ok()?,
+                LlamaChatMessage::new("user".to_string(), user.to_string()).ok()?,
+            ]
+        };
         self.model.apply_chat_template(&tmpl, &messages, true).ok()
     }
 
-    fn run_inference(&self, prompt: &str) -> Result<String, LlmError> {
+    fn run_inference(&self, prompt: &str, stop_on_newline: bool) -> Result<String, LlmError> {
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(2048));
 
@@ -142,9 +184,11 @@ impl LoadedModel {
             let piece = String::from_utf8_lossy(&bytes);
             output.push_str(&piece);
 
-            let cleaned = strip_thinking(&output);
-            if !cleaned.is_empty() && cleaned.contains('\n') {
-                break;
+            if stop_on_newline {
+                let cleaned = strip_thinking(&output);
+                if !cleaned.is_empty() && cleaned.contains('\n') {
+                    break;
+                }
             }
 
             batch.clear();
@@ -157,7 +201,9 @@ impl LoadedModel {
                 .map_err(|e| LlmError::Context(format!("decode gen: {e}")))?;
         }
 
-        Ok(strip_thinking(&output))
+        // Return raw output — callers strip thinking blocks themselves
+        // so Layer C can log both raw and stripped for diagnostics.
+        Ok(output)
     }
 }
 
@@ -210,9 +256,96 @@ impl LazyLlmFallback {
             .map(|s| s.loaded.is_some())
             .unwrap_or(false)
     }
+
 }
 
 impl Fallback for LazyLlmFallback {
+    /// Run an arbitrary prompt through the loaded model and return the
+    /// raw stripped output. The prompt is wrapped in the model's chat
+    /// template as a single user turn (no system prompt) so
+    /// instruction-tuned models get the turn markers they expect.
+    /// Mirrors the lazy lifecycle of [`Self::try_answer`]: evicts on
+    /// idle, loads on demand, schedules a 60-second eviction timer after
+    /// each call. Serialised through the same mutex — concurrent callers
+    /// queue.
+    fn run_prompt(&self, prompt: &str) -> Result<String, LlmError> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| LlmError::Backend("inner mutex poisoned".into()))?;
+
+        if let Some(last) = state.last_used {
+            if last.elapsed().as_secs() >= IDLE_TIMEOUT_SECS {
+                state.loaded = None;
+            }
+        }
+
+        if state.loaded.is_none() {
+            let loaded = LoadedModel::load(&self.model_path)?;
+            state.loaded = Some(loaded);
+        }
+
+        let now = Instant::now();
+        state.last_used = Some(now);
+
+        let model = state.loaded.as_ref().unwrap();
+        let wrapping;
+        let wrapped = match model.build_chat_prompt("", prompt) {
+            Some(p) => {
+                wrapping = "native";
+                p
+            }
+            None => {
+                // llama-cpp-2 couldn't apply the GGUF's embedded chat
+                // template (Gemma 4's Jinja can be too rich for minja).
+                // All three tiers we ship are Gemma, so fall back to the
+                // well-known Gemma turn-marker format manually. <bos> is
+                // already prepended by AddBos::Always in str_to_token.
+                wrapping = "manual_gemma";
+                format!(
+                    "<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
+                )
+            }
+        };
+
+        let output = model.run_inference(&wrapped, false)?;
+
+        // Surface a diagnostic when the model produces zero tokens.
+        // Fold in whether the chat template applied and a head sample of
+        // the wrapped prompt so logcat can tell us which path is broken.
+        if output.is_empty() {
+            let head: String = wrapped.chars().take(120).collect();
+            return Err(LlmError::Backend(format!(
+                "model emitted zero tokens; wrapping={wrapping}, wrapped_len={}, wrapped_head={head:?}",
+                wrapped.len()
+            )));
+        }
+
+        let last_used_at = Instant::now();
+        state.last_used = Some(last_used_at);
+
+        let idle_timeout = std::time::Duration::from_secs(IDLE_TIMEOUT_SECS);
+        drop(state);
+
+        let inner = &self.inner as *const Mutex<LazyState> as usize;
+        std::thread::spawn(move || {
+            std::thread::sleep(idle_timeout);
+            // SAFETY: same as try_answer's eviction thread — the
+            // LazyLlmFallback outlives any spawned timer.
+            let mutex = unsafe { &*(inner as *const Mutex<LazyState>) };
+            if let Ok(mut state) = mutex.lock() {
+                if let Some(last) = state.last_used {
+                    if last == last_used_at {
+                        state.loaded = None;
+                        state.last_used = None;
+                    }
+                }
+            }
+        });
+
+        Ok(output)
+    }
+
     fn try_answer(&self, input: &str, skills: &[SkillInfo]) -> Option<FallbackResult> {
         let mut state = self.inner.lock().ok()?;
 
@@ -244,8 +377,8 @@ impl Fallback for LazyLlmFallback {
             None => format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "),
         };
 
-        let output = match model.run_inference(&prompt) {
-            Ok(text) => text,
+        let output = match model.run_inference(&prompt, true) {
+            Ok(text) => strip_thinking(&text),
             Err(_) => return None,
         };
 
@@ -305,12 +438,26 @@ impl LlmFallback {
         self.loaded.build_chat_prompt(system, user)
     }
 
-    fn run_inference(&self, prompt: &str) -> Result<String, LlmError> {
-        self.loaded.run_inference(prompt)
+    fn run_inference(&self, prompt: &str, stop_on_newline: bool) -> Result<String, LlmError> {
+        self.loaded.run_inference(prompt, stop_on_newline)
     }
 }
 
 impl Fallback for LlmFallback {
+    fn run_prompt(&self, prompt: &str) -> Result<String, LlmError> {
+        let _guard = self
+            .inference_lock
+            .lock()
+            .map_err(|_| LlmError::Backend("inference mutex poisoned".into()))?;
+
+        let wrapped = match self.build_chat_prompt("", prompt) {
+            Some(p) => p,
+            None => prompt.to_string(),
+        };
+
+        self.run_inference(&wrapped, false)
+    }
+
     fn try_answer(&self, input: &str, skills: &[SkillInfo]) -> Option<FallbackResult> {
         let _guard = self.inference_lock.lock().ok()?;
 
@@ -322,8 +469,8 @@ impl Fallback for LlmFallback {
             None => format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "),
         };
 
-        let output = match self.run_inference(&prompt) {
-            Ok(text) => text,
+        let output = match self.run_inference(&prompt, true) {
+            Ok(text) => strip_thinking(&text),
             Err(_) => return None,
         };
 
@@ -333,7 +480,11 @@ impl Fallback for LlmFallback {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn strip_thinking(raw: &str) -> String {
+/// Remove `<think>…</think>` blocks from a model's raw output. Gemma 4
+/// can emit a reasoning preamble before its real answer; the QA path
+/// always strips, but Layer C calls this explicitly so it can also log
+/// the raw output for diagnostics.
+pub fn strip_thinking(raw: &str) -> String {
     let mut result = raw.to_string();
     while let Some(start) = result.find("<think>") {
         if let Some(end) = result.find("</think>") {
@@ -700,7 +851,7 @@ mod tests {
         };
 
         eprintln!("--- Running inference ---");
-        let output = fallback.run_inference(&prompt).expect("inference failed");
+        let output = fallback.run_inference(&prompt, true).expect("inference failed");
         eprintln!("--- Raw output ---");
         eprintln!("[{output}]");
 

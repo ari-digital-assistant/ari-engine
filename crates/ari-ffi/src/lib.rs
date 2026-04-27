@@ -567,7 +567,7 @@ impl AriEngine {
         }
         let lazy = ari_llm::LazyLlmFallback::new(path);
         let mut engine = self.inner.lock().expect("engine mutex poisoned");
-        engine.set_llm(Box::new(lazy));
+        engine.set_llm(std::sync::Arc::new(lazy));
         true
     }
 

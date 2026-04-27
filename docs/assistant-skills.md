@@ -421,17 +421,17 @@ pub struct Engine {
     ctx: SkillContext,
     debug: bool,
     #[cfg(feature = "llm")]
-    llm: Option<Box<dyn ari_llm::Fallback>>,
+    llm: Option<Arc<dyn ari_llm::Fallback>>,
     active_assistant: Option<ActiveAssistant>,
 }
 
 enum ActiveAssistant {
-    Builtin,    // route to self.llm
+    Builtin { tier: BuiltinTier },    // route to self.llm; tier gates Layer C
     Api(ApiConfig, ConfigStore),
 }
 ```
 
-When `active_assistant` is `Some(Builtin)`, the existing `self.llm.try_answer()` path fires — zero behaviour change from today. When it's `Some(Api(..))`, the engine builds the HTTP request from the `ApiConfig`, resolves config values (model, endpoint, API key) from the `ConfigStore`, makes the call, and extracts the response via `response_path`.
+When `active_assistant` is `Some(Builtin { .. })`, the existing `self.llm.try_answer()` path fires for the QA fallback. The `tier` field (Small/Medium/Large) further gates Layer C consultation: Small is rejected (too small for structured JSON), Medium and Large invoke `Fallback::run_prompt` for on-device round-trips. When it's `Some(Api(..))`, the engine builds the HTTP request from the `ApiConfig`, resolves config values (model, endpoint, API key) from the `ConfigStore`, makes the call, and extracts the response via `response_path`.
 
 When `active_assistant` is `None`, the engine returns `FALLBACK_RESPONSE` immediately. No LLM, no API call.
 
