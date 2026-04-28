@@ -312,6 +312,21 @@ impl Engine {
                         return (response, Some(trace));
                     }
                 }
+                RouteResult::SkillWithArgs { ref id, ref args_json } => {
+                    if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
+                        trace.winner = Some(format!("router:{id}+args"));
+                        self.log(
+                            LogLevel::Info,
+                            &format!(
+                                "router: dispatching skill={id} with typed args ({} bytes)",
+                                args_json.len()
+                            ),
+                        );
+                        let response = skill.execute_with_args(&normalized, args_json, &self.ctx);
+                        let response = self.maybe_intercept_consult(skill, response);
+                        return (response, Some(trace));
+                    }
+                }
                 RouteResult::Action(action) => {
                     trace.winner = Some("router:action".to_string());
                     return (Response::Action(action), Some(trace));

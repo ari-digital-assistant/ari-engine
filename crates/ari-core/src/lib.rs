@@ -4,8 +4,17 @@ use serde::{Deserialize, Serialize};
 
 /// What the skill router decided.
 pub enum RouteResult {
-    /// Route to a registered skill by id.
+    /// Route to a registered skill by id, no args extracted.
     Skill(String),
+    /// Route to a registered skill by id with typed arguments the
+    /// router extracted from the user's utterance. `args_json` is a
+    /// JSON object string matching the skill's `parameters_schema` —
+    /// e.g. `{"app_name":"Spotify"}` for the `open` skill, or
+    /// `{"title":"call mum","when":"tomorrow at 3pm"}` for reminder.
+    /// The engine threads this through to the skill so it can skip
+    /// its own grammar/regex parser. Empty `{}` carries the same
+    /// semantics as `Skill(id)` — no extracted slots.
+    SkillWithArgs { id: String, args_json: String },
     /// Route to a system action (Android intent). The JSON value carries
     /// the action type and parameters for the frontend to dispatch.
     Action(serde_json::Value),
@@ -142,6 +151,32 @@ pub trait Skill: Send + Sync {
     fn specificity(&self) -> Specificity;
     fn score(&self, input: &str, ctx: &SkillContext) -> f32;
     fn execute(&self, input: &str, ctx: &SkillContext) -> Response;
+
+    /// Variant of [`execute`] called when the FunctionGemma router
+    /// extracted typed arguments from the user's utterance and is
+    /// dispatching this skill to handle them. `args_json` is a JSON
+    /// object string matching the skill's [`parameters_schema`] —
+    /// e.g. `{"app_name":"Spotify"}` for the `open` skill, or
+    /// `{"title":"call mum","when":"tomorrow at 3pm"}` for reminder.
+    /// `input` is the raw (post-normalise) utterance, kept available
+    /// for skills that want both the args and the original wording —
+    /// useful during the typed-args transition and for skills whose
+    /// own parser is more thorough than the model's slot extraction
+    /// (parse-confidence Layer A still applies).
+    ///
+    /// Default impl ignores `args_json` and delegates to [`execute`]
+    /// so existing skills are unaffected. Skills that want typed args
+    /// override this method and read the JSON directly. The keyword
+    /// scorer's matched skills always go through [`execute`] (no args
+    /// to pass); only router-with-args matches call this entry point.
+    fn execute_with_args(
+        &self,
+        input: &str,
+        _args_json: &str,
+        ctx: &SkillContext,
+    ) -> Response {
+        self.execute(input, ctx)
+    }
 
     /// Example user utterances that should trigger this skill, paired
     /// with the JSON arguments the function call should produce. Used as

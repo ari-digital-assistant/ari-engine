@@ -113,6 +113,7 @@ const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
     ("local_now_components", None),
     ("local_timezone_id", None),
     ("setting_get", None),
+    ("args", None),
     ("http_fetch", Some(Capability::Http)),
     ("storage_get", Some(Capability::StorageKv)),
     ("storage_set", Some(Capability::StorageKv)),
@@ -262,6 +263,12 @@ struct StoreData {
     local_clock: Arc<dyn crate::platform_capabilities::LocalClock>,
     /// Config store — ungated; every skill can read its own settings.
     config_store: Arc<dyn crate::assistant::ConfigStore>,
+    /// Per-call typed args JSON, set by `execute_with_args` before
+    /// invoking the WASM module's `execute` export. Read back from
+    /// inside the skill via the `ari::args` host import. `None` for
+    /// keyword-scorer dispatches and for `score()` invocations — the
+    /// SDK's `ari::args()` helper returns an empty/None equivalent.
+    args_json: Option<String>,
 }
 
 /// Bundle of (configured client, config) so the host import has everything it
@@ -516,6 +523,7 @@ impl WasmSkill {
                 },
                 local_clock: self.local_clock.clone(),
                 config_store: self.config_store.clone(),
+                args_json: None,
             },
         );
         store.limiter(|data| &mut data.limits);
@@ -783,6 +791,21 @@ impl WasmSkill {
                 "setting_get",
                 |mut caller: Caller<'_, StoreData>, key_ptr: i32, key_len: i32| -> i64 {
                     setting_get_impl(&mut caller, key_ptr, key_len)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+
+        // Typed args — ungated; every skill can read whatever JSON the
+        // FunctionGemma router extracted for this call. Returns 0 (the
+        // empty-pack sentinel) when the skill was invoked via the
+        // keyword scorer or with no extracted args, so the SDK helper
+        // surfaces it as `None` to the skill.
+        linker
+            .func_wrap(
+                "ari",
+                "args",
+                |mut caller: Caller<'_, StoreData>| -> i64 {
+                    args_impl(&mut caller)
                 },
             )
             .map_err(|e| WasmError::Compile(e.to_string()))?;
@@ -1424,6 +1447,19 @@ fn local_timezone_id_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
     write_response(caller, memory, &tz)
 }
 
+fn args_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    // Empty/None args → return 0 so the SDK helper exposes it as None.
+    let args = match caller.data().args_json.as_deref() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return 0,
+    };
+    write_response(caller, memory, &args)
+}
+
 fn setting_get_impl(caller: &mut Caller<'_, StoreData>, key_ptr: i32, key_len: i32) -> i64 {
     let memory = match caller.get_export("memory") {
         Some(wasmtime::Extern::Memory(m)) => m,
@@ -1508,6 +1544,31 @@ impl Skill for WasmSkill {
     }
 
     fn execute(&self, input: &str, _ctx: &SkillContext) -> Response {
+        self.execute_inner(input, None)
+    }
+
+    fn execute_with_args(
+        &self,
+        input: &str,
+        args_json: &str,
+        _ctx: &SkillContext,
+    ) -> Response {
+        // Stash a non-empty args JSON for the duration of this call;
+        // the `ari::args` host import reads it back from StoreData.
+        // Empty-string args are treated as "no args" so the skill's
+        // SDK helper exposes None — same shape as a keyword-scorer
+        // dispatch.
+        let args = if args_json.trim().is_empty() {
+            None
+        } else {
+            Some(args_json.to_string())
+        };
+        self.execute_inner(input, args)
+    }
+}
+
+impl WasmSkill {
+    fn execute_inner(&self, input: &str, args_json: Option<String>) -> Response {
         let fallback = || Response::Text("(skill error)".to_string());
         let log_sink = self.log_sink.clone();
         let skill_id = self.id.clone();
@@ -1516,6 +1577,12 @@ impl Skill for WasmSkill {
         };
         self.with_instance(
             |store, instance| {
+                // Make the args JSON visible to the `ari::args` host
+                // import for the duration of this call. Cleared after
+                // by the `fresh_store` cycle since the store is
+                // dropped post-`with_instance`.
+                store.data_mut().args_json = args_json.clone();
+
                 let Some((memory, ptr, len)) = WasmSkill::write_input(store, instance, input) else {
                     warn("execute: write_input failed");
                     return fallback();

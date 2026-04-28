@@ -815,25 +815,265 @@ fn render_funcgemma_value(v: &serde_json::Value, e: &str) -> String {
 }
 
 /// Parse FunctionGemma's output into a RouteResult.
+///
+/// The model emits
+/// `<start_function_call>call:NAME{key:<escape>value<escape>,...}<end_function_call>`
+/// where `NAME` is the skill id and the brace block holds args in
+/// FunctionGemma's declaration syntax (bare keys, escape-wrapped
+/// strings, uppercased type sentinels). This converts the brace block
+/// into JSON via [`funcgemma_to_json`] so downstream layers can read
+/// the args as standard JSON. Empty / parameterless calls fall back
+/// to [`RouteResult::Skill`]; calls with non-empty args emit
+/// [`RouteResult::SkillWithArgs`].
 fn parse_router_output(output: &str, skills: &[(String, String, String)]) -> RouteResult {
     let skill_names: std::collections::HashSet<&str> =
         skills.iter().map(|(id, _, _)| id.as_str()).collect();
 
-    // Look for the first <start_function_call>call:name{...}<end_function_call>
-    let re = regex::Regex::new(r"<start_function_call>call:(\w+)\{").unwrap();
-    if let Some(caps) = re.captures(output) {
-        let name = caps.get(1).unwrap().as_str();
-        if skill_names.contains(name) {
-            return RouteResult::Skill(name.to_string());
-        }
+    let Some((name, args_block)) = extract_call_block(output) else {
+        // No function call — model declined.
+        return RouteResult::NoMatch;
+    };
+
+    if !skill_names.contains(name.as_str()) {
         // Function name not in our skill list — could be a mobile action
         // or a hallucination. For now, treat unknown names as NoMatch.
         // TODO: map known mobile action names to RouteResult::Action
         return RouteResult::NoMatch;
     }
 
-    // No function call — model declined.
-    RouteResult::NoMatch
+    // No args block (or model emitted just `name{}`) — pre-typed-args
+    // shape, equivalent to RouteResult::Skill.
+    let args_json = funcgemma_to_json(args_block.as_str()).unwrap_or_default();
+    if args_json.is_empty() || args_json == "{}" {
+        return RouteResult::Skill(name);
+    }
+
+    RouteResult::SkillWithArgs { id: name, args_json }
+}
+
+/// Extract the function name and the inner brace contents from a
+/// FunctionGemma call. Returns `None` if no call is present in the
+/// output. The brace block is matched by counting braces / respecting
+/// the `<escape>...<escape>` string delimiter, so nested objects work.
+fn extract_call_block(output: &str) -> Option<(String, String)> {
+    let head_re = regex::Regex::new(r"<start_function_call>call:(\w+)\{").unwrap();
+    let caps = head_re.captures(output)?;
+    let name = caps.get(1)?.as_str().to_string();
+    let head_match = caps.get(0)?;
+    // Inner block starts right after the opening `{`.
+    let inner_start = head_match.end();
+    let bytes = output.as_bytes();
+    let mut depth: i32 = 1;
+    let mut in_escape = false;
+    let mut i = inner_start;
+    while i < bytes.len() {
+        // FunctionGemma's string delimiter is the literal token
+        // "<escape>" — toggle in/out on each occurrence so braces
+        // inside strings don't perturb the depth counter.
+        if !in_escape && output[i..].starts_with("<escape>") {
+            in_escape = true;
+            i += "<escape>".len();
+            continue;
+        }
+        if in_escape && output[i..].starts_with("<escape>") {
+            in_escape = false;
+            i += "<escape>".len();
+            continue;
+        }
+        if !in_escape {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((name, output[inner_start..i].to_string()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    // Unbalanced braces — likely truncated output.
+    None
+}
+
+/// Translate FunctionGemma's brace-block syntax into a JSON object
+/// string. The input looks like
+/// `key:<escape>value<escape>,key2:42,key3:{nested:<escape>x<escape>}`
+/// with bare alphanumeric/underscore keys, `<escape>...<escape>`-wrapped
+/// string values, bare numbers/booleans, and nested object/array
+/// braces. The output is conventional JSON: `{"key":"value",...}`.
+///
+/// Returns `None` on malformed input (mismatched escape/braces/etc.).
+fn funcgemma_to_json(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Some(String::new());
+    }
+    let (rendered, consumed) = render_object_body(trimmed)?;
+    // Allow trailing whitespace but no other tokens after the body.
+    if trimmed[consumed..].chars().all(|c| c.is_whitespace()) {
+        Some(rendered)
+    } else {
+        None
+    }
+}
+
+/// Render the body of an object — `key:value, key:value, ...` — into a
+/// JSON object string. Returns the JSON plus the number of bytes
+/// consumed from `input`.
+fn render_object_body(input: &str) -> Option<(String, usize)> {
+    let mut out = String::from("{");
+    let mut first = true;
+    let mut cursor = 0;
+    loop {
+        cursor += skip_whitespace(&input[cursor..]);
+        if cursor >= input.len() {
+            break;
+        }
+        // End of containing object — caller handles the closing brace.
+        if input.as_bytes()[cursor] == b'}' {
+            break;
+        }
+        if !first {
+            // Expect a separator before the next pair.
+            if input.as_bytes()[cursor] != b',' {
+                return None;
+            }
+            cursor += 1;
+            cursor += skip_whitespace(&input[cursor..]);
+        }
+        // Key — bare identifier.
+        let key_end = input[cursor..]
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|p| cursor + p)
+            .unwrap_or(input.len());
+        if key_end == cursor {
+            return None;
+        }
+        let key = &input[cursor..key_end];
+        cursor = key_end;
+        cursor += skip_whitespace(&input[cursor..]);
+        if cursor >= input.len() || input.as_bytes()[cursor] != b':' {
+            return None;
+        }
+        cursor += 1;
+        cursor += skip_whitespace(&input[cursor..]);
+        let (value_json, value_consumed) = render_value(&input[cursor..])?;
+        cursor += value_consumed;
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push('"');
+        out.push_str(&escape_json_string(key));
+        out.push_str("\":");
+        out.push_str(&value_json);
+    }
+    out.push('}');
+    Some((out, cursor))
+}
+
+/// Render a single value — string, number, bool, null, object, or
+/// array — into JSON. Returns the JSON plus bytes consumed.
+fn render_value(input: &str) -> Option<(String, usize)> {
+    let bytes = input.as_bytes();
+    if input.is_empty() {
+        return None;
+    }
+    // String: <escape>...<escape>
+    if input.starts_with("<escape>") {
+        let after = &input["<escape>".len()..];
+        let close = after.find("<escape>")?;
+        let raw = &after[..close];
+        let consumed = "<escape>".len() + close + "<escape>".len();
+        // Type sentinels (OBJECT/STRING/NUMBER/etc.) are always
+        // uppercased values; preserve case verbatim. Real string
+        // values are passed through with JSON-string escaping.
+        let json = format!("\"{}\"", escape_json_string(raw));
+        return Some((json, consumed));
+    }
+    // Object: { key:value, ... }
+    if bytes[0] == b'{' {
+        let (body, body_consumed) = render_object_body(&input[1..])?;
+        let after = 1 + body_consumed;
+        if after >= input.len() || input.as_bytes()[after] != b'}' {
+            return None;
+        }
+        return Some((body, after + 1));
+    }
+    // Array: [ value, value, ... ]
+    if bytes[0] == b'[' {
+        let mut out = String::from("[");
+        let mut first = true;
+        let mut cursor = 1;
+        loop {
+            cursor += skip_whitespace(&input[cursor..]);
+            if cursor >= input.len() {
+                return None;
+            }
+            if input.as_bytes()[cursor] == b']' {
+                cursor += 1;
+                break;
+            }
+            if !first {
+                if input.as_bytes()[cursor] != b',' {
+                    return None;
+                }
+                cursor += 1;
+                cursor += skip_whitespace(&input[cursor..]);
+            }
+            let (item_json, item_consumed) = render_value(&input[cursor..])?;
+            cursor += item_consumed;
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            out.push_str(&item_json);
+        }
+        out.push(']');
+        return Some((out, cursor));
+    }
+    // Bare token: number, boolean, null, or unquoted identifier
+    // (e.g. an enum-ish value). Stop at the first separator.
+    let token_end = input
+        .find(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace())
+        .unwrap_or(input.len());
+    let token = &input[..token_end];
+    if token.is_empty() {
+        return None;
+    }
+    let json = if token == "true" || token == "false" || token == "null" {
+        token.to_string()
+    } else if token.parse::<f64>().is_ok() {
+        token.to_string()
+    } else {
+        // Bare unquoted identifier — fall back to string. Safer than
+        // emitting an invalid JSON token.
+        format!("\"{}\"", escape_json_string(token))
+    };
+    Some((json, token_end))
+}
+
+fn skip_whitespace(s: &str) -> usize {
+    s.bytes().take_while(|b| b.is_ascii_whitespace()).count()
+}
+
+fn escape_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -909,6 +1149,94 @@ mod tests {
             }
             _ => panic!("expected DirectAnswer from first line"),
         }
+    }
+
+    fn router_skill_catalog() -> Vec<(String, String, String)> {
+        vec![
+            (
+                "current_time".to_string(),
+                "Tells the current time.".to_string(),
+                r#"{"type":"object","properties":{}}"#.to_string(),
+            ),
+            (
+                "open".to_string(),
+                "Opens apps by name.".to_string(),
+                r#"{"type":"object","properties":{"app_name":{"type":"string"}}}"#.to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn parse_router_output_parameterless_returns_skill() {
+        // Empty brace block — parameterless skill, behave as before.
+        let out = "<start_function_call>call:current_time{}<end_function_call>";
+        match parse_router_output(out, &router_skill_catalog()) {
+            RouteResult::Skill(id) => assert_eq!(id, "current_time"),
+            other => panic!("expected Skill, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn parse_router_output_typed_args_returns_skill_with_args() {
+        // Real shape we observed from Gemma 4 E2B for "fire up spotify".
+        let out = "<start_function_call>call:open{app_name:<escape>Spotify<escape>}<end_function_call>";
+        match parse_router_output(out, &router_skill_catalog()) {
+            RouteResult::SkillWithArgs { id, args_json } => {
+                assert_eq!(id, "open");
+                assert_eq!(args_json, r#"{"app_name":"Spotify"}"#);
+            }
+            other => panic!("expected SkillWithArgs, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn parse_router_output_unknown_skill_returns_nomatch() {
+        let out = "<start_function_call>call:not_a_skill{}<end_function_call>";
+        assert!(matches!(
+            parse_router_output(out, &router_skill_catalog()),
+            RouteResult::NoMatch
+        ));
+    }
+
+    #[test]
+    fn parse_router_output_no_call_returns_nomatch() {
+        // Model declined; emitted no function call at all.
+        assert!(matches!(
+            parse_router_output("Some prose with no call.", &router_skill_catalog()),
+            RouteResult::NoMatch
+        ));
+    }
+
+    #[test]
+    fn funcgemma_to_json_handles_strings_numbers_bools_nested() {
+        // String + number + bool + nested object + escaped quote in value.
+        let input = r#"name:<escape>foo "bar"<escape>,count:42,enabled:true,meta:{kind:<escape>tool<escape>}"#;
+        let json = funcgemma_to_json(input).expect("parse should succeed");
+        // serde_json roundtrip ensures the output is valid JSON.
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("emit valid JSON");
+        assert_eq!(parsed["name"], "foo \"bar\"");
+        assert_eq!(parsed["count"], 42);
+        assert_eq!(parsed["enabled"], true);
+        assert_eq!(parsed["meta"]["kind"], "tool");
+    }
+
+    #[test]
+    fn funcgemma_to_json_handles_braces_inside_escape_strings() {
+        // Brace counter must respect <escape> delimiters — a `}` inside
+        // a string mustn't close the surrounding object.
+        let input = r#"title:<escape>fix {bug}<escape>,count:1"#;
+        let json = funcgemma_to_json(input).expect("parse should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["title"], "fix {bug}");
+        assert_eq!(parsed["count"], 1);
+    }
+
+    #[test]
+    fn funcgemma_to_json_empty_input_yields_empty_string() {
+        // Empty body → empty string sentinel so the caller can short-
+        // circuit to RouteResult::Skill instead of SkillWithArgs.
+        assert_eq!(funcgemma_to_json("").as_deref(), Some(""));
+        assert_eq!(funcgemma_to_json("   ").as_deref(), Some(""));
     }
 
     #[test]

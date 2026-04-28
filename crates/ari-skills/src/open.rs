@@ -124,6 +124,31 @@ impl Skill for OpenSkill {
             None => Response::Text("What would you like me to open?".to_string()),
         }
     }
+
+    /// Typed-args path. The FunctionGemma router extracts the
+    /// `app_name` slot directly so we skip `extract_target`'s trigger-
+    /// word scan and use the model's value verbatim. Falls back to
+    /// `execute` when the args JSON is missing the field or the model
+    /// emitted something unparseable.
+    fn execute_with_args(
+        &self,
+        input: &str,
+        args_json: &str,
+        ctx: &SkillContext,
+    ) -> Response {
+        let app_name = serde_json::from_str::<serde_json::Value>(args_json)
+            .ok()
+            .and_then(|v| v.get("app_name").and_then(|n| n.as_str()).map(String::from))
+            .filter(|s| !s.trim().is_empty());
+
+        match app_name {
+            Some(name) => Response::Action(serde_json::json!({
+                "v": 1,
+                "launch_app": name,
+            })),
+            None => self.execute(input, ctx),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -218,5 +243,52 @@ mod tests {
     #[test]
     fn specificity_is_medium() {
         assert_eq!(OpenSkill::new().specificity(), Specificity::Medium);
+    }
+
+    #[test]
+    fn execute_with_args_uses_app_name_directly() {
+        // Router-extracted args bypass the trigger-word scan entirely;
+        // even an utterance with no "open"/"launch"/etc. keyword gets
+        // routed to the right app when the model picked the slot.
+        let skill = OpenSkill::new();
+        let response = skill.execute_with_args(
+            "fire up spotify",
+            r#"{"app_name":"Spotify"}"#,
+            &ctx(),
+        );
+        match response {
+            Response::Action(v) => {
+                assert_eq!(v["launch_app"], "Spotify");
+                assert_eq!(v["v"], 1);
+            }
+            other => panic!("expected Action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_with_args_falls_back_when_app_name_missing() {
+        // Empty args object, malformed JSON, or whitespace-only
+        // app_name should fall through to the keyword-scan path so the
+        // skill behaves as if the router had emitted no args.
+        let skill = OpenSkill::new();
+        let response = skill.execute_with_args("open the camera", "{}", &ctx());
+        match response {
+            Response::Action(v) => assert_eq!(v["launch_app"], "the camera"),
+            other => panic!("expected Action via fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_with_args_falls_back_on_blank_app_name() {
+        let skill = OpenSkill::new();
+        let response = skill.execute_with_args(
+            "launch firefox",
+            r#"{"app_name":"   "}"#,
+            &ctx(),
+        );
+        match response {
+            Response::Action(v) => assert_eq!(v["launch_app"], "firefox"),
+            other => panic!("expected Action via fallback, got {other:?}"),
+        }
     }
 }
