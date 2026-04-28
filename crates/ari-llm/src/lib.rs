@@ -48,6 +48,15 @@ pub trait Fallback: Send + Sync {
             "run_prompt not supported by this Fallback".into(),
         ))
     }
+
+    /// Last error from `try_answer` or `run_prompt`, if the most recent
+    /// call failed. Used by the engine to surface model-load /
+    /// inference failures to logcat — `try_answer` returns `None` on
+    /// failure with no other signal, which is impossible to debug
+    /// without this side channel. Default impl returns `None`.
+    fn last_error(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Size classification of the loaded built-in model. Layer C uses this to
@@ -97,7 +106,6 @@ impl std::error::Error for LlmError {}
 /// A loaded GGUF model ready for inference. Held transiently by
 /// `LazyLlmFallback` and dropped when the idle timer fires.
 struct LoadedModel {
-    backend: LlamaBackend,
     model: LlamaModel,
 }
 
@@ -109,14 +117,45 @@ const MAX_GENERATION_TOKENS: usize = 1024;
 /// How long the model stays loaded after the last query.
 const IDLE_TIMEOUT_SECS: u64 = 60;
 
+/// Process-wide shared `LlamaBackend`. llama.cpp's backend is a global
+/// singleton — calling `LlamaBackend::init()` more than once fails
+/// with `BackendAlreadyInitialized`, which previously broke any path
+/// that loaded a second model after the FunctionGemma router (e.g.
+/// the QA fallback's first invocation, since the router loads at
+/// startup). Shared access via `OnceLock` ensures every loader sees
+/// the same already-initialized backend.
+static SHARED_BACKEND: std::sync::OnceLock<LlamaBackend> = std::sync::OnceLock::new();
+
+fn shared_backend() -> Result<&'static LlamaBackend, LlmError> {
+    // Double-checked locking. `OnceLock::get_or_try_init` is still
+    // nightly-only, so we fall back to an explicit mutex-guarded
+    // init: fast path = lock-free read; slow path = serialise the
+    // first init across threads so we don't race two LlamaBackend
+    // creations.
+    static INIT_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    if let Some(b) = SHARED_BACKEND.get() {
+        return Ok(b);
+    }
+    let _guard = INIT_MUTEX
+        .lock()
+        .map_err(|_| LlmError::Backend("backend init mutex poisoned".into()))?;
+    if let Some(b) = SHARED_BACKEND.get() {
+        return Ok(b);
+    }
+    let backend = LlamaBackend::init().map_err(|e| LlmError::Backend(e.to_string()))?;
+    let _ = SHARED_BACKEND.set(backend);
+    SHARED_BACKEND
+        .get()
+        .ok_or_else(|| LlmError::Backend("backend set race lost".into()))
+}
+
 impl LoadedModel {
     fn load(model_path: &Path) -> Result<Self, LlmError> {
-        let backend =
-            LlamaBackend::init().map_err(|e| LlmError::Backend(e.to_string()))?;
+        let backend = shared_backend()?;
         let model_params = LlamaModelParams::default();
-        let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
+        let model = LlamaModel::load_from_file(backend, model_path, &model_params)
             .map_err(|e| LlmError::Model(e.to_string()))?;
-        Ok(LoadedModel { backend, model })
+        Ok(LoadedModel { model })
     }
 
     fn build_chat_prompt(&self, system: &str, user: &str) -> Option<String> {
@@ -142,7 +181,7 @@ impl LoadedModel {
 
         let mut ctx = self
             .model
-            .new_context(&self.backend, ctx_params)
+            .new_context(shared_backend()?, ctx_params)
             .map_err(|e| LlmError::Context(e.to_string()))?;
 
         let tokens = self
@@ -216,6 +255,11 @@ impl LoadedModel {
 pub struct LazyLlmFallback {
     model_path: PathBuf,
     inner: Mutex<LazyState>,
+    /// Last error from a `try_answer` or `run_prompt` failure, surfaced
+    /// via [`Fallback::last_error`] so the engine can log model-load /
+    /// inference failures that the trait's `Option<FallbackResult>`
+    /// shape would otherwise swallow.
+    last_error: Mutex<Option<String>>,
 }
 
 struct LazyState {
@@ -223,7 +267,7 @@ struct LazyState {
     last_used: Option<Instant>,
 }
 
-// SAFETY: LoadedModel fields (LlamaBackend, LlamaModel) are Send once
+// SAFETY: LoadedModel fields (LlamaModel) are Send once
 // loaded. All access is serialised through the Mutex.
 unsafe impl Send for LazyLlmFallback {}
 unsafe impl Sync for LazyLlmFallback {}
@@ -238,6 +282,19 @@ impl LazyLlmFallback {
                 loaded: None,
                 last_used: None,
             }),
+            last_error: Mutex::new(None),
+        }
+    }
+
+    fn record_error(&self, msg: impl Into<String>) {
+        if let Ok(mut g) = self.last_error.lock() {
+            *g = Some(msg.into());
+        }
+    }
+
+    fn clear_error(&self) {
+        if let Ok(mut g) = self.last_error.lock() {
+            *g = None;
         }
     }
 
@@ -347,7 +404,14 @@ impl Fallback for LazyLlmFallback {
     }
 
     fn try_answer(&self, input: &str, skills: &[SkillInfo]) -> Option<FallbackResult> {
-        let mut state = self.inner.lock().ok()?;
+        self.clear_error();
+        let mut state = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                self.record_error("inner mutex poisoned");
+                return None;
+            }
+        };
 
         // Evict if idle too long.
         if let Some(last) = state.last_used {
@@ -360,7 +424,13 @@ impl Fallback for LazyLlmFallback {
         if state.loaded.is_none() {
             match LoadedModel::load(&self.model_path) {
                 Ok(m) => state.loaded = Some(m),
-                Err(_) => return None,
+                Err(e) => {
+                    self.record_error(format!(
+                        "LoadedModel::load failed for {:?}: {e}",
+                        self.model_path
+                    ));
+                    return None;
+                }
             }
         }
 
@@ -379,8 +449,22 @@ impl Fallback for LazyLlmFallback {
 
         let output = match model.run_inference(&prompt, true) {
             Ok(text) => strip_thinking(&text),
-            Err(_) => return None,
+            Err(e) => {
+                self.record_error(format!("run_inference failed: {e}"));
+                return None;
+            }
         };
+
+        if parse_output(&output, skills).is_none() {
+            // Record diagnostic about why parse_output rejected the
+            // model's response. Common reasons: empty / "NONE" /
+            // ≤10 chars after first-line trim.
+            let preview: String = output.chars().take(120).collect();
+            self.record_error(format!(
+                "parse_output rejected response (output_len={}, first_120={preview:?})",
+                output.len()
+            ));
+        }
 
         // Update last_used after inference (could have taken a while).
         let last_used_at = Instant::now();
@@ -411,6 +495,10 @@ impl Fallback for LazyLlmFallback {
         });
 
         parse_output(&output, skills)
+    }
+
+    fn last_error(&self) -> Option<String> {
+        self.last_error.lock().ok().and_then(|g| g.clone())
     }
 }
 
@@ -499,7 +587,15 @@ pub fn strip_thinking(raw: &str) -> String {
 }
 
 fn build_system_prompt(_skills: &[SkillInfo]) -> String {
-    "You are Ari, a helpful voice assistant. Answer the user's question in one short sentence."
+    // FIXME(i18n): once Ari supports more than one locale, this
+    // prompt should be templated against `SkillContext::locale` so
+    // a user with locale=fr gets the same fence in French. Today
+    // every install is en, so hardcoding "English" is fine and
+    // helps Gemma 4 E2B avoid multilingual bleed-through (small
+    // models occasionally inject non-English tokens like `不` for
+    // "no" when the QA prompt doesn't fence the language).
+    "You are Ari, a helpful voice assistant. Answer the user's question in one short \
+     English sentence."
         .to_string()
 }
 
@@ -667,7 +763,7 @@ impl LoadedModel {
 
         let mut ctx = self
             .model
-            .new_context(&self.backend, ctx_params)
+            .new_context(shared_backend()?, ctx_params)
             .map_err(|e| LlmError::Context(e.to_string()))?;
 
         let tokens = self

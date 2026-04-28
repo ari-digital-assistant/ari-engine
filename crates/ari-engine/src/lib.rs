@@ -375,12 +375,45 @@ impl Engine {
                         })
                         .collect();
 
-                    if let Some(ari_llm::FallbackResult::DirectAnswer { text }) =
-                        llm.try_answer(&normalized, &catalog)
-                    {
-                        trace.winner = Some("assistant:builtin".to_string());
-                        return (Response::Text(text), Some(trace));
+                    self.log(
+                        LogLevel::Info,
+                        &format!(
+                            "assistant:builtin: invoking llm.try_answer (input_len={})",
+                            normalized.len()
+                        ),
+                    );
+                    let result = llm.try_answer(&normalized, &catalog);
+                    match result {
+                        Some(ari_llm::FallbackResult::DirectAnswer { text }) => {
+                            let preview: String = text.chars().take(160).collect();
+                            self.log(
+                                LogLevel::Info,
+                                &format!(
+                                    "assistant:builtin: try_answer returned answer ({} bytes): {preview:?}",
+                                    text.len()
+                                ),
+                            );
+                            trace.winner = Some("assistant:builtin".to_string());
+                            return (Response::Text(text), Some(trace));
+                        }
+                        None => {
+                            let detail = llm
+                                .last_error()
+                                .unwrap_or_else(|| "(no error reason recorded)".to_string());
+                            self.log(
+                                LogLevel::Warn,
+                                &format!(
+                                    "assistant:builtin: try_answer returned None — {detail}. \
+                                     Falling through to FALLBACK_RESPONSE."
+                                ),
+                            );
+                        }
                     }
+                } else {
+                    self.log(
+                        LogLevel::Warn,
+                        "assistant:builtin: no LLM loaded — falling through to FALLBACK_RESPONSE",
+                    );
                 }
             }
             Some(ActiveAssistant::Api {
