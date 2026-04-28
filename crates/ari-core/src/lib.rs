@@ -2,10 +2,17 @@ use serde::{Deserialize, Serialize};
 
 // ── Skill router ──────────────────────────────────────────────────────
 
-/// What the skill router decided.
+/// What the skill router decided. `confidence` on the skill variants
+/// is the mean per-token log-probability of the model's generated
+/// output — close to 0 = model was sure of every token; -3.0 or
+/// lower = distribution at each position was flat enough that the
+/// routing decision is shaky. The engine compares against
+/// [`MIN_ROUTER_CONFIDENCE`] and falls through to the LLM fallback /
+/// assistant when below threshold, so the user gets a useful answer
+/// instead of running a wrongly-picked skill.
 pub enum RouteResult {
     /// Route to a registered skill by id, no args extracted.
-    Skill(String),
+    Skill { id: String, confidence: f32 },
     /// Route to a registered skill by id with typed arguments the
     /// router extracted from the user's utterance. `args_json` is a
     /// JSON object string matching the skill's `parameters_schema` —
@@ -13,14 +20,24 @@ pub enum RouteResult {
     /// `{"title":"call mum","when":"tomorrow at 3pm"}` for reminder.
     /// The engine threads this through to the skill so it can skip
     /// its own grammar/regex parser. Empty `{}` carries the same
-    /// semantics as `Skill(id)` — no extracted slots.
-    SkillWithArgs { id: String, args_json: String },
+    /// semantics as `Skill { id }` — no extracted slots.
+    SkillWithArgs {
+        id: String,
+        args_json: String,
+        confidence: f32,
+    },
     /// Route to a system action (Android intent). The JSON value carries
     /// the action type and parameters for the frontend to dispatch.
     Action(serde_json::Value),
     /// No match — fall through to the assistant.
     NoMatch,
 }
+
+/// Confidence threshold below which the engine ignores the router's
+/// pick and falls through to the LLM fallback / assistant. Set
+/// loose-ish to start (-3.0 = mean per-token probability ≈ 0.05);
+/// retune once we have empirical numbers from real routes.
+pub const MIN_ROUTER_CONFIDENCE: f32 = -3.0;
 
 /// Trait for an LLM-based skill router that runs after the keyword
 /// matcher fails. The router sees the user input and the list of

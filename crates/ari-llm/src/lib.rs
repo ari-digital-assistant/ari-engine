@@ -600,18 +600,22 @@ impl SkillRouter for FunctionGemmaRouter {
         let prompt = build_router_prompt(input, skills);
         let model = state.loaded.as_ref().unwrap();
 
-        let output = match model.run_router_inference(&prompt) {
-            Ok(text) => text,
+        let inference = match model.run_router_inference(&prompt) {
+            Ok(out) => out,
             Err(_) => return RouteResult::NoMatch,
         };
 
-        // Stash the raw output so the engine can log it after the call
-        // returns. The whole point of the diagnostic is seeing what the
-        // model actually emits — function name, args block, stop tokens,
-        // anything weird — so we can decide whether typed args are
-        // already viable or whether the prompt / training needs work.
+        // Stash the raw output (with confidence appended for the log)
+        // so the engine can log what the model actually emitted —
+        // function name, args block, stop tokens, plus the routing
+        // confidence we extracted from the per-token log-probs. The
+        // engine compares against MIN_ROUTER_CONFIDENCE downstream;
+        // we just preserve the data here.
         if let Ok(mut last) = self.last_raw.lock() {
-            *last = Some(output.clone());
+            *last = Some(format!(
+                "{} (confidence: {:.3})",
+                inference.text, inference.confidence
+            ));
         }
 
         state.last_used = Some(Instant::now());
@@ -635,7 +639,7 @@ impl SkillRouter for FunctionGemmaRouter {
             }
         });
 
-        parse_router_output(&output, skills)
+        parse_router_output(&inference.text, skills, inference.confidence)
     }
 
     fn last_raw_output(&self) -> Option<String> {
@@ -643,8 +647,21 @@ impl SkillRouter for FunctionGemmaRouter {
     }
 }
 
+/// What `run_router_inference` returns: the raw output text plus a
+/// confidence score derived from the per-token log-probabilities.
+/// `confidence` is the mean log-probability of the generated tokens
+/// — close to 0 means the model was sure of every token; -3.0 or
+/// lower means the distribution at each position was flat enough
+/// that the routing decision is shaky. Default empty / no-call
+/// outputs land at 0.0; callers should treat that as a NoMatch
+/// signal regardless.
+struct RouterInferenceOutput {
+    text: String,
+    confidence: f32,
+}
+
 impl LoadedModel {
-    fn run_router_inference(&self, prompt: &str) -> Result<String, LlmError> {
+    fn run_router_inference(&self, prompt: &str) -> Result<RouterInferenceOutput, LlmError> {
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(2048));
 
@@ -676,10 +693,49 @@ impl LoadedModel {
 
         let mut output = String::new();
         let mut n_cur = tokens.len() as i32;
+        // Per-token log-probs of the chosen tokens. Aggregated into a
+        // confidence score below — see RouterInferenceOutput.
+        let mut log_probs: Vec<f32> = Vec::with_capacity(ROUTER_MAX_TOKENS);
 
         for _ in 0..ROUTER_MAX_TOKENS {
-            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+            // Snapshot the logit distribution at the current position
+            // BEFORE sampling, so we can score the chosen token against
+            // the full vocab. greedy() only commits to the argmax —
+            // it doesn't compute softmax — so we have to do it here.
+            let position = batch.n_tokens() - 1;
+            let raw_logits = ctx.candidates_ith(position);
+            let mut max_logit = f32::NEG_INFINITY;
+            let mut chosen_logit_for_this_step: Option<f32> = None;
+            // Two-pass over candidates: first to find max for numeric
+            // stability, second to sum exp(logit - max) for log-sum-exp.
+            // candidates_ith returns a fresh iterator each call so we
+            // collect once.
+            let collected: Vec<(i32, f32)> = raw_logits.map(|td| {
+                let logit = td.logit();
+                if logit > max_logit { max_logit = logit; }
+                (td.id().0, logit)
+            }).collect();
+
+            let token = sampler.sample(&ctx, position);
             sampler.accept(token);
+
+            // Find the chosen token's logit for this position so we
+            // can compute its log-probability.
+            for &(id, logit) in &collected {
+                if id == token.0 {
+                    chosen_logit_for_this_step = Some(logit);
+                    break;
+                }
+            }
+            if let Some(chosen_logit) = chosen_logit_for_this_step {
+                let log_sum_exp = max_logit
+                    + collected
+                        .iter()
+                        .map(|&(_, l)| (l - max_logit).exp())
+                        .sum::<f32>()
+                        .ln();
+                log_probs.push(chosen_logit - log_sum_exp);
+            }
 
             if self.model.is_eog_token(token) {
                 break;
@@ -712,7 +768,13 @@ impl LoadedModel {
                 .map_err(|e| LlmError::Context(format!("decode gen: {e}")))?;
         }
 
-        Ok(output)
+        let confidence = if log_probs.is_empty() {
+            0.0
+        } else {
+            log_probs.iter().sum::<f32>() / log_probs.len() as f32
+        };
+
+        Ok(RouterInferenceOutput { text: output, confidence })
     }
 }
 
@@ -824,8 +886,14 @@ fn render_funcgemma_value(v: &serde_json::Value, e: &str) -> String {
 /// into JSON via [`funcgemma_to_json`] so downstream layers can read
 /// the args as standard JSON. Empty / parameterless calls fall back
 /// to [`RouteResult::Skill`]; calls with non-empty args emit
-/// [`RouteResult::SkillWithArgs`].
-fn parse_router_output(output: &str, skills: &[(String, String, String)]) -> RouteResult {
+/// [`RouteResult::SkillWithArgs`]. `confidence` is the mean
+/// log-probability of the generated tokens; both skill variants
+/// surface it so the engine can drop sub-threshold picks.
+fn parse_router_output(
+    output: &str,
+    skills: &[(String, String, String)],
+    confidence: f32,
+) -> RouteResult {
     let skill_names: std::collections::HashSet<&str> =
         skills.iter().map(|(id, _, _)| id.as_str()).collect();
 
@@ -845,10 +913,14 @@ fn parse_router_output(output: &str, skills: &[(String, String, String)]) -> Rou
     // shape, equivalent to RouteResult::Skill.
     let args_json = funcgemma_to_json(args_block.as_str()).unwrap_or_default();
     if args_json.is_empty() || args_json == "{}" {
-        return RouteResult::Skill(name);
+        return RouteResult::Skill { id: name, confidence };
     }
 
-    RouteResult::SkillWithArgs { id: name, args_json }
+    RouteResult::SkillWithArgs {
+        id: name,
+        args_json,
+        confidence,
+    }
 }
 
 /// Extract the function name and the inner brace contents from a
@@ -1170,8 +1242,11 @@ mod tests {
     fn parse_router_output_parameterless_returns_skill() {
         // Empty brace block — parameterless skill, behave as before.
         let out = "<start_function_call>call:current_time{}<end_function_call>";
-        match parse_router_output(out, &router_skill_catalog()) {
-            RouteResult::Skill(id) => assert_eq!(id, "current_time"),
+        match parse_router_output(out, &router_skill_catalog(), -0.5) {
+            RouteResult::Skill { id, confidence } => {
+                assert_eq!(id, "current_time");
+                assert_eq!(confidence, -0.5);
+            }
             other => panic!("expected Skill, got {:?}", std::mem::discriminant(&other)),
         }
     }
@@ -1180,10 +1255,11 @@ mod tests {
     fn parse_router_output_typed_args_returns_skill_with_args() {
         // Real shape we observed from Gemma 4 E2B for "fire up spotify".
         let out = "<start_function_call>call:open{app_name:<escape>Spotify<escape>}<end_function_call>";
-        match parse_router_output(out, &router_skill_catalog()) {
-            RouteResult::SkillWithArgs { id, args_json } => {
+        match parse_router_output(out, &router_skill_catalog(), -0.2) {
+            RouteResult::SkillWithArgs { id, args_json, confidence } => {
                 assert_eq!(id, "open");
                 assert_eq!(args_json, r#"{"app_name":"Spotify"}"#);
+                assert_eq!(confidence, -0.2);
             }
             other => panic!("expected SkillWithArgs, got {:?}", std::mem::discriminant(&other)),
         }
@@ -1193,7 +1269,7 @@ mod tests {
     fn parse_router_output_unknown_skill_returns_nomatch() {
         let out = "<start_function_call>call:not_a_skill{}<end_function_call>";
         assert!(matches!(
-            parse_router_output(out, &router_skill_catalog()),
+            parse_router_output(out, &router_skill_catalog(), 0.0),
             RouteResult::NoMatch
         ));
     }
@@ -1202,7 +1278,7 @@ mod tests {
     fn parse_router_output_no_call_returns_nomatch() {
         // Model declined; emitted no function call at all.
         assert!(matches!(
-            parse_router_output("Some prose with no call.", &router_skill_catalog()),
+            parse_router_output("Some prose with no call.", &router_skill_catalog(), 0.0),
             RouteResult::NoMatch
         ));
     }

@@ -304,21 +304,47 @@ impl Engine {
             }
 
             match route_result {
-                RouteResult::Skill(ref id) => {
-                    if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
+                RouteResult::Skill { ref id, confidence } => {
+                    if confidence < ari_core::MIN_ROUTER_CONFIDENCE {
+                        self.log(
+                            LogLevel::Info,
+                            &format!(
+                                "router: skipping skill={id} — confidence {confidence:.3} \
+                                 below threshold {threshold:.3}; falling through to assistant",
+                                threshold = ari_core::MIN_ROUTER_CONFIDENCE,
+                            ),
+                        );
+                    } else if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
                         trace.winner = Some(format!("router:{id}"));
+                        self.log(
+                            LogLevel::Info,
+                            &format!("router: dispatching skill={id} (confidence {confidence:.3})"),
+                        );
                         let response = skill.execute(&normalized, &self.ctx);
                         let response = self.maybe_intercept_consult(skill, response);
                         return (response, Some(trace));
                     }
                 }
-                RouteResult::SkillWithArgs { ref id, ref args_json } => {
-                    if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
+                RouteResult::SkillWithArgs {
+                    ref id,
+                    ref args_json,
+                    confidence,
+                } => {
+                    if confidence < ari_core::MIN_ROUTER_CONFIDENCE {
+                        self.log(
+                            LogLevel::Info,
+                            &format!(
+                                "router: skipping skill={id} — confidence {confidence:.3} \
+                                 below threshold {threshold:.3}; falling through to assistant",
+                                threshold = ari_core::MIN_ROUTER_CONFIDENCE,
+                            ),
+                        );
+                    } else if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
                         trace.winner = Some(format!("router:{id}+args"));
                         self.log(
                             LogLevel::Info,
                             &format!(
-                                "router: dispatching skill={id} with typed args ({} bytes)",
+                                "router: dispatching skill={id} with typed args ({} bytes, confidence {confidence:.3})",
                                 args_json.len()
                             ),
                         );
