@@ -642,6 +642,27 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
             );
             Response::Text(format!("{display} took too long to reply — try again."))
         }
+        Err(AssistantApiError::ApiError { status, ref body }) => {
+            log(
+                LogLevel::Warn,
+                &format!(
+                    "named_assistant: skill={} api error {status}: {body}",
+                    binding.skill_id
+                ),
+            );
+            // Anthropic, OpenAI, and Gemini all nest the user-facing
+            // reason at error.message in the JSON response. Surface it
+            // when present so problems like "out of credits" or "model
+            // not found" are actionable instead of generic. Cap at
+            // ~200 chars to keep an accidental verbose body from
+            // dumping into the conversation UI.
+            match extract_api_error_message(body) {
+                Some(msg) => Response::Text(format!("{display}: {msg}")),
+                None => Response::Text(format!(
+                    "{display} returned an error (HTTP {status})."
+                )),
+            }
+        }
         Err(e) => {
             log(
                 LogLevel::Warn,
@@ -649,6 +670,25 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
             );
             Response::Text(format!("{display} couldn't reply right now."))
         }
+    }
+}
+
+/// Pull a user-facing reason out of an API error body. All three of
+/// our cloud providers (Anthropic, OpenAI, Gemini-OpenAI-compat) nest
+/// the message at `error.message`. Returns `None` if the body isn't
+/// JSON or the field is missing.
+fn extract_api_error_message(body: &str) -> Option<String> {
+    const MAX_LEN: usize = 200;
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let msg = v.get("error")?.get("message")?.as_str()?.trim();
+    if msg.is_empty() {
+        return None;
+    }
+    if msg.chars().count() > MAX_LEN {
+        let truncated: String = msg.chars().take(MAX_LEN).collect();
+        Some(format!("{truncated}…"))
+    } else {
+        Some(msg.to_string())
     }
 }
 
@@ -976,6 +1016,42 @@ mod tests {
         fn execute(&self, _input: &str, _ctx: &SkillContext) -> Response {
             Response::Text(self.response.to_string())
         }
+    }
+
+    // --- Named-assistant API error extraction ---
+
+    #[test]
+    fn extracts_anthropic_error_message() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low."}}"#;
+        assert_eq!(
+            extract_api_error_message(body).as_deref(),
+            Some("Your credit balance is too low.")
+        );
+    }
+
+    #[test]
+    fn extracts_openai_error_message() {
+        let body = r#"{"error":{"message":"Incorrect API key provided.","type":"invalid_request_error","code":"invalid_api_key"}}"#;
+        assert_eq!(
+            extract_api_error_message(body).as_deref(),
+            Some("Incorrect API key provided.")
+        );
+    }
+
+    #[test]
+    fn extract_returns_none_on_unstructured_body() {
+        assert!(extract_api_error_message("not json at all").is_none());
+        assert!(extract_api_error_message(r#"{"foo": "bar"}"#).is_none());
+        assert!(extract_api_error_message(r#"{"error": "string not object"}"#).is_none());
+    }
+
+    #[test]
+    fn extract_truncates_runaway_message() {
+        let long = "a".repeat(500);
+        let body = format!(r#"{{"error":{{"message":"{long}"}}}}"#);
+        let extracted = extract_api_error_message(&body).unwrap();
+        assert!(extracted.chars().count() <= 201, "got {} chars", extracted.chars().count());
+        assert!(extracted.ends_with('…'));
     }
 
     // --- Fallback behaviour ---
