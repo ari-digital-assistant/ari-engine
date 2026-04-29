@@ -5,7 +5,7 @@
 //! local LLM assistant is always present; community assistants come from
 //! installed SKILL.md manifests with `type: assistant`.
 
-use ari_engine::ActiveAssistant;
+use ari_engine::{ActiveAssistant, NamedAssistantBinding};
 use ari_skill_loader::manifest::{
     AssistantManifest, AssistantProvider, ConfigFieldType, Privacy, Skillfile,
 };
@@ -242,8 +242,23 @@ impl AssistantRegistry {
             }
         };
 
+        let named = self.build_named_bindings();
+
         let mut engine_inner = engine.inner.lock().expect("engine mutex poisoned");
         engine_inner.set_active_assistant(assistant);
+        engine_inner.set_named_assistants(named);
+    }
+
+    /// Rescan the skill store for community assistants AND push the
+    /// active+named assistant state to the engine in one call. This is
+    /// the install/update/uninstall entry point — calling
+    /// `reload_community_assistants` alone wouldn't propagate the new
+    /// alias list to the engine until the next `apply_to_engine`, so
+    /// the frontend should always use this wrapper after a skill
+    /// install completes.
+    pub fn reload_and_apply(&self, engine: &crate::AriEngine) {
+        self.reload_community_assistants();
+        self.apply_to_engine(engine);
     }
 
     /// Get the config schema for an assistant, with current values filled in.
@@ -336,6 +351,31 @@ impl AssistantRegistry {
             .iter()
             .find(|e| e.id == id)
             .map(|e| e.manifest.clone())
+    }
+
+    /// Build the list of name-addressable assistants pushed to the
+    /// engine. Built-in is intentionally excluded — it has no aliases
+    /// (it's already the typical default fallback). An entry only
+    /// makes the list when its manifest declares non-empty aliases
+    /// AND has a populated `api` config block (without one we couldn't
+    /// dispatch even if we matched).
+    fn build_named_bindings(&self) -> Vec<NamedAssistantBinding> {
+        let community = self.community.lock().expect("community lock poisoned");
+        community
+            .iter()
+            .filter_map(|entry| {
+                if entry.manifest.aliases.is_empty() {
+                    return None;
+                }
+                let api = entry.manifest.api.as_ref()?;
+                Some(NamedAssistantBinding {
+                    skill_id: entry.id.clone(),
+                    aliases: entry.manifest.aliases.clone(),
+                    config: api.clone(),
+                    config_store: self.settings_store.as_config_store(),
+                })
+            })
+            .collect()
     }
 }
 

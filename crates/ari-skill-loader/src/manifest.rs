@@ -46,6 +46,12 @@ pub struct AssistantManifest {
     pub privacy: Privacy,
     pub api: Option<ApiConfig>,
     pub config: Vec<ConfigField>,
+    /// Voice/text aliases addressable as "ask <alias> ...". The engine
+    /// short-circuits the normal pipeline when an utterance starts with
+    /// one of these (optionally preceded by a verb like ask/tell/use).
+    /// Each entry is post-`normalize_input` form: lowercase ASCII
+    /// alphanum + spaces only. Empty list = not addressable by name.
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +306,12 @@ pub enum ManifestError {
 
     #[error("`metadata.ari.wasm.memory_limit_mb` must be 1..=16 (found {found})")]
     MemoryLimitOutOfRange { found: u32 },
+
+    #[error(
+        "`metadata.ari.assistant.aliases` entry {value:?} is invalid — must be \
+         lowercase ASCII alphanumeric + single spaces, no leading/trailing/double spaces"
+    )]
+    InvalidAlias { value: String },
 }
 
 /// A fully parsed `SKILL.md`. Holds both the raw AgentSkills frontmatter fields
@@ -752,13 +764,47 @@ impl AssistantManifest {
             }
         };
 
+        let aliases = raw
+            .aliases
+            .iter()
+            .map(|a| validate_alias(a))
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(AssistantManifest {
             provider,
             privacy,
             api,
             config: settings.to_vec(),
+            aliases,
         })
     }
+}
+
+/// Validate one entry from `metadata.ari.assistant.aliases`. Aliases
+/// must be lowercase ASCII alphanumeric with single-space separators
+/// (so they survive `normalize_input` byte-for-byte). Returns the
+/// trimmed value on success or `InvalidAlias` on any rule violation.
+fn validate_alias(raw: &str) -> Result<String, ManifestError> {
+    let bad = || ManifestError::InvalidAlias {
+        value: raw.to_string(),
+    };
+    if raw.is_empty() {
+        return Err(bad());
+    }
+    if raw.starts_with(' ') || raw.ends_with(' ') {
+        return Err(bad());
+    }
+    if raw.contains("  ") {
+        return Err(bad());
+    }
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        let ok = c == ' ' || (c.is_ascii_alphanumeric() && !c.is_ascii_uppercase());
+        if !ok {
+            return Err(bad());
+        }
+    }
+    Ok(raw.to_string())
 }
 
 impl ApiConfig {
@@ -1166,6 +1212,8 @@ struct RawAssistant {
     api: Option<RawApiConfig>,
     #[serde(default)]
     config: Vec<RawConfigField>,
+    #[serde(default)]
+    aliases: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1828,6 +1876,124 @@ Runs locally.
             }
             _ => panic!("expected select config field"),
         }
+    }
+
+    #[test]
+    fn parses_assistant_aliases() {
+        let src = r#"---
+name: claude
+description: Anthropic Claude.
+metadata:
+  ari:
+    id: dev.heyari.assistant.claude
+    version: "0.2.0"
+    type: assistant
+    engine: ">=0.3"
+    languages: [en]
+    assistant:
+      provider: api
+      privacy: cloud
+      aliases: [claude, anthropic]
+      api:
+        endpoint: https://api.anthropic.com/v1/messages
+        auth: header
+        auth_header: x-api-key
+        auth_config_key: api_key
+        default_model: claude-sonnet-4-6
+        request_format: anthropic
+        system_prompt: be brief
+        response_path: "content[0].text"
+      config:
+        - key: api_key
+          label: API Key
+          type: secret
+          required: true
+---
+"#;
+        let sf = Skillfile::parse(src, Some("claude")).unwrap();
+        let asst = sf
+            .ari_extension
+            .unwrap()
+            .assistant
+            .expect("assistant present");
+        assert_eq!(asst.aliases, vec!["claude".to_string(), "anthropic".to_string()]);
+    }
+
+    #[test]
+    fn assistant_without_aliases_field_defaults_empty() {
+        let sf = Skillfile::parse(chatgpt_assistant_source(), Some("chatgpt")).unwrap();
+        let asst = sf.ari_extension.unwrap().assistant.unwrap();
+        assert!(asst.aliases.is_empty());
+    }
+
+    #[test]
+    fn rejects_alias_with_uppercase() {
+        let src = bad_alias_src("[Claude]");
+        assert!(matches!(
+            Skillfile::parse(&src, Some("claude")).unwrap_err(),
+            ManifestError::InvalidAlias { value } if value == "Claude"
+        ));
+    }
+
+    #[test]
+    fn rejects_alias_with_punctuation() {
+        let src = bad_alias_src("[\"chat-gpt\"]");
+        assert!(matches!(
+            Skillfile::parse(&src, Some("claude")).unwrap_err(),
+            ManifestError::InvalidAlias { value } if value == "chat-gpt"
+        ));
+    }
+
+    #[test]
+    fn rejects_alias_with_leading_space() {
+        let src = bad_alias_src("[\" claude\"]");
+        assert!(matches!(
+            Skillfile::parse(&src, Some("claude")).unwrap_err(),
+            ManifestError::InvalidAlias { value } if value == " claude"
+        ));
+    }
+
+    #[test]
+    fn rejects_alias_with_double_space() {
+        let src = bad_alias_src("[\"chat  gpt\"]");
+        assert!(matches!(
+            Skillfile::parse(&src, Some("claude")).unwrap_err(),
+            ManifestError::InvalidAlias { value } if value == "chat  gpt"
+        ));
+    }
+
+    fn bad_alias_src(aliases_yaml: &str) -> String {
+        format!(
+            r#"---
+name: claude
+description: Anthropic Claude.
+metadata:
+  ari:
+    id: dev.heyari.assistant.claude
+    version: "0.2.0"
+    type: assistant
+    engine: ">=0.3"
+    languages: [en]
+    assistant:
+      provider: api
+      privacy: cloud
+      aliases: {aliases_yaml}
+      api:
+        endpoint: https://api.anthropic.com/v1/messages
+        auth: header
+        auth_header: x-api-key
+        auth_config_key: api_key
+        default_model: claude-sonnet-4-6
+        system_prompt: be brief
+        response_path: "content[0].text"
+      config:
+        - key: api_key
+          label: API Key
+          type: secret
+          required: true
+---
+"#
+        )
     }
 
     #[test]

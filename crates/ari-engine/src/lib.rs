@@ -1,10 +1,13 @@
 use ari_core::{
     normalize_input, Response, RouteResult, Skill, SkillContext, SkillRouter, Specificity,
 };
-use ari_skill_loader::assistant::ConfigStore;
+use ari_skill_loader::assistant::{AssistantApiError, ConfigStore};
 use ari_skill_loader::manifest::ApiConfig;
 use ari_skill_loader::wasm::{LogLevel, LogSink};
 use std::sync::Arc;
+
+pub mod named_assistant;
+pub use named_assistant::NamedAssistantBinding;
 
 /// Pseudo skill-id used for engine-emitted log lines so they surface in
 /// `adb logcat -s AriSkill` alongside real skill traces without being
@@ -99,6 +102,11 @@ pub struct Engine {
     /// `consult_assistant` directive is inert (skill's first envelope
     /// is returned unchanged).
     envelope_sink: Option<Arc<dyn EnvelopeSink>>,
+    /// Named cloud assistants addressable as "ask <alias> ...". Pushed
+    /// by [`AriEngine::AssistantRegistry::apply_to_engine`] from the
+    /// installed skill set. Empty when no community assistants are
+    /// installed (or none declare aliases).
+    named_assistants: Vec<NamedAssistantBinding>,
 }
 
 impl Engine {
@@ -113,6 +121,7 @@ impl Engine {
             router: None,
             log_sink: None,
             envelope_sink: None,
+            named_assistants: Vec::new(),
         }
     }
 
@@ -172,6 +181,14 @@ impl Engine {
         self.active_assistant = assistant;
     }
 
+    /// Replace the list of name-addressable assistants. Pushed by the
+    /// FFI registry on every install/uninstall and on every active-
+    /// assistant change. An empty list disables "ask <alias> ..."
+    /// routing without affecting the active-assistant fallback.
+    pub fn set_named_assistants(&mut self, list: Vec<NamedAssistantBinding>) {
+        self.named_assistants = list;
+    }
+
     /// Set the skill router (e.g. FunctionGemma). When set, the engine
     /// consults the router after keyword scoring fails, before falling
     /// through to the assistant. Pass `None` to disable.
@@ -212,6 +229,8 @@ impl Engine {
                     None
                 } else if let Some(rest) = w.strip_prefix("router:") {
                     Some(rest.to_string())
+                } else if let Some(rest) = w.strip_prefix("named_assistant:") {
+                    Some(rest.to_string())
                 } else if let Some(rest) = w.strip_prefix("assistant:") {
                     Some(rest.to_string())
                 } else {
@@ -226,6 +245,32 @@ impl Engine {
         let normalized = normalize_input(input.trim());
         if normalized.is_empty() {
             return (Response::Text(FALLBACK_RESPONSE.to_string()), None);
+        }
+
+        // "Ask <assistant> X" short-circuit. Runs before keyword
+        // scoring so a high-specificity skill (e.g. time) can't snatch
+        // utterances like "ask chatgpt what time is it" from the named
+        // assistant. If no alias matches, the normal pipeline below
+        // runs untouched.
+        if let Some(m) = named_assistant::match_named(&normalized, &self.named_assistants) {
+            let trace = DebugTrace {
+                normalized_input: normalized.clone(),
+                scores: Vec::new(),
+                winner: Some(format!("named_assistant:{}", m.binding.skill_id)),
+                round: None,
+            };
+            self.log(
+                LogLevel::Info,
+                &format!(
+                    "named_assistant: dispatching skill={} (prompt_len={})",
+                    m.binding.skill_id,
+                    m.remainder.len()
+                ),
+            );
+            let response = dispatch_named_assistant(m.binding, &m.remainder, |level, msg| {
+                self.log(level, msg)
+            });
+            return (response, Some(trace));
         }
 
         let scores: Vec<SkillScore> = self
@@ -533,6 +578,78 @@ struct ConsultDirective {
     /// Opaque string the skill uses to carry state into its
     /// continuation invocation. Engine treats it as a black box.
     continuation_context: String,
+}
+
+/// Pretty user-facing label for an assistant skill id. Strips the
+/// `dev.heyari.assistant.` prefix and capitalises — best-effort, the
+/// frontend can do better but the engine is the only thing that
+/// surfaces error text for named-assistant dispatch.
+fn assistant_display_name(skill_id: &str) -> String {
+    let stem = skill_id
+        .rsplit('.')
+        .next()
+        .unwrap_or(skill_id);
+    let mut chars = stem.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => skill_id.to_string(),
+    }
+}
+
+/// Dispatch a "ask <alias> X" match to the cloud API and translate any
+/// failure into a user-facing text response. The closure logs detailed
+/// diagnostics via the engine's log_sink — never leaks raw API error
+/// bodies to the user.
+fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
+    binding: &NamedAssistantBinding,
+    prompt: &str,
+    log: F,
+) -> Response {
+    let display = assistant_display_name(&binding.skill_id);
+    match ari_skill_loader::call_assistant_api(
+        &binding.config,
+        &binding.skill_id,
+        binding.config_store.as_ref(),
+        prompt,
+    ) {
+        Ok(text) if !text.is_empty() => Response::Text(text),
+        Ok(_) => {
+            log(
+                LogLevel::Warn,
+                &format!(
+                    "named_assistant: skill={} returned empty body",
+                    binding.skill_id
+                ),
+            );
+            Response::Text(format!("{display} couldn't reply right now."))
+        }
+        Err(AssistantApiError::MissingConfig { ref key }) => {
+            log(
+                LogLevel::Warn,
+                &format!(
+                    "named_assistant: skill={} missing config key={}",
+                    binding.skill_id, key
+                ),
+            );
+            Response::Text(format!(
+                "{display} isn't set up yet. Add your API key in Settings → Assistants."
+            ))
+        }
+        Err(AssistantApiError::Timeout) => {
+            log(
+                LogLevel::Warn,
+                &format!("named_assistant: skill={} timed out", binding.skill_id),
+            );
+            Response::Text(format!("{display} took too long to reply — try again."))
+        }
+        Err(e) => {
+            log(
+                LogLevel::Warn,
+                &format!("named_assistant: skill={} failed: {e}", binding.skill_id),
+            );
+            Response::Text(format!("{display} couldn't reply right now."))
+        }
+    }
 }
 
 fn parse_consult_directive(v: &serde_json::Value) -> Option<ConsultDirective> {
