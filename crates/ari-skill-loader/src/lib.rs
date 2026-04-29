@@ -36,9 +36,9 @@ pub use registry::{
     RegistryClient, RegistryError, REGISTRY_BASE_URL, REGISTRY_INDEX_URL, REGISTRY_TRUST_KEY,
 };
 pub use platform_capabilities::{
-    Calendar, CalendarEventRow, CalendarProvider, InsertCalendarEventParams, InsertTaskParams,
-    LocalClock, LocalTimeComponents, NullCalendarProvider, NullTasksProvider,
-    TaskList, TaskRow, TasksProvider, UtcLocalClock,
+    Calendar, CalendarEventRow, CalendarProvider, EnglishLocaleProvider, InsertCalendarEventParams,
+    InsertTaskParams, LocalClock, LocalTimeComponents, LocaleProvider, NullCalendarProvider,
+    NullTasksProvider, TaskList, TaskRow, TasksProvider, UtcLocalClock,
 };
 pub use storage_config::StorageConfig;
 pub use store::{InstalledSkill, SkillStore, StoreError};

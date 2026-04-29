@@ -333,6 +333,39 @@ fn days_to_ymd(z: i64) -> (i32, u8, u8) {
     (year as i32, m as u8, d as u8)
 }
 
+// ── Locale ─────────────────────────────────────────────────────────────
+
+/// Host-supplied access to the user's currently-active language.
+///
+/// The frontend's settings store is the single source of truth for
+/// locale (per the multi-language architecture decision). Engine code
+/// that needs to dispatch on language — text normalisers, LLM prompt
+/// selection, skill regex filtering — reads through this trait rather
+/// than threading a parameter manually.
+///
+/// Implementations are read on every utterance, so they should be
+/// cheap. The host typically caches the latest value via a `StateFlow`
+/// or atomic, updated by a background coroutine that watches the
+/// settings store.
+pub trait LocaleProvider: Send + Sync {
+    /// ISO 639-1 lowercase language code (e.g. `"en"`, `"it"`). The
+    /// engine treats this as opaque; mapping rules between region
+    /// variants ("en-GB" → "en") live on the host side.
+    fn current_locale(&self) -> String;
+}
+
+/// Default locale provider used when no host has supplied one. Always
+/// returns `"en"`. Used by the CLI engine and tests so engine code can
+/// call `current_locale()` unconditionally without first checking that
+/// a real provider has been wired up.
+pub struct EnglishLocaleProvider;
+
+impl LocaleProvider for EnglishLocaleProvider {
+    fn current_locale(&self) -> String {
+        "en".into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +431,10 @@ mod tests {
         let unix_day_2026_04_22 = 20_565_i64; // precomputed
         assert_eq!(days_to_ymd(unix_day_2026_04_22), (2026, 4, 22));
         assert_eq!(((unix_day_2026_04_22 + 3).rem_euclid(7)) as u8, 2);
+    }
+
+    #[test]
+    fn english_locale_provider_returns_en() {
+        assert_eq!(EnglishLocaleProvider.current_locale(), "en");
     }
 }
