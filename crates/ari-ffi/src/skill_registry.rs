@@ -24,8 +24,33 @@ use crate::assistant_registry::{FfiConfigField, FfiSelectOption};
 use crate::settings_store::SkillSettingsStore;
 
 use crate::android_load_options;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
+
+/// Auto-derive the locale list for an on-disk skill bundle. Reads
+/// `SKILL.{locale}.md` and `strings/{locale}.json` file presence per
+/// the multi-language plan's self-validation rule, falling back to
+/// the canonical English locale when either layer is unparseable so
+/// the browser at least shows *something* rather than rendering the
+/// row with no language badges.
+fn derive_supported_locales(skill_dir: &Path) -> Vec<String> {
+    let manifests = match ari_skill_loader::parse_skill_directory(skill_dir) {
+        Ok(m) => m,
+        Err(_) => {
+            // Bundle layout is broken — surface nothing rather than
+            // guessing. Frontend treats empty as "unknown / none";
+            // the install warning will fire for any locale the user
+            // is in.
+            return Vec::new();
+        }
+    };
+    let strings = match ari_skill_loader::parse_strings_directory(skill_dir) {
+        Ok(s) => s,
+        Err(_) => return manifests.supported_locales(),
+    };
+    manifests.supported_for_user(&strings)
+}
 
 /// One already-installed skill, flattened into a uniffi-safe record.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -34,6 +59,14 @@ pub struct FfiInstalledSkill {
     pub version: String,
     /// Absolute path to the extracted skill directory on disk.
     pub install_dir: String,
+    /// Locale codes the skill actually supports for end users. Auto-
+    /// derived from on-disk file presence: a locale is supported iff
+    /// `SKILL.{locale}.md` is present, AND (if the skill ships any
+    /// `strings/` files at all) `strings/{locale}.json` is also
+    /// present. The skill browser uses this for language badges and
+    /// the install flow uses it for the locale-mismatch warning when
+    /// the user's active locale isn't in the list.
+    pub languages: Vec<String>,
 }
 
 /// One update the registry has for a skill that's already installed.
@@ -176,10 +209,14 @@ impl SkillRegistry {
         let mut out: Vec<FfiInstalledSkill> = store
             .list()
             .into_iter()
-            .map(|s| FfiInstalledSkill {
-                id: s.id,
-                version: s.version,
-                install_dir: s.install_dir.to_string_lossy().into_owned(),
+            .map(|s| {
+                let languages = derive_supported_locales(&s.install_dir);
+                FfiInstalledSkill {
+                    id: s.id,
+                    version: s.version,
+                    install_dir: s.install_dir.to_string_lossy().into_owned(),
+                    languages,
+                }
             })
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -237,10 +274,12 @@ impl SkillRegistry {
             .map_err(|e| FfiRegistryError::Registry {
                 message: e.to_string(),
             })?;
+        let languages = derive_supported_locales(&installed.install_dir);
         Ok(FfiInstalledSkill {
             id: installed.id,
             version: installed.version,
             install_dir: installed.install_dir.to_string_lossy().into_owned(),
+            languages,
         })
     }
 
@@ -307,10 +346,12 @@ impl SkillRegistry {
                 message: other.to_string(),
             },
         })?;
+        let languages = derive_supported_locales(&installed.install_dir);
         Ok(FfiInstalledSkill {
             id: installed.id,
             version: installed.version,
             install_dir: installed.install_dir.to_string_lossy().into_owned(),
+            languages,
         })
     }
 

@@ -80,6 +80,36 @@ impl LocalizedManifestSet {
     pub fn supported_locales(&self) -> Vec<String> {
         self.manifests.keys().cloned().collect()
     }
+
+    /// Auto-derived set of locales the skill supports **for end users**,
+    /// taking the strings table into account.
+    ///
+    /// - If the skill ships no `strings/` directory at all, support
+    ///   follows `SKILL.{locale}.md` files alone — pure-action skills
+    ///   that emit JSON envelopes don't have translatable user-facing
+    ///   text, so they're not penalised for not shipping translations.
+    /// - If the skill ships any `strings/` files, a locale is
+    ///   supported iff **both** `SKILL.{locale}.md` AND
+    ///   `strings/{locale}.json` are present. This is the
+    ///   self-validation rule from the multi-language plan: an author
+    ///   can't claim Italian support while shipping broken Italian.
+    ///
+    /// Sorted alphabetically.
+    pub fn supported_for_user(&self, strings: &crate::localized_strings::LocalizedStrings) -> Vec<String> {
+        if strings.is_empty() {
+            return self.supported_locales();
+        }
+        let strings_locales: std::collections::HashSet<String> =
+            strings.supported_locales().into_iter().collect();
+        let mut out: Vec<String> = self
+            .manifests
+            .keys()
+            .filter(|l| strings_locales.contains(*l))
+            .cloned()
+            .collect();
+        out.sort();
+        out
+    }
 }
 
 #[derive(Debug, Error)]
@@ -610,6 +640,48 @@ metadata:
         assert_eq!(
             set.supported_locales(),
             vec!["en".to_string(), "es".to_string(), "it".to_string()]
+        );
+    }
+
+    #[test]
+    fn supported_for_user_with_no_strings_dir_falls_back_to_manifest_locales() {
+        // Pure-action skill that ships no translatable user-facing
+        // text — its supported locales are whatever SKILL.{locale}.md
+        // files exist.
+        let td = TempDir::new();
+        let dir = td.path().join("greet");
+        std::fs::create_dir(&dir).unwrap();
+        write(dir.join("SKILL.en.md"), english_skill("greet", "greet")).unwrap();
+        write(dir.join("SKILL.it.md"), italian_skill("greet", "greet")).unwrap();
+        let set = parse_skill_directory(&dir).unwrap();
+        let strings = crate::localized_strings::LocalizedStrings::default();
+        assert_eq!(
+            set.supported_for_user(&strings),
+            vec!["en".to_string(), "it".to_string()]
+        );
+    }
+
+    #[test]
+    fn supported_for_user_intersects_when_strings_present() {
+        // Skill ships strings for en + it. Manifest exists for en + it
+        // + es. Italian is supported (both present). Spanish is NOT
+        // supported (manifest exists but strings missing). English is
+        // supported (both present, by definition canonical).
+        let td = TempDir::new();
+        let dir = td.path().join("greet");
+        std::fs::create_dir(&dir).unwrap();
+        write(dir.join("SKILL.en.md"), english_skill("greet", "greet")).unwrap();
+        write(dir.join("SKILL.it.md"), italian_skill("greet", "greet")).unwrap();
+        write(dir.join("SKILL.es.md"), english_skill("greet", "greet")).unwrap();
+        std::fs::create_dir(dir.join("strings")).unwrap();
+        write(dir.join("strings/en.json"), r#"{"k": "v"}"#).unwrap();
+        write(dir.join("strings/it.json"), r#"{"k": "v"}"#).unwrap();
+
+        let set = parse_skill_directory(&dir).unwrap();
+        let strings = crate::localized_strings::parse_strings_directory(&dir).unwrap();
+        assert_eq!(
+            set.supported_for_user(&strings),
+            vec!["en".to_string(), "it".to_string()]
         );
     }
 }
