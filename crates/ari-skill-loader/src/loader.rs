@@ -242,10 +242,11 @@ pub fn load_single_skill_dir_with(skill_dir: &Path, options: &LoadOptions) -> Lo
         }
     };
 
-    // Use the canonical (English) Skillfile for structural identity.
-    // Non-English variants are parsed and validated but not yet
-    // surfaced to the rest of the engine — Phase 3 step 8 routes
-    // skill matching through them.
+    // Use the canonical (English) Skillfile for structural identity
+    // checks below. The full LocalizedManifestSet is passed through
+    // to the skill constructors so per-locale pattern scorers and
+    // response specs feed into the runtime — `score()` and
+    // `execute()` dispatch on `ctx.locale` with English fallback.
     let sf = manifest_set.canonical().clone();
 
     let Some(ari) = sf.ari_extension.as_ref() else {
@@ -281,20 +282,22 @@ pub fn load_single_skill_dir_with(skill_dir: &Path, options: &LoadOptions) -> Lo
     }
 
     match &ari.behaviour {
-        Some(Behaviour::Declarative(_)) => match DeclarativeSkill::from_skillfile(&sf) {
+        Some(Behaviour::Declarative(_)) => match DeclarativeSkill::from_localized(&manifest_set) {
             Ok(skill) => report.skills.push(Box::new(skill)),
             Err(e) => report.failures.push(LoadFailure {
                 path: skill_dir.to_path_buf(),
                 kind: LoadFailureKind::Adapter(e),
             }),
         },
-        Some(Behaviour::Wasm(_)) => match WasmSkill::from_skillfile(&sf, skill_dir, options) {
-            Ok(skill) => report.skills.push(Box::new(skill)),
-            Err(e) => report.failures.push(LoadFailure {
-                path: skill_dir.to_path_buf(),
-                kind: LoadFailureKind::Wasm(e),
-            }),
-        },
+        Some(Behaviour::Wasm(_)) => {
+            match WasmSkill::from_localized(&manifest_set, skill_dir, options) {
+                Ok(skill) => report.skills.push(Box::new(skill)),
+                Err(e) => report.failures.push(LoadFailure {
+                    path: skill_dir.to_path_buf(),
+                    kind: LoadFailureKind::Wasm(e),
+                }),
+            }
+        }
         None => {}
     }
 

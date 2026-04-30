@@ -133,6 +133,18 @@ impl Engine {
         self.log_sink = sink;
     }
 
+    /// Update the locale that the engine threads into [`SkillContext`]
+    /// on every subsequent `process_input` call. Skills read it via
+    /// `ctx.locale` to dispatch their per-locale pattern scorers and
+    /// response specs. Callers refresh this from the host's locale
+    /// provider (frontend DataStore on Android) before each utterance
+    /// — Phase 1 of the multi-language plan put `LocaleProvider` on
+    /// the FFI engine; this is where it lands inside the inner engine's
+    /// SkillContext.
+    pub fn set_locale(&mut self, locale: String) {
+        self.ctx.locale = locale;
+    }
+
     /// Install an envelope sink so the engine can push phase-2 Layer C
     /// envelopes (produced asynchronously after the assistant replies)
     /// back to the host. When `None`, the `consult_assistant` directive

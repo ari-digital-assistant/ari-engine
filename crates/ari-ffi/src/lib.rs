@@ -580,7 +580,14 @@ impl AriEngine {
     }
 
     pub fn process_input(&self, input: String) -> FfiResponse {
-        let engine = self.inner.lock().expect("engine mutex poisoned");
+        // Refresh the engine's locale on every call so per-locale
+        // skill scorers and responses pick up live changes from the
+        // frontend's settings store. The locale provider's read is a
+        // synchronous AtomicReference lookup on Android (see
+        // AriFfiLocaleProvider), so this is essentially free.
+        let locale = self.locale_provider.current_locale();
+        let mut engine = self.inner.lock().expect("engine mutex poisoned");
+        engine.set_locale(locale);
         let (response, skill_id) = engine.process_input_with_skill(&input);
         match response {
             ari_core::Response::Text(s) => {

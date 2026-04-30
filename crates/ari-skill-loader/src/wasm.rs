@@ -307,11 +307,14 @@ pub struct WasmSkill {
     description: String,
     specificity: Specificity,
     custom_score: bool,
-    /// Native pattern scorer used when `custom_score = false`. Same code path
-    /// as the declarative adapter, so a WASM skill that doesn't override
-    /// scoring behaves identically to a declarative one with the same
-    /// `metadata.ari.matching` block.
-    scorer: PatternScorer,
+    /// Per-locale native pattern scorers used when `custom_score = false`.
+    /// Same code path as the declarative adapter, so a WASM skill that
+    /// doesn't override scoring behaves identically to a declarative one
+    /// with the same `metadata.ari.matching` block. Keyed by ISO 639-1
+    /// locale; `score()` reads `ctx.locale` to dispatch and falls back
+    /// to the canonical-English scorer when the requested locale isn't
+    /// shipped (best-effort fallback per the multi-language plan).
+    scorers: std::collections::BTreeMap<String, PatternScorer>,
     engine: Engine,
     module: Module,
     memory_limit_bytes: usize,
@@ -377,7 +380,57 @@ impl WasmSkill {
             Some(Behaviour::Wasm(w)) => w,
             Some(Behaviour::Declarative(_)) | None => return Err(WasmError::NotWasm),
         };
-        Self::build(ari, &sf.description, wasm, skill_dir, options)
+        // Single-Skillfile path: synthesise a one-locale set so the
+        // build helper can stay locale-aware end-to-end.
+        let mut scorers = std::collections::BTreeMap::new();
+        if let Some(matching) = ari.matching.as_ref() {
+            scorers.insert(
+                crate::localized_manifest::CANONICAL_LOCALE.to_string(),
+                PatternScorer::compile(matching).map_err(|e| WasmError::Compile(e.to_string()))?,
+            );
+        }
+        Self::build(ari, &sf.description, wasm, skill_dir, options, scorers)
+    }
+
+    /// Build from a parsed [`LocalizedManifestSet`] — preferred entry
+    /// point. Each locale variant contributes its own pattern scorer;
+    /// the canonical structural fields (capabilities, behaviour, WASM
+    /// module path) are taken from the canonical entry.
+    pub fn from_localized(
+        set: &crate::localized_manifest::LocalizedManifestSet,
+        skill_dir: &Path,
+        options: &crate::LoadOptions,
+    ) -> Result<Self, WasmError> {
+        let canonical = set.canonical();
+        let canonical_ari = canonical
+            .ari_extension
+            .as_ref()
+            .ok_or(WasmError::NotAnAriSkill)?;
+        let wasm = match &canonical_ari.behaviour {
+            Some(Behaviour::Wasm(w)) => w,
+            Some(Behaviour::Declarative(_)) | None => return Err(WasmError::NotWasm),
+        };
+
+        // Compile a scorer for every locale variant that ships a
+        // matching block. Variants without `metadata.ari.matching`
+        // are silently skipped — the canonical-set parser already
+        // enforces structural consistency, so any variant lacking
+        // matching is an authoring choice (e.g. a translation that
+        // didn't bother shipping patterns yet).
+        let mut scorers: std::collections::BTreeMap<String, PatternScorer> =
+            std::collections::BTreeMap::new();
+        for (locale, sf) in &set.manifests {
+            let Some(ari) = sf.ari_extension.as_ref() else {
+                continue;
+            };
+            let Some(matching) = ari.matching.as_ref() else {
+                continue;
+            };
+            let scorer =
+                PatternScorer::compile(matching).map_err(|e| WasmError::Compile(e.to_string()))?;
+            scorers.insert(locale.clone(), scorer);
+        }
+        Self::build(canonical_ari, &canonical.description, wasm, skill_dir, options, scorers)
     }
 
     fn build(
@@ -386,6 +439,7 @@ impl WasmSkill {
         wasm: &WasmBehaviour,
         skill_dir: &Path,
         options: &crate::LoadOptions,
+        scorers: std::collections::BTreeMap<String, PatternScorer>,
     ) -> Result<Self, WasmError> {
         let module_path = skill_dir.join(&wasm.module);
         let bytes = std::fs::read(&module_path).map_err(|source| WasmError::ReadModule {
@@ -400,13 +454,14 @@ impl WasmSkill {
         // with hidden empty strings.
         let localized_strings = crate::localized_strings::parse_strings_directory(skill_dir)
             .map_err(|e| WasmError::Compile(format!("strings/ load failed: {e}")))?;
-        Self::from_module_bytes_with_strings(
+        Self::from_parts(
             ari,
             description,
             wasm,
             &bytes,
             options,
             Arc::new(localized_strings),
+            scorers,
         )
     }
 
@@ -431,11 +486,9 @@ impl WasmSkill {
         )
     }
 
-    /// Build directly from in-memory module bytes plus a pre-parsed
-    /// localized-string table. Used by [`build`] (which parses the
-    /// skill's `strings/` directory once and passes it through here)
-    /// and by tests that explicitly want to exercise the `ari::t`
-    /// host import.
+    /// Test seam: build from in-memory module bytes plus a pre-parsed
+    /// localized-string table. The scorer table is auto-built as a
+    /// single canonical-locale scorer compiled from `ari.matching`.
     pub fn from_module_bytes_with_strings(
         ari: &AriExtension,
         description: &str,
@@ -443,6 +496,29 @@ impl WasmSkill {
         bytes: &[u8],
         options: &crate::LoadOptions,
         localized_strings: Arc<crate::localized_strings::LocalizedStrings>,
+    ) -> Result<Self, WasmError> {
+        let mut scorers: std::collections::BTreeMap<String, PatternScorer> =
+            std::collections::BTreeMap::new();
+        if let Some(matching) = ari.matching.as_ref() {
+            scorers.insert(
+                crate::localized_manifest::CANONICAL_LOCALE.to_string(),
+                PatternScorer::compile(matching)?,
+            );
+        }
+        Self::from_parts(ari, description, wasm, bytes, options, localized_strings, scorers)
+    }
+
+    /// The actual constructor body. Takes pre-compiled per-locale
+    /// scorers and pre-parsed localized strings. Called by [`build`]
+    /// (production path) and the `from_module_bytes*` test seams.
+    fn from_parts(
+        ari: &AriExtension,
+        description: &str,
+        wasm: &WasmBehaviour,
+        bytes: &[u8],
+        options: &crate::LoadOptions,
+        localized_strings: Arc<crate::localized_strings::LocalizedStrings>,
+        scorers: std::collections::BTreeMap<String, PatternScorer>,
     ) -> Result<Self, WasmError> {
         let log_sink = options.log_sink.clone();
         let host_caps = &options.host_capabilities;
@@ -462,7 +538,15 @@ impl WasmSkill {
 
         let memory_limit_bytes = wasm.memory_limit_mb.max(1) as usize * 1024 * 1024;
         let matching = ari.matching.as_ref().ok_or(WasmError::NotWasm)?;
-        let scorer = PatternScorer::compile(matching)?;
+        // `scorers` is supplied by the caller — already compiled per
+        // locale. Sanity-check that the canonical entry is present;
+        // every entry point guarantees this, but a future refactor
+        // could drift the contract.
+        if !scorers.contains_key(crate::localized_manifest::CANONICAL_LOCALE) {
+            return Err(WasmError::Compile(
+                "internal: WasmSkill::from_parts called without canonical-locale scorer".into(),
+            ));
+        }
 
         // Capability check at install time. The grant set is the intersection
         // of (declared) ∩ (host-provided). Anything declared but not provided
@@ -518,7 +602,7 @@ impl WasmSkill {
             description: description.to_string(),
             specificity: ari.specificity.as_core(),
             custom_score: matching.custom_score,
-            scorer,
+            scorers,
             engine,
             module,
             memory_limit_bytes,
@@ -1679,16 +1763,22 @@ impl Skill for WasmSkill {
         self.specificity
     }
 
-    fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {
+    fn score(&self, input: &str, ctx: &SkillContext) -> f32 {
         // Default path: same native pattern scorer the declarative adapter
         // uses, applied to the manifest's `metadata.ari.matching` block. The
-        // WASM module is never invoked.
+        // WASM module is never invoked. Per-locale dispatch with
+        // canonical-English fallback (best-effort rule).
         //
         // Custom path: when `custom_score = true` the manifest grants the
         // module its own `score()` export, called for every input. Documented
         // as a power-user feature with a perf warning.
         if !self.custom_score {
-            return self.scorer.score(input);
+            let scorer = self.scorers.get(&ctx.locale).unwrap_or_else(|| {
+                self.scorers
+                    .get(crate::localized_manifest::CANONICAL_LOCALE)
+                    .expect("canonical scorer guaranteed by from_parts")
+            });
+            return scorer.score(input);
         }
 
         self.with_instance(
