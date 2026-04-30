@@ -5,6 +5,7 @@ pub mod host_capabilities;
 pub mod http_config;
 pub mod loader;
 pub mod localized_manifest;
+pub mod localized_strings;
 pub mod manifest;
 pub mod platform_capabilities;
 pub mod scoring;
@@ -38,6 +39,9 @@ pub use registry::{
 };
 pub use localized_manifest::{
     parse_skill_directory, LocalizedManifestError, LocalizedManifestSet, CANONICAL_LOCALE,
+};
+pub use localized_strings::{
+    parse_strings_directory, LocalizedStrings, LocalizedStringsError,
 };
 pub use platform_capabilities::{
     Calendar, CalendarEventRow, CalendarProvider, EnglishLocaleProvider, InsertCalendarEventParams,
