@@ -317,7 +317,7 @@ impl LocalClock for UtcLocalClock {
 /// Shamelessly lifted from the "civil_from_days" algorithm in Howard
 /// Hinnant's date library — public-domain, branchless, leap-year-safe
 /// across the full range of i64 days.
-fn days_to_ymd(z: i64) -> (i32, u8, u8) {
+pub(crate) fn days_to_ymd(z: i64) -> (i32, u8, u8) {
     // Shift so day 0 is 0000-03-01 (the "era" boundary — start of a
     // 400-year cycle). Every era has exactly 146_097 days.
     let z = z + 719_468;

@@ -116,6 +116,9 @@ const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
     ("args", None),
     ("get_locale", None),
     ("t", None),
+    ("format_date", None),
+    ("format_number", None),
+    ("format_currency", None),
     ("http_fetch", Some(Capability::Http)),
     ("storage_get", Some(Capability::StorageKv)),
     ("storage_set", Some(Capability::StorageKv)),
@@ -987,6 +990,47 @@ impl WasmSkill {
             )
             .map_err(|e| WasmError::Compile(e.to_string()))?;
 
+        // Locale-aware formatters — ungated. Skills emit raw values
+        // (epoch ms, f64 numbers, currency code + amount) and the
+        // host renders to the active locale. Empty `locale` argument
+        // means "use the active locale"; explicit code overrides.
+        linker
+            .func_wrap(
+                "ari",
+                "format_date",
+                |mut caller: Caller<'_, StoreData>,
+                 ts_ms: i64,
+                 locale_ptr: i32, locale_len: i32,
+                 style_ptr: i32, style_len: i32| -> i64 {
+                    format_date_impl(&mut caller, ts_ms, locale_ptr, locale_len, style_ptr, style_len)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+        linker
+            .func_wrap(
+                "ari",
+                "format_number",
+                |mut caller: Caller<'_, StoreData>,
+                 value: f64,
+                 locale_ptr: i32, locale_len: i32,
+                 style_ptr: i32, style_len: i32| -> i64 {
+                    format_number_impl(&mut caller, value, locale_ptr, locale_len, style_ptr, style_len)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+        linker
+            .func_wrap(
+                "ari",
+                "format_currency",
+                |mut caller: Caller<'_, StoreData>,
+                 amount: f64,
+                 currency_ptr: i32, currency_len: i32,
+                 locale_ptr: i32, locale_len: i32| -> i64 {
+                    format_currency_impl(&mut caller, amount, currency_ptr, currency_len, locale_ptr, locale_len)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+
         Ok(linker)
     }
 
@@ -1723,6 +1767,97 @@ fn t_impl(
         .render(&locale, &key, &args)
         .unwrap_or_else(|| key.clone());
     write_response(caller, memory, &rendered)
+}
+
+/// Read a `(ptr, len)` pair as UTF-8 from WASM memory; an empty input
+/// resolves to `None` so the formatter functions can transparently
+/// substitute the active locale.
+fn read_optional_string(
+    memory: &Memory,
+    caller: &Caller<'_, StoreData>,
+    ptr: i32,
+    len: i32,
+) -> Option<String> {
+    if len <= 0 {
+        return None;
+    }
+    read_utf8(memory, caller, ptr, len).filter(|s| !s.is_empty())
+}
+
+/// Implementation of `ari::format_date`. `locale` may be empty (uses
+/// the active locale) or an explicit ISO 639-1 code. `style` is the
+/// hint string ("short", "medium", "long", "full"); unrecognised
+/// values default to medium.
+fn format_date_impl(
+    caller: &mut Caller<'_, StoreData>,
+    ts_ms: i64,
+    locale_ptr: i32,
+    locale_len: i32,
+    style_ptr: i32,
+    style_len: i32,
+) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let explicit_locale = read_optional_string(&memory, &*caller, locale_ptr, locale_len);
+    let style_str = read_optional_string(&memory, &*caller, style_ptr, style_len)
+        .unwrap_or_default();
+    let locale = explicit_locale.unwrap_or_else(|| caller.data().locale_provider.current_locale());
+    let formatted = crate::formatters::format_date(
+        ts_ms,
+        &locale,
+        crate::formatters::FormatStyle::parse(&style_str),
+    );
+    write_response(caller, memory, &formatted)
+}
+
+/// Implementation of `ari::format_number`.
+fn format_number_impl(
+    caller: &mut Caller<'_, StoreData>,
+    value: f64,
+    locale_ptr: i32,
+    locale_len: i32,
+    style_ptr: i32,
+    style_len: i32,
+) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let explicit_locale = read_optional_string(&memory, &*caller, locale_ptr, locale_len);
+    let style_str = read_optional_string(&memory, &*caller, style_ptr, style_len)
+        .unwrap_or_default();
+    let locale = explicit_locale.unwrap_or_else(|| caller.data().locale_provider.current_locale());
+    let formatted = crate::formatters::format_number(
+        value,
+        &locale,
+        crate::formatters::FormatStyle::parse(&style_str),
+    );
+    write_response(caller, memory, &formatted)
+}
+
+/// Implementation of `ari::format_currency`. `currency` is the ISO
+/// 4217 code (`"USD"`, `"EUR"`); unknown codes pass through verbatim
+/// rather than failing.
+fn format_currency_impl(
+    caller: &mut Caller<'_, StoreData>,
+    amount: f64,
+    currency_ptr: i32,
+    currency_len: i32,
+    locale_ptr: i32,
+    locale_len: i32,
+) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let currency = read_optional_string(&memory, &*caller, currency_ptr, currency_len)
+        .unwrap_or_default();
+    let explicit_locale = read_optional_string(&memory, &*caller, locale_ptr, locale_len);
+    let locale = explicit_locale.unwrap_or_else(|| caller.data().locale_provider.current_locale());
+    let formatted = crate::formatters::format_currency(amount, &currency, &locale);
+    write_response(caller, memory, &formatted)
 }
 
 fn write_response(caller: &mut Caller<'_, StoreData>, memory: Memory, s: &str) -> i64 {

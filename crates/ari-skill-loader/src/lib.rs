@@ -3,6 +3,7 @@ pub mod bundle;
 pub mod declarative;
 pub mod host_capabilities;
 pub mod http_config;
+pub mod formatters;
 pub mod loader;
 pub mod localized_manifest;
 pub mod localized_strings;
