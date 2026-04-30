@@ -114,6 +114,8 @@ const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
     ("local_timezone_id", None),
     ("setting_get", None),
     ("args", None),
+    ("get_locale", None),
+    ("t", None),
     ("http_fetch", Some(Capability::Http)),
     ("storage_get", Some(Capability::StorageKv)),
     ("storage_set", Some(Capability::StorageKv)),
@@ -263,6 +265,16 @@ struct StoreData {
     local_clock: Arc<dyn crate::platform_capabilities::LocalClock>,
     /// Config store — ungated; every skill can read its own settings.
     config_store: Arc<dyn crate::assistant::ConfigStore>,
+    /// Locale provider — ungated; backs `ari::get_locale` and
+    /// `ari::t` (which reads the current locale to pick the right
+    /// `strings/{locale}.json` table). Cloned from the WasmSkill,
+    /// which got it from `LoadOptions.locale_provider`.
+    locale_provider: Arc<dyn crate::platform_capabilities::LocaleProvider>,
+    /// Per-skill localized string tables — ungated; backs `ari::t`.
+    /// Cloned from the WasmSkill. Empty when the skill bundle
+    /// shipped no `strings/` directory; `t()` will return the bare
+    /// key in that case.
+    localized_strings: Arc<crate::localized_strings::LocalizedStrings>,
     /// Per-call typed args JSON, set by `execute_with_args` before
     /// invoking the WASM module's `execute` export. Read back from
     /// inside the skill via the `ari::args` host import. `None` for
@@ -327,6 +339,14 @@ pub struct WasmSkill {
     /// user-configurable settings declared in `metadata.ari.settings`.
     /// Ungated; every skill can read its own settings.
     config_store: Arc<dyn crate::assistant::ConfigStore>,
+    /// Locale source for `ari::get_locale` and `ari::t`. Threaded
+    /// from `LoadOptions.locale_provider` at construction time.
+    /// Ungated; every skill can read the active locale.
+    locale_provider: Arc<dyn crate::platform_capabilities::LocaleProvider>,
+    /// Per-skill string tables, parsed from `<skill_dir>/strings/`
+    /// at construction time. Ungated; backs `ari::t`. Empty when the
+    /// skill bundle shipped no strings directory.
+    localized_strings: Arc<crate::localized_strings::LocalizedStrings>,
 }
 
 impl std::fmt::Debug for WasmSkill {
@@ -372,16 +392,57 @@ impl WasmSkill {
             path: module_path.clone(),
             source,
         })?;
-        Self::from_module_bytes(ari, description, wasm, &bytes, options)
+        // Parse the per-skill `strings/{locale}.json` tables alongside
+        // the module. Missing `strings/` is fine — skills without any
+        // user-facing text don't need translations. Surface fatal
+        // failures (broken JSON, missing en.json when others present)
+        // as compile errors so a botched bundle never silently loads
+        // with hidden empty strings.
+        let localized_strings = crate::localized_strings::parse_strings_directory(skill_dir)
+            .map_err(|e| WasmError::Compile(format!("strings/ load failed: {e}")))?;
+        Self::from_module_bytes_with_strings(
+            ari,
+            description,
+            wasm,
+            &bytes,
+            options,
+            Arc::new(localized_strings),
+        )
     }
 
     /// Test seam: build directly from in-memory module bytes (WASM or WAT).
+    /// Defaults `localized_strings` to an empty table — most tests
+    /// don't exercise translations. Use [`from_module_bytes_with_strings`]
+    /// when you need to pass a populated string table.
     pub fn from_module_bytes(
         ari: &AriExtension,
         description: &str,
         wasm: &WasmBehaviour,
         bytes: &[u8],
         options: &crate::LoadOptions,
+    ) -> Result<Self, WasmError> {
+        Self::from_module_bytes_with_strings(
+            ari,
+            description,
+            wasm,
+            bytes,
+            options,
+            Arc::new(crate::localized_strings::LocalizedStrings::default()),
+        )
+    }
+
+    /// Build directly from in-memory module bytes plus a pre-parsed
+    /// localized-string table. Used by [`build`] (which parses the
+    /// skill's `strings/` directory once and passes it through here)
+    /// and by tests that explicitly want to exercise the `ari::t`
+    /// host import.
+    pub fn from_module_bytes_with_strings(
+        ari: &AriExtension,
+        description: &str,
+        wasm: &WasmBehaviour,
+        bytes: &[u8],
+        options: &crate::LoadOptions,
+        localized_strings: Arc<crate::localized_strings::LocalizedStrings>,
     ) -> Result<Self, WasmError> {
         let log_sink = options.log_sink.clone();
         let host_caps = &options.host_capabilities;
@@ -391,6 +452,7 @@ impl WasmSkill {
         let calendar_provider = options.calendar_provider.clone();
         let local_clock = options.local_clock.clone();
         let config_store = options.config_store.clone();
+        let locale_provider = options.locale_provider.clone();
 
         let mut config = wasmtime::Config::new();
         config.consume_fuel(true);
@@ -468,6 +530,8 @@ impl WasmSkill {
             calendar_provider,
             local_clock,
             config_store,
+            locale_provider,
+            localized_strings,
         };
         skill.validate_exports()?;
         Ok(skill)
@@ -523,6 +587,8 @@ impl WasmSkill {
                 },
                 local_clock: self.local_clock.clone(),
                 config_store: self.config_store.clone(),
+                locale_provider: self.locale_provider.clone(),
+                localized_strings: self.localized_strings.clone(),
                 args_json: None,
             },
         );
@@ -806,6 +872,33 @@ impl WasmSkill {
                 "args",
                 |mut caller: Caller<'_, StoreData>| -> i64 {
                     args_impl(&mut caller)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+
+        // Locale + i18n — ungated; every skill can read the active
+        // locale and look up translations from its own
+        // `strings/{locale}.json` tables. `get_locale` returns the
+        // ISO 639-1 code (`en`, `it`, …); `t` looks up a key with
+        // English fallback and substitutes `{placeholder}` slots from
+        // a JSON args object.
+        linker
+            .func_wrap(
+                "ari",
+                "get_locale",
+                |mut caller: Caller<'_, StoreData>| -> i64 {
+                    get_locale_impl(&mut caller)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+        linker
+            .func_wrap(
+                "ari",
+                "t",
+                |mut caller: Caller<'_, StoreData>,
+                 key_ptr: i32, key_len: i32,
+                 args_ptr: i32, args_len: i32| -> i64 {
+                    t_impl(&mut caller, key_ptr, key_len, args_ptr, args_len)
                 },
             )
             .map_err(|e| WasmError::Compile(e.to_string()))?;
@@ -1477,6 +1570,77 @@ fn setting_get_impl(caller: &mut Caller<'_, StoreData>, key_ptr: i32, key_len: i
     }
 }
 
+/// Implementation of `ari::get_locale`. Returns the user's currently
+/// active language as an ISO 639-1 lowercase string (e.g. `"en"`,
+/// `"it"`). Reads through the [`LocaleProvider`] the host supplied via
+/// `LoadOptions.locale_provider`.
+fn get_locale_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let locale = caller.data().locale_provider.current_locale();
+    write_response(caller, memory, &locale)
+}
+
+/// Implementation of `ari::t`. Reads `key` and `args_json` from the
+/// skill's linear memory, looks up `key` in the skill's
+/// `strings/{current_locale}.json` table (with English fallback),
+/// substitutes `{placeholder}` slots from the parsed args, and returns
+/// the rendered string.
+///
+/// `args_json` is a flat JSON object of string→string. Numeric args
+/// the skill wants substituted should be stringified on the skill
+/// side (`{"count": "3"}`); the host stays type-agnostic on purpose
+/// so the WASM string passing convention doesn't need a side schema.
+///
+/// Lookup miss → returns the bare key (debug visibility — typoed
+/// keys stay visible to the dev rather than rendering as empty).
+/// Bad JSON in `args_json` → silently treated as empty args; missing
+/// placeholders are left intact in the output by [`LocalizedStrings::render`].
+fn t_impl(
+    caller: &mut Caller<'_, StoreData>,
+    key_ptr: i32,
+    key_len: i32,
+    args_ptr: i32,
+    args_len: i32,
+) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let key = match read_utf8(&memory, &*caller, key_ptr, key_len) {
+        Some(s) => s,
+        None => return 0,
+    };
+    // Empty args is fine — skills frequently call `t("greeting")` with
+    // no placeholders. SDK helper passes `args_len = 0` in that case.
+    let args_json = if args_len > 0 {
+        match read_utf8(&memory, &*caller, args_ptr, args_len) {
+            Some(s) => s,
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    };
+    let args: std::collections::BTreeMap<String, String> = if args_json.is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        // Bad JSON: silently fall through with empty args. The
+        // resulting render will leave any `{placeholder}` slots in
+        // the template intact, which is the same visible-failure UX
+        // the SDK already gets for typoed placeholder names.
+        serde_json::from_str(&args_json).unwrap_or_default()
+    };
+
+    let strings = caller.data().localized_strings.clone();
+    let locale = caller.data().locale_provider.current_locale();
+    let rendered = strings
+        .render(&locale, &key, &args)
+        .unwrap_or_else(|| key.clone());
+    write_response(caller, memory, &rendered)
+}
+
 fn write_response(caller: &mut Caller<'_, StoreData>, memory: Memory, s: &str) -> i64 {
     let alloc = match caller.get_export("ari_alloc") {
         Some(wasmtime::Extern::Func(f)) => f,
@@ -1676,6 +1840,7 @@ mod tests {
             calendar_provider: Arc::new(crate::NullCalendarProvider),
             local_clock: Arc::new(crate::UtcLocalClock),
             config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
+            locale_provider: Arc::new(crate::EnglishLocaleProvider),
         }
     }
 
@@ -2499,6 +2664,7 @@ mod tests {
                 calendar_provider: Arc::new(crate::NullCalendarProvider),
                 local_clock: Arc::new(crate::UtcLocalClock),
                 config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
+                locale_provider: Arc::new(crate::EnglishLocaleProvider),
             },
         )
         .unwrap()
@@ -2608,6 +2774,7 @@ mod tests {
                 calendar_provider: Arc::new(crate::NullCalendarProvider),
                 local_clock: Arc::new(crate::UtcLocalClock),
                 config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
+                locale_provider: Arc::new(crate::EnglishLocaleProvider),
             },
         )
         .unwrap();

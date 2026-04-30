@@ -51,6 +51,7 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
         calendar_provider: Arc::new(NullCalendarProvider),
         local_clock: Arc::new(UtcLocalClock),
         config_store: Arc::new(MemoryConfigStore::new()),
+        locale_provider: Arc::new(EnglishLocaleProvider),
     }
 }
 
@@ -693,6 +694,7 @@ impl AriEngine {
         options.calendar_provider = self.calendar_provider.clone();
         options.local_clock = self.local_clock.clone();
         options.config_store = self.config_store.clone();
+        options.locale_provider = self.locale_provider.clone();
         let loaded: u32 =
             match load_skill_directory_with(&PathBuf::from(&skill_store_dir), &options) {
                 Ok(report) => {

@@ -146,6 +146,14 @@ pub struct LoadOptions {
     /// settings UI writes to, so a skill reading
     /// `ari::setting_get("destination")` sees the live value.
     pub config_store: Arc<dyn crate::assistant::ConfigStore>,
+    /// Locale source of truth — engine reads through this to know
+    /// which language the user is operating in. Backs the WASM
+    /// `ari::get_locale` host import and the locale parameter the
+    /// `t()` translation lookup uses to pick a `strings/{locale}.json`
+    /// table. Defaults to [`EnglishLocaleProvider`] for tests and the
+    /// CLI engine; the Android host wires a real provider that mirrors
+    /// the user's settings flow.
+    pub locale_provider: Arc<dyn crate::platform_capabilities::LocaleProvider>,
 }
 
 impl Default for LoadOptions {
@@ -159,6 +167,7 @@ impl Default for LoadOptions {
             calendar_provider: Arc::new(crate::platform_capabilities::NullCalendarProvider),
             local_clock: Arc::new(crate::platform_capabilities::UtcLocalClock),
             config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
+            locale_provider: Arc::new(crate::platform_capabilities::EnglishLocaleProvider),
         }
     }
 }
