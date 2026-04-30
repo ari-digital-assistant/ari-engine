@@ -26,9 +26,8 @@
 use crate::declarative::{AdapterError, DeclarativeSkill};
 use crate::host_capabilities::HostCapabilities;
 use crate::http_config::HttpConfig;
-use crate::manifest::{
-    AssistantManifest, Behaviour, Capability, ManifestError, SkillType, Skillfile,
-};
+use crate::localized_manifest::{parse_skill_directory, LocalizedManifestError};
+use crate::manifest::{AssistantManifest, Behaviour, Capability, ManifestError, SkillType};
 use crate::storage_config::StorageConfig;
 use crate::wasm::{LogSink, NullLogSink, WasmError, WasmSkill};
 use ari_core::Skill;
@@ -59,6 +58,10 @@ pub enum LoadFailureKind {
     MissingCapabilities { missing: Vec<Capability> },
     /// IO error walking the directory.
     Io(std::io::Error),
+    /// Localized-manifest layout failure — duplicate canonical
+    /// (`SKILL.md` AND `SKILL.en.md` both present), structural mismatch
+    /// across locale variants, invalid locale filename, etc.
+    LocalizedManifest(LocalizedManifestError),
 }
 
 impl std::fmt::Display for LoadFailure {
@@ -77,6 +80,7 @@ impl std::fmt::Display for LoadFailure {
                 missing
             ),
             LoadFailureKind::Io(e) => write!(f, "{}: {e}", self.path.display()),
+            LoadFailureKind::LocalizedManifest(e) => write!(f, "{}: {e}", self.path.display()),
         }
     }
 }
@@ -193,25 +197,47 @@ pub fn load_single_skill_dir(skill_dir: &Path) -> LoadReport {
 /// Same as [`load_single_skill_dir`] but lets the caller pass options.
 pub fn load_single_skill_dir_with(skill_dir: &Path, options: &LoadOptions) -> LoadReport {
     let mut report = LoadReport::new();
-    let manifest_path = skill_dir.join("SKILL.md");
-    if !manifest_path.is_file() {
-        report.failures.push(LoadFailure {
-            path: skill_dir.to_path_buf(),
-            kind: LoadFailureKind::MissingSkillfile,
-        });
-        return report;
-    }
 
-    let sf = match Skillfile::parse_file(&manifest_path) {
-        Ok(sf) => sf,
-        Err(e) => {
+    // Phase 3 routing: parse all SKILL.{locale}.md files in the
+    // directory (plus the legacy bare SKILL.md), validate cross-file
+    // structural consistency, and use the canonical (English)
+    // manifest as the structural source for the rest of this
+    // function. Locale-aware consumers (skill matching, browser
+    // display, t() host capability) come in later steps; for now
+    // the existing downstream is unchanged.
+    let manifest_set = match parse_skill_directory(skill_dir) {
+        Ok(set) => set,
+        Err(LocalizedManifestError::MissingCanonical) => {
             report.failures.push(LoadFailure {
-                path: manifest_path,
-                kind: LoadFailureKind::Manifest(e),
+                path: skill_dir.to_path_buf(),
+                kind: LoadFailureKind::MissingSkillfile,
+            });
+            return report;
+        }
+        // Translate manifest-parse failures back into the existing
+        // LoadFailureKind::Manifest shape so consumers that grep on
+        // it (tests, frontend error reporting) keep working unchanged.
+        Err(LocalizedManifestError::Parse { path, error }) => {
+            report.failures.push(LoadFailure {
+                path,
+                kind: LoadFailureKind::Manifest(error),
+            });
+            return report;
+        }
+        Err(other) => {
+            report.failures.push(LoadFailure {
+                path: skill_dir.to_path_buf(),
+                kind: LoadFailureKind::LocalizedManifest(other),
             });
             return report;
         }
     };
+
+    // Use the canonical (English) Skillfile for structural identity.
+    // Non-English variants are parsed and validated but not yet
+    // surfaced to the rest of the engine — Phase 3 step 8 routes
+    // skill matching through them.
+    let sf = manifest_set.canonical().clone();
 
     let Some(ari) = sf.ari_extension.as_ref() else {
         // Valid AgentSkills doc but not an Ari skill — silently skip.
@@ -239,7 +265,7 @@ pub fn load_single_skill_dir_with(skill_dir: &Path, options: &LoadOptions) -> Lo
     let missing = options.host_capabilities.missing_for(&ari.capabilities);
     if !missing.is_empty() {
         report.failures.push(LoadFailure {
-            path: manifest_path,
+            path: skill_dir.to_path_buf(),
             kind: LoadFailureKind::MissingCapabilities { missing },
         });
         return report;
@@ -249,14 +275,14 @@ pub fn load_single_skill_dir_with(skill_dir: &Path, options: &LoadOptions) -> Lo
         Some(Behaviour::Declarative(_)) => match DeclarativeSkill::from_skillfile(&sf) {
             Ok(skill) => report.skills.push(Box::new(skill)),
             Err(e) => report.failures.push(LoadFailure {
-                path: manifest_path,
+                path: skill_dir.to_path_buf(),
                 kind: LoadFailureKind::Adapter(e),
             }),
         },
         Some(Behaviour::Wasm(_)) => match WasmSkill::from_skillfile(&sf, skill_dir, options) {
             Ok(skill) => report.skills.push(Box::new(skill)),
             Err(e) => report.failures.push(LoadFailure {
-                path: manifest_path,
+                path: skill_dir.to_path_buf(),
                 kind: LoadFailureKind::Wasm(e),
             }),
         },

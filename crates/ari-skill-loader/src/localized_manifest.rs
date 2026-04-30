@@ -126,11 +126,6 @@ pub enum LocalizedManifestError {
          Localized name, description, body, and patterns are allowed to differ."
     )]
     StructuralMismatch { locale: String, field: String },
-
-    /// A manifest is missing the `metadata.ari` block entirely — it's
-    /// a valid AgentSkills doc but not an Ari skill.
-    #[error("{locale}: manifest has no `metadata.ari` block; not an Ari skill")]
-    MissingAriExtension { locale: String },
 }
 
 /// Scan a skill directory for `SKILL.{locale}.md` files (and the legacy
@@ -227,26 +222,29 @@ fn parse_locale_filename(filename: &str) -> Result<Option<String>, LocalizedMani
 fn validate_cross_file_consistency(
     manifests: &BTreeMap<String, Skillfile>,
 ) -> Result<(), LocalizedManifestError> {
+    // Canonical without `metadata.ari` is a plain AgentSkills doc that
+    // isn't an Ari skill — the loader will silently skip the whole
+    // directory the same way it always did pre-Phase-3. No structural
+    // truth to validate against, so we early-exit here.
     let canonical = manifests
         .get(CANONICAL_LOCALE)
         .expect("canonical guaranteed by caller");
-    let canonical_ari = canonical
-        .ari_extension
-        .as_ref()
-        .ok_or_else(|| LocalizedManifestError::MissingAriExtension {
-            locale: CANONICAL_LOCALE.to_string(),
-        })?;
+    let Some(canonical_ari) = canonical.ari_extension.as_ref() else {
+        return Ok(());
+    };
 
     for (locale, sf) in manifests {
         if locale == CANONICAL_LOCALE {
             continue;
         }
-        let other_ari = sf
-            .ari_extension
-            .as_ref()
-            .ok_or_else(|| LocalizedManifestError::MissingAriExtension {
-                locale: locale.clone(),
-            })?;
+        // A non-canonical variant lacking `metadata.ari` is harmless
+        // — the loader uses canonical for structural identity. Skip
+        // the consistency check for this locale; the variant's
+        // localized fields (name/description/body/patterns) still
+        // get parsed and stored.
+        let Some(other_ari) = sf.ari_extension.as_ref() else {
+            continue;
+        };
 
         // id — every locale variant of the same skill must share its id.
         if other_ari.id != canonical_ari.id {
