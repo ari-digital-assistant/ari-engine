@@ -4,6 +4,7 @@ pub mod declarative;
 pub mod host_capabilities;
 pub mod http_config;
 pub mod loader;
+pub mod localized_manifest;
 pub mod manifest;
 pub mod platform_capabilities;
 pub mod scoring;
@@ -34,6 +35,9 @@ pub use manifest::{
 pub use registry::{
     check_updates, install_by_id, install_update, AvailableUpdate, Index, IndexEntry,
     RegistryClient, RegistryError, REGISTRY_BASE_URL, REGISTRY_INDEX_URL, REGISTRY_TRUST_KEY,
+};
+pub use localized_manifest::{
+    parse_skill_directory, LocalizedManifestError, LocalizedManifestSet, CANONICAL_LOCALE,
 };
 pub use platform_capabilities::{
     Calendar, CalendarEventRow, CalendarProvider, EnglishLocaleProvider, InsertCalendarEventParams,
