@@ -36,7 +36,18 @@ pub enum FallbackResult {
 
 /// Trait so the engine can use a mock in tests.
 pub trait Fallback: Send + Sync {
-    fn try_answer(&self, input: &str, skills: &[SkillInfo]) -> Option<FallbackResult>;
+    /// Try answering the user's input using the on-device LLM.
+    /// `locale` is the user's currently-active language (ISO 639-1
+    /// lowercase) — the impl threads it into the system prompt's
+    /// "respond in <language>" fence so the model doesn't bleed
+    /// non-target-language tokens into the answer. Returns `None`
+    /// if the model declined to answer or the call failed.
+    fn try_answer(
+        &self,
+        input: &str,
+        skills: &[SkillInfo],
+        locale: &str,
+    ) -> Option<FallbackResult>;
 
     /// Run an arbitrary prompt and return the raw stripped output. Used
     /// by Layer C to run on-device assistant consultation when the user
@@ -403,7 +414,12 @@ impl Fallback for LazyLlmFallback {
         Ok(output)
     }
 
-    fn try_answer(&self, input: &str, skills: &[SkillInfo]) -> Option<FallbackResult> {
+    fn try_answer(
+        &self,
+        input: &str,
+        skills: &[SkillInfo],
+        locale: &str,
+    ) -> Option<FallbackResult> {
         self.clear_error();
         let mut state = match self.inner.lock() {
             Ok(g) => g,
@@ -438,7 +454,7 @@ impl Fallback for LazyLlmFallback {
         let now = Instant::now();
         state.last_used = Some(now);
 
-        let system_prompt = build_system_prompt(skills);
+        let system_prompt = build_system_prompt(skills, locale);
         let user_prompt = build_user_prompt(input);
 
         let model = state.loaded.as_ref().unwrap();
@@ -546,10 +562,15 @@ impl Fallback for LlmFallback {
         self.run_inference(&wrapped, false)
     }
 
-    fn try_answer(&self, input: &str, skills: &[SkillInfo]) -> Option<FallbackResult> {
+    fn try_answer(
+        &self,
+        input: &str,
+        skills: &[SkillInfo],
+        locale: &str,
+    ) -> Option<FallbackResult> {
         let _guard = self.inference_lock.lock().ok()?;
 
-        let system_prompt = build_system_prompt(skills);
+        let system_prompt = build_system_prompt(skills, locale);
         let user_prompt = build_user_prompt(input);
 
         let prompt = match self.build_chat_prompt(&system_prompt, &user_prompt) {
@@ -586,17 +607,32 @@ pub fn strip_thinking(raw: &str) -> String {
     result.trim().to_string()
 }
 
-fn build_system_prompt(_skills: &[SkillInfo]) -> String {
-    // FIXME(i18n): once Ari supports more than one locale, this
-    // prompt should be templated against `SkillContext::locale` so
-    // a user with locale=fr gets the same fence in French. Today
-    // every install is en, so hardcoding "English" is fine and
-    // helps Gemma 4 E2B avoid multilingual bleed-through (small
-    // models occasionally inject non-English tokens like `不` for
-    // "no" when the QA prompt doesn't fence the language).
-    "You are Ari, a helpful voice assistant. Answer the user's question in one short \
-     English sentence."
-        .to_string()
+/// Per-locale system prompt baked into the binary at compile time
+/// via `include_str!`. Adding a new locale is a `prompts/{locale}/`
+/// directory + an arm in [`build_system_prompt`].
+const PROMPT_EN_SYSTEM: &str = include_str!("../prompts/en/system.md");
+const PROMPT_IT_SYSTEM: &str = include_str!("../prompts/it/system.md");
+
+/// The QA-style system prompt for the on-device LLM fallback. Picks
+/// the locale-specific template and trims trailing whitespace from
+/// the file. Unknown locales fall back to English with a warn-log
+/// (engine catches it via the LogSink). The locale fence is critical
+/// for small models (Gemma 4 E2B occasionally bleeds in non-target-
+/// language tokens like `不` for "no" when the prompt isn't language-
+/// scoped).
+fn build_system_prompt(_skills: &[SkillInfo], locale: &str) -> String {
+    let template = match locale {
+        "en" => PROMPT_EN_SYSTEM,
+        "it" => PROMPT_IT_SYSTEM,
+        _ => {
+            // No template for this locale — silently fall through to
+            // English. Engine-level logging tracks the active locale
+            // so the dev can see this is happening; we don't surface
+            // it as a model error.
+            PROMPT_EN_SYSTEM
+        }
+    };
+    template.trim().to_string()
 }
 
 fn build_user_prompt(input: &str) -> String {
@@ -1259,10 +1295,34 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_is_concise() {
-        let prompt = build_system_prompt(&test_skills());
+    fn system_prompt_english_is_concise_and_locale_fenced() {
+        let prompt = build_system_prompt(&test_skills(), "en");
         assert!(prompt.contains("Ari"));
-        assert!(prompt.contains("one short sentence"));
+        // Locale fence — the explicit "English" word matters for
+        // small models that occasionally bleed in non-English tokens.
+        assert!(prompt.contains("English"));
+        // Brevity hint stays loud.
+        assert!(prompt.contains("one short"));
+        assert!(prompt.contains("sentence"));
+    }
+
+    #[test]
+    fn system_prompt_italian_is_localized() {
+        let prompt = build_system_prompt(&test_skills(), "it");
+        assert!(prompt.contains("Ari"));
+        assert!(prompt.contains("italiano"));
+        assert!(prompt.contains("breve frase"));
+        // Italian template must NOT carry the English fence — that
+        // would confuse the model into mixing languages.
+        assert!(!prompt.contains("English"));
+    }
+
+    #[test]
+    fn system_prompt_unknown_locale_falls_back_to_english() {
+        let prompt = build_system_prompt(&test_skills(), "ja");
+        // "Ja" isn't shipped — should silently get the en template.
+        assert!(prompt.contains("Ari"));
+        assert!(prompt.contains("English"));
     }
 
     #[test]
@@ -1427,7 +1487,7 @@ mod tests {
         eprintln!("Model loaded.");
 
         let skills = test_skills();
-        let system = build_system_prompt(&skills);
+        let system = build_system_prompt(&skills, "en");
         let user = build_user_prompt("what is the capital of australia");
 
         eprintln!("--- System prompt ---");

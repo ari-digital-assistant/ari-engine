@@ -439,7 +439,7 @@ impl Engine {
                             normalized.len()
                         ),
                     );
-                    let result = llm.try_answer(&normalized, &catalog);
+                    let result = llm.try_answer(&normalized, &catalog, &self.ctx.locale);
                     match result {
                         Some(ari_llm::FallbackResult::DirectAnswer { text }) => {
                             let preview: String = text.chars().take(160).collect();
