@@ -242,7 +242,7 @@ impl Skill for DeclarativeSkill {
     }
 
     fn score(&self, input: &str, ctx: &SkillContext) -> f32 {
-        self.entry_for_locale(&ctx.locale).scorer.score(input)
+        self.entry_for_locale(&ctx.locale).scorer.score(input, &ctx.locale)
     }
 
     fn execute(&self, _input: &str, ctx: &SkillContext) -> Response {

@@ -1913,7 +1913,7 @@ impl Skill for WasmSkill {
                     .get(crate::localized_manifest::CANONICAL_LOCALE)
                     .expect("canonical scorer guaranteed by from_parts")
             });
-            return scorer.score(input);
+            return scorer.score(input, &ctx.locale);
         }
 
         self.with_instance(

@@ -254,7 +254,7 @@ impl Engine {
     }
 
     pub fn process_input_traced(&self, input: &str) -> (Response, Option<DebugTrace>) {
-        let normalized = normalize_input(input.trim());
+        let normalized = normalize_input(input.trim(), &self.ctx.locale);
         if normalized.is_empty() {
             return (Response::Text(FALLBACK_RESPONSE.to_string()), None);
         }

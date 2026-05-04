@@ -388,10 +388,46 @@ pub fn replace_number_words(input: &str) -> String {
     result.join(" ")
 }
 
-pub fn normalize_input(input: &str) -> String {
+/// Lowercase, locale-specific contraction/elision handling, punctuation
+/// strip, locale-specific number-word replacement.
+///
+/// Per-locale dispatch:
+/// - `"en"` — expand English contractions (`"don't"` → `"do not"`,
+///   `"what's"` → `"what is"`) and replace English number words
+///   (`"five"` → `"5"`).
+/// - `"it"` — strip Italian apostrophe-elisions (`"l'ora"` → `"l ora"`,
+///   `"c'è"` → `"c è"`). No contraction expansion or number words yet
+///   (Italian number words are a Phase-7 polish item, alongside the
+///   first Italian skill).
+/// - Any other locale — lowercase + punctuation strip only.
+///
+/// Adding a new locale: extend the `match locale` block — the rest of
+/// the pipeline (lowercase, punctuation strip) is locale-neutral.
+pub fn normalize_input(input: &str, locale: &str) -> String {
     let lower = input.to_lowercase();
 
-    let expanded = lower
+    let pre_clean = match locale {
+        "en" => expand_english_contractions(&lower),
+        "it" => strip_italian_elisions(&lower),
+        _ => lower,
+    };
+
+    let cleaned: String = pre_clean
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c.is_whitespace() || "+-*/.%^".contains(c) { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ");
+
+    match locale {
+        "en" => replace_number_words(&cleaned),
+        _ => cleaned,
+    }
+}
+
+fn expand_english_contractions(lower: &str) -> String {
+    lower
         .replace("what's", "what is")
         .replace("whats", "what is")
         .replace("it's", "it is")
@@ -406,17 +442,31 @@ pub fn normalize_input(input: &str) -> String {
         .replace("there's", "there is")
         .replace("here's", "here is")
         .replace("that's", "that is")
-        .replace("let's", "let us");
+        .replace("let's", "let us")
+}
 
-    let cleaned: String = expanded
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c.is_whitespace() || "+-*/.%^".contains(c) { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<&str>>()
-        .join(" ");
-
-    replace_number_words(&cleaned)
+/// Replace any apostrophe (or unicode right-single-quote) that's
+/// flanked by alphabetic chars with a space. Handles Italian
+/// elisions cleanly: `"l'ora"` → `"l ora"`, `"c'è"` → `"c è"`,
+/// `"dell'amico"` → `"dell amico"`. The elided form would otherwise
+/// fail keyword matches against `"ora"` or `"amico"`.
+fn strip_italian_elisions(lower: &str) -> String {
+    let chars: Vec<char> = lower.chars().collect();
+    let mut out = String::with_capacity(lower.len());
+    for (i, c) in chars.iter().enumerate() {
+        let is_apostrophe = *c == '\'' || *c == '\u{2019}';
+        if is_apostrophe
+            && i > 0
+            && i + 1 < chars.len()
+            && chars[i - 1].is_alphabetic()
+            && chars[i + 1].is_alphabetic()
+        {
+            out.push(' ');
+        } else {
+            out.push(*c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -427,55 +477,94 @@ mod tests {
 
     #[test]
     fn normalize_lowercases() {
-        assert_eq!(normalize_input("HELLO World"), "hello world");
+        assert_eq!(normalize_input("HELLO World", "en"), "hello world");
     }
 
     #[test]
     fn normalize_expands_all_contractions() {
-        assert_eq!(normalize_input("what's"), "what is");
-        assert_eq!(normalize_input("whats"), "what is");
-        assert_eq!(normalize_input("it's"), "it is");
-        assert_eq!(normalize_input("i'm"), "i am");
-        assert_eq!(normalize_input("don't"), "do not");
-        assert_eq!(normalize_input("doesn't"), "does not");
-        assert_eq!(normalize_input("can't"), "cannot");
-        assert_eq!(normalize_input("won't"), "will not");
-        assert_eq!(normalize_input("isn't"), "is not");
-        assert_eq!(normalize_input("aren't"), "are not");
-        assert_eq!(normalize_input("didn't"), "did not");
-        assert_eq!(normalize_input("there's"), "there is");
-        assert_eq!(normalize_input("here's"), "here is");
-        assert_eq!(normalize_input("that's"), "that is");
-        assert_eq!(normalize_input("let's"), "let us");
+        assert_eq!(normalize_input("what's", "en"), "what is");
+        assert_eq!(normalize_input("whats", "en"), "what is");
+        assert_eq!(normalize_input("it's", "en"), "it is");
+        assert_eq!(normalize_input("i'm", "en"), "i am");
+        assert_eq!(normalize_input("don't", "en"), "do not");
+        assert_eq!(normalize_input("doesn't", "en"), "does not");
+        assert_eq!(normalize_input("can't", "en"), "cannot");
+        assert_eq!(normalize_input("won't", "en"), "will not");
+        assert_eq!(normalize_input("isn't", "en"), "is not");
+        assert_eq!(normalize_input("aren't", "en"), "are not");
+        assert_eq!(normalize_input("didn't", "en"), "did not");
+        assert_eq!(normalize_input("there's", "en"), "there is");
+        assert_eq!(normalize_input("here's", "en"), "here is");
+        assert_eq!(normalize_input("that's", "en"), "that is");
+        assert_eq!(normalize_input("let's", "en"), "let us");
     }
 
     #[test]
     fn normalize_strips_punctuation_keeps_math() {
-        assert_eq!(normalize_input("hello, world!"), "hello world");
-        assert_eq!(normalize_input("what?!"), "what");
-        assert_eq!(normalize_input("2 + 2"), "2 + 2");
-        assert_eq!(normalize_input("10 * 3.5"), "10 * 3.5");
-        assert_eq!(normalize_input("5 % 3"), "5 % 3");
-        assert_eq!(normalize_input("2^8"), "2^8");
-        assert_eq!(normalize_input("(1 + 2)"), "1 + 2");
+        assert_eq!(normalize_input("hello, world!", "en"), "hello world");
+        assert_eq!(normalize_input("what?!", "en"), "what");
+        assert_eq!(normalize_input("2 + 2", "en"), "2 + 2");
+        assert_eq!(normalize_input("10 * 3.5", "en"), "10 * 3.5");
+        assert_eq!(normalize_input("5 % 3", "en"), "5 % 3");
+        assert_eq!(normalize_input("2^8", "en"), "2^8");
+        assert_eq!(normalize_input("(1 + 2)", "en"), "1 + 2");
     }
 
     #[test]
     fn normalize_collapses_whitespace() {
-        assert_eq!(normalize_input("  hello   world  "), "hello world");
-        assert_eq!(normalize_input("\thello\tworld"), "hello world");
+        assert_eq!(normalize_input("  hello   world  ", "en"), "hello world");
+        assert_eq!(normalize_input("\thello\tworld", "en"), "hello world");
     }
 
     #[test]
     fn normalize_empty_and_whitespace() {
-        assert_eq!(normalize_input(""), "");
-        assert_eq!(normalize_input("   "), "");
-        assert_eq!(normalize_input("!!!"), "");
+        assert_eq!(normalize_input("", "en"), "");
+        assert_eq!(normalize_input("   ", "en"), "");
+        assert_eq!(normalize_input("!!!", "en"), "");
     }
 
     #[test]
     fn normalize_combined_contraction_and_number() {
-        assert_eq!(normalize_input("what's two plus three"), "what is 2 plus 3");
+        assert_eq!(normalize_input("what's two plus three", "en"), "what is 2 plus 3");
+    }
+
+    #[test]
+    fn normalize_italian_strips_apostrophe_elisions() {
+        // Definite article "l'" + vowel-initial noun → "l ora" so the
+        // pattern matcher's "ora" keyword catches this.
+        assert_eq!(normalize_input("l'ora", "it"), "l ora");
+        // Multi-letter contraction: "dell'amico" → "dell amico".
+        assert_eq!(normalize_input("dell'amico", "it"), "dell amico");
+        // "c'è" with a non-ASCII grave-accented vowel should pass
+        // through unchanged after the elision split.
+        assert_eq!(normalize_input("c'è", "it"), "c è");
+        // Right single quote (U+2019) is treated identically to ASCII apostrophe.
+        assert_eq!(normalize_input("l\u{2019}ora", "it"), "l ora");
+    }
+
+    #[test]
+    fn normalize_italian_does_not_expand_english_contractions() {
+        // English contraction expansion is a per-locale concern;
+        // an Italian utterance shouldn't get "what is" rewriting.
+        assert_eq!(normalize_input("what's", "it"), "what s");
+    }
+
+    #[test]
+    fn normalize_italian_does_not_run_english_number_words() {
+        // Italian number-word handling is deliberately not implemented
+        // yet (Phase 7 polish item); for now the cleaned string passes
+        // through. English number-word replacement must NOT fire.
+        assert_eq!(normalize_input("ho due ore", "it"), "ho due ore");
+    }
+
+    #[test]
+    fn normalize_unknown_locale_falls_through_to_lowercase_and_clean() {
+        // Some future locale we don't have a normaliser for yet:
+        // lowercase + punctuation strip only, no contraction or
+        // elision logic.
+        assert_eq!(normalize_input("Hello, World!", "es"), "hello world");
+        // English contractions do NOT expand for unknown locales.
+        assert_eq!(normalize_input("what's", "es"), "what s");
     }
 
     // --- words_to_number ---
