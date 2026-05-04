@@ -37,6 +37,21 @@ pub trait EnvelopeSink: Send + Sync {
 /// host uses that signal to trigger an STT retry path.
 pub const FALLBACK_RESPONSE: &str = "Sorry, I didn't understand that.";
 
+/// The locale-appropriate version of [`FALLBACK_RESPONSE`]. Used when
+/// every routing layer (skill regex → router → assistant) returned
+/// nothing — engine surfaces this so the user gets a graceful "I'm
+/// not sure" rather than silence. Falls back to the English
+/// constant for unknown locales.
+pub fn fallback_response_for(locale: &str) -> &'static str {
+    match locale {
+        "it" => "Scusa, non ho capito.",
+        "es" => "Lo siento, no entendí.",
+        "fr" => "Désolé, je n'ai pas compris.",
+        "de" => "Entschuldigung, das habe ich nicht verstanden.",
+        _ => FALLBACK_RESPONSE,
+    }
+}
+
 struct RankingRound {
     high_threshold: f32,
     medium_threshold: f32,
@@ -256,7 +271,10 @@ impl Engine {
     pub fn process_input_traced(&self, input: &str) -> (Response, Option<DebugTrace>) {
         let normalized = normalize_input(input.trim(), &self.ctx.locale);
         if normalized.is_empty() {
-            return (Response::Text(FALLBACK_RESPONSE.to_string()), None);
+            return (
+                Response::Text(fallback_response_for(&self.ctx.locale).to_string()),
+                None,
+            );
         }
 
         // "Ask <assistant> X" short-circuit. Runs before keyword
@@ -333,19 +351,62 @@ impl Engine {
             }
         }
 
-        // No keyword match. Try the skill router (FunctionGemma) if available.
-        if let Some(ref router) = self.router {
-            let skill_catalog: Vec<(String, String, String)> = self
-                .skills
-                .iter()
-                .map(|s| (
-                    s.id().to_string(),
-                    s.description().to_string(),
-                    s.parameters_schema().to_string(),
-                ))
-                .collect();
+        // No keyword match. Try the skill router. The Phase-5 routing
+        // fork picks the right backend based on the active locale:
+        //
+        // - English: FunctionGemma (the existing fast English-specific
+        //   tie-breaker — small fine-tuned model, returns typed args).
+        // - Non-English: ask the user's configured assistant LLM (cloud
+        //   or on-device Gemma E2B/E4B) to pick a skill_id from the
+        //   catalogue. Slower than FunctionGemma but multilingual out
+        //   of the box, with no per-language router fine-tune to
+        //   maintain. Doesn't extract typed args today (skill's own
+        //   parser handles the slot filling).
 
-            let route_result = router.route(&normalized, &skill_catalog);
+        let skill_catalog: Vec<(String, String, String)> = self
+            .skills
+            .iter()
+            .map(|s| (
+                s.id().to_string(),
+                s.description().to_string(),
+                s.parameters_schema().to_string(),
+            ))
+            .collect();
+
+        // Phase 5 non-English routing: ask the active assistant LLM
+        // to pick a skill_id. Runs INSTEAD OF FunctionGemma when the
+        // locale isn't English. Falls through to the existing
+        // assistant-answer path if no skill is picked.
+        if self.ctx.locale != "en" {
+            if let Some(picked_id) = self.try_assistant_route(&normalized, &skill_catalog) {
+                if let Some(skill) = self
+                    .skills
+                    .iter()
+                    .find(|s| s.id() == picked_id)
+                    .cloned()
+                {
+                    trace.winner = Some(format!("router:assistant:{picked_id}"));
+                    self.log(
+                        LogLevel::Info,
+                        &format!(
+                            "router:assistant: dispatching skill={picked_id} \
+                             (locale={})",
+                            self.ctx.locale
+                        ),
+                    );
+                    let response = skill.execute(&normalized, &self.ctx);
+                    let response = self.maybe_intercept_consult(skill, response);
+                    return (response, Some(trace));
+                }
+            }
+        }
+
+        // English: existing FunctionGemma path. Skipped for non-English
+        // locales — FunctionGemma is English-trained and would return
+        // garbage for Italian / Spanish / etc. utterances.
+        if self.ctx.locale == "en" {
+            if let Some(ref router) = self.router {
+                let route_result = router.route(&normalized, &skill_catalog);
 
             // Diagnostic: log the model's raw output so we can see what
             // FunctionGemma actually emits — function name + args block +
@@ -414,7 +475,8 @@ impl Engine {
                     trace.winner = Some("router:action".to_string());
                     return (Response::Action(action), Some(trace));
                 }
-                RouteResult::NoMatch => {}
+                    RouteResult::NoMatch => {}
+                }
             }
         }
 
@@ -495,7 +557,10 @@ impl Engine {
             None => {}
         }
 
-        (Response::Text(FALLBACK_RESPONSE.to_string()), Some(trace))
+        (
+            Response::Text(fallback_response_for(&self.ctx.locale).to_string()),
+            Some(trace),
+        )
     }
 
     /// If the skill's response envelope carries a `consult_assistant`
@@ -505,6 +570,78 @@ impl Engine {
     /// the phase-2 envelope via [`EnvelopeSink`]. When anything is
     /// missing (no sink, malformed directive, etc.) the skill's first
     /// envelope is returned unchanged — no assistant call happens.
+    /// Phase-5 non-English routing path. Build a routing prompt
+    /// asking the active assistant LLM to pick a skill_id from the
+    /// catalogue, dispatch to whichever backend the user has wired
+    /// (cloud assistant API or on-device Gemma E2B/E4B), and parse
+    /// the response back to a skill id.
+    ///
+    /// Returns `None` when:
+    /// - No active assistant is configured (regex-only world; engine
+    ///   surfaces FALLBACK_RESPONSE downstream).
+    /// - The active assistant is Builtin but the LLM isn't loaded
+    ///   (or the `llm` feature isn't compiled in).
+    /// - The model call failed.
+    /// - The model picked "NONE" or returned an unparseable response.
+    /// - The model picked an id that isn't in the catalogue.
+    fn try_assistant_route(
+        &self,
+        input: &str,
+        skill_catalog: &[(String, String, String)],
+    ) -> Option<String> {
+        let prompt = build_assistant_routing_prompt(input, skill_catalog, &self.ctx.locale);
+        let response = match &self.active_assistant {
+            Some(ActiveAssistant::Api {
+                skill_id,
+                config,
+                config_store,
+            }) => match ari_skill_loader::call_assistant_api(
+                config,
+                skill_id,
+                config_store.as_ref(),
+                &prompt,
+                &self.ctx.locale,
+            ) {
+                Ok(text) => text,
+                Err(e) => {
+                    self.log(
+                        LogLevel::Warn,
+                        &format!("router:assistant: cloud call failed: {e}"),
+                    );
+                    return None;
+                }
+            },
+            #[cfg(feature = "llm")]
+            Some(ActiveAssistant::Builtin { .. }) => {
+                let llm = self.llm.as_ref()?;
+                match llm.run_prompt(&prompt) {
+                    Ok(text) => ari_llm::strip_thinking(&text),
+                    Err(e) => {
+                        self.log(
+                            LogLevel::Warn,
+                            &format!("router:assistant: built-in LLM failed: {e}"),
+                        );
+                        return None;
+                    }
+                }
+            }
+            #[cfg(not(feature = "llm"))]
+            Some(ActiveAssistant::Builtin { .. }) => return None,
+            None => return None,
+        };
+        let picked = parse_assistant_routing_response(&response, skill_catalog);
+        if picked.is_none() {
+            let preview: String = response.chars().take(120).collect();
+            self.log(
+                LogLevel::Info,
+                &format!(
+                    "router:assistant: no skill picked (response preview={preview:?})"
+                ),
+            );
+        }
+        picked
+    }
+
     fn maybe_intercept_consult(
         &self,
         skill: Arc<dyn Skill>,
@@ -613,6 +750,95 @@ fn assistant_display_name(skill_id: &str) -> String {
 /// failure into a user-facing text response. The closure logs detailed
 /// diagnostics via the engine's log_sink — never leaks raw API error
 /// bodies to the user.
+/// Phase-5 routing prompt for the active assistant LLM. Asks the
+/// model to pick a single skill_id from the catalogue (or "NONE" if
+/// none fit). Locale is used to phrase the instructions in the
+/// user's language so monolingual cloud assistants don't get
+/// confused — the skill_ids themselves stay in their canonical
+/// form (reverse-DNS, ASCII).
+///
+/// Cloud-LLM-friendly format: instructions first, catalogue as a
+/// bulleted list, then the user's input fenced in quotes. Output
+/// constraint kept minimal so we get a parseable response on the
+/// first line even when the model insists on adding prose.
+fn build_assistant_routing_prompt(
+    input: &str,
+    skills: &[(String, String, String)],
+    locale: &str,
+) -> String {
+    let header = match locale {
+        "it" => "Sei un router di skill. L'utente ha detto:",
+        "es" => "Eres un enrutador de habilidades. El usuario dijo:",
+        "fr" => "Tu es un routeur de compétences. L'utilisateur a dit:",
+        "de" => "Du bist ein Skill-Router. Der Benutzer sagte:",
+        // Unknown locale falls back to English instructions — the
+        // skill list itself is what the model needs to match against,
+        // and skill ids are language-neutral.
+        _ => "You are a skill router. The user said:",
+    };
+    let pick_line = match locale {
+        "it" => "Scegli la skill che meglio corrisponde. Rispondi solo con l'id della skill sulla prima riga, oppure \"NONE\" se nessuna è appropriata. Non aggiungere spiegazioni.",
+        "es" => "Elige la habilidad que mejor coincida. Responde solo con el id de la habilidad en la primera línea, o \"NONE\" si ninguna es apropiada. No expliques.",
+        "fr" => "Choisis la compétence qui correspond le mieux. Réponds uniquement avec l'id de la compétence sur la première ligne, ou \"NONE\" si aucune ne convient. N'explique pas.",
+        "de" => "Wähle den passenden Skill. Antworte nur mit der Skill-ID in der ersten Zeile, oder \"NONE\", wenn keiner passt. Keine Erklärungen.",
+        _ => "Pick the skill that best matches. Respond with just the skill id on the first line, or \"NONE\" if none fit. Do not explain.",
+    };
+
+    let mut catalogue = String::new();
+    for (id, description, _schema) in skills {
+        catalogue.push_str(&format!("- {id}: {description}\n"));
+    }
+    format!("{header} \"{input}\"\n\n{catalogue}\n{pick_line}")
+}
+
+/// Parse the active assistant LLM's routing response. The contract
+/// is "skill_id on the first line, or NONE". Real models routinely
+/// violate it (markdown fences, leading explanation, trailing
+/// punctuation), so the parser is forgiving:
+///
+/// 1. Look at every non-empty line in turn.
+/// 2. Strip surrounding markdown (`*`, `_`, backticks, quotes).
+/// 3. Match (case-sensitive) against any skill id in the catalogue.
+/// 4. The first match wins.
+///
+/// Returns `None` for "NONE" responses, empty responses, or when no
+/// line matches a known skill id. The engine treats `None` as
+/// "fall through to the assistant-answer path" — the same behaviour
+/// FunctionGemma's `RouteResult::NoMatch` produces for English.
+fn parse_assistant_routing_response(
+    response: &str,
+    skills: &[(String, String, String)],
+) -> Option<String> {
+    let known_ids: std::collections::HashSet<&str> =
+        skills.iter().map(|(id, _, _)| id.as_str()).collect();
+    for raw_line in response.lines() {
+        let cleaned = raw_line
+            .trim()
+            .trim_matches(|c: char| {
+                c == '`'
+                    || c == '*'
+                    || c == '_'
+                    || c == '"'
+                    || c == '\''
+                    || c == '.'
+                    || c == ','
+                    || c == ':'
+                    || c == ';'
+                    || c.is_whitespace()
+            });
+        if cleaned.is_empty() {
+            continue;
+        }
+        if cleaned.eq_ignore_ascii_case("NONE") {
+            return None;
+        }
+        if known_ids.contains(cleaned) {
+            return Some(cleaned.to_string());
+        }
+    }
+    None
+}
+
 fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
     binding: &NamedAssistantBinding,
     prompt: &str,
@@ -1605,4 +1831,104 @@ mod tests {
         );
     }
 
+    // --- Phase 5: assistant-routing prompt + parser ---
+
+    fn router_test_skills() -> Vec<(String, String, String)> {
+        vec![
+            (
+                "current_time".to_string(),
+                "Tells the current time.".to_string(),
+                "{}".to_string(),
+            ),
+            (
+                "dev.heyari.timer".to_string(),
+                "Sets a countdown timer.".to_string(),
+                "{}".to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn assistant_routing_prompt_uses_italian_for_italian_locale() {
+        let skills = router_test_skills();
+        let prompt = build_assistant_routing_prompt("che ore sono", &skills, "it");
+        assert!(prompt.contains("L'utente ha detto"));
+        assert!(prompt.contains("\"che ore sono\""));
+        assert!(prompt.contains("- current_time:"));
+        assert!(prompt.contains("Scegli la skill"));
+        // Catalogue includes the dotted skill id verbatim.
+        assert!(prompt.contains("- dev.heyari.timer:"));
+    }
+
+    #[test]
+    fn assistant_routing_prompt_falls_back_to_english_for_unknown_locale() {
+        let skills = router_test_skills();
+        let prompt = build_assistant_routing_prompt("what time is it", &skills, "ja");
+        assert!(prompt.contains("You are a skill router"));
+        assert!(prompt.contains("Pick the skill"));
+    }
+
+    #[test]
+    fn parses_routing_response_first_line_skill_id() {
+        let skills = router_test_skills();
+        let picked = parse_assistant_routing_response("current_time", &skills);
+        assert_eq!(picked.as_deref(), Some("current_time"));
+    }
+
+    #[test]
+    fn parses_routing_response_strips_markdown_fences() {
+        let skills = router_test_skills();
+        // Common cloud-LLM behaviour: backtick-fences the answer.
+        let picked = parse_assistant_routing_response("`dev.heyari.timer`", &skills);
+        assert_eq!(picked.as_deref(), Some("dev.heyari.timer"));
+    }
+
+    #[test]
+    fn parses_routing_response_skips_explanation_lines() {
+        let skills = router_test_skills();
+        // Model added prose despite "do not explain". Find the
+        // skill id on a later line.
+        let response = "Sure, here's my pick:\n\ncurrent_time";
+        let picked = parse_assistant_routing_response(response, &skills);
+        assert_eq!(picked.as_deref(), Some("current_time"));
+    }
+
+    #[test]
+    fn parses_routing_response_returns_none_for_NONE() {
+        let skills = router_test_skills();
+        assert!(parse_assistant_routing_response("NONE", &skills).is_none());
+        assert!(parse_assistant_routing_response("none", &skills).is_none());
+        assert!(parse_assistant_routing_response("**NONE**", &skills).is_none());
+    }
+
+    #[test]
+    fn parses_routing_response_returns_none_for_unknown_id() {
+        let skills = router_test_skills();
+        // Model hallucinated a skill that doesn't exist — must not
+        // dispatch to a non-existent skill.
+        assert!(parse_assistant_routing_response("ai.example.bogus", &skills).is_none());
+    }
+
+    #[test]
+    fn parses_routing_response_returns_none_for_empty() {
+        let skills = router_test_skills();
+        assert!(parse_assistant_routing_response("", &skills).is_none());
+        assert!(parse_assistant_routing_response("   \n\n   ", &skills).is_none());
+    }
+
+    #[test]
+    fn fallback_response_localised_per_supported_locale() {
+        assert_eq!(
+            fallback_response_for("en"),
+            "Sorry, I didn't understand that."
+        );
+        assert_eq!(fallback_response_for("it"), "Scusa, non ho capito.");
+        assert_eq!(fallback_response_for("es"), "Lo siento, no entendí.");
+        assert_eq!(fallback_response_for("fr"), "Désolé, je n'ai pas compris.");
+        // Unknown locale falls back to English.
+        assert_eq!(
+            fallback_response_for("ja"),
+            "Sorry, I didn't understand that."
+        );
+    }
 }

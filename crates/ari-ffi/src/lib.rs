@@ -1,6 +1,6 @@
 #![allow(clippy::new_without_default)]
 
-use ari_engine::{Engine, EnvelopeSink, FALLBACK_RESPONSE};
+use ari_engine::{fallback_response_for, Engine, EnvelopeSink, FALLBACK_RESPONSE};
 use ari_skill_loader::assistant::{ConfigStore, MemoryConfigStore};
 use ari_skill_loader::{
     load_skill_directory_with, Calendar, CalendarEventRow, CalendarProvider, Capability,
@@ -587,11 +587,18 @@ impl AriEngine {
         // AriFfiLocaleProvider), so this is essentially free.
         let locale = self.locale_provider.current_locale();
         let mut engine = self.inner.lock().expect("engine mutex poisoned");
-        engine.set_locale(locale);
+        engine.set_locale(locale.clone());
         let (response, skill_id) = engine.process_input_with_skill(&input);
         match response {
             ari_core::Response::Text(s) => {
-                if s == FALLBACK_RESPONSE {
+                // The engine's fallback text is locale-specific
+                // (Phase 5 step 2). Compare against the locale-
+                // appropriate version so the Android NotUnderstood
+                // retry path fires for Italian / French / etc.
+                // users too — not just English.
+                let is_fallback =
+                    s == fallback_response_for(&locale) || s == FALLBACK_RESPONSE;
+                if is_fallback {
                     FfiResponse::NotUnderstood { body: s }
                 } else {
                     FfiResponse::Text { body: s }
