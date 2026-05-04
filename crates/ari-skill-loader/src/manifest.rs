@@ -10,7 +10,8 @@
 //! AgentSkills documents without it parse cleanly but yield `ari_extension =
 //! None`, so the loader can skip them without error.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 use thiserror::Error;
 
@@ -79,7 +80,7 @@ pub struct ApiConfig {
     pub auth_config_key: Option<String>,
     pub model_config_key: Option<String>,
     pub default_model: String,
-    pub system_prompt: String,
+    pub system_prompt: LocalizedPrompt,
     pub request_format: RequestFormat,
     pub response_path: String,
     pub api_version: Option<String>,
@@ -94,6 +95,137 @@ pub enum AuthScheme {
     Bearer,
     Header,
     None,
+}
+
+/// A cloud assistant's `system_prompt`, in one or more locales.
+///
+/// Wire format accepts either:
+///
+/// ```yaml
+/// system_prompt: "You are Ari."           # legacy: implicit en
+/// ```
+///
+/// or:
+///
+/// ```yaml
+/// system_prompt:
+///   en: "You are Ari."
+///   it: "Sei Ari."
+/// ```
+///
+/// Internally always a `BTreeMap<String, String>` keyed by ISO 639-1
+/// lowercase locale code. Lookup via [`for_locale`](Self::for_locale)
+/// falls back to canonical English when the requested locale isn't
+/// shipped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LocalizedPrompt {
+    /// Per-locale prompt strings. Always contains an `"en"` entry —
+    /// the parser synthesises one from a legacy plain-string value.
+    by_locale: BTreeMap<String, String>,
+}
+
+impl LocalizedPrompt {
+    /// Construct from a single English string. Used by the parser to
+    /// upgrade the legacy `system_prompt: "..."` form, and by tests /
+    /// programmatic builders via the `From<&str> / From<String>`
+    /// impls below.
+    pub fn from_english(prompt: String) -> Self {
+        let mut by_locale = BTreeMap::new();
+        by_locale.insert("en".to_string(), prompt);
+        Self { by_locale }
+    }
+
+    /// Construct from a pre-built map. Used by tests and any caller
+    /// that builds the prompts programmatically. Returns `None` if
+    /// the map is missing the canonical-English entry — every
+    /// localised prompt must have an English baseline to fall back to.
+    pub fn from_map(by_locale: BTreeMap<String, String>) -> Option<Self> {
+        if !by_locale.contains_key("en") {
+            return None;
+        }
+        Some(Self { by_locale })
+    }
+
+    /// The prompt for the given locale, or canonical English if the
+    /// requested locale isn't shipped. The `"en"` entry is guaranteed
+    /// present by the constructor invariants.
+    pub fn for_locale(&self, locale: &str) -> &str {
+        self.by_locale
+            .get(locale)
+            .unwrap_or_else(|| {
+                self.by_locale
+                    .get("en")
+                    .expect("canonical English prompt guaranteed by constructor")
+            })
+            .as_str()
+    }
+
+    /// Locales the prompt has explicit translations for. Always
+    /// includes `"en"`; sorted alphabetically.
+    pub fn supported_locales(&self) -> Vec<String> {
+        self.by_locale.keys().cloned().collect()
+    }
+}
+
+impl From<&str> for LocalizedPrompt {
+    fn from(s: &str) -> Self {
+        LocalizedPrompt::from_english(s.to_string())
+    }
+}
+
+impl From<String> for LocalizedPrompt {
+    fn from(s: String) -> Self {
+        LocalizedPrompt::from_english(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalizedPrompt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Accept either a plain string (legacy) or a string→string
+        // map (new). serde_yaml_ng routes both through the
+        // `serde::de::Value`-style untagged path; using
+        // serde_json::Value is uniform across YAML and JSON inputs.
+        use serde::de::Error;
+        let v = serde_yaml_ng::Value::deserialize(deserializer)?;
+        match v {
+            serde_yaml_ng::Value::String(s) => Ok(LocalizedPrompt::from_english(s)),
+            serde_yaml_ng::Value::Mapping(m) => {
+                let mut by_locale = BTreeMap::new();
+                for (k, val) in m {
+                    let k_str = match k {
+                        serde_yaml_ng::Value::String(s) => s,
+                        other => {
+                            return Err(Error::custom(format!(
+                                "system_prompt locale key must be a string, got {other:?}"
+                            )));
+                        }
+                    };
+                    let v_str = match val {
+                        serde_yaml_ng::Value::String(s) => s,
+                        other => {
+                            return Err(Error::custom(format!(
+                                "system_prompt[{k_str:?}] must be a string, got {other:?}"
+                            )));
+                        }
+                    };
+                    by_locale.insert(k_str, v_str);
+                }
+                if !by_locale.contains_key("en") {
+                    return Err(Error::custom(
+                        "system_prompt map must contain an 'en' entry — \
+                         English is the canonical fallback locale",
+                    ));
+                }
+                Ok(LocalizedPrompt { by_locale })
+            }
+            other => Err(Error::custom(format!(
+                "system_prompt must be a string or a {{locale: prompt}} map, got {other:?}"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -835,7 +967,7 @@ impl ApiConfig {
         let system_prompt = raw
             .system_prompt
             .clone()
-            .filter(|s| !s.is_empty())
+            .filter(|p| !p.for_locale("en").is_empty())
             .ok_or(ManifestError::MissingSystemPrompt)?;
 
         let response_path = raw
@@ -1226,7 +1358,9 @@ struct RawApiConfig {
     auth_config_key: Option<String>,
     model_config_key: Option<String>,
     default_model: Option<String>,
-    system_prompt: Option<String>,
+    /// Accepts either a plain string (legacy form, parsed as
+    /// English) or a `{locale: prompt}` map. See [`LocalizedPrompt`].
+    system_prompt: Option<LocalizedPrompt>,
     request_format: Option<RequestFormat>,
     response_path: Option<String>,
     api_version: Option<String>,
@@ -1321,6 +1455,56 @@ metadata:
 # Coin Flip
 Flips a virtual coin.
 "#
+    }
+
+    #[test]
+    fn localized_prompt_legacy_string_form_parses_as_english() {
+        // YAML in the wild today: `system_prompt: "be brief"`.
+        // Must round-trip into a single-locale "en" entry without
+        // breaking existing manifests.
+        let yaml = "be brief";
+        let p: LocalizedPrompt = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(p.for_locale("en"), "be brief");
+        assert_eq!(p.supported_locales(), vec!["en".to_string()]);
+        // Unknown locales fall back to English.
+        assert_eq!(p.for_locale("it"), "be brief");
+    }
+
+    #[test]
+    fn localized_prompt_map_form_parses_per_locale() {
+        let yaml = "
+en: be brief
+it: sii breve
+";
+        let p: LocalizedPrompt = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(p.for_locale("en"), "be brief");
+        assert_eq!(p.for_locale("it"), "sii breve");
+        // Unsupplied locale falls back to canonical English.
+        assert_eq!(p.for_locale("fr"), "be brief");
+        assert_eq!(p.supported_locales(), vec!["en".to_string(), "it".to_string()]);
+    }
+
+    #[test]
+    fn localized_prompt_map_without_english_is_rejected() {
+        // Without "en" there's no fallback for any other locale we
+        // might add later — disallow at parse time.
+        let yaml = "
+it: sii breve
+";
+        let err = serde_yaml_ng::from_str::<LocalizedPrompt>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("'en' entry"),
+            "expected error mentioning 'en' entry, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn localized_prompt_non_string_value_rejected() {
+        let yaml = "
+en: 42
+";
+        let err = serde_yaml_ng::from_str::<LocalizedPrompt>(yaml).unwrap_err();
+        assert!(err.to_string().contains("must be a string"));
     }
 
     #[test]

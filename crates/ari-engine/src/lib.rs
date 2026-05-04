@@ -279,7 +279,7 @@ impl Engine {
                     m.remainder.len()
                 ),
             );
-            let response = dispatch_named_assistant(m.binding, &m.remainder, |level, msg| {
+            let response = dispatch_named_assistant(m.binding, &m.remainder, &self.ctx.locale, |level, msg| {
                 self.log(level, msg)
             });
             return (response, Some(trace));
@@ -483,6 +483,7 @@ impl Engine {
                     skill_id,
                     config_store.as_ref(),
                     &normalized,
+                    &self.ctx.locale,
                 ) {
                     Ok(text) if !text.is_empty() => {
                         trace.winner = Some(format!("assistant:{skill_id}"));
@@ -615,6 +616,7 @@ fn assistant_display_name(skill_id: &str) -> String {
 fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
     binding: &NamedAssistantBinding,
     prompt: &str,
+    locale: &str,
     log: F,
 ) -> Response {
     let display = assistant_display_name(&binding.skill_id);
@@ -623,6 +625,7 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
         &binding.skill_id,
         binding.config_store.as_ref(),
         prompt,
+        locale,
     ) {
         Ok(text) if !text.is_empty() => Response::Text(text),
         Ok(_) => {
@@ -797,6 +800,7 @@ fn run_consult_phase_two(
     let (tx, rx) = std::sync::mpsc::channel();
     let prompt_for_thread = directive.prompt.clone();
     let assistant_for_thread = assistant.clone();
+    let locale_for_thread = ctx.locale.clone();
     #[cfg(feature = "llm")]
     let llm_for_thread = llm.clone();
     std::thread::spawn(move || {
@@ -805,9 +809,14 @@ fn run_consult_phase_two(
             &assistant_for_thread,
             &llm_for_thread,
             &prompt_for_thread,
+            &locale_for_thread,
         );
         #[cfg(not(feature = "llm"))]
-        let result = call_assistant_for_consult(&assistant_for_thread, &prompt_for_thread);
+        let result = call_assistant_for_consult(
+            &assistant_for_thread,
+            &prompt_for_thread,
+            &locale_for_thread,
+        );
         let _ = tx.send(result);
     });
 
@@ -899,6 +908,7 @@ fn call_assistant_for_consult(
     assistant: &Option<ActiveAssistant>,
     llm: &Option<Arc<dyn ari_llm::Fallback>>,
     prompt: &str,
+    locale: &str,
 ) -> Result<String, String> {
     match assistant {
         Some(ActiveAssistant::Api {
@@ -911,6 +921,7 @@ fn call_assistant_for_consult(
                 skill_id,
                 config_store.as_ref(),
                 prompt,
+                locale,
             )
             .map_err(|e| e.to_string())?;
             if text.trim().is_empty() {
@@ -959,6 +970,7 @@ fn call_assistant_for_consult(
 fn call_assistant_for_consult(
     assistant: &Option<ActiveAssistant>,
     prompt: &str,
+    locale: &str,
 ) -> Result<String, String> {
     match assistant {
         Some(ActiveAssistant::Api {
@@ -971,6 +983,7 @@ fn call_assistant_for_consult(
                 skill_id,
                 config_store.as_ref(),
                 prompt,
+                locale,
             )
             .map_err(|e| e.to_string())?;
             if text.trim().is_empty() {

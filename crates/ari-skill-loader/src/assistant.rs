@@ -132,10 +132,11 @@ pub fn call_assistant_api(
     skill_id: &str,
     store: &dyn ConfigStore,
     user_input: &str,
+    locale: &str,
 ) -> Result<String, AssistantApiError> {
     let resolved = resolve_config(config, skill_id, store)?;
 
-    let body = build_request_body(config, &resolved, user_input);
+    let body = build_request_body(config, &resolved, user_input, locale);
 
     let tls_config = tls::webpki_roots_config();
     let client = reqwest::blocking::Client::builder()
@@ -223,7 +224,9 @@ fn build_request_body(
     config: &ApiConfig,
     resolved: &ResolvedConfig,
     user_input: &str,
+    locale: &str,
 ) -> String {
+    let system_prompt = config.system_prompt.for_locale(locale);
     let body = match config.request_format {
         RequestFormat::Openai => {
             // `max_completion_tokens` replaced `max_tokens` in the
@@ -236,7 +239,7 @@ fn build_request_body(
                 "max_completion_tokens": config.max_tokens,
                 "temperature": config.temperature,
                 "messages": [
-                    {"role": "system", "content": config.system_prompt},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_input}
                 ]
             })
@@ -245,7 +248,7 @@ fn build_request_body(
             let mut obj = serde_json::json!({
                 "model": resolved.model,
                 "max_tokens": config.max_tokens,
-                "system": config.system_prompt,
+                "system": system_prompt,
                 "messages": [
                     {"role": "user", "content": user_input}
                 ]
@@ -349,7 +352,7 @@ mod tests {
             model: "gpt-4o-mini".into(),
             api_key: Some("sk-test".into()),
         };
-        let body = build_request_body(&config, &resolved, "What is 2+2?");
+        let body = build_request_body(&config, &resolved, "What is 2+2?", "en");
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["model"], "gpt-4o-mini");
         assert_eq!(parsed["max_completion_tokens"], 256);
@@ -387,7 +390,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             api_key: Some("sk-ant-test".into()),
         };
-        let body = build_request_body(&config, &resolved, "Hello");
+        let body = build_request_body(&config, &resolved, "Hello", "en");
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["model"], "claude-sonnet-4-6");
         assert_eq!(parsed["system"], "You are Ari.");
@@ -502,7 +505,7 @@ mod tests {
         let mut store = MemoryConfigStore::new();
         store.set(&entry.id, "api_key", &api_key);
 
-        let result = call_assistant_api(api, &entry.id, &store, "what is the capital of malta");
+        let result = call_assistant_api(api, &entry.id, &store, "what is the capital of malta", "en");
         match result {
             Ok(text) => {
                 eprintln!("ChatGPT response: {text}");
