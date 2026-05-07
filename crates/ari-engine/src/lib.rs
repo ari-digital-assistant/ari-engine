@@ -1894,7 +1894,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_routing_response_returns_none_for_NONE() {
+    fn parses_routing_response_returns_none_for_none_sentinel() {
         let skills = router_test_skills();
         assert!(parse_assistant_routing_response("NONE", &skills).is_none());
         assert!(parse_assistant_routing_response("none", &skills).is_none());
