@@ -142,7 +142,7 @@ impl Skill for CalculatorSkill {
         0.0
     }
 
-    fn execute(&self, input: &str, _ctx: &SkillContext) -> Response {
+    fn execute(&self, input: &str, ctx: &SkillContext) -> Response {
         let expr = to_math_expr(input);
 
         match eval_expr(&expr) {
@@ -153,7 +153,16 @@ impl Skill for CalculatorSkill {
                     Response::Text(format!("{:.6}", result).trim_end_matches('0').trim_end_matches('.').to_string())
                 }
             }
-            None => Response::Text("Sorry, I couldn't evaluate that expression.".to_string()),
+            None => Response::Text(
+                match ctx.locale.as_str() {
+                    "it" => "Mi spiace, non sono riuscito a calcolare quell'espressione.",
+                    "es" => "Lo siento, no pude evaluar esa expresión.",
+                    "fr" => "Désolé, je n'ai pas pu évaluer cette expression.",
+                    "de" => "Tut mir leid, ich konnte diesen Ausdruck nicht berechnen.",
+                    _ => "Sorry, I couldn't evaluate that expression.",
+                }
+                .to_string(),
+            ),
         }
     }
 }

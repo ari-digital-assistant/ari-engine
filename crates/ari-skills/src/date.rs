@@ -1,5 +1,5 @@
 use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
-use chrono::Local;
+use chrono::{Datelike, Local};
 
 const TRIGGER_PHRASES: &[&[&str]] = &[
     &["what", "date"],
@@ -97,12 +97,78 @@ impl Skill for DateSkill {
         best_score
     }
 
-    fn execute(&self, _input: &str, _ctx: &SkillContext) -> Response {
+    fn execute(&self, _input: &str, ctx: &SkillContext) -> Response {
         let now = Local::now();
-        let formatted = now.format("%A, %B %-d, %Y").to_string();
-        Response::Text(format!("Today is {}.", formatted))
+        // chrono's `%A` (weekday) and `%B` (month) format using the
+        // system's C-locale by default — that's English-only on most
+        // builds. Hand-roll the locale-specific tables so the response
+        // doesn't depend on what locales the host happens to have
+        // installed at the OS level.
+        let weekday_idx = now.weekday().num_days_from_monday() as usize; // 0..=6
+        let month_idx = now.month() as usize; // 1..=12
+        let day = now.day();
+        let year = now.year();
+        let response = match ctx.locale.as_str() {
+            "it" => {
+                let weekday = ITALIAN_WEEKDAYS[weekday_idx];
+                let month = ITALIAN_MONTHS[month_idx];
+                format!("Oggi è {} {} {} {}.", weekday, day, month, year)
+            }
+            "es" => {
+                let weekday = SPANISH_WEEKDAYS[weekday_idx];
+                let month = SPANISH_MONTHS[month_idx];
+                format!("Hoy es {} {} de {} de {}.", weekday, day, month, year)
+            }
+            "fr" => {
+                let weekday = FRENCH_WEEKDAYS[weekday_idx];
+                let month = FRENCH_MONTHS[month_idx];
+                format!("Nous sommes le {} {} {} {}.", weekday, day, month, year)
+            }
+            "de" => {
+                let weekday = GERMAN_WEEKDAYS[weekday_idx];
+                let month = GERMAN_MONTHS[month_idx];
+                format!("Heute ist {}, der {}. {} {}.", weekday, day, month, year)
+            }
+            _ => {
+                let formatted = now.format("%A, %B %-d, %Y").to_string();
+                format!("Today is {}.", formatted)
+            }
+        };
+        Response::Text(response)
     }
 }
+
+// Index 0 = Monday (chrono's `num_days_from_monday`).
+const ITALIAN_WEEKDAYS: [&str; 7] = [
+    "lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica",
+];
+const SPANISH_WEEKDAYS: [&str; 7] = [
+    "lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo",
+];
+const FRENCH_WEEKDAYS: [&str; 7] = [
+    "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche",
+];
+const GERMAN_WEEKDAYS: [&str; 7] = [
+    "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag",
+];
+
+// Index 0 unused — months are 1..=12.
+const ITALIAN_MONTHS: [&str; 13] = [
+    "", "gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio",
+    "agosto", "settembre", "ottobre", "novembre", "dicembre",
+];
+const SPANISH_MONTHS: [&str; 13] = [
+    "", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+    "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+];
+const FRENCH_MONTHS: [&str; 13] = [
+    "", "janvier", "février", "mars", "avril", "mai", "juin", "juillet",
+    "août", "septembre", "octobre", "novembre", "décembre",
+];
+const GERMAN_MONTHS: [&str; 13] = [
+    "", "Januar", "Februar", "März", "April", "Mai", "Juni", "Juli",
+    "August", "September", "Oktober", "November", "Dezember",
+];
 
 #[cfg(test)]
 mod tests {
@@ -165,6 +231,32 @@ mod tests {
         assert_eq!(skill.score("what is the holiday discount", &ctx()), 0.0);
         // "what" and "today" both as standalone words still trigger.
         assert!(skill.score("what is the date today", &ctx()) > 0.0);
+    }
+
+    #[test]
+    fn execute_italian_uses_italian_weekday_and_month() {
+        let skill = DateSkill::new();
+        let mut italian = SkillContext::default();
+        italian.locale = "it".to_string();
+        let resp = skill.execute("che giorno è oggi", &italian);
+        match resp {
+            Response::Text(s) => {
+                // Shape: "Oggi è <weekday> <day> <month> <year>."
+                assert!(s.starts_with("Oggi è "));
+                assert!(s.ends_with('.'));
+                // At least one Italian weekday or month must be present —
+                // the exact ones depend on test-run date, so we check
+                // membership rather than equality.
+                let italian_weekday = ITALIAN_WEEKDAYS.iter().any(|w| s.contains(*w));
+                let italian_month = ITALIAN_MONTHS.iter().any(|m| !m.is_empty() && s.contains(*m));
+                assert!(italian_weekday, "no Italian weekday in: {s}");
+                assert!(italian_month, "no Italian month in: {s}");
+                // No English months should appear
+                assert!(!s.contains("January"));
+                assert!(!s.contains("Today is"));
+            }
+            _ => panic!("expected Text response"),
+        }
     }
 
     #[test]

@@ -111,7 +111,7 @@ impl Skill for OpenSkill {
         }
     }
 
-    fn execute(&self, input: &str, _ctx: &SkillContext) -> Response {
+    fn execute(&self, input: &str, ctx: &SkillContext) -> Response {
         match extract_target(input) {
             // `speak` is omitted deliberately — the frontend owns the
             // platform-appropriate phrasing ("Opening Spotify" on Android,
@@ -121,7 +121,16 @@ impl Skill for OpenSkill {
                 "v": 1,
                 "launch_app": target,
             })),
-            None => Response::Text("What would you like me to open?".to_string()),
+            None => Response::Text(
+                match ctx.locale.as_str() {
+                    "it" => "Cosa vuoi che apra?",
+                    "es" => "¿Qué quieres que abra?",
+                    "fr" => "Qu'est-ce que tu veux que j'ouvre ?",
+                    "de" => "Was soll ich öffnen?",
+                    _ => "What would you like me to open?",
+                }
+                .to_string(),
+            ),
         }
     }
 

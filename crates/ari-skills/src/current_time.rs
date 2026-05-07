@@ -90,10 +90,20 @@ impl Skill for CurrentTimeSkill {
         best_score
     }
 
-    fn execute(&self, _input: &str, _ctx: &SkillContext) -> Response {
+    fn execute(&self, _input: &str, ctx: &SkillContext) -> Response {
         let now = Local::now();
-        let formatted = now.format("%-I:%M %p").to_string();
-        Response::Text(format!("It's {}.", formatted))
+        // Locale-aware time format. English keeps 12-hour with AM/PM
+        // ("It's 3:25 PM."). Other shipped locales use 24-hour ("alle
+        // 15:25") — that's the conventional written form in IT/ES/FR/DE
+        // and avoids translating the AM/PM tokens.
+        let response = match ctx.locale.as_str() {
+            "it" => format!("Sono le {}.", now.format("%H:%M")),
+            "es" => format!("Son las {}.", now.format("%H:%M")),
+            "fr" => format!("Il est {}.", now.format("%H:%M")),
+            "de" => format!("Es ist {} Uhr.", now.format("%H:%M")),
+            _ => format!("It's {}.", now.format("%-I:%M %p")),
+        };
+        Response::Text(response)
     }
 }
 
@@ -200,5 +210,45 @@ mod tests {
     #[test]
     fn specificity_is_high() {
         assert_eq!(CurrentTimeSkill::new().specificity(), Specificity::High);
+    }
+
+    #[test]
+    fn execute_italian_uses_24h_and_italian_text() {
+        let skill = CurrentTimeSkill::new();
+        let mut italian = SkillContext::default();
+        italian.locale = "it".to_string();
+        let resp = skill.execute("che ora e", &italian);
+        match resp {
+            Response::Text(s) => {
+                // Italian: "Sono le HH:MM." — 24-hour, no AM/PM, leading
+                // "Sono le". Don't pin the exact time; just shape.
+                assert!(
+                    s.starts_with("Sono le "),
+                    "Italian response should start with 'Sono le ': {s}"
+                );
+                assert!(s.ends_with('.'));
+                assert!(!s.contains("AM"));
+                assert!(!s.contains("PM"));
+                // Pull the HH:MM out of "Sono le HH:MM."
+                let inner = s
+                    .strip_prefix("Sono le ")
+                    .and_then(|s| s.strip_suffix('.'))
+                    .expect("expected 'Sono le HH:MM.' shape");
+                assert!(inner.contains(':'), "expected HH:MM, got {inner}");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn execute_unknown_locale_falls_back_to_english() {
+        let skill = CurrentTimeSkill::new();
+        let mut other = SkillContext::default();
+        other.locale = "ja".to_string();
+        let resp = skill.execute("what time is it", &other);
+        match resp {
+            Response::Text(s) => assert!(s.starts_with("It's "), "fallback to English: {s}"),
+            _ => panic!("expected Text response"),
+        }
     }
 }
