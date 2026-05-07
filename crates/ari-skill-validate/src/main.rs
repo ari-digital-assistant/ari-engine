@@ -313,10 +313,11 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
     });
 }
 
-/// Re-parse SKILL.md to pull the descriptive frontmatter fields for rows
-/// the loader accepted. The loader returns `Box<dyn Skill>` which only
-/// exposes id/specificity — the rest of the frontmatter isn't on the
-/// trait. Cheap to re-parse; we've already loaded the file once.
+/// Re-parse the canonical-locale manifest to pull the descriptive
+/// frontmatter fields for rows the loader accepted. The loader
+/// returns `Box<dyn Skill>` which only exposes id/specificity — the
+/// rest of the frontmatter isn't on the trait. Cheap to re-parse;
+/// we've already loaded the file once.
 #[derive(Default)]
 struct ManifestFields {
     version: Option<String>,
@@ -332,8 +333,18 @@ struct ManifestFields {
 }
 
 fn read_manifest_fields(skill_dir: &Path) -> ManifestFields {
-    let path = skill_dir.join("SKILL.md");
-    let Ok(sf) = Skillfile::parse_file(&path) else {
+    // Prefer `SKILL.en.md` (the per-locale layout) and fall back to
+    // the legacy `SKILL.md` so skills that haven't migrated yet still
+    // get their fields read correctly. Without this fallback, skills
+    // on the new layout returned `ManifestFields::default()` and the
+    // publish-index pipeline silently dropped them ("skill at X has
+    // no id/version — skipping" with no version to report).
+    let candidates = [skill_dir.join("SKILL.en.md"), skill_dir.join("SKILL.md")];
+    let path = candidates.iter().find(|p| p.is_file());
+    let Some(path) = path else {
+        return ManifestFields::default();
+    };
+    let Ok(sf) = Skillfile::parse_file(path) else {
         return ManifestFields::default();
     };
     let mut out = ManifestFields {
