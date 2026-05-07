@@ -444,7 +444,21 @@ impl SkillRegistry {
             .get(&id)
             .ok_or_else(|| FfiRegistryError::NotInstalled { id: id.clone() })?;
 
-        let manifest_path = entry.install_dir.join("SKILL.md");
+        // Prefer the per-locale canonical (`SKILL.en.md`); fall back
+        // to legacy `SKILL.md` for skills that haven't migrated yet.
+        // The detail screen historically hit only SKILL.md and surfaced
+        // a "Couldn't read the skill manifest" error for any skill on
+        // the new layout — even successfully-installed ones.
+        //
+        // TODO(phase-11): once browse-side localisation lands, switch
+        // to `LocalizedManifestSet::for_locale(active_locale)` so
+        // Italian users get the Italian name + description on the
+        // installed-skill detail screen.
+        let manifest_path = {
+            let en = entry.install_dir.join("SKILL.en.md");
+            let legacy = entry.install_dir.join("SKILL.md");
+            if en.is_file() { en } else { legacy }
+        };
         let skillfile = Skillfile::parse_file(&manifest_path).map_err(|e: ManifestError| {
             FfiRegistryError::Manifest {
                 message: e.to_string(),
@@ -452,7 +466,7 @@ impl SkillRegistry {
         })?;
 
         let ext = skillfile.ari_extension.ok_or_else(|| FfiRegistryError::Manifest {
-            message: "SKILL.md is missing the ari extension metadata".to_string(),
+            message: "manifest is missing the ari extension metadata".to_string(),
         })?;
 
         Ok(FfiSkillManifest {
@@ -499,14 +513,20 @@ impl SkillRegistry {
         let entry = store
             .get(&id)
             .ok_or_else(|| FfiRegistryError::NotInstalled { id: id.clone() })?;
-        let manifest_path = entry.install_dir.join("SKILL.md");
+        // Same dual-acceptance rule as `read_installed_manifest`:
+        // prefer SKILL.en.md, fall back to legacy SKILL.md.
+        let manifest_path = {
+            let en = entry.install_dir.join("SKILL.en.md");
+            let legacy = entry.install_dir.join("SKILL.md");
+            if en.is_file() { en } else { legacy }
+        };
         let skillfile = Skillfile::parse_file(&manifest_path).map_err(|e: ManifestError| {
             FfiRegistryError::Manifest {
                 message: e.to_string(),
             }
         })?;
         let ext = skillfile.ari_extension.ok_or_else(|| FfiRegistryError::Manifest {
-            message: "SKILL.md is missing the ari extension metadata".to_string(),
+            message: "manifest is missing the ari extension metadata".to_string(),
         })?;
 
         Ok(ext
