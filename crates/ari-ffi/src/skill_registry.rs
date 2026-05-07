@@ -467,43 +467,42 @@ impl SkillRegistry {
         })
     }
 
-    /// Read the on-disk `SKILL.md` for an already-installed skill and
-    /// return the rich manifest the list/row view doesn't have room for —
+    /// Read the on-disk manifest for an already-installed skill and
+    /// return the rich record the list/row view doesn't have room for —
     /// author, homepage, capabilities, supported languages, full body.
     ///
+    /// `locale` is the user's active ISO 639-1 code (`"en"`, `"it"`,
+    /// …). When the skill ships a `SKILL.{locale}.md`, fields that
+    /// legitimately differ across locales (`name`, `description`,
+    /// `body`) come from that variant — Italian users see Italian
+    /// description on the installed-skill detail screen instead of
+    /// the canonical English. Locales the skill hasn't translated
+    /// fall back to canonical English via `LocalizedManifestSet::for_locale`.
+    ///
     /// Returns [`FfiRegistryError::NotInstalled`] if `id` isn't in the
-    /// store, or [`FfiRegistryError::Manifest`] if the file is missing
-    /// or fails to parse (shouldn't happen for skills we installed
-    /// ourselves but possible if the user's tampered with the dir).
+    /// store, or [`FfiRegistryError::Manifest`] if the manifest is
+    /// missing or fails to parse.
     pub fn read_installed_manifest(
         &self,
         id: String,
+        locale: String,
     ) -> Result<FfiSkillManifest, FfiRegistryError> {
         let store = self.store.lock().expect("skill store mutex poisoned");
         let entry = store
             .get(&id)
             .ok_or_else(|| FfiRegistryError::NotInstalled { id: id.clone() })?;
 
-        // Prefer the per-locale canonical (`SKILL.en.md`); fall back
-        // to legacy `SKILL.md` for skills that haven't migrated yet.
-        // The detail screen historically hit only SKILL.md and surfaced
-        // a "Couldn't read the skill manifest" error for any skill on
-        // the new layout — even successfully-installed ones.
-        //
-        // TODO(phase-11): once browse-side localisation lands, switch
-        // to `LocalizedManifestSet::for_locale(active_locale)` so
-        // Italian users get the Italian name + description on the
-        // installed-skill detail screen.
-        let manifest_path = {
-            let en = entry.install_dir.join("SKILL.en.md");
-            let legacy = entry.install_dir.join("SKILL.md");
-            if en.is_file() { en } else { legacy }
-        };
-        let skillfile = Skillfile::parse_file(&manifest_path).map_err(|e: ManifestError| {
-            FfiRegistryError::Manifest {
+        // Walk the per-locale manifest set, then pick the variant for
+        // the user's active locale. The set's invariants guarantee
+        // both a canonical English entry and structural consistency
+        // with it (`id`, `type`, `capabilities`, `behaviour` all
+        // match), so picking the localized variant is safe — only
+        // the human-language fields differ.
+        let manifest_set = ari_skill_loader::parse_skill_directory(&entry.install_dir)
+            .map_err(|e| FfiRegistryError::Manifest {
                 message: e.to_string(),
-            }
-        })?;
+            })?;
+        let skillfile = manifest_set.for_locale(&locale).clone();
 
         let ext = skillfile.ari_extension.ok_or_else(|| FfiRegistryError::Manifest {
             message: "manifest is missing the ari extension metadata".to_string(),
