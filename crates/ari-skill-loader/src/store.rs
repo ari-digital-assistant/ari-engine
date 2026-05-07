@@ -84,7 +84,10 @@ impl SkillStore {
     }
 
     /// Re-read the root directory and rebuild the in-memory index. Cheap;
-    /// only parses each SKILL.md, doesn't instantiate WASM.
+    /// only parses each canonical-locale manifest, doesn't instantiate
+    /// WASM. Accepts either the legacy bare `SKILL.md` or the
+    /// per-locale `SKILL.en.md` — same dual-acceptance rule the loader
+    /// uses elsewhere.
     pub fn rescan(&mut self) -> Result<(), StoreError> {
         self.index.clear();
         for entry in std::fs::read_dir(&self.root)? {
@@ -99,10 +102,23 @@ impl SkillStore {
                     continue;
                 }
             }
-            let manifest_path = path.join("SKILL.md");
-            if !manifest_path.is_file() {
-                continue;
-            }
+            // Try the per-locale canonical first; fall back to legacy.
+            // Without this fallback, a freshly-installed skill on the
+            // SKILL.en.md / SKILL.it.md layout would be skipped here
+            // entirely, and the registry's post-install rescan + get
+            // would fail with "install succeeded but ID not in index
+            // after rescan" — even though the bundle extracted cleanly.
+            let manifest_path = {
+                let en = path.join("SKILL.en.md");
+                let legacy = path.join("SKILL.md");
+                if en.is_file() {
+                    en
+                } else if legacy.is_file() {
+                    legacy
+                } else {
+                    continue;
+                }
+            };
             let Ok(sf) = Skillfile::parse_file(&manifest_path) else {
                 continue;
             };
@@ -226,9 +242,11 @@ impl SkillStore {
     }
 }
 
-/// Peek at a bundle without unpacking it to disk: scan the tar in memory for
-/// `*/SKILL.md`, parse the manifest, and return `(id, version)`. Used by the
-/// store to enforce downgrade defence before committing to an install.
+/// Peek at a bundle without unpacking it to disk: scan the tar in memory
+/// for `<slug>/SKILL.en.md` (per-locale layout) or `<slug>/SKILL.md`
+/// (legacy), parse the manifest, and return `(id, version)`. Used by
+/// the store to enforce downgrade defence before committing to an
+/// install.
 fn peek_bundle_manifest(bundle_bytes: &[u8]) -> Result<(String, String), StoreError> {
     let gz = flate2::read::GzDecoder::new(bundle_bytes);
     let mut archive = tar::Archive::new(gz);
@@ -243,7 +261,11 @@ fn peek_bundle_manifest(bundle_bytes: &[u8]) -> Result<(String, String), StoreEr
             .path()
             .map_err(|e| StoreError::Peek(format!("read entry path: {e}")))?
             .into_owned();
-        // Match `<anything>/SKILL.md` at depth 1 (one parent directory).
+        // Match `<anything>/SKILL.md` or `<anything>/SKILL.en.md` at
+        // depth 1 (one parent directory). The canonical-English locale
+        // file is the structural identity source per
+        // `localized_manifest.rs`, so peeking it gives the right
+        // `(id, version)` for downgrade-defence purposes.
         let mut comps = path.components();
         let parent = comps.next();
         let file = comps.next();
@@ -259,24 +281,24 @@ fn peek_bundle_manifest(bundle_bytes: &[u8]) -> Result<(String, String), StoreEr
             std::path::Component::Normal(s) => s.to_string_lossy().into_owned(),
             _ => continue,
         };
-        if file_name != "SKILL.md" {
+        if file_name != "SKILL.md" && file_name != "SKILL.en.md" {
             continue;
         }
 
         let mut buf = String::new();
         entry
             .read_to_string(&mut buf)
-            .map_err(|e| StoreError::Peek(format!("read SKILL.md: {e}")))?;
+            .map_err(|e| StoreError::Peek(format!("read {file_name}: {e}")))?;
         let sf = Skillfile::parse(&buf, Some(&parent_name))
-            .map_err(|e| StoreError::Peek(format!("parse SKILL.md: {e}")))?;
-        let ari = sf
-            .ari_extension
-            .ok_or_else(|| StoreError::Peek("SKILL.md has no metadata.ari".to_string()))?;
+            .map_err(|e| StoreError::Peek(format!("parse {file_name}: {e}")))?;
+        let ari = sf.ari_extension.ok_or_else(|| {
+            StoreError::Peek(format!("{file_name} has no metadata.ari"))
+        })?;
         return Ok((ari.id, ari.version));
     }
 
     Err(StoreError::Peek(
-        "bundle contains no SKILL.md".to_string(),
+        "bundle contains no SKILL.md or SKILL.en.md".to_string(),
     ))
 }
 
