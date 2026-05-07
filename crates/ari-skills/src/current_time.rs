@@ -1,11 +1,27 @@
 use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 use chrono::Local;
 
+// English + Italian. The scorer is locale-agnostic; the words don't
+// collide across languages, so a single union table keeps Stage 1
+// keyword routing fast (no cloud round-trip needed for "che ora è").
+//
+// Italian trigger shapes after `normalize_input` (lowercases, strips
+// elisions like `l'ora` → `l ora`):
+//   - "che ora è" / "a che ora" → ["che", "ora"]
+//   - "che ore sono" / "che ore" → ["che", "ore"]
+//   - "dimmi l'ora" → "dimmi l ora" → ["dimmi", "ora"]
+//   - "ora attuale" → ["ora", "attuale"]
 const TRIGGER_PHRASES: &[&[&str]] = &[
+    // English
     &["what", "time"],
     &["current", "time"],
     &["tell", "time"],
     &["what is", "time"],
+    // Italian
+    &["che", "ora"],
+    &["che", "ore"],
+    &["dimmi", "ora"],
+    &["ora", "attuale"],
 ];
 
 pub struct CurrentTimeSkill;
@@ -238,6 +254,35 @@ mod tests {
             }
             _ => panic!("expected Text response"),
         }
+    }
+
+    #[test]
+    fn score_italian_che_ora() {
+        let skill = CurrentTimeSkill::new();
+        // "che ora è" — the canonical Italian "what time is it"
+        // After normalize_input("che ora è", "it") the input stays as
+        // "che ora è" (lowercase, è preserved as alphanumeric). Words
+        // = ["che", "ora", "è"]. Phrase ["che", "ora"] matches:
+        // coverage = 2/3, score = 0.5 + 0.667*0.5 ≈ 0.833.
+        let score = skill.score("che ora è", &ctx());
+        assert!(score > 0.5, "expected score > 0.5, got {score}");
+    }
+
+    #[test]
+    fn score_italian_che_ore_sono() {
+        let skill = CurrentTimeSkill::new();
+        // "che ore sono" — the other common Italian time query
+        let score = skill.score("che ore sono", &ctx());
+        assert!(score > 0.5, "expected score > 0.5, got {score}");
+    }
+
+    #[test]
+    fn score_italian_dimmi_lora_after_normalisation() {
+        let skill = CurrentTimeSkill::new();
+        // "dimmi l'ora" → after `strip_italian_elisions` becomes
+        // "dimmi l ora" (3 tokens). Phrase ["dimmi", "ora"] matches.
+        let score = skill.score("dimmi l ora", &ctx());
+        assert!(score > 0.5, "expected score > 0.5, got {score}");
     }
 
     #[test]

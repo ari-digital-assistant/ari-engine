@@ -1,6 +1,22 @@
 use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 
-const TRIGGER_WORDS: &[&str] = &["open", "launch", "start", "run"];
+// English + Italian + Spanish + French + German trigger verbs. Same
+// union-dictionary pattern as the other built-ins — words don't
+// collide across these languages so a single contains-check
+// disambiguates without a locale parameter.
+const TRIGGER_WORDS: &[&str] = &[
+    // English
+    "open", "launch", "start", "run",
+    // Italian: apri (open), avvia (start/launch), lancia (launch),
+    // esegui (run)
+    "apri", "avvia", "lancia", "esegui",
+    // Spanish: abre, abrir, inicia, ejecuta
+    "abre", "abrir", "inicia", "ejecuta",
+    // French: ouvre, ouvrir, lance, exécute
+    "ouvre", "ouvrir", "lance",
+    // German: öffne, starte
+    "öffne", "starte",
+];
 
 pub struct OpenSkill;
 

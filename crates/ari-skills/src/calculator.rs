@@ -1,9 +1,26 @@
 use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 
+// English + Italian + Spanish + French + German trigger verbs. The
+// `to_math_expr` step strips these from the input before passing the
+// rest to the expression evaluator, so adding a foreign-language
+// trigger doesn't require parser changes.
 const TRIGGER_WORDS: &[&str] = &[
+    // English
     "calculate", "compute", "eval", "solve",
+    // Italian: calcola (calculate), risolvi (solve)
+    "calcola", "risolvi",
+    // Spanish: calcula, resuelve
+    "calcula", "resuelve",
+    // French: calcule, calculer, résous
+    "calcule", "calculer",
+    // German: berechne, berechnen, löse
+    "berechne", "berechnen",
 ];
 
+// Math word → operator. English only for now; Italian "più"/"meno"/
+// "per"/"diviso" etc. would need their own table. Out of scope for
+// the current pass — Italian users typing `2 + 3` work fine because
+// the symbolic operators are language-agnostic.
 const MATH_WORDS: &[(&str, &str)] = &[
     ("plus", "+"),
     ("minus", "-"),

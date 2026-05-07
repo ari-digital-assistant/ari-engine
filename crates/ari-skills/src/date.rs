@@ -1,12 +1,25 @@
 use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 use chrono::{Datelike, Local};
 
+// English + Italian. Same union-dictionary pattern as `current_time` —
+// keeps Stage 1 keyword routing fast for both languages, no cloud
+// round-trip needed. Italian shapes after normalize_input:
+//   - "che giorno è" / "che giorno è oggi" → ["che", "giorno"]
+//   - "che data è" / "data di oggi" → ["che", "data"] / ["oggi", "data"]
+//   - "che data abbiamo" → ["che", "data"]
+//   - "in che giorno siamo" → ["che", "giorno"]
 const TRIGGER_PHRASES: &[&[&str]] = &[
+    // English
     &["what", "date"],
     &["today", "date"],
     &["current", "date"],
     &["what", "day"],
     &["which", "day"],
+    // Italian
+    &["che", "giorno"],
+    &["che", "data"],
+    &["data", "oggi"],
+    &["data", "attuale"],
 ];
 
 pub struct DateSkill;
@@ -74,8 +87,12 @@ impl Skill for DateSkill {
     fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {
         let words: Vec<&str> = input.split_whitespace().collect();
 
-        // "time" in the input likely means the user wants the time skill, not date
-        if words.contains(&"time") {
+        // English "time" / Italian "ora" / Spanish "hora" / French
+        // "heure" / German "uhr" — any of these in the input means
+        // the user wants the time skill, not date. Mirrors the
+        // English-only guard that was here before; same intent.
+        const TIME_WORDS: &[&str] = &["time", "ora", "ore", "hora", "heure", "uhr"];
+        if words.iter().any(|w| TIME_WORDS.contains(w)) {
             return 0.0;
         }
 
@@ -231,6 +248,34 @@ mod tests {
         assert_eq!(skill.score("what is the holiday discount", &ctx()), 0.0);
         // "what" and "today" both as standalone words still trigger.
         assert!(skill.score("what is the date today", &ctx()) > 0.0);
+    }
+
+    #[test]
+    fn score_italian_che_giorno() {
+        let skill = DateSkill::new();
+        // "che giorno è" — the canonical Italian "what day is it"
+        let score = skill.score("che giorno è", &ctx());
+        assert!(score > 0.5, "expected score > 0.5, got {score}");
+    }
+
+    #[test]
+    fn score_italian_che_data() {
+        let skill = DateSkill::new();
+        // "che data è oggi" — Italian "what date is it today"
+        let score = skill.score("che data è oggi", &ctx());
+        assert!(score > 0.5, "expected score > 0.5, got {score}");
+    }
+
+    #[test]
+    fn score_italian_zero_when_ora_present() {
+        // "ora" (Italian for "hour") in the input means the user wants
+        // the time skill, not date — same logic as the existing
+        // English "time" guard. Without this, "che ora è" would match
+        // both date (no — actually no Italian date phrase, fine) and
+        // current_time. Just a sanity check that date doesn't
+        // false-positive on Italian time queries.
+        let skill = DateSkill::new();
+        assert_eq!(skill.score("che ora è", &ctx()), 0.0);
     }
 
     #[test]
