@@ -103,7 +103,11 @@ fn main() -> ExitCode {
             continue;
         }
 
-        if path.join("SKILL.md").is_file() {
+        // A directory is a single-skill dir when it has either the legacy
+        // bare `SKILL.md` or the canonical `SKILL.en.md` (the localized-
+        // manifest entry point — see ari_skill_loader::localized_manifest).
+        // Otherwise treat it as a registry root and walk its children.
+        if path.join("SKILL.md").is_file() || path.join("SKILL.en.md").is_file() {
             let report = load_single_skill_dir_with(path, &options);
             push_rows_from_report(&mut rows, path, &report);
         } else {
@@ -123,7 +127,12 @@ fn main() -> ExitCode {
                 if !child.is_dir() {
                     continue;
                 }
-                if !child.join("SKILL.md").is_file() {
+                // Same dual-check as the single-skill branch — a child
+                // qualifies if it has either the legacy bare manifest or
+                // the canonical English locale manifest.
+                if !child.join("SKILL.md").is_file()
+                    && !child.join("SKILL.en.md").is_file()
+                {
                     continue;
                 }
                 any_child = true;

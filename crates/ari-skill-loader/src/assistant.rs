@@ -220,13 +220,53 @@ pub fn call_assistant_api(
     })
 }
 
+/// Map an ISO 639-1 locale code to its English language name, for the
+/// per-request "Please reply in X" hint. Returns `None` for English
+/// (no hint needed) and for locales we don't yet ship — those fall
+/// back to the canonical-English system prompt without a language
+/// override, matching the existing behaviour. Keep the entries here
+/// in lockstep with `SupportedLocales` on each frontend.
+fn english_language_name(locale: &str) -> Option<&'static str> {
+    match locale {
+        "it" => Some("Italian"),
+        "es" => Some("Spanish"),
+        "fr" => Some("French"),
+        "de" => Some("German"),
+        _ => None,
+    }
+}
+
 fn build_request_body(
     config: &ApiConfig,
     resolved: &ResolvedConfig,
     user_input: &str,
     locale: &str,
 ) -> String {
-    let system_prompt = config.system_prompt.for_locale(locale);
+    // Two-tier locale handling for cloud assistants:
+    //   1. If the skill ships a `system_prompt` translation for this
+    //      locale, use it verbatim.
+    //   2. Otherwise — the common case for community skills authored
+    //      in English — we fall back to the English prompt and append
+    //      a one-line "Please reply in <Language>." hint. Cloud LLMs
+    //      reliably honour this without needing the rest of the prompt
+    //      translated.
+    // English locale or unknown-to-us locales just use the prompt as-is.
+    let base_prompt = config.system_prompt.for_locale(locale);
+    let has_translation = config
+        .system_prompt
+        .supported_locales()
+        .iter()
+        .any(|l| l == locale);
+    let system_prompt: String = if !has_translation {
+        if let Some(language) = english_language_name(locale) {
+            format!("{}\n\nPlease reply in {}.", base_prompt, language)
+        } else {
+            base_prompt.to_string()
+        }
+    } else {
+        base_prompt.to_string()
+    };
+    let system_prompt = system_prompt.as_str();
     let body = match config.request_format {
         RequestFormat::Openai => {
             // `max_completion_tokens` replaced `max_tokens` in the
@@ -364,6 +404,108 @@ mod tests {
         assert_eq!(parsed["messages"][0]["content"], "You are Ari.");
         assert_eq!(parsed["messages"][1]["role"], "user");
         assert_eq!(parsed["messages"][1]["content"], "What is 2+2?");
+    }
+
+    #[test]
+    fn build_request_body_appends_locale_hint_for_untranslated_locale() {
+        // English-only system prompt + Italian user → engine should
+        // append "Please reply in Italian." so the LLM doesn't default
+        // to English. This is the path taken by every cloud assistant
+        // skill in the registry today (none yet ship per-locale
+        // translations of their system_prompt).
+        let config = ApiConfig {
+            endpoint: Some("https://api.example.com".into()),
+            endpoint_config_key: None,
+            default_endpoint: None,
+            auth: AuthScheme::Bearer,
+            auth_header: None,
+            auth_config_key: Some("api_key".into()),
+            model_config_key: None,
+            default_model: "gpt-4o-mini".into(),
+            system_prompt: "You are Ari.".into(),
+            request_format: RequestFormat::Openai,
+            response_path: "choices[0].message.content".into(),
+            api_version: None,
+            api_version_header: None,
+            max_tokens: 256,
+            temperature: 0.7,
+        };
+        let resolved = ResolvedConfig {
+            endpoint: "https://api.example.com".into(),
+            model: "gpt-4o-mini".into(),
+            api_key: Some("sk-test".into()),
+        };
+        let body = build_request_body(&config, &resolved, "che ora è?", "it");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["messages"][0]["content"],
+            "You are Ari.\n\nPlease reply in Italian.",
+        );
+    }
+
+    #[test]
+    fn build_request_body_no_hint_when_locale_translation_present() {
+        use std::collections::BTreeMap;
+        // Skill ships its own Italian system_prompt → engine must use
+        // it verbatim, without appending a redundant "Please reply in
+        // Italian." instruction.
+        let mut prompts = BTreeMap::new();
+        prompts.insert("en".to_string(), "You are Ari.".to_string());
+        prompts.insert("it".to_string(), "Sei Ari.".to_string());
+        let config = ApiConfig {
+            endpoint: Some("https://api.example.com".into()),
+            endpoint_config_key: None,
+            default_endpoint: None,
+            auth: AuthScheme::Bearer,
+            auth_header: None,
+            auth_config_key: Some("api_key".into()),
+            model_config_key: None,
+            default_model: "gpt-4o-mini".into(),
+            system_prompt: crate::manifest::LocalizedPrompt::from_map(prompts).unwrap(),
+            request_format: RequestFormat::Openai,
+            response_path: "choices[0].message.content".into(),
+            api_version: None,
+            api_version_header: None,
+            max_tokens: 256,
+            temperature: 0.7,
+        };
+        let resolved = ResolvedConfig {
+            endpoint: "https://api.example.com".into(),
+            model: "gpt-4o-mini".into(),
+            api_key: Some("sk-test".into()),
+        };
+        let body = build_request_body(&config, &resolved, "ciao", "it");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["messages"][0]["content"], "Sei Ari.");
+    }
+
+    #[test]
+    fn build_request_body_no_hint_for_english() {
+        let config = ApiConfig {
+            endpoint: Some("https://api.example.com".into()),
+            endpoint_config_key: None,
+            default_endpoint: None,
+            auth: AuthScheme::Bearer,
+            auth_header: None,
+            auth_config_key: Some("api_key".into()),
+            model_config_key: None,
+            default_model: "gpt-4o-mini".into(),
+            system_prompt: "You are Ari.".into(),
+            request_format: RequestFormat::Openai,
+            response_path: "choices[0].message.content".into(),
+            api_version: None,
+            api_version_header: None,
+            max_tokens: 256,
+            temperature: 0.7,
+        };
+        let resolved = ResolvedConfig {
+            endpoint: "https://api.example.com".into(),
+            model: "gpt-4o-mini".into(),
+            api_key: Some("sk-test".into()),
+        };
+        let body = build_request_body(&config, &resolved, "what time?", "en");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["messages"][0]["content"], "You are Ari.");
     }
 
     #[test]
