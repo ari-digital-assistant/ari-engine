@@ -542,28 +542,29 @@ impl SkillRegistry {
     /// other's existence).
     ///
     /// Returns [`FfiRegistryError::NotInstalled`] if `id` isn't in the
-    /// store, or [`FfiRegistryError::Manifest`] if SKILL.md fails to
-    /// parse (shouldn't happen for skills we installed ourselves).
+    /// store, or [`FfiRegistryError::Manifest`] if the manifest fails
+    /// to parse (shouldn't happen for skills we installed ourselves).
+    ///
+    /// `locale` follows the same rule as
+    /// [`Self::read_installed_manifest`] — pass the user's active ISO
+    /// 639-1 code so field labels (`Save reminders to` vs
+    /// `Salva i promemoria in`) and select-option labels render in
+    /// the user's language. Falls back to canonical English when the
+    /// skill hasn't translated for the requested locale.
     pub fn get_skill_settings(
         &self,
         id: String,
+        locale: String,
     ) -> Result<Vec<FfiConfigField>, FfiRegistryError> {
         let store = self.store.lock().expect("skill store mutex poisoned");
         let entry = store
             .get(&id)
             .ok_or_else(|| FfiRegistryError::NotInstalled { id: id.clone() })?;
-        // Same dual-acceptance rule as `read_installed_manifest`:
-        // prefer SKILL.en.md, fall back to legacy SKILL.md.
-        let manifest_path = {
-            let en = entry.install_dir.join("SKILL.en.md");
-            let legacy = entry.install_dir.join("SKILL.md");
-            if en.is_file() { en } else { legacy }
-        };
-        let skillfile = Skillfile::parse_file(&manifest_path).map_err(|e: ManifestError| {
-            FfiRegistryError::Manifest {
+        let manifest_set = ari_skill_loader::parse_skill_directory(&entry.install_dir)
+            .map_err(|e| FfiRegistryError::Manifest {
                 message: e.to_string(),
-            }
-        })?;
+            })?;
+        let skillfile = manifest_set.for_locale(&locale).clone();
         let ext = skillfile.ari_extension.ok_or_else(|| FfiRegistryError::Manifest {
             message: "manifest is missing the ari extension metadata".to_string(),
         })?;
