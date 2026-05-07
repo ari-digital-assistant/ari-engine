@@ -98,6 +98,30 @@ pub struct FfiBrowseEntry {
     pub homepage: Option<String>,
     pub capabilities: Vec<String>,
     pub languages: Vec<String>,
+    /// Per-locale display strings keyed by ISO 639-1 lowercase code
+    /// (`"it"`, `"es"`, …). Comes straight from `index.json`'s
+    /// `localizations` block, populated by the publish pipeline from
+    /// every `SKILL.{locale}.md` variant. English is intentionally
+    /// absent — the canonical `name` + `description` above already
+    /// carry it. Empty for skills that haven't been migrated to the
+    /// per-locale layout, which is also the case for older registry
+    /// indexes (pre-Phase 11) where the field doesn't exist on disk.
+    ///
+    /// Frontends should pick the user's active-locale entry here and
+    /// fall back to `name` / `description` when missing — see
+    /// [`IndexEntry::display_for_locale`] in ari-skill-loader for the
+    /// reference resolution logic.
+    pub localizations: std::collections::HashMap<String, FfiLocalizedDisplay>,
+}
+
+/// Per-locale display strings for a registry entry. Mirrors
+/// [`ari_skill_loader::registry::LocalizedDisplay`] across the FFI
+/// boundary so frontends can render localised name + description on
+/// browse rows without extra lookups.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiLocalizedDisplay {
+    pub name: String,
+    pub description: String,
 }
 
 /// Rich manifest details for an already-installed skill, parsed from the
@@ -298,17 +322,33 @@ impl SkillRegistry {
         let mut out: Vec<FfiBrowseEntry> = index
             .skills
             .into_iter()
-            .map(|entry| FfiBrowseEntry {
-                installed: store.get(&entry.id).is_some(),
-                id: entry.id,
-                version: entry.version,
-                name: entry.name,
-                description: entry.description,
-                license: entry.license,
-                author: entry.author,
-                homepage: entry.homepage,
-                capabilities: entry.capabilities,
-                languages: entry.languages,
+            .map(|entry| {
+                let localizations = entry
+                    .localizations
+                    .into_iter()
+                    .map(|(locale, display)| {
+                        (
+                            locale,
+                            FfiLocalizedDisplay {
+                                name: display.name,
+                                description: display.description,
+                            },
+                        )
+                    })
+                    .collect();
+                FfiBrowseEntry {
+                    installed: store.get(&entry.id).is_some(),
+                    id: entry.id,
+                    version: entry.version,
+                    name: entry.name,
+                    description: entry.description,
+                    license: entry.license,
+                    author: entry.author,
+                    homepage: entry.homepage,
+                    capabilities: entry.capabilities,
+                    languages: entry.languages,
+                    localizations,
+                }
             })
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));

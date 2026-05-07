@@ -23,6 +23,7 @@ use ari_skill_loader::{
     capability_name, load_single_skill_dir_with, load_skill_directory_with, HostCapabilities,
     LoadFailure, LoadOptions, LoadReport, Skillfile,
 };
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -184,8 +185,21 @@ struct Row {
     capabilities: Vec<String>,
     languages: Vec<String>,
     examples: usize,
+    /// Per-locale (name, description) pairs lifted from any
+    /// `SKILL.{locale}.md` files alongside the canonical manifest. The
+    /// publish pipeline writes these into `index.json`'s
+    /// `localizations` object so browse-time consumers can render the
+    /// right copy without downloading the bundle. English is omitted
+    /// — `name` + `description` above already carry it.
+    localizations: BTreeMap<String, LocalizedDisplay>,
     failures: Vec<String>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalizedDisplay {
+    name: String,
+    description: String,
 }
 
 impl Row {
@@ -203,6 +217,7 @@ impl Row {
             capabilities: Vec::new(),
             languages: Vec::new(),
             examples: 0,
+            localizations: BTreeMap::new(),
             failures: vec!["path does not exist".to_string()],
             warnings: Vec::new(),
         }
@@ -221,6 +236,7 @@ impl Row {
             capabilities: Vec::new(),
             languages: Vec::new(),
             examples: 0,
+            localizations: BTreeMap::new(),
             failures: vec![msg.to_string()],
             warnings: Vec::new(),
         }
@@ -249,6 +265,7 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             capabilities: fields.capabilities,
             languages: fields.languages,
             examples: fields.examples,
+            localizations: fields.localizations,
             failures: Vec::new(),
             warnings: fields.warnings,
         });
@@ -271,6 +288,7 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             capabilities: fields.capabilities,
             languages: fields.languages,
             examples: fields.examples,
+            localizations: fields.localizations,
             failures: Vec::new(),
             warnings: fields.warnings,
         });
@@ -290,6 +308,7 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             capabilities: Vec::new(),
             languages: Vec::new(),
             examples: 0,
+            localizations: BTreeMap::new(),
             failures: report.failures.iter().map(LoadFailure::to_string).collect(),
             warnings: Vec::new(),
         });
@@ -308,6 +327,7 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
         capabilities: Vec::new(),
         languages: Vec::new(),
         examples: 0,
+        localizations: BTreeMap::new(),
         failures: vec!["SKILL.md has no metadata.ari extension (not an Ari skill)".to_string()],
         warnings: Vec::new(),
     });
@@ -329,6 +349,13 @@ struct ManifestFields {
     capabilities: Vec<String>,
     languages: Vec<String>,
     examples: usize,
+    /// Per-locale display strings lifted from `SKILL.{locale}.md`
+    /// files alongside the canonical English manifest. Keyed by ISO
+    /// 639-1 lowercase code; English is excluded because the
+    /// canonical `name` + `description` fields above already cover it.
+    /// Empty for skills using the legacy single-file (`SKILL.md`)
+    /// layout — they have nothing to localise.
+    localizations: BTreeMap<String, LocalizedDisplay>,
     warnings: Vec<String>,
 }
 
@@ -351,6 +378,7 @@ fn read_manifest_fields(skill_dir: &Path) -> ManifestFields {
         name: Some(sf.name),
         description: Some(sf.description),
         license: sf.license,
+        localizations: read_localizations(skill_dir),
         ..ManifestFields::default()
     };
     if let Some(ext) = sf.ari_extension {
@@ -367,6 +395,64 @@ fn read_manifest_fields(skill_dir: &Path) -> ManifestFields {
             .map(|c| capability_name(c).to_string())
             .collect();
         out.languages = ext.languages;
+    }
+    out
+}
+
+/// Walk `skill_dir` looking for non-canonical `SKILL.{locale}.md`
+/// variants and pull `(name, description)` out of each. The canonical
+/// English manifest is intentionally excluded — its values live on the
+/// top-level `name` + `description` fields and would duplicate.
+///
+/// Filenames must be exactly `SKILL.{locale}.md` where `{locale}` is a
+/// 2-character lowercase ASCII code (matching `localized_manifest.rs`'s
+/// rule). Anything else (`SKILL.md`, `README.md`, `SKILL.it.draft.md`)
+/// is silently ignored — same forgiving stance as the loader.
+fn read_localizations(skill_dir: &Path) -> BTreeMap<String, LocalizedDisplay> {
+    let mut out = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(skill_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Match SKILL.<locale>.md with a 2-char lowercase locale.
+        // Hand-rolled rather than using the loader's `parse_locale_filename`
+        // because that helper isn't exported from ari-skill-loader; the
+        // shape is small and the constraints stable.
+        let Some(rest) = filename.strip_prefix("SKILL.") else {
+            continue;
+        };
+        let Some(locale) = rest.strip_suffix(".md") else {
+            continue;
+        };
+        if locale.len() != 2 || !locale.chars().all(|c| c.is_ascii_lowercase()) {
+            continue;
+        }
+        // English is canonical; its strings already live on the top-
+        // level `name` + `description` and shouldn't be duplicated into
+        // the per-locale map. Skip it here.
+        if locale == "en" {
+            continue;
+        }
+        let Ok(sf) = Skillfile::parse_file(&path) else {
+            // A failing per-locale parse is a warning-class issue — the
+            // caller's `read_manifest_fields` doesn't surface it because
+            // the cross-file consistency check inside the loader already
+            // would have refused the skill earlier if the variant was
+            // structurally bad. If we're here, the file probably has a
+            // bad frontmatter that the loader rejected entry-wide.
+            continue;
+        };
+        out.insert(
+            locale.to_string(),
+            LocalizedDisplay {
+                name: sf.name,
+                description: sf.description,
+            },
+        );
     }
     out
 }
@@ -467,6 +553,26 @@ fn render_json(rows: &[Row]) {
         push_json_str_array(&mut out, "languages", &row.languages, true);
         push_json_kv(&mut out, "examples", &row.examples.to_string(), true);
         push_json_str_array(&mut out, "warnings", &row.warnings, true);
+        // Per-locale display strings — `{ "it": { "name": "...", "description": "..." } }`.
+        // BTreeMap iter is alphabetical-by-key, which keeps the JSON
+        // output stable across runs and easier to diff in CI.
+        out.push_str("    \"localizations\": {");
+        for (j, (locale, display)) in row.localizations.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push(' ');
+            out.push_str(&json_string(locale));
+            out.push_str(": {\"name\": ");
+            out.push_str(&json_string(&display.name));
+            out.push_str(", \"description\": ");
+            out.push_str(&json_string(&display.description));
+            out.push('}');
+        }
+        if !row.localizations.is_empty() {
+            out.push(' ');
+        }
+        out.push_str("},\n");
         out.push_str("    \"failures\": [");
         for (j, f) in row.failures.iter().enumerate() {
             if j > 0 {

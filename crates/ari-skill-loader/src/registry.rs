@@ -161,6 +161,63 @@ pub struct IndexEntry {
     /// is the right tradeoff because install still verifies everything.
     #[serde(default)]
     pub manifest: Option<String>,
+    /// Per-locale display strings keyed by ISO 639-1 lowercase code
+    /// (`"it"`, `"es"`, …). The canonical English `name` + `description`
+    /// fields above are unchanged; this is the additive store for
+    /// locales the skill author ships translations for via
+    /// `SKILL.{locale}.md`. Empty for skills that haven't migrated to
+    /// the per-locale layout, which is also the default when reading
+    /// an `index_version: 1` index from before this field existed.
+    ///
+    /// Use [`IndexEntry::display_for_locale`] to resolve to the right
+    /// (`name`, `description`) pair with English fallback.
+    #[serde(default)]
+    pub localizations: std::collections::HashMap<String, LocalizedDisplay>,
+}
+
+/// One locale's worth of display strings for a skill — the parts the
+/// browse list / detail screen renders to the user, lifted from the
+/// localised manifest variant. System-identity fields (`id`, `version`,
+/// capabilities, etc.) live on [`IndexEntry`] proper since they're
+/// language-invariant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalizedDisplay {
+    pub name: String,
+    pub description: String,
+}
+
+impl IndexEntry {
+    /// Resolve `(name, description)` for the user's active locale.
+    /// Returns the entry's `localizations[locale]` when present; falls
+    /// back to the canonical English `name` + `description` otherwise.
+    /// The returned `is_localized` flag tells the caller whether the
+    /// resolution actually used the localized strings, which the
+    /// browse UI can surface as a "this is shown in English" tag for
+    /// untranslated entries.
+    pub fn display_for_locale(&self, locale: &str) -> ResolvedDisplay<'_> {
+        if let Some(loc) = self.localizations.get(locale) {
+            return ResolvedDisplay {
+                name: &loc.name,
+                description: &loc.description,
+                is_localized: true,
+            };
+        }
+        ResolvedDisplay {
+            name: &self.name,
+            description: &self.description,
+            is_localized: false,
+        }
+    }
+}
+
+/// Borrowed result of [`IndexEntry::display_for_locale`].
+pub struct ResolvedDisplay<'a> {
+    pub name: &'a str,
+    pub description: &'a str,
+    /// `true` iff the strings came from a per-locale entry in
+    /// `localizations`, `false` if the canonical English fallback
+    /// fired. Use this to surface an "in English" tag in the browse UI.
+    pub is_localized: bool,
 }
 
 /// One available update for an already-installed skill, as reported by
@@ -691,6 +748,7 @@ metadata:
                     signature: "bundles/dev.heyari.coinflip-0.2.0.tar.gz.sig".into(),
                     sha256: "deadbeef".into(),
                     manifest: None,
+                    localizations: Default::default(),
                 },
                 IndexEntry {
                     id: "dev.heyari.counter".into(),
@@ -706,6 +764,7 @@ metadata:
                     signature: "bundles/dev.heyari.counter-5.0.0.tar.gz.sig".into(),
                     sha256: "cafe".into(),
                     manifest: None,
+                    localizations: Default::default(),
                 },
             ],
         };
@@ -751,6 +810,7 @@ metadata:
             signature: "x".into(),
             sha256: "x".into(),
             manifest: None,
+            localizations: Default::default(),
         };
         let mut index = Index {
             index_version: 1,
@@ -1077,6 +1137,7 @@ metadata:
             signature: "bundles/dev.heyari.coinflip-0.3.0.tar.gz.sig".into(),
             sha256: "deadbeef".into(),
             manifest: Some("manifests/dev.heyari.coinflip-0.3.0.md".into()),
+            localizations: Default::default(),
         };
         let got = client.fetch_manifest(&entry).unwrap();
         assert_eq!(got, md, "fetched sidecar must be byte-identical to served");
@@ -1099,6 +1160,7 @@ metadata:
             signature: "bundles/legacy.tar.gz.sig".into(),
             sha256: "x".into(),
             manifest: None,
+            localizations: Default::default(),
         };
         let err = client.fetch_manifest(&entry).unwrap_err();
         match err {
