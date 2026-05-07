@@ -84,7 +84,7 @@ pub enum BundleError {
     #[error("bundle root contains multiple top-level directories: {found:?}")]
     MultipleBundleRoots { found: Vec<String> },
 
-    #[error("bundle is missing SKILL.md at the bundle root")]
+    #[error("bundle is missing SKILL.md / SKILL.en.md at the bundle root")]
     MissingSkillFile,
 
     #[error("io error during install: {0}")]
@@ -372,7 +372,13 @@ fn extract_validated(bundle_bytes: &[u8], staging: &Path) -> Result<PathBuf, Bun
     let root_name = top_levels.into_iter().next().unwrap();
     let bundle_root = staging.join(&root_name);
 
-    if !bundle_root.join("SKILL.md").is_file() {
+    // Either layout is acceptable: legacy `SKILL.md` or the per-locale
+    // `SKILL.en.md` (canonical English manifest in the new layout).
+    // Skills shipping the localised layout don't have a bare `SKILL.md`
+    // at all — the install-time extractor previously rejected them
+    // with `MissingSkillFile`, so even though the publish pipeline
+    // bundled them correctly the engine refused to install them.
+    if !bundle_root.join("SKILL.md").is_file() && !bundle_root.join("SKILL.en.md").is_file() {
         return Err(BundleError::MissingSkillFile);
     }
     Ok(bundle_root)
