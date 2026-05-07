@@ -65,8 +65,15 @@ impl PatternScorer {
 
     /// Score a raw (un-normalised) input string. Returns the highest matching
     /// weight across all patterns, or `0.0` if nothing matches.
-    pub fn score(&self, raw_input: &str) -> f32 {
-        let normalised = normalize_input(raw_input);
+    ///
+    /// `locale` is the user's currently-active language (ISO 639-1
+    /// lowercase) — feeds into [`normalize_input`]'s per-locale
+    /// dispatch (English contractions, Italian elisions, etc.). Skills
+    /// that have already been normalised once in the engine pipeline
+    /// should call [`score_normalised`](Self::score_normalised)
+    /// directly to skip the duplicate work.
+    pub fn score(&self, raw_input: &str, locale: &str) -> f32 {
+        let normalised = normalize_input(raw_input, locale);
         self.score_normalised(&normalised)
     }
 
@@ -130,10 +137,10 @@ mod tests {
             weight: 0.95,
         }]);
         let s = PatternScorer::compile(&m).unwrap();
-        assert_eq!(s.score("flip a coin"), 0.95);
-        assert_eq!(s.score("toss a coin"), 0.0);
-        assert_eq!(s.score("flipping a coin"), 0.0);
-        assert_eq!(s.score("flip the pancakes"), 0.0);
+        assert_eq!(s.score("flip a coin", "en"), 0.95);
+        assert_eq!(s.score("toss a coin", "en"), 0.0);
+        assert_eq!(s.score("flipping a coin", "en"), 0.0);
+        assert_eq!(s.score("flip the pancakes", "en"), 0.0);
     }
 
     #[test]
@@ -149,8 +156,8 @@ mod tests {
             },
         ]);
         let s = PatternScorer::compile(&m).unwrap();
-        assert_eq!(s.score("just foo"), 0.5);
-        assert_eq!(s.score("foo bar"), 0.9);
+        assert_eq!(s.score("just foo", "en"), 0.5);
+        assert_eq!(s.score("foo bar", "en"), 0.9);
     }
 
     #[test]
@@ -161,8 +168,8 @@ mod tests {
         }]);
         let s = PatternScorer::compile(&m).unwrap();
         // normalize_input lowercases and expands contractions
-        assert_eq!(s.score("What's the weather like?"), 0.85);
-        assert_eq!(s.score("the weather is nice"), 0.0);
+        assert_eq!(s.score("What's the weather like?", "en"), 0.85);
+        assert_eq!(s.score("the weather is nice", "en"), 0.0);
     }
 
     #[test]
@@ -181,6 +188,6 @@ mod tests {
     fn no_patterns_means_zero_score() {
         let m = matching(vec![]);
         let s = PatternScorer::compile(&m).unwrap();
-        assert_eq!(s.score("anything at all"), 0.0);
+        assert_eq!(s.score("anything at all", "en"), 0.0);
     }
 }

@@ -1,12 +1,13 @@
 #![allow(clippy::new_without_default)]
 
-use ari_engine::{Engine, EnvelopeSink, FALLBACK_RESPONSE};
+use ari_engine::{fallback_response_for, Engine, EnvelopeSink, FALLBACK_RESPONSE};
 use ari_skill_loader::assistant::{ConfigStore, MemoryConfigStore};
 use ari_skill_loader::{
     load_skill_directory_with, Calendar, CalendarEventRow, CalendarProvider, Capability,
-    HostCapabilities, HttpConfig, InsertCalendarEventParams, InsertTaskParams, LoadOptions,
-    LocalClock, LocalTimeComponents, LogLevel, LogSink, NullCalendarProvider, NullLogSink,
-    NullTasksProvider, StorageConfig, TaskList, TaskRow, TasksProvider, UtcLocalClock,
+    EnglishLocaleProvider, HostCapabilities, HttpConfig, InsertCalendarEventParams,
+    InsertTaskParams, LoadOptions, LocalClock, LocalTimeComponents, LocaleProvider, LogLevel,
+    LogSink, NullCalendarProvider, NullLogSink, NullTasksProvider, StorageConfig, TaskList,
+    TaskRow, TasksProvider, UtcLocalClock,
 };
 use ari_skills::{
     CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill,
@@ -50,6 +51,7 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
         calendar_provider: Arc::new(NullCalendarProvider),
         local_clock: Arc::new(UtcLocalClock),
         config_store: Arc::new(MemoryConfigStore::new()),
+        locale_provider: Arc::new(EnglishLocaleProvider),
     }
 }
 
@@ -259,6 +261,17 @@ pub trait FfiLocalClock: Send + Sync {
     fn timezone_id(&self) -> String;
 }
 
+/// Foreign-implemented locale reader. The host's settings store is the
+/// single source of truth for the user's currently-active language.
+/// Engine code reads through this trait whenever it needs to dispatch
+/// on locale (text normalisers, prompt selection, skill regex
+/// filtering). Implementations must be cheap — called on every utterance.
+#[uniffi::export(with_foreign)]
+pub trait FfiLocaleProvider: Send + Sync {
+    /// ISO 639-1 lowercase language code (e.g. `"en"`, `"it"`).
+    fn current_locale(&self) -> String;
+}
+
 // Adapters from the foreign FFI traits to the engine's internal
 // traits. Engine code only sees the internal trait object; these
 // adapters handle the `Arc<dyn FfiFoo>` → `Arc<dyn Foo>` conversion
@@ -384,6 +397,14 @@ impl LocalClock for ForeignLocalClockAdapter {
     }
 }
 
+struct ForeignLocaleProviderAdapter(Arc<dyn FfiLocaleProvider>);
+
+impl LocaleProvider for ForeignLocaleProviderAdapter {
+    fn current_locale(&self) -> String {
+        self.0.current_locale()
+    }
+}
+
 #[derive(uniffi::Enum)]
 pub enum FfiResponse {
     Text { body: String },
@@ -421,6 +442,12 @@ pub struct AriEngine {
     pub(crate) tasks_provider: Arc<dyn TasksProvider>,
     pub(crate) calendar_provider: Arc<dyn CalendarProvider>,
     pub(crate) local_clock: Arc<dyn LocalClock>,
+    /// Locale source of truth — engine reads through this whenever it
+    /// needs to dispatch on language. Defaults to [`EnglishLocaleProvider`]
+    /// for callers that don't supply a real one (CLI, tests). The
+    /// Android host wires a real provider that reads the user's
+    /// chosen language from the frontend DataStore.
+    pub(crate) locale_provider: Arc<dyn LocaleProvider>,
     /// Config store backing `ari::setting_get` in WASM skills.
     /// Defaults to an empty in-memory map; the Android host passes
     /// the shared `SkillSettingsStore`'s inner map so skills see
@@ -455,6 +482,7 @@ impl AriEngine {
             tasks_provider: Arc::new(NullTasksProvider),
             calendar_provider: Arc::new(NullCalendarProvider),
             local_clock: Arc::new(UtcLocalClock),
+            locale_provider: Arc::new(EnglishLocaleProvider),
             config_store: Arc::new(MemoryConfigStore::new()),
             envelope_sink: None,
         }
@@ -475,6 +503,7 @@ impl AriEngine {
             tasks_provider: Arc::new(NullTasksProvider),
             calendar_provider: Arc::new(NullCalendarProvider),
             local_clock: Arc::new(UtcLocalClock),
+            locale_provider: Arc::new(EnglishLocaleProvider),
             config_store: Arc::new(MemoryConfigStore::new()),
             envelope_sink: None,
         }
@@ -495,6 +524,7 @@ impl AriEngine {
         clock: Option<Arc<dyn FfiLocalClock>>,
         settings: Option<Arc<SkillSettingsStore>>,
         envelope_sink: Option<Arc<dyn FfiEnvelopeSink>>,
+        locale: Option<Arc<dyn FfiLocaleProvider>>,
     ) -> Self {
         let log_sink: Arc<dyn LogSink> = match sink {
             Some(s) => Arc::new(ForeignLogSinkAdapter(s)),
@@ -511,6 +541,10 @@ impl AriEngine {
         let local_clock: Arc<dyn LocalClock> = match clock {
             Some(c) => Arc::new(ForeignLocalClockAdapter(c)),
             None => Arc::new(UtcLocalClock),
+        };
+        let locale_provider: Arc<dyn LocaleProvider> = match locale {
+            Some(l) => Arc::new(ForeignLocaleProviderAdapter(l)),
+            None => Arc::new(EnglishLocaleProvider),
         };
         let config_store: Arc<dyn ConfigStore> = match settings {
             Some(s) => s.as_config_store(),
@@ -529,17 +563,42 @@ impl AriEngine {
             tasks_provider,
             calendar_provider,
             local_clock,
+            locale_provider,
             config_store,
             envelope_sink: adapted_envelope_sink,
         }
     }
 
+    /// The user's currently-active language, as seen by the engine.
+    /// Reads through the [`LocaleProvider`] the host wired up at
+    /// construction time. ISO 639-1 lowercase (e.g. `"en"`, `"it"`).
+    ///
+    /// Cheap to call — DataStore-backed implementations cache the
+    /// latest value and read it without blocking.
+    pub fn current_locale(&self) -> String {
+        self.locale_provider.current_locale()
+    }
+
     pub fn process_input(&self, input: String) -> FfiResponse {
-        let engine = self.inner.lock().expect("engine mutex poisoned");
+        // Refresh the engine's locale on every call so per-locale
+        // skill scorers and responses pick up live changes from the
+        // frontend's settings store. The locale provider's read is a
+        // synchronous AtomicReference lookup on Android (see
+        // AriFfiLocaleProvider), so this is essentially free.
+        let locale = self.locale_provider.current_locale();
+        let mut engine = self.inner.lock().expect("engine mutex poisoned");
+        engine.set_locale(locale.clone());
         let (response, skill_id) = engine.process_input_with_skill(&input);
         match response {
             ari_core::Response::Text(s) => {
-                if s == FALLBACK_RESPONSE {
+                // The engine's fallback text is locale-specific
+                // (Phase 5 step 2). Compare against the locale-
+                // appropriate version so the Android NotUnderstood
+                // retry path fires for Italian / French / etc.
+                // users too — not just English.
+                let is_fallback =
+                    s == fallback_response_for(&locale) || s == FALLBACK_RESPONSE;
+                if is_fallback {
                     FfiResponse::NotUnderstood { body: s }
                 } else {
                     FfiResponse::Text { body: s }
@@ -649,6 +708,7 @@ impl AriEngine {
         options.calendar_provider = self.calendar_provider.clone();
         options.local_clock = self.local_clock.clone();
         options.config_store = self.config_store.clone();
+        options.locale_provider = self.locale_provider.clone();
         let loaded: u32 =
             match load_skill_directory_with(&PathBuf::from(&skill_store_dir), &options) {
                 Ok(report) => {

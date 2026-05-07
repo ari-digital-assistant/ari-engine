@@ -1,11 +1,27 @@
 use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 use chrono::Local;
 
+// English + Italian. The scorer is locale-agnostic; the words don't
+// collide across languages, so a single union table keeps Stage 1
+// keyword routing fast (no cloud round-trip needed for "che ora è").
+//
+// Italian trigger shapes after `normalize_input` (lowercases, strips
+// elisions like `l'ora` → `l ora`):
+//   - "che ora è" / "a che ora" → ["che", "ora"]
+//   - "che ore sono" / "che ore" → ["che", "ore"]
+//   - "dimmi l'ora" → "dimmi l ora" → ["dimmi", "ora"]
+//   - "ora attuale" → ["ora", "attuale"]
 const TRIGGER_PHRASES: &[&[&str]] = &[
+    // English
     &["what", "time"],
     &["current", "time"],
     &["tell", "time"],
     &["what is", "time"],
+    // Italian
+    &["che", "ora"],
+    &["che", "ore"],
+    &["dimmi", "ora"],
+    &["ora", "attuale"],
 ];
 
 pub struct CurrentTimeSkill;
@@ -90,10 +106,20 @@ impl Skill for CurrentTimeSkill {
         best_score
     }
 
-    fn execute(&self, _input: &str, _ctx: &SkillContext) -> Response {
+    fn execute(&self, _input: &str, ctx: &SkillContext) -> Response {
         let now = Local::now();
-        let formatted = now.format("%-I:%M %p").to_string();
-        Response::Text(format!("It's {}.", formatted))
+        // Locale-aware time format. English keeps 12-hour with AM/PM
+        // ("It's 3:25 PM."). Other shipped locales use 24-hour ("alle
+        // 15:25") — that's the conventional written form in IT/ES/FR/DE
+        // and avoids translating the AM/PM tokens.
+        let response = match ctx.locale.as_str() {
+            "it" => format!("Sono le {}.", now.format("%H:%M")),
+            "es" => format!("Son las {}.", now.format("%H:%M")),
+            "fr" => format!("Il est {}.", now.format("%H:%M")),
+            "de" => format!("Es ist {} Uhr.", now.format("%H:%M")),
+            _ => format!("It's {}.", now.format("%-I:%M %p")),
+        };
+        Response::Text(response)
     }
 }
 
@@ -200,5 +226,74 @@ mod tests {
     #[test]
     fn specificity_is_high() {
         assert_eq!(CurrentTimeSkill::new().specificity(), Specificity::High);
+    }
+
+    #[test]
+    fn execute_italian_uses_24h_and_italian_text() {
+        let skill = CurrentTimeSkill::new();
+        let mut italian = SkillContext::default();
+        italian.locale = "it".to_string();
+        let resp = skill.execute("che ora e", &italian);
+        match resp {
+            Response::Text(s) => {
+                // Italian: "Sono le HH:MM." — 24-hour, no AM/PM, leading
+                // "Sono le". Don't pin the exact time; just shape.
+                assert!(
+                    s.starts_with("Sono le "),
+                    "Italian response should start with 'Sono le ': {s}"
+                );
+                assert!(s.ends_with('.'));
+                assert!(!s.contains("AM"));
+                assert!(!s.contains("PM"));
+                // Pull the HH:MM out of "Sono le HH:MM."
+                let inner = s
+                    .strip_prefix("Sono le ")
+                    .and_then(|s| s.strip_suffix('.'))
+                    .expect("expected 'Sono le HH:MM.' shape");
+                assert!(inner.contains(':'), "expected HH:MM, got {inner}");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn score_italian_che_ora() {
+        let skill = CurrentTimeSkill::new();
+        // "che ora è" — the canonical Italian "what time is it"
+        // After normalize_input("che ora è", "it") the input stays as
+        // "che ora è" (lowercase, è preserved as alphanumeric). Words
+        // = ["che", "ora", "è"]. Phrase ["che", "ora"] matches:
+        // coverage = 2/3, score = 0.5 + 0.667*0.5 ≈ 0.833.
+        let score = skill.score("che ora è", &ctx());
+        assert!(score > 0.5, "expected score > 0.5, got {score}");
+    }
+
+    #[test]
+    fn score_italian_che_ore_sono() {
+        let skill = CurrentTimeSkill::new();
+        // "che ore sono" — the other common Italian time query
+        let score = skill.score("che ore sono", &ctx());
+        assert!(score > 0.5, "expected score > 0.5, got {score}");
+    }
+
+    #[test]
+    fn score_italian_dimmi_lora_after_normalisation() {
+        let skill = CurrentTimeSkill::new();
+        // "dimmi l'ora" → after `strip_italian_elisions` becomes
+        // "dimmi l ora" (3 tokens). Phrase ["dimmi", "ora"] matches.
+        let score = skill.score("dimmi l ora", &ctx());
+        assert!(score > 0.5, "expected score > 0.5, got {score}");
+    }
+
+    #[test]
+    fn execute_unknown_locale_falls_back_to_english() {
+        let skill = CurrentTimeSkill::new();
+        let mut other = SkillContext::default();
+        other.locale = "ja".to_string();
+        let resp = skill.execute("what time is it", &other);
+        match resp {
+            Response::Text(s) => assert!(s.starts_with("It's "), "fallback to English: {s}"),
+            _ => panic!("expected Text response"),
+        }
     }
 }

@@ -1,25 +1,99 @@
 use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 
+// English + Italian + Spanish + French + German trigger words. Same
+// union-dictionary approach as the reminder skill's parser — words
+// don't collide across these languages, so a single contains-check
+// disambiguates.
 const GREETINGS: &[&str] = &[
+    // English
     "hello", "hi", "hey", "heya", "howdy", "greetings", "good morning",
     "good afternoon", "good evening", "yo", "sup", "hiya", "ello",
     "hey ari", "hi ari", "hello ari",
+    // Italian
+    "ciao", "salve", "buongiorno", "buonasera", "buonanotte",
+    "ciao ari", "salve ari",
+    // Spanish
+    "hola", "buenos días", "buenas tardes", "buenas noches",
+    // French
+    "bonjour", "salut", "bonsoir", "coucou",
+    // German
+    "hallo", "guten morgen", "guten tag", "guten abend",
 ];
 
 const HOW_ARE_YOU: &[&[&str]] = &[
+    // English
     &["how", "are", "you"],
     &["how", "you", "doing"],
     &["how", "is", "it", "going"],
     &["what", "is", "up"],
     &["what", "up"],
+    // Italian
+    &["come", "stai"],
+    &["come", "va"],
+    // Spanish
+    &["cómo", "estás"],
+    &["qué", "tal"],
+    // French
+    &["comment", "vas"],
+    &["ça", "va"],
+    // German
+    &["wie", "geht"],
 ];
 
-const RESPONSES: &[&str] = &[
+const RESPONSES_EN: &[&str] = &[
     "Hey there! What can I do for you?",
     "Hello! How can I help?",
     "Hi! What's on your mind?",
     "Hey! Ready when you are.",
 ];
+
+const RESPONSES_IT: &[&str] = &[
+    "Ciao! Cosa posso fare per te?",
+    "Ciao! Come posso aiutarti?",
+    "Ciao! A cosa stai pensando?",
+    "Ciao! Sono qui quando vuoi.",
+];
+
+const RESPONSES_ES: &[&str] = &[
+    "¡Hola! ¿Qué puedo hacer por ti?",
+    "¡Hola! ¿Cómo puedo ayudarte?",
+    "¡Hola! ¿En qué estás pensando?",
+    "¡Hola! Listo cuando quieras.",
+];
+
+const RESPONSES_FR: &[&str] = &[
+    "Salut ! Que puis-je faire pour toi ?",
+    "Bonjour ! Comment puis-je aider ?",
+    "Salut ! Qu'est-ce qui te trotte ?",
+    "Salut ! Prêt quand tu veux.",
+];
+
+const RESPONSES_DE: &[&str] = &[
+    "Hallo! Was kann ich für dich tun?",
+    "Hallo! Wie kann ich helfen?",
+    "Hallo! Was hast du vor?",
+    "Hallo! Bereit, wenn du es bist.",
+];
+
+fn responses_for_locale(locale: &str) -> &'static [&'static str] {
+    match locale {
+        "it" => RESPONSES_IT,
+        "es" => RESPONSES_ES,
+        "fr" => RESPONSES_FR,
+        "de" => RESPONSES_DE,
+        _ => RESPONSES_EN,
+    }
+}
+
+fn how_are_you_response(locale: &str) -> &'static str {
+    match locale {
+        "it" => "Sto benissimo, grazie! Come posso aiutarti?",
+        "es" => "¡Estoy genial, gracias por preguntar! ¿Cómo puedo ayudarte?",
+        "fr" => "Je vais très bien, merci ! Comment puis-je t'aider ?",
+        "de" => "Mir geht es großartig, danke der Nachfrage! Wie kann ich helfen?",
+        _ => "I'm doing great, thanks for asking! How can I help you?",
+    }
+}
 
 pub struct GreetingSkill;
 
@@ -111,18 +185,19 @@ impl Skill for GreetingSkill {
         0.0
     }
 
-    fn execute(&self, input: &str, _ctx: &SkillContext) -> Response {
+    fn execute(&self, input: &str, ctx: &SkillContext) -> Response {
         let words: Vec<&str> = input.split_whitespace().collect();
         let is_how_are_you = HOW_ARE_YOU.iter().any(|phrase| {
             phrase.iter().all(|kw| words.contains(kw))
         });
 
         if is_how_are_you {
-            return Response::Text("I'm doing great, thanks for asking! How can I help you?".to_string());
+            return Response::Text(how_are_you_response(ctx.locale.as_str()).to_string());
         }
 
-        let idx = input.len() % RESPONSES.len();
-        Response::Text(RESPONSES[idx].to_string())
+        let responses = responses_for_locale(ctx.locale.as_str());
+        let idx = input.len() % responses.len();
+        Response::Text(responses[idx].to_string())
     }
 }
 
@@ -208,13 +283,50 @@ mod tests {
     #[test]
     fn execute_regular_greeting_picks_from_responses() {
         let skill = GreetingSkill::new();
-        // Response selection: input.len() % RESPONSES.len()
-        // "hello" = 5 chars, 5 % 4 = 1 → RESPONSES[1]
+        // Response selection: input.len() % RESPONSES_EN.len()
+        // "hello" = 5 chars, 5 % 4 = 1 → RESPONSES_EN[1]
         let resp = skill.execute("hello", &ctx());
         match resp {
             Response::Text(s) => assert_eq!(s, "Hello! How can I help?"),
             _ => panic!("expected Text"),
         }
+    }
+
+    #[test]
+    fn execute_italian_how_are_you() {
+        let skill = GreetingSkill::new();
+        let mut italian = SkillContext::default();
+        italian.locale = "it".to_string();
+        let resp = skill.execute("come stai", &italian);
+        match resp {
+            Response::Text(s) => assert_eq!(
+                s,
+                "Sto benissimo, grazie! Come posso aiutarti?"
+            ),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn execute_italian_regular_greeting_picks_from_italian_responses() {
+        let skill = GreetingSkill::new();
+        let mut italian = SkillContext::default();
+        italian.locale = "it".to_string();
+        // "ciao" = 4 chars, 4 % 4 = 0 → RESPONSES_IT[0]
+        let resp = skill.execute("ciao", &italian);
+        match resp {
+            Response::Text(s) => assert_eq!(s, "Ciao! Cosa posso fare per te?"),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn score_italian_greeting_triggers() {
+        let skill = GreetingSkill::new();
+        // Italian greeting "ciao" must score above 0 — the union
+        // dictionary lets the same scorer recognise both languages.
+        assert!(skill.score("ciao", &ctx()) > 0.0);
+        assert!(skill.score("buongiorno", &ctx()) > 0.0);
     }
 
     #[test]

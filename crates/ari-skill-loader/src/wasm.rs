@@ -114,6 +114,11 @@ const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
     ("local_timezone_id", None),
     ("setting_get", None),
     ("args", None),
+    ("get_locale", None),
+    ("t", None),
+    ("format_date", None),
+    ("format_number", None),
+    ("format_currency", None),
     ("http_fetch", Some(Capability::Http)),
     ("storage_get", Some(Capability::StorageKv)),
     ("storage_set", Some(Capability::StorageKv)),
@@ -263,6 +268,16 @@ struct StoreData {
     local_clock: Arc<dyn crate::platform_capabilities::LocalClock>,
     /// Config store — ungated; every skill can read its own settings.
     config_store: Arc<dyn crate::assistant::ConfigStore>,
+    /// Locale provider — ungated; backs `ari::get_locale` and
+    /// `ari::t` (which reads the current locale to pick the right
+    /// `strings/{locale}.json` table). Cloned from the WasmSkill,
+    /// which got it from `LoadOptions.locale_provider`.
+    locale_provider: Arc<dyn crate::platform_capabilities::LocaleProvider>,
+    /// Per-skill localized string tables — ungated; backs `ari::t`.
+    /// Cloned from the WasmSkill. Empty when the skill bundle
+    /// shipped no `strings/` directory; `t()` will return the bare
+    /// key in that case.
+    localized_strings: Arc<crate::localized_strings::LocalizedStrings>,
     /// Per-call typed args JSON, set by `execute_with_args` before
     /// invoking the WASM module's `execute` export. Read back from
     /// inside the skill via the `ari::args` host import. `None` for
@@ -295,11 +310,14 @@ pub struct WasmSkill {
     description: String,
     specificity: Specificity,
     custom_score: bool,
-    /// Native pattern scorer used when `custom_score = false`. Same code path
-    /// as the declarative adapter, so a WASM skill that doesn't override
-    /// scoring behaves identically to a declarative one with the same
-    /// `metadata.ari.matching` block.
-    scorer: PatternScorer,
+    /// Per-locale native pattern scorers used when `custom_score = false`.
+    /// Same code path as the declarative adapter, so a WASM skill that
+    /// doesn't override scoring behaves identically to a declarative one
+    /// with the same `metadata.ari.matching` block. Keyed by ISO 639-1
+    /// locale; `score()` reads `ctx.locale` to dispatch and falls back
+    /// to the canonical-English scorer when the requested locale isn't
+    /// shipped (best-effort fallback per the multi-language plan).
+    scorers: std::collections::BTreeMap<String, PatternScorer>,
     engine: Engine,
     module: Module,
     memory_limit_bytes: usize,
@@ -327,6 +345,14 @@ pub struct WasmSkill {
     /// user-configurable settings declared in `metadata.ari.settings`.
     /// Ungated; every skill can read its own settings.
     config_store: Arc<dyn crate::assistant::ConfigStore>,
+    /// Locale source for `ari::get_locale` and `ari::t`. Threaded
+    /// from `LoadOptions.locale_provider` at construction time.
+    /// Ungated; every skill can read the active locale.
+    locale_provider: Arc<dyn crate::platform_capabilities::LocaleProvider>,
+    /// Per-skill string tables, parsed from `<skill_dir>/strings/`
+    /// at construction time. Ungated; backs `ari::t`. Empty when the
+    /// skill bundle shipped no strings directory.
+    localized_strings: Arc<crate::localized_strings::LocalizedStrings>,
 }
 
 impl std::fmt::Debug for WasmSkill {
@@ -357,7 +383,57 @@ impl WasmSkill {
             Some(Behaviour::Wasm(w)) => w,
             Some(Behaviour::Declarative(_)) | None => return Err(WasmError::NotWasm),
         };
-        Self::build(ari, &sf.description, wasm, skill_dir, options)
+        // Single-Skillfile path: synthesise a one-locale set so the
+        // build helper can stay locale-aware end-to-end.
+        let mut scorers = std::collections::BTreeMap::new();
+        if let Some(matching) = ari.matching.as_ref() {
+            scorers.insert(
+                crate::localized_manifest::CANONICAL_LOCALE.to_string(),
+                PatternScorer::compile(matching).map_err(|e| WasmError::Compile(e.to_string()))?,
+            );
+        }
+        Self::build(ari, &sf.description, wasm, skill_dir, options, scorers)
+    }
+
+    /// Build from a parsed [`LocalizedManifestSet`] — preferred entry
+    /// point. Each locale variant contributes its own pattern scorer;
+    /// the canonical structural fields (capabilities, behaviour, WASM
+    /// module path) are taken from the canonical entry.
+    pub fn from_localized(
+        set: &crate::localized_manifest::LocalizedManifestSet,
+        skill_dir: &Path,
+        options: &crate::LoadOptions,
+    ) -> Result<Self, WasmError> {
+        let canonical = set.canonical();
+        let canonical_ari = canonical
+            .ari_extension
+            .as_ref()
+            .ok_or(WasmError::NotAnAriSkill)?;
+        let wasm = match &canonical_ari.behaviour {
+            Some(Behaviour::Wasm(w)) => w,
+            Some(Behaviour::Declarative(_)) | None => return Err(WasmError::NotWasm),
+        };
+
+        // Compile a scorer for every locale variant that ships a
+        // matching block. Variants without `metadata.ari.matching`
+        // are silently skipped — the canonical-set parser already
+        // enforces structural consistency, so any variant lacking
+        // matching is an authoring choice (e.g. a translation that
+        // didn't bother shipping patterns yet).
+        let mut scorers: std::collections::BTreeMap<String, PatternScorer> =
+            std::collections::BTreeMap::new();
+        for (locale, sf) in &set.manifests {
+            let Some(ari) = sf.ari_extension.as_ref() else {
+                continue;
+            };
+            let Some(matching) = ari.matching.as_ref() else {
+                continue;
+            };
+            let scorer =
+                PatternScorer::compile(matching).map_err(|e| WasmError::Compile(e.to_string()))?;
+            scorers.insert(locale.clone(), scorer);
+        }
+        Self::build(canonical_ari, &canonical.description, wasm, skill_dir, options, scorers)
     }
 
     fn build(
@@ -366,22 +442,86 @@ impl WasmSkill {
         wasm: &WasmBehaviour,
         skill_dir: &Path,
         options: &crate::LoadOptions,
+        scorers: std::collections::BTreeMap<String, PatternScorer>,
     ) -> Result<Self, WasmError> {
         let module_path = skill_dir.join(&wasm.module);
         let bytes = std::fs::read(&module_path).map_err(|source| WasmError::ReadModule {
             path: module_path.clone(),
             source,
         })?;
-        Self::from_module_bytes(ari, description, wasm, &bytes, options)
+        // Parse the per-skill `strings/{locale}.json` tables alongside
+        // the module. Missing `strings/` is fine — skills without any
+        // user-facing text don't need translations. Surface fatal
+        // failures (broken JSON, missing en.json when others present)
+        // as compile errors so a botched bundle never silently loads
+        // with hidden empty strings.
+        let localized_strings = crate::localized_strings::parse_strings_directory(skill_dir)
+            .map_err(|e| WasmError::Compile(format!("strings/ load failed: {e}")))?;
+        Self::from_parts(
+            ari,
+            description,
+            wasm,
+            &bytes,
+            options,
+            Arc::new(localized_strings),
+            scorers,
+        )
     }
 
     /// Test seam: build directly from in-memory module bytes (WASM or WAT).
+    /// Defaults `localized_strings` to an empty table — most tests
+    /// don't exercise translations. Use [`from_module_bytes_with_strings`]
+    /// when you need to pass a populated string table.
     pub fn from_module_bytes(
         ari: &AriExtension,
         description: &str,
         wasm: &WasmBehaviour,
         bytes: &[u8],
         options: &crate::LoadOptions,
+    ) -> Result<Self, WasmError> {
+        Self::from_module_bytes_with_strings(
+            ari,
+            description,
+            wasm,
+            bytes,
+            options,
+            Arc::new(crate::localized_strings::LocalizedStrings::default()),
+        )
+    }
+
+    /// Test seam: build from in-memory module bytes plus a pre-parsed
+    /// localized-string table. The scorer table is auto-built as a
+    /// single canonical-locale scorer compiled from `ari.matching`.
+    pub fn from_module_bytes_with_strings(
+        ari: &AriExtension,
+        description: &str,
+        wasm: &WasmBehaviour,
+        bytes: &[u8],
+        options: &crate::LoadOptions,
+        localized_strings: Arc<crate::localized_strings::LocalizedStrings>,
+    ) -> Result<Self, WasmError> {
+        let mut scorers: std::collections::BTreeMap<String, PatternScorer> =
+            std::collections::BTreeMap::new();
+        if let Some(matching) = ari.matching.as_ref() {
+            scorers.insert(
+                crate::localized_manifest::CANONICAL_LOCALE.to_string(),
+                PatternScorer::compile(matching)?,
+            );
+        }
+        Self::from_parts(ari, description, wasm, bytes, options, localized_strings, scorers)
+    }
+
+    /// The actual constructor body. Takes pre-compiled per-locale
+    /// scorers and pre-parsed localized strings. Called by [`build`]
+    /// (production path) and the `from_module_bytes*` test seams.
+    fn from_parts(
+        ari: &AriExtension,
+        description: &str,
+        wasm: &WasmBehaviour,
+        bytes: &[u8],
+        options: &crate::LoadOptions,
+        localized_strings: Arc<crate::localized_strings::LocalizedStrings>,
+        scorers: std::collections::BTreeMap<String, PatternScorer>,
     ) -> Result<Self, WasmError> {
         let log_sink = options.log_sink.clone();
         let host_caps = &options.host_capabilities;
@@ -391,6 +531,7 @@ impl WasmSkill {
         let calendar_provider = options.calendar_provider.clone();
         let local_clock = options.local_clock.clone();
         let config_store = options.config_store.clone();
+        let locale_provider = options.locale_provider.clone();
 
         let mut config = wasmtime::Config::new();
         config.consume_fuel(true);
@@ -400,7 +541,15 @@ impl WasmSkill {
 
         let memory_limit_bytes = wasm.memory_limit_mb.max(1) as usize * 1024 * 1024;
         let matching = ari.matching.as_ref().ok_or(WasmError::NotWasm)?;
-        let scorer = PatternScorer::compile(matching)?;
+        // `scorers` is supplied by the caller — already compiled per
+        // locale. Sanity-check that the canonical entry is present;
+        // every entry point guarantees this, but a future refactor
+        // could drift the contract.
+        if !scorers.contains_key(crate::localized_manifest::CANONICAL_LOCALE) {
+            return Err(WasmError::Compile(
+                "internal: WasmSkill::from_parts called without canonical-locale scorer".into(),
+            ));
+        }
 
         // Capability check at install time. The grant set is the intersection
         // of (declared) ∩ (host-provided). Anything declared but not provided
@@ -456,7 +605,7 @@ impl WasmSkill {
             description: description.to_string(),
             specificity: ari.specificity.as_core(),
             custom_score: matching.custom_score,
-            scorer,
+            scorers,
             engine,
             module,
             memory_limit_bytes,
@@ -468,6 +617,8 @@ impl WasmSkill {
             calendar_provider,
             local_clock,
             config_store,
+            locale_provider,
+            localized_strings,
         };
         skill.validate_exports()?;
         Ok(skill)
@@ -523,6 +674,8 @@ impl WasmSkill {
                 },
                 local_clock: self.local_clock.clone(),
                 config_store: self.config_store.clone(),
+                locale_provider: self.locale_provider.clone(),
+                localized_strings: self.localized_strings.clone(),
                 args_json: None,
             },
         );
@@ -806,6 +959,74 @@ impl WasmSkill {
                 "args",
                 |mut caller: Caller<'_, StoreData>| -> i64 {
                     args_impl(&mut caller)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+
+        // Locale + i18n — ungated; every skill can read the active
+        // locale and look up translations from its own
+        // `strings/{locale}.json` tables. `get_locale` returns the
+        // ISO 639-1 code (`en`, `it`, …); `t` looks up a key with
+        // English fallback and substitutes `{placeholder}` slots from
+        // a JSON args object.
+        linker
+            .func_wrap(
+                "ari",
+                "get_locale",
+                |mut caller: Caller<'_, StoreData>| -> i64 {
+                    get_locale_impl(&mut caller)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+        linker
+            .func_wrap(
+                "ari",
+                "t",
+                |mut caller: Caller<'_, StoreData>,
+                 key_ptr: i32, key_len: i32,
+                 args_ptr: i32, args_len: i32| -> i64 {
+                    t_impl(&mut caller, key_ptr, key_len, args_ptr, args_len)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+
+        // Locale-aware formatters — ungated. Skills emit raw values
+        // (epoch ms, f64 numbers, currency code + amount) and the
+        // host renders to the active locale. Empty `locale` argument
+        // means "use the active locale"; explicit code overrides.
+        linker
+            .func_wrap(
+                "ari",
+                "format_date",
+                |mut caller: Caller<'_, StoreData>,
+                 ts_ms: i64,
+                 locale_ptr: i32, locale_len: i32,
+                 style_ptr: i32, style_len: i32| -> i64 {
+                    format_date_impl(&mut caller, ts_ms, locale_ptr, locale_len, style_ptr, style_len)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+        linker
+            .func_wrap(
+                "ari",
+                "format_number",
+                |mut caller: Caller<'_, StoreData>,
+                 value: f64,
+                 locale_ptr: i32, locale_len: i32,
+                 style_ptr: i32, style_len: i32| -> i64 {
+                    format_number_impl(&mut caller, value, locale_ptr, locale_len, style_ptr, style_len)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+        linker
+            .func_wrap(
+                "ari",
+                "format_currency",
+                |mut caller: Caller<'_, StoreData>,
+                 amount: f64,
+                 currency_ptr: i32, currency_len: i32,
+                 locale_ptr: i32, locale_len: i32| -> i64 {
+                    format_currency_impl(&mut caller, amount, currency_ptr, currency_len, locale_ptr, locale_len)
                 },
             )
             .map_err(|e| WasmError::Compile(e.to_string()))?;
@@ -1477,6 +1698,168 @@ fn setting_get_impl(caller: &mut Caller<'_, StoreData>, key_ptr: i32, key_len: i
     }
 }
 
+/// Implementation of `ari::get_locale`. Returns the user's currently
+/// active language as an ISO 639-1 lowercase string (e.g. `"en"`,
+/// `"it"`). Reads through the [`LocaleProvider`] the host supplied via
+/// `LoadOptions.locale_provider`.
+fn get_locale_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let locale = caller.data().locale_provider.current_locale();
+    write_response(caller, memory, &locale)
+}
+
+/// Implementation of `ari::t`. Reads `key` and `args_json` from the
+/// skill's linear memory, looks up `key` in the skill's
+/// `strings/{current_locale}.json` table (with English fallback),
+/// substitutes `{placeholder}` slots from the parsed args, and returns
+/// the rendered string.
+///
+/// `args_json` is a flat JSON object of string→string. Numeric args
+/// the skill wants substituted should be stringified on the skill
+/// side (`{"count": "3"}`); the host stays type-agnostic on purpose
+/// so the WASM string passing convention doesn't need a side schema.
+///
+/// Lookup miss → returns the bare key (debug visibility — typoed
+/// keys stay visible to the dev rather than rendering as empty).
+/// Bad JSON in `args_json` → silently treated as empty args; missing
+/// placeholders are left intact in the output by [`LocalizedStrings::render`].
+fn t_impl(
+    caller: &mut Caller<'_, StoreData>,
+    key_ptr: i32,
+    key_len: i32,
+    args_ptr: i32,
+    args_len: i32,
+) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let key = match read_utf8(&memory, &*caller, key_ptr, key_len) {
+        Some(s) => s,
+        None => return 0,
+    };
+    // Empty args is fine — skills frequently call `t("greeting")` with
+    // no placeholders. SDK helper passes `args_len = 0` in that case.
+    let args_json = if args_len > 0 {
+        match read_utf8(&memory, &*caller, args_ptr, args_len) {
+            Some(s) => s,
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    };
+    let args: std::collections::BTreeMap<String, String> = if args_json.is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        // Bad JSON: silently fall through with empty args. The
+        // resulting render will leave any `{placeholder}` slots in
+        // the template intact, which is the same visible-failure UX
+        // the SDK already gets for typoed placeholder names.
+        serde_json::from_str(&args_json).unwrap_or_default()
+    };
+
+    let strings = caller.data().localized_strings.clone();
+    let locale = caller.data().locale_provider.current_locale();
+    let rendered = strings
+        .render(&locale, &key, &args)
+        .unwrap_or_else(|| key.clone());
+    write_response(caller, memory, &rendered)
+}
+
+/// Read a `(ptr, len)` pair as UTF-8 from WASM memory; an empty input
+/// resolves to `None` so the formatter functions can transparently
+/// substitute the active locale.
+fn read_optional_string(
+    memory: &Memory,
+    caller: &Caller<'_, StoreData>,
+    ptr: i32,
+    len: i32,
+) -> Option<String> {
+    if len <= 0 {
+        return None;
+    }
+    read_utf8(memory, caller, ptr, len).filter(|s| !s.is_empty())
+}
+
+/// Implementation of `ari::format_date`. `locale` may be empty (uses
+/// the active locale) or an explicit ISO 639-1 code. `style` is the
+/// hint string ("short", "medium", "long", "full"); unrecognised
+/// values default to medium.
+fn format_date_impl(
+    caller: &mut Caller<'_, StoreData>,
+    ts_ms: i64,
+    locale_ptr: i32,
+    locale_len: i32,
+    style_ptr: i32,
+    style_len: i32,
+) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let explicit_locale = read_optional_string(&memory, &*caller, locale_ptr, locale_len);
+    let style_str = read_optional_string(&memory, &*caller, style_ptr, style_len)
+        .unwrap_or_default();
+    let locale = explicit_locale.unwrap_or_else(|| caller.data().locale_provider.current_locale());
+    let formatted = crate::formatters::format_date(
+        ts_ms,
+        &locale,
+        crate::formatters::FormatStyle::parse(&style_str),
+    );
+    write_response(caller, memory, &formatted)
+}
+
+/// Implementation of `ari::format_number`.
+fn format_number_impl(
+    caller: &mut Caller<'_, StoreData>,
+    value: f64,
+    locale_ptr: i32,
+    locale_len: i32,
+    style_ptr: i32,
+    style_len: i32,
+) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let explicit_locale = read_optional_string(&memory, &*caller, locale_ptr, locale_len);
+    let style_str = read_optional_string(&memory, &*caller, style_ptr, style_len)
+        .unwrap_or_default();
+    let locale = explicit_locale.unwrap_or_else(|| caller.data().locale_provider.current_locale());
+    let formatted = crate::formatters::format_number(
+        value,
+        &locale,
+        crate::formatters::FormatStyle::parse(&style_str),
+    );
+    write_response(caller, memory, &formatted)
+}
+
+/// Implementation of `ari::format_currency`. `currency` is the ISO
+/// 4217 code (`"USD"`, `"EUR"`); unknown codes pass through verbatim
+/// rather than failing.
+fn format_currency_impl(
+    caller: &mut Caller<'_, StoreData>,
+    amount: f64,
+    currency_ptr: i32,
+    currency_len: i32,
+    locale_ptr: i32,
+    locale_len: i32,
+) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let currency = read_optional_string(&memory, &*caller, currency_ptr, currency_len)
+        .unwrap_or_default();
+    let explicit_locale = read_optional_string(&memory, &*caller, locale_ptr, locale_len);
+    let locale = explicit_locale.unwrap_or_else(|| caller.data().locale_provider.current_locale());
+    let formatted = crate::formatters::format_currency(amount, &currency, &locale);
+    write_response(caller, memory, &formatted)
+}
+
 fn write_response(caller: &mut Caller<'_, StoreData>, memory: Memory, s: &str) -> i64 {
     let alloc = match caller.get_export("ari_alloc") {
         Some(wasmtime::Extern::Func(f)) => f,
@@ -1515,16 +1898,22 @@ impl Skill for WasmSkill {
         self.specificity
     }
 
-    fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {
+    fn score(&self, input: &str, ctx: &SkillContext) -> f32 {
         // Default path: same native pattern scorer the declarative adapter
         // uses, applied to the manifest's `metadata.ari.matching` block. The
-        // WASM module is never invoked.
+        // WASM module is never invoked. Per-locale dispatch with
+        // canonical-English fallback (best-effort rule).
         //
         // Custom path: when `custom_score = true` the manifest grants the
         // module its own `score()` export, called for every input. Documented
         // as a power-user feature with a perf warning.
         if !self.custom_score {
-            return self.scorer.score(input);
+            let scorer = self.scorers.get(&ctx.locale).unwrap_or_else(|| {
+                self.scorers
+                    .get(crate::localized_manifest::CANONICAL_LOCALE)
+                    .expect("canonical scorer guaranteed by from_parts")
+            });
+            return scorer.score(input, &ctx.locale);
         }
 
         self.with_instance(
@@ -1676,6 +2065,7 @@ mod tests {
             calendar_provider: Arc::new(crate::NullCalendarProvider),
             local_clock: Arc::new(crate::UtcLocalClock),
             config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
+            locale_provider: Arc::new(crate::EnglishLocaleProvider),
         }
     }
 
@@ -2499,6 +2889,7 @@ mod tests {
                 calendar_provider: Arc::new(crate::NullCalendarProvider),
                 local_clock: Arc::new(crate::UtcLocalClock),
                 config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
+                locale_provider: Arc::new(crate::EnglishLocaleProvider),
             },
         )
         .unwrap()
@@ -2608,6 +2999,7 @@ mod tests {
                 calendar_provider: Arc::new(crate::NullCalendarProvider),
                 local_clock: Arc::new(crate::UtcLocalClock),
                 config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
+                locale_provider: Arc::new(crate::EnglishLocaleProvider),
             },
         )
         .unwrap();

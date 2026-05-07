@@ -1,9 +1,26 @@
 use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 
+// English + Italian + Spanish + French + German trigger verbs. The
+// `to_math_expr` step strips these from the input before passing the
+// rest to the expression evaluator, so adding a foreign-language
+// trigger doesn't require parser changes.
 const TRIGGER_WORDS: &[&str] = &[
+    // English
     "calculate", "compute", "eval", "solve",
+    // Italian: calcola (calculate), risolvi (solve)
+    "calcola", "risolvi",
+    // Spanish: calcula, resuelve
+    "calcula", "resuelve",
+    // French: calcule, calculer, résous
+    "calcule", "calculer",
+    // German: berechne, berechnen, löse
+    "berechne", "berechnen",
 ];
 
+// Math word → operator. English only for now; Italian "più"/"meno"/
+// "per"/"diviso" etc. would need their own table. Out of scope for
+// the current pass — Italian users typing `2 + 3` work fine because
+// the symbolic operators are language-agnostic.
 const MATH_WORDS: &[(&str, &str)] = &[
     ("plus", "+"),
     ("minus", "-"),
@@ -142,7 +159,7 @@ impl Skill for CalculatorSkill {
         0.0
     }
 
-    fn execute(&self, input: &str, _ctx: &SkillContext) -> Response {
+    fn execute(&self, input: &str, ctx: &SkillContext) -> Response {
         let expr = to_math_expr(input);
 
         match eval_expr(&expr) {
@@ -153,7 +170,16 @@ impl Skill for CalculatorSkill {
                     Response::Text(format!("{:.6}", result).trim_end_matches('0').trim_end_matches('.').to_string())
                 }
             }
-            None => Response::Text("Sorry, I couldn't evaluate that expression.".to_string()),
+            None => Response::Text(
+                match ctx.locale.as_str() {
+                    "it" => "Mi spiace, non sono riuscito a calcolare quell'espressione.",
+                    "es" => "Lo siento, no pude evaluar esa expresión.",
+                    "fr" => "Désolé, je n'ai pas pu évaluer cette expression.",
+                    "de" => "Tut mir leid, ich konnte diesen Ausdruck nicht berechnen.",
+                    _ => "Sorry, I couldn't evaluate that expression.",
+                }
+                .to_string(),
+            ),
         }
     }
 }
