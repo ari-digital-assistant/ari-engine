@@ -219,6 +219,32 @@ fn seed_pick_counter() -> u64 {
         .unwrap_or(0)
 }
 
+/// Recursively resolve every JSON string leaf through the strings table.
+/// A string matching a key becomes its per-locale value (English
+/// fallback); a non-key string is left untouched. Same implicit-lookup
+/// contract as the response text. Used to localize the declarative
+/// `action` envelope's own text fields (card titles, labels, etc.).
+fn resolve_json_strings(value: &mut serde_json::Value, locale: &str, strings: &LocalizedStrings) {
+    match value {
+        serde_json::Value::String(s) => {
+            if let Some(resolved) = strings.get(locale, s) {
+                *s = resolved.to_string();
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                resolve_json_strings(v, locale, strings);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_k, v) in map.iter_mut() {
+                resolve_json_strings(v, locale, strings);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn build_response(
     response: &ResponseSpec,
     action: &Option<serde_json::Value>,
@@ -243,11 +269,14 @@ fn build_response(
         None => Response::Text(text),
         Some(action) => {
             // The manifest's `action:` block is a presentation-envelope
-            // fragment (see docs/action-responses.md). Overlay `v` and
-            // `speak` onto it — those are protocol-level concerns the
-            // manifest author doesn't need to repeat. Any `speak` the
-            // author did set wins over the `response`-derived text.
+            // fragment (see docs/action-responses.md). Resolve any
+            // string leaves through the strings table first (card
+            // titles, labels, etc.), then overlay `v` and `speak` —
+            // those are protocol-level concerns the manifest author
+            // doesn't need to repeat. Any `speak` the author did set
+            // wins over the `response`-derived text (already resolved).
             let mut env = action.clone();
+            resolve_json_strings(&mut env, locale, strings);
             if let Some(obj) = env.as_object_mut() {
                 obj.insert("v".into(), serde_json::json!(1));
                 obj.entry("speak".to_string())
@@ -747,6 +776,93 @@ metadata:
         match s.render_with_pick_in(0, "it") {
             Response::Text(t) => assert_eq!(t, "Heads."),
             other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declarative_action_envelope_strings_resolve_per_locale() {
+        use std::fs;
+        let dir = tempdir_lite::TempDir::new();
+        let skill = dir.path().join("card");
+        fs::create_dir_all(skill.join("strings")).unwrap();
+        let md = r#"---
+name: card
+description: Shows a card.
+metadata:
+  ari:
+    id: ai.example.card
+    version: "0.1.0"
+    engine: ">=0.3"
+    languages: [en, it]
+    matching:
+      patterns:
+        - keywords: [show, card]
+          weight: 0.95
+    declarative:
+      response: "card.say"
+      action:
+        card:
+          title: "card.title"
+          subtitle: "not-a-key literal"
+---
+"#;
+        fs::write(skill.join("SKILL.en.md"), md).unwrap();
+        fs::write(skill.join("strings/en.json"), r#"{"card.say":"Done.","card.title":"Result"}"#).unwrap();
+        fs::write(skill.join("strings/it.json"), r#"{"card.say":"Fatto.","card.title":"Risultato"}"#).unwrap();
+
+        let set = crate::localized_manifest::parse_skill_directory(&skill).unwrap();
+        let s = DeclarativeSkill::from_localized(&set, &skill).unwrap();
+
+        match s.render_with_pick_in(0, "it") {
+            Response::Action(env) => {
+                // action's own key-string resolved per locale:
+                assert_eq!(env["card"]["title"], serde_json::json!("Risultato"));
+                // non-key string left verbatim:
+                assert_eq!(env["card"]["subtitle"], serde_json::json!("not-a-key literal"));
+                // protocol fields injected; speak from the resolved response:
+                assert_eq!(env["v"], serde_json::json!(1));
+                assert_eq!(env["speak"], serde_json::json!("Fatto."));
+            }
+            other => panic!("expected Action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declarative_action_envelope_resolves_in_english_too() {
+        use std::fs;
+        let dir = tempdir_lite::TempDir::new();
+        let skill = dir.path().join("card");
+        fs::create_dir_all(skill.join("strings")).unwrap();
+        let md = r#"---
+name: card
+description: Shows a card.
+metadata:
+  ari:
+    id: ai.example.card
+    version: "0.1.0"
+    engine: ">=0.3"
+    languages: [en, it]
+    matching:
+      patterns:
+        - keywords: [show, card]
+          weight: 0.95
+    declarative:
+      response: "card.say"
+      action:
+        card:
+          title: "card.title"
+---
+"#;
+        fs::write(skill.join("SKILL.en.md"), md).unwrap();
+        fs::write(skill.join("strings/en.json"), r#"{"card.say":"Done.","card.title":"Result"}"#).unwrap();
+        let set = crate::localized_manifest::parse_skill_directory(&skill).unwrap();
+        let s = DeclarativeSkill::from_localized(&set, &skill).unwrap();
+        match s.render_with_pick_in(0, "en") {
+            Response::Action(env) => {
+                assert_eq!(env["card"]["title"], serde_json::json!("Result"));
+                assert_eq!(env["speak"], serde_json::json!("Done."));
+            }
+            other => panic!("expected Action, got {other:?}"),
         }
     }
 
