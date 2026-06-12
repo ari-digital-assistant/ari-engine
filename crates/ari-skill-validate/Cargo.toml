@@ -9,3 +9,4 @@ path = "src/main.rs"
 
 [dependencies]
 ari-skill-loader = { path = "../ari-skill-loader" }
+serde_json = { workspace = true }
