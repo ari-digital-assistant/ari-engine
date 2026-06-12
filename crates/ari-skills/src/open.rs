@@ -140,9 +140,6 @@ impl Skill for OpenSkill {
             None => Response::Text(
                 match ctx.locale.as_str() {
                     "it" => "Cosa vuoi che apra?",
-                    "es" => "¿Qué quieres que abra?",
-                    "fr" => "Qu'est-ce que tu veux que j'ouvre ?",
-                    "de" => "Was soll ich öffnen?",
                     _ => "What would you like me to open?",
                 }
                 .to_string(),
@@ -314,6 +311,17 @@ mod tests {
         match response {
             Response::Action(v) => assert_eq!(v["launch_app"], "firefox"),
             other => panic!("expected Action via fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_no_target_spanish_falls_back_to_english() {
+        let skill = OpenSkill::new();
+        let mut es = SkillContext::default();
+        es.locale = "es".to_string();
+        match skill.execute("open", &es) {
+            Response::Text(s) => assert_eq!(s, "What would you like me to open?"),
+            other => panic!("expected Text, got {other:?}"),
         }
     }
 }
