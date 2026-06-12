@@ -155,6 +155,7 @@ name = "ari-skill-validate"
 version = "0.1.0"
 dependencies = [
  "ari-skill-loader",
+ "serde_json",
 ]
 
 [[package]]
