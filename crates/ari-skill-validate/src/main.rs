@@ -382,6 +382,19 @@ fn read_manifest_fields(skill_dir: &Path) -> ManifestFields {
         ..ManifestFields::default()
     };
     if let Some(ext) = sf.ari_extension {
+        let resp_strings = ext
+            .behaviour
+            .as_ref()
+            .map(declarative_response_strings)
+            .unwrap_or_default();
+        let en_keys = en_string_keys(skill_dir);
+        for s in resp_strings {
+            if looks_like_strings_key(&s) && !en_keys.contains(&s) {
+                out.warnings.push(format!(
+                    "declarative response \"{s}\" looks like a strings key but is not in strings/en.json — it will render verbatim"
+                ));
+            }
+        }
         out.examples = ext.examples.len();
         if let Err(e) = ext.validate_examples() {
             out.warnings.push(e.to_string());
@@ -668,6 +681,42 @@ fn escape_markdown(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
 }
 
+/// True when a string looks like a strings-table key: dotted, lowercase
+/// ASCII / digits / underscores, no whitespace, no empty segments (e.g.
+/// `coinflip.heads`). Deliberately excludes real literals like "Heads."
+/// (uppercase) or "No timers." (space).
+fn looks_like_strings_key(s: &str) -> bool {
+    s.contains('.')
+        && !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.')
+        && s.split('.').all(|seg| !seg.is_empty())
+}
+
+/// The keys defined in `strings/en.json`, or empty if absent/unparseable.
+fn en_string_keys(skill_dir: &std::path::Path) -> std::collections::HashSet<String> {
+    let path = skill_dir.join("strings").join("en.json");
+    let Ok(src) = std::fs::read_to_string(&path) else {
+        return std::collections::HashSet::new();
+    };
+    match serde_json::from_str::<std::collections::BTreeMap<String, String>>(&src) {
+        Ok(map) => map.into_keys().collect(),
+        Err(_) => std::collections::HashSet::new(),
+    }
+}
+
+/// Response strings of a declarative behaviour (for key-warning scanning).
+fn declarative_response_strings(behaviour: &ari_skill_loader::Behaviour) -> Vec<String> {
+    use ari_skill_loader::{Behaviour, ResponseSpec};
+    match behaviour {
+        Behaviour::Declarative(d) => match &d.response {
+            ResponseSpec::Fixed(s) => vec![s.clone()],
+            ResponseSpec::Pick(v) => v.clone(),
+            ResponseSpec::Template(s) => vec![s.clone()],
+        },
+        Behaviour::Wasm(_) => Vec::new(),
+    }
+}
+
 fn print_usage() {
     eprintln!("usage: ari-skill-validate [--quiet] [--format text|pr-comment|json] <path>...");
     eprintln!();
@@ -682,9 +731,146 @@ fn print_usage() {
     eprintln!("exit codes: 0 ok, 1 validation failure, 2 bad usage");
 }
 
+// --- Tiny test-only tempdir helper ---
+//
+// Mirrors the pattern used in ari-skill-loader tests; avoids adding a
+// tempfile crate dependency.
+#[cfg(test)]
+mod tempdir_lite {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    pub struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        pub fn new(prefix: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("{prefix}-{nanos}-{n}"));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warns_on_dotted_response_string_absent_from_en_json() {
+        use std::fs;
+        let dir = tempdir_lite::TempDir::new("ari-validate-test");
+        let skill = dir.path().join("coin");
+        fs::create_dir_all(skill.join("strings")).unwrap();
+        let md = r#"---
+name: coin
+description: Flips a coin.
+metadata:
+  ari:
+    id: ai.example.coin
+    version: "0.1.0"
+    engine: ">=0.3"
+    languages: [en]
+    matching:
+      patterns:
+        - keywords: [flip, coin]
+          weight: 0.95
+    examples:
+      - text: "flip a coin"
+      - text: "flip coin"
+      - text: "toss a coin"
+      - text: "coin flip"
+      - text: "heads or tails"
+    declarative:
+      response_pick: ["coin.heads", "coin.tals"]
+---
+"#;
+        fs::write(skill.join("SKILL.en.md"), md).unwrap();
+        fs::write(skill.join("strings/en.json"), r#"{"coin.heads":"Heads."}"#).unwrap();
+
+        let fields = read_manifest_fields(&skill);
+        assert!(
+            fields.warnings.iter().any(|w| w.contains("coin.tals")),
+            "expected a warning naming the unresolved key, got {:?}",
+            fields.warnings
+        );
+        assert!(
+            !fields.warnings.iter().any(|w| w.contains("coin.heads")),
+            "coin.heads is present in en.json — must not warn"
+        );
+    }
+
+    #[test]
+    fn does_not_warn_on_literal_response() {
+        use std::fs;
+        let dir = tempdir_lite::TempDir::new("ari-validate-test");
+        let skill = dir.path().join("coin");
+        fs::create_dir_all(&skill).unwrap();
+        let md = r#"---
+name: coin
+description: Flips a coin.
+metadata:
+  ari:
+    id: ai.example.coin
+    version: "0.1.0"
+    engine: ">=0.3"
+    matching:
+      patterns:
+        - keywords: [flip, coin]
+          weight: 0.95
+    examples:
+      - text: "flip a coin"
+      - text: "flip coin"
+      - text: "toss a coin"
+      - text: "coin flip"
+      - text: "heads or tails"
+    declarative:
+      response_pick: ["Heads.", "Tails."]
+---
+"#;
+        fs::write(skill.join("SKILL.en.md"), md).unwrap();
+        let fields = read_manifest_fields(&skill);
+        assert!(
+            fields.warnings.is_empty(),
+            "literal responses must not warn, got {:?}",
+            fields.warnings
+        );
+    }
+
+    #[test]
+    fn looks_like_strings_key_accepts_dotted_lowercase() {
+        assert!(looks_like_strings_key("coin.heads"));
+        assert!(looks_like_strings_key("coinflip.result.heads"));
+        assert!(looks_like_strings_key("a.b"));
+    }
+
+    #[test]
+    fn looks_like_strings_key_rejects_non_keys() {
+        assert!(!looks_like_strings_key("Heads."));     // uppercase
+        assert!(!looks_like_strings_key("No timers.")); // space
+        assert!(!looks_like_strings_key("simple"));     // no dot
+        assert!(!looks_like_strings_key("a..b"));       // empty segment
+        assert!(!looks_like_strings_key(".leading"));   // leading dot → empty seg
+        assert!(!looks_like_strings_key("trailing."));  // trailing dot → empty seg
+    }
 
     #[test]
     fn json_string_escapes_special_chars() {
