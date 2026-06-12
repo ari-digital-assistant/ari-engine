@@ -87,11 +87,10 @@ impl Skill for DateSkill {
     fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {
         let words: Vec<&str> = input.split_whitespace().collect();
 
-        // English "time" / Italian "ora" / Spanish "hora" / French
-        // "heure" / German "uhr" — any of these in the input means
-        // the user wants the time skill, not date. Mirrors the
-        // English-only guard that was here before; same intent.
-        const TIME_WORDS: &[&str] = &["time", "ora", "ore", "hora", "heure", "uhr"];
+        // English "time" / Italian "ora"/"ore" — any of these in the
+        // input means the user wants the time skill, not date. Mirrors
+        // the English-only guard that was here before; same intent.
+        const TIME_WORDS: &[&str] = &["time", "ora", "ore"];
         if words.iter().any(|w| TIME_WORDS.contains(w)) {
             return 0.0;
         }
@@ -302,11 +301,7 @@ mod tests {
         es.locale = "es".to_string();
         let resp = skill.execute("what date is it", &es);
         match resp {
-            Response::Text(s) => {
-                // English output uses English weekday/month words — assert it is
-                // NOT a Spanish date (Spanish uses " de " connectors).
-                assert!(!s.contains(" de "), "expected English fallback: {s}");
-            }
+            Response::Text(s) => assert!(s.starts_with("Today is "), "expected English fallback: {s}"),
             _ => panic!("expected Text"),
         }
     }

@@ -1,9 +1,8 @@
 use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 
-// English + Italian + Spanish + French + German trigger words. Same
-// union-dictionary approach as the reminder skill's parser — words
-// don't collide across these languages, so a single contains-check
-// disambiguates.
+// English + Italian trigger words. Same union-dictionary approach as
+// the reminder skill's parser — words don't collide across these
+// languages, so a single contains-check disambiguates.
 const GREETINGS: &[&str] = &[
     // English
     "hello", "hi", "hey", "heya", "howdy", "greetings", "good morning",
