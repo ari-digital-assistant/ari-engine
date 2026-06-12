@@ -28,6 +28,14 @@ const MATH_WORDS_EN: &[(&str, &str)] = &[
 ];
 
 const MATH_WORDS_IT: &[(&str, &str)] = &[
+    // Percent family guards — "per" is a substring of these, and
+    // percentage phrases aren't supported yet, so neutralise them to an
+    // all-letters placeholder (stripped by the char filter → a non-
+    // evaluating expression → graceful error) instead of letting the
+    // "per" -> "*" rule below produce a wrong numeric answer.
+    ("percentuale", "PCT"),
+    ("per cento", "PCT"),
+    ("percento", "PCT"),
     ("diviso per", "/"),
     ("elevato alla", "^"),
     ("più", "+"),
@@ -433,4 +441,17 @@ mod tests {
         it.locale = "it".to_string();
         assert_eq!(skill.score("calcola 2 + 2", &it), 0.95);
     }
+
+    #[test]
+    fn italian_percent_phrases_do_not_return_wrong_answer() {
+        // Percentage phrases aren't supported; they must NOT yield a
+        // wrong number via the "per" -> "*" substitution. Graceful
+        // error is the correct behaviour.
+        let err = "Mi spiace, non sono riuscito a calcolare quell'espressione.";
+        assert_eq!(exec_it("quanto fa il 10 per cento di 200"), err);
+        assert_eq!(exec_it("quanto fa il 10 percento di 200"), err);
+        assert_eq!(exec_it("calcola il 20 percentuale di 50"), err);
+    }
+
 }
+
