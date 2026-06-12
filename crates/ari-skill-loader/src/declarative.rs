@@ -7,17 +7,23 @@
 //! that don't trip the WASM custom-score path.
 //!
 //! Execution renders the response spec — `Fixed` returns verbatim, `Pick` picks
-//! one entry pseudo-randomly, `Template` is currently rendered as-is (capture
-//! filling is deferred to a later step). When the manifest also carries an
+//! one entry pseudo-randomly, `Template` is rendered as-is (capture filling is
+//! deferred to a later step). Every rendered string is then resolved through the
+//! skill's `strings/{locale}.json` table: a value matching a key becomes its
+//! per-locale string (English fallback), a non-key value is emitted verbatim.
+//! When the manifest also carries an
 //! `action`, the response is wrapped in `Response::Action` with both `text` and
 //! `action` keys; otherwise it's a plain `Response::Text`.
 
 use crate::localized_manifest::{LocalizedManifestSet, CANONICAL_LOCALE};
+use crate::localized_strings::{parse_strings_directory, LocalizedStrings};
 use crate::manifest::{AriExtension, Behaviour, ResponseSpec, Skillfile};
 use crate::scoring::{PatternScorer, ScorerError};
 use ari_core::{Response, Skill, SkillContext, Specificity};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -30,6 +36,10 @@ pub enum AdapterError {
 
     #[error("scorer compile failed: {0}")]
     Scorer(#[from] ScorerError),
+
+    /// The skill's `strings/` directory failed to load.
+    #[error("strings/ load failed: {0}")]
+    Strings(String),
 }
 
 /// Per-locale slice of a declarative skill: the bits that legitimately
@@ -66,6 +76,11 @@ pub struct DeclarativeSkill {
     /// across locale variants — they all draw from the same sequence so a
     /// user who flips locales mid-session doesn't see the picker reset.
     pick_counter: AtomicU64,
+    /// Per-skill string tables (`strings/{locale}.json`). Declarative
+    /// response strings are resolved through this at execute time — a
+    /// string that matches a key becomes its per-locale value, a
+    /// non-key string renders verbatim (same contract as `t()`).
+    strings: Arc<LocalizedStrings>,
 }
 
 impl DeclarativeSkill {
@@ -73,6 +88,11 @@ impl DeclarativeSkill {
     /// Treats the input as the canonical English manifest. Use
     /// [`from_localized`](Self::from_localized) when you have the
     /// full per-locale set.
+    ///
+    /// Note: this constructor uses an empty `strings/` table — response
+    /// strings are rendered verbatim, never resolved as keys. The real
+    /// load path goes through [`from_localized`], which loads the
+    /// skill's `strings/{locale}.json`.
     pub fn from_skillfile(sf: &Skillfile) -> Result<Self, AdapterError> {
         let ari = sf.ari_extension.as_ref().ok_or(AdapterError::NotAnAriSkill)?;
         let id = ari.id.clone();
@@ -85,6 +105,7 @@ impl DeclarativeSkill {
             specificity,
             by_locale,
             pick_counter: AtomicU64::new(seed_pick_counter()),
+            strings: Arc::new(LocalizedStrings::default()),
         })
     }
 
@@ -93,7 +114,7 @@ impl DeclarativeSkill {
     /// spec; structural identity (id, type, capabilities, behaviour-shape)
     /// is taken from the canonical entry. The set is guaranteed to have a
     /// canonical entry by the localized-manifest parser.
-    pub fn from_localized(set: &LocalizedManifestSet) -> Result<Self, AdapterError> {
+    pub fn from_localized(set: &LocalizedManifestSet, skill_dir: &Path) -> Result<Self, AdapterError> {
         let canonical = set.canonical();
         let canonical_ari = canonical
             .ari_extension
@@ -101,6 +122,9 @@ impl DeclarativeSkill {
             .ok_or(AdapterError::NotAnAriSkill)?;
         let id = canonical_ari.id.clone();
         let specificity = canonical_ari.specificity.as_core();
+
+        let strings = parse_strings_directory(skill_dir)
+            .map_err(|e| AdapterError::Strings(e.to_string()))?;
 
         let mut by_locale: BTreeMap<String, LocalizedDeclarative> = BTreeMap::new();
         for (locale, sf) in &set.manifests {
@@ -128,6 +152,7 @@ impl DeclarativeSkill {
             specificity,
             by_locale,
             pick_counter: AtomicU64::new(seed_pick_counter()),
+            strings: Arc::new(strings),
         })
     }
 
@@ -152,7 +177,13 @@ impl DeclarativeSkill {
     /// counter state.
     #[cfg(test)]
     fn render_with_pick(&self, pick_idx: usize) -> Response {
-        build_response(&self.canonical().response, &self.canonical().action, pick_idx)
+        self.render_with_pick_in(pick_idx, CANONICAL_LOCALE)
+    }
+
+    #[cfg(test)]
+    fn render_with_pick_in(&self, pick_idx: usize, locale: &str) -> Response {
+        let entry = self.entry_for_locale(locale);
+        build_response(&entry.response, &entry.action, pick_idx, locale, &self.strings)
     }
 }
 
@@ -192,18 +223,21 @@ fn build_response(
     response: &ResponseSpec,
     action: &Option<serde_json::Value>,
     pick_idx: usize,
+    locale: &str,
+    strings: &LocalizedStrings,
 ) -> Response {
-    let text = match response {
-        ResponseSpec::Fixed(s) => s.clone(),
+    let raw = match response {
+        ResponseSpec::Fixed(s) => s.as_str(),
         ResponseSpec::Pick(options) => {
             // Caller is responsible for keeping pick_idx in range; the
             // public path always uses `pick_counter`, which we modulo
             // here. We never index out of bounds because options is
             // guaranteed non-empty by the manifest validator.
-            options[pick_idx % options.len()].clone()
+            options[pick_idx % options.len()].as_str()
         }
-        ResponseSpec::Template(t) => t.clone(),
+        ResponseSpec::Template(t) => t.as_str(),
     };
+    let text = strings.get(locale, raw).unwrap_or(raw).to_string();
 
     match action {
         None => Response::Text(text),
@@ -248,7 +282,7 @@ impl Skill for DeclarativeSkill {
     fn execute(&self, _input: &str, ctx: &SkillContext) -> Response {
         let entry = self.entry_for_locale(&ctx.locale);
         let idx = self.pick_counter.fetch_add(1, Ordering::Relaxed) as usize;
-        build_response(&entry.response, &entry.action, idx)
+        build_response(&entry.response, &entry.action, idx, &ctx.locale, &self.strings)
     }
 }
 
@@ -594,7 +628,7 @@ metadata:
         manifests.insert("en".to_string(), parse(en_src));
         manifests.insert("it".to_string(), parse(it_src));
         let set = LocalizedManifestSet { manifests };
-        let skill = DeclarativeSkill::from_localized(&set).unwrap();
+        let skill = DeclarativeSkill::from_localized(&set, std::path::Path::new("/nonexistent")).unwrap();
 
         // English context: English patterns match, Italian don't.
         let en_ctx = SkillContext { locale: "en".to_string() };
@@ -625,6 +659,164 @@ metadata:
         match skill.execute("hello", &es_ctx) {
             Response::Text(t) => assert_eq!(t, "Hi!"),
             other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declarative_response_resolves_per_locale_via_strings() {
+        use std::fs;
+        let dir = tempdir_lite::TempDir::new();
+        let skill = dir.path().join("coin");
+        fs::create_dir_all(skill.join("strings")).unwrap();
+
+        let en_md = r#"---
+name: coin
+description: Flips a coin.
+metadata:
+  ari:
+    id: ai.example.coin
+    version: "0.1.0"
+    engine: ">=0.3"
+    languages: [en, it]
+    matching:
+      patterns:
+        - keywords: [flip, coin]
+          weight: 0.95
+    declarative:
+      response_pick: ["coin.heads", "coin.tails"]
+---
+"#;
+        let it_md = r#"---
+name: coin
+description: Lancia una moneta.
+metadata:
+  ari:
+    id: ai.example.coin
+    version: "0.1.0"
+    engine: ">=0.3"
+    languages: [en, it]
+    matching:
+      patterns:
+        - keywords: [lancia, moneta]
+          weight: 0.95
+    declarative:
+      response_pick: ["coin.heads", "coin.tails"]
+---
+"#;
+        fs::write(skill.join("SKILL.en.md"), en_md).unwrap();
+        fs::write(skill.join("SKILL.it.md"), it_md).unwrap();
+        fs::write(skill.join("strings/en.json"), r#"{"coin.heads":"Heads.","coin.tails":"Tails."}"#).unwrap();
+        fs::write(skill.join("strings/it.json"), r#"{"coin.heads":"Testa.","coin.tails":"Croce."}"#).unwrap();
+
+        let set = crate::localized_manifest::parse_skill_directory(&skill).unwrap();
+        let s = DeclarativeSkill::from_localized(&set, &skill).unwrap();
+
+        match s.render_with_pick_in(0, "en") {
+            Response::Text(t) => assert_eq!(t, "Heads."),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        match s.render_with_pick_in(0, "it") {
+            Response::Text(t) => assert_eq!(t, "Testa."),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        match s.render_with_pick_in(1, "it") {
+            Response::Text(t) => assert_eq!(t, "Croce."),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declarative_literal_response_renders_verbatim_when_not_a_key() {
+        let src = r#"---
+name: coin
+description: Flips a coin.
+metadata:
+  ari:
+    id: ai.example.coin
+    version: "0.1.0"
+    engine: ">=0.3"
+    matching:
+      patterns:
+        - keywords: [flip, coin]
+          weight: 0.95
+    declarative:
+      response_pick: ["Heads.", "Tails."]
+---
+"#;
+        let s = DeclarativeSkill::from_skillfile(&parse(src)).unwrap();
+        match s.render_with_pick_in(0, "it") {
+            Response::Text(t) => assert_eq!(t, "Heads."),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declarative_missing_locale_key_falls_back_to_english() {
+        use std::fs;
+        let dir = tempdir_lite::TempDir::new();
+        let skill = dir.path().join("coin");
+        fs::create_dir_all(skill.join("strings")).unwrap();
+        let md = r#"---
+name: coin
+description: Flips a coin.
+metadata:
+  ari:
+    id: ai.example.coin
+    version: "0.1.0"
+    engine: ">=0.3"
+    languages: [en]
+    matching:
+      patterns:
+        - keywords: [flip, coin]
+          weight: 0.95
+    declarative:
+      response: "coin.only"
+---
+"#;
+        fs::write(skill.join("SKILL.en.md"), md).unwrap();
+        fs::write(skill.join("strings/en.json"), r#"{"coin.only":"Heads."}"#).unwrap();
+        fs::write(skill.join("strings/it.json"), r#"{"unrelated":"x"}"#).unwrap();
+        let set = crate::localized_manifest::parse_skill_directory(&skill).unwrap();
+        let s = DeclarativeSkill::from_localized(&set, &skill).unwrap();
+        match s.render_with_pick_in(0, "it") {
+            Response::Text(t) => assert_eq!(t, "Heads."),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+}
+
+// --- Tiny test-only tempdir helper for declarative tests. ---
+#[cfg(test)]
+mod tempdir_lite {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    pub struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        pub fn new() -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("ari-declarative-test-{nanos}-{n}"));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 }

@@ -282,7 +282,7 @@ pub fn load_single_skill_dir_with(skill_dir: &Path, options: &LoadOptions) -> Lo
     }
 
     match &ari.behaviour {
-        Some(Behaviour::Declarative(_)) => match DeclarativeSkill::from_localized(&manifest_set) {
+        Some(Behaviour::Declarative(_)) => match DeclarativeSkill::from_localized(&manifest_set, skill_dir) {
             Ok(skill) => report.skills.push(Box::new(skill)),
             Err(e) => report.failures.push(LoadFailure {
                 path: skill_dir.to_path_buf(),
