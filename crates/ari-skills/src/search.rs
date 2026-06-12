@@ -11,7 +11,6 @@ const TRIGGER_PHRASES: &[&[&str]] = &[
     &["cerca"],
     &["cercare"],
     &["trova"],
-    &["cerca", "su"], // "cerca su internet/google"
 ];
 
 const QUESTION_STARTERS: &[&[&str]] = &[
@@ -60,12 +59,13 @@ impl Default for SearchSkill {
 
 fn extract_query_explicit(input: &str) -> Option<String> {
     let skip_words = [
-        // English
+        // English — command/intent words and polite filler only (never articles)
         "search", "for", "look", "up", "google", "find", "please",
         "can", "you", "me",
-        // Italian
-        "cerca", "cercare", "trova", "su", "per", "favore", "mi",
-        "puoi", "le", "la", "il", "lo", "di", "dimmi",
+        // Italian — command verbs and polite filler only; deliberately NOT
+        // articles/prepositions (la/il/lo/le/di/su/per), which are load-bearing
+        // parts of proper nouns and titles.
+        "cerca", "cercare", "trova", "favore", "mi", "puoi", "dimmi",
     ];
 
     let words: Vec<&str> = input.split_whitespace().collect();
@@ -367,12 +367,13 @@ mod tests {
     }
 
     #[test]
-    fn extract_strips_italian_trigger_and_skip_words() {
-        // "cerca le migliori crate di rust" → "migliori crate rust"
-        // ("cerca","le","di" are skip words)
+    fn extract_strips_italian_trigger_and_filler_keeps_articles() {
+        // "puoi cercare le pizzerie" = "can you search the pizzerias".
+        // Strips the filler "puoi" and trigger "cercare"; KEEPS the
+        // article "le" — articles are part of proper nouns/titles.
         assert_eq!(
-            extract_query_explicit("cerca le migliori crate di rust"),
-            Some("migliori crate rust".to_string())
+            extract_query_explicit("puoi cercare le pizzerie"),
+            Some("le pizzerie".to_string())
         );
     }
 
