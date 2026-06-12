@@ -1,14 +1,20 @@
 use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 
 const TRIGGER_PHRASES: &[&[&str]] = &[
+    // English
     &["search", "for"],
     &["look", "up"],
     &["google"],
     &["search"],
     &["find"],
+    // Italian — cerca (search), trova (find), cercare (to search)
+    &["cerca"],
+    &["cercare"],
+    &["trova"],
 ];
 
 const QUESTION_STARTERS: &[&[&str]] = &[
+    // English
     &["where", "can"],
     &["where", "do"],
     &["where", "is"],
@@ -23,6 +29,18 @@ const QUESTION_STARTERS: &[&[&str]] = &[
     &["why", "do"],
     &["why", "does"],
     &["why", "are"],
+    // Italian — single interrogatives; the >=4-word floor in `score`
+    // and the index<3 guard in `is_question` keep these from
+    // over-matching short greetings like "come stai".
+    &["dove"],   // where
+    &["come"],   // how
+    &["chi"],    // who
+    &["perché"], // why (accented form survives normalize_input)
+    &["perche"], // why (de-accented fallback)
+    &["quando"], // when
+    &["quale"],  // which
+    &["quali"],  // which (plural)
+    &["cosa"],   // what
 ];
 
 pub struct SearchSkill;
@@ -40,7 +58,15 @@ impl Default for SearchSkill {
 }
 
 fn extract_query_explicit(input: &str) -> Option<String> {
-    let skip_words = ["search", "for", "look", "up", "google", "find", "please", "can", "you", "me"];
+    let skip_words = [
+        // English — command/intent words and polite filler only (never articles)
+        "search", "for", "look", "up", "google", "find", "please",
+        "can", "you", "me",
+        // Italian — command verbs and polite filler only; deliberately NOT
+        // articles/prepositions (la/il/lo/le/di/su/per), which are load-bearing
+        // parts of proper nouns and titles.
+        "cerca", "cercare", "trova", "favore", "mi", "puoi", "dimmi",
+    ];
 
     let words: Vec<&str> = input.split_whitespace().collect();
     let query_words: Vec<&&str> = words.iter().filter(|w| !skip_words.contains(w)).collect();
@@ -122,6 +148,12 @@ impl Skill for SearchSkill {
             ExampleUtterance { text: "what's the latest on the mars rover", args: r#"{"query": "the mars rover"}"# },
             ExampleUtterance { text: "what does the web say about kubernetes", args: r#"{"query": "kubernetes"}"# },
             ExampleUtterance { text: "tell me about the great barrier reef", args: r#"{"query": "the great barrier reef"}"# },
+            // Italian
+            ExampleUtterance { text: "cerca ristoranti vicini", args: r#"{"query": "ristoranti vicini"}"# },
+            ExampleUtterance { text: "trova una ricetta per la pizza", args: r#"{"query": "ricetta per la pizza"}"# },
+            ExampleUtterance { text: "cerca su internet i voli per tokyo", args: r#"{"query": "voli per tokyo"}"# },
+            ExampleUtterance { text: "dove posso comprare un caffè", args: r#"{"query": "dove posso comprare un caffè"}"# },
+            ExampleUtterance { text: "chi ha vinto i mondiali", args: r#"{"query": "chi ha vinto i mondiali"}"# },
         ]
     }
 
@@ -312,5 +344,48 @@ mod tests {
     #[test]
     fn specificity_is_low() {
         assert_eq!(SearchSkill::new().specificity(), Specificity::Low);
+    }
+
+    // --- Italian ---
+
+    #[test]
+    fn score_italian_explicit_trigger_with_query() {
+        let skill = SearchSkill::new();
+        // "cerca ristoranti vicini" = search nearby restaurants
+        assert_eq!(skill.score("cerca ristoranti vicini", &ctx()), 0.90);
+        // "trova una pizzeria" = find a pizzeria
+        assert_eq!(skill.score("trova una pizzeria", &ctx()), 0.90);
+    }
+
+    #[test]
+    fn score_italian_question_patterns() {
+        let skill = SearchSkill::new();
+        // "dove posso trovare una pizza" = where can I find a pizza (5 words)
+        assert_eq!(skill.score("dove posso trovare una pizza", &ctx()), 0.85);
+        // "come si cuoce la pasta" = how do you cook pasta (5 words)
+        assert_eq!(skill.score("come si cuoce la pasta", &ctx()), 0.85);
+    }
+
+    #[test]
+    fn extract_strips_italian_trigger_and_filler_keeps_articles() {
+        // "puoi cercare le pizzerie" = "can you search the pizzerias".
+        // Strips the filler "puoi" and trigger "cercare"; KEEPS the
+        // article "le" — articles are part of proper nouns/titles.
+        assert_eq!(
+            extract_query_explicit("puoi cercare le pizzerie"),
+            Some("le pizzerie".to_string())
+        );
+    }
+
+    #[test]
+    fn execute_italian_trigger_strips_skip_words() {
+        let skill = SearchSkill::new();
+        match skill.execute("trova ristoranti vicini", &ctx()) {
+            Response::Action(v) => {
+                assert_eq!(v["v"], 1);
+                assert_eq!(v["search"], "ristoranti vicini");
+            }
+            other => panic!("expected Action, got {other:?}"),
+        }
     }
 }

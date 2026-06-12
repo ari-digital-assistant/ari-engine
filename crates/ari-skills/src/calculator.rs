@@ -1,38 +1,68 @@
 use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 
-// English + Italian + Spanish + French + German trigger verbs. The
-// `to_math_expr` step strips these from the input before passing the
-// rest to the expression evaluator, so adding a foreign-language
-// trigger doesn't require parser changes.
+// English + Italian trigger verbs. The `to_math_expr` step strips
+// these from the input before passing the rest to the expression
+// evaluator, so adding a trigger doesn't require parser changes.
 const TRIGGER_WORDS: &[&str] = &[
     // English
     "calculate", "compute", "eval", "solve",
     // Italian: calcola (calculate), risolvi (solve)
     "calcola", "risolvi",
-    // Spanish: calcula, resuelve
-    "calcula", "resuelve",
-    // French: calcule, calculer, résous
-    "calcule", "calculer",
-    // German: berechne, berechnen, löse
-    "berechne", "berechnen",
 ];
 
-// Math word → operator. English only for now; Italian "più"/"meno"/
-// "per"/"diviso" etc. would need their own table. Out of scope for
-// the current pass — Italian users typing `2 + 3` work fine because
-// the symbolic operators are language-agnostic.
-const MATH_WORDS: &[(&str, &str)] = &[
+// Math word → operator, per locale. English and Italian only.
+// Multi-word entries (e.g. "divided by") MUST come before their
+// single-word prefixes are stripped — order matters because
+// `replace` runs top to bottom.
+const MATH_WORDS_EN: &[(&str, &str)] = &[
+    ("multiplied by", "*"),
+    ("divided by", "/"),
+    ("to the power of", "^"),
     ("plus", "+"),
     ("minus", "-"),
     ("times", "*"),
-    ("multiplied by", "*"),
-    ("divided by", "/"),
     ("over", "/"),
     ("mod", "%"),
-    ("to the power of", "^"),
     ("squared", "^2"),
     ("cubed", "^3"),
 ];
+
+const MATH_WORDS_IT: &[(&str, &str)] = &[
+    // Percent family guards — "per" is a substring of these, and
+    // percentage phrases aren't supported yet, so neutralise them to an
+    // all-letters placeholder (stripped by the char filter → a non-
+    // evaluating expression → graceful error) instead of letting the
+    // "per" -> "*" rule below produce a wrong numeric answer.
+    ("percentuale", "PCT"),
+    ("per cento", "PCT"),
+    ("percento", "PCT"),
+    ("diviso per", "/"),
+    ("elevato alla", "^"),
+    ("più", "+"),
+    ("meno", "-"),
+    ("per", "*"),
+    ("diviso", "/"),
+    ("al quadrato", "^2"),
+    ("al cubo", "^3"),
+];
+
+fn math_words(locale: &str) -> &'static [(&'static str, &'static str)] {
+    match locale {
+        "it" => MATH_WORDS_IT,
+        _ => MATH_WORDS_EN,
+    }
+}
+
+// Leading "what is" style phrases stripped before evaluation, per locale.
+const LEADIN_PHRASES_EN: &[&str] = &["what is", "how much is"];
+const LEADIN_PHRASES_IT: &[&str] = &["quanto fa", "quanto è", "quanto e"];
+
+fn leadin_phrases(locale: &str) -> &'static [&'static str] {
+    match locale {
+        "it" => LEADIN_PHRASES_IT,
+        _ => LEADIN_PHRASES_EN,
+    }
+}
 
 pub struct CalculatorSkill;
 
@@ -53,15 +83,17 @@ fn eval_expr(expr: &str) -> Option<f64> {
     fasteval::ez_eval(expr, &mut ns).ok()
 }
 
-fn to_math_expr(input: &str) -> String {
+fn to_math_expr(input: &str, locale: &str) -> String {
     let mut expr = input.to_string();
 
     for trigger in TRIGGER_WORDS {
         expr = expr.replace(trigger, "");
     }
-    expr = expr.replace("what is", "").replace("how much is", "");
+    for phrase in leadin_phrases(locale) {
+        expr = expr.replace(phrase, "");
+    }
 
-    for (word, op) in MATH_WORDS {
+    for (word, op) in math_words(locale) {
         expr = expr.replace(word, op);
     }
 
@@ -72,10 +104,10 @@ fn to_math_expr(input: &str) -> String {
         .to_string()
 }
 
-fn has_math_content(input: &str) -> bool {
+fn has_math_content(input: &str, locale: &str) -> bool {
     let has_digits = input.chars().any(|c| c.is_ascii_digit());
     let has_operators = input.chars().any(|c| "+-*/%^".contains(c))
-        || MATH_WORDS.iter().any(|(word, _)| input.contains(word));
+        || math_words(locale).iter().any(|(word, _)| input.contains(word));
     has_digits && has_operators
 }
 
@@ -135,18 +167,24 @@ impl Skill for CalculatorSkill {
             ExampleUtterance { text: "I need the result of 200 minus 47", args: r#"{"expression": "200 - 47"}"# },
             ExampleUtterance { text: "give me 15 percent off 80", args: r#"{"expression": "80 - (80 * 15%)"}"# },
             ExampleUtterance { text: "what does 42 over 6 come to", args: r#"{"expression": "42 / 6"}"# },
+            // Italian
+            ExampleUtterance { text: "calcola 5 + 3", args: r#"{"expression": "5 + 3"}"# },
+            ExampleUtterance { text: "quanto fa 99 diviso 3", args: r#"{"expression": "99 / 3"}"# },
+            ExampleUtterance { text: "quanto fa 12 per 8", args: r#"{"expression": "12 * 8"}"# },
+            ExampleUtterance { text: "calcola 100 meno 37", args: r#"{"expression": "100 - 37"}"# },
+            ExampleUtterance { text: "quanto fa 25 più 75", args: r#"{"expression": "25 + 75"}"# },
         ]
     }
 
-    fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {
+    fn score(&self, input: &str, ctx: &SkillContext) -> f32 {
         let has_trigger = TRIGGER_WORDS.iter().any(|t| input.contains(t));
 
-        if has_trigger && has_math_content(input) {
+        if has_trigger && has_math_content(input, ctx.locale.as_str()) {
             return 0.95;
         }
 
-        if has_math_content(input) {
-            let expr = to_math_expr(input);
+        if has_math_content(input, ctx.locale.as_str()) {
+            let expr = to_math_expr(input, ctx.locale.as_str());
             if eval_expr(&expr).is_some() {
                 return 0.85;
             }
@@ -160,7 +198,7 @@ impl Skill for CalculatorSkill {
     }
 
     fn execute(&self, input: &str, ctx: &SkillContext) -> Response {
-        let expr = to_math_expr(input);
+        let expr = to_math_expr(input, ctx.locale.as_str());
 
         match eval_expr(&expr) {
             Some(result) => {
@@ -173,9 +211,6 @@ impl Skill for CalculatorSkill {
             None => Response::Text(
                 match ctx.locale.as_str() {
                     "it" => "Mi spiace, non sono riuscito a calcolare quell'espressione.",
-                    "es" => "Lo siento, no pude evaluar esa expresión.",
-                    "fr" => "Désolé, je n'ai pas pu évaluer cette expression.",
-                    "de" => "Tut mir leid, ich konnte diesen Ausdruck nicht berechnen.",
                     _ => "Sorry, I couldn't evaluate that expression.",
                 }
                 .to_string(),
@@ -195,6 +230,16 @@ mod tests {
     fn exec(input: &str) -> String {
         let skill = CalculatorSkill::new();
         match skill.execute(input, &ctx()) {
+            Response::Text(s) => s,
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    fn exec_it(input: &str) -> String {
+        let skill = CalculatorSkill::new();
+        let mut it = SkillContext::default();
+        it.locale = "it".to_string();
+        match skill.execute(input, &it) {
             Response::Text(s) => s,
             other => panic!("expected Text, got {other:?}"),
         }
@@ -338,36 +383,75 @@ mod tests {
 
     #[test]
     fn to_math_expr_strips_trigger_words() {
-        assert_eq!(to_math_expr("calculate 5 + 3"), "5 + 3");
-        assert_eq!(to_math_expr("compute 10 - 2"), "10 - 2");
+        assert_eq!(to_math_expr("calculate 5 + 3", "en"), "5 + 3");
+        assert_eq!(to_math_expr("compute 10 - 2", "en"), "10 - 2");
     }
 
     #[test]
     fn to_math_expr_converts_math_words() {
-        assert_eq!(to_math_expr("5 plus 3"), "5 + 3");
-        assert_eq!(to_math_expr("10 minus 2"), "10 - 2");
-        assert_eq!(to_math_expr("4 times 3"), "4 * 3");
-        assert_eq!(to_math_expr("10 divided by 2"), "10 / 2");
+        assert_eq!(to_math_expr("5 plus 3", "en"), "5 + 3");
+        assert_eq!(to_math_expr("10 minus 2", "en"), "10 - 2");
+        assert_eq!(to_math_expr("4 times 3", "en"), "4 * 3");
+        assert_eq!(to_math_expr("10 divided by 2", "en"), "10 / 2");
     }
 
     #[test]
     fn to_math_expr_strips_what_is() {
-        assert_eq!(to_math_expr("what is 5 + 3"), "5 + 3");
-        assert_eq!(to_math_expr("how much is 10 * 2"), "10 * 2");
+        assert_eq!(to_math_expr("what is 5 + 3", "en"), "5 + 3");
+        assert_eq!(to_math_expr("how much is 10 * 2", "en"), "10 * 2");
     }
 
     // --- has_math_content ---
 
     #[test]
     fn has_math_content_true() {
-        assert!(has_math_content("2 + 2"));
-        assert!(has_math_content("5 times 3"));
+        assert!(has_math_content("2 + 2", "en"));
+        assert!(has_math_content("5 times 3", "en"));
     }
 
     #[test]
     fn has_math_content_false() {
-        assert!(!has_math_content("hello"));
-        assert!(!has_math_content("2"));
-        assert!(!has_math_content("plus minus"));
+        assert!(!has_math_content("hello", "en"));
+        assert!(!has_math_content("2", "en"));
+        assert!(!has_math_content("plus minus", "en"));
     }
+
+    // --- Italian ---
+
+    #[test]
+    fn italian_natural_language_operations() {
+        assert_eq!(exec_it("quanto fa 10 più 5"), "15");
+        assert_eq!(exec_it("quanto fa 20 meno 7"), "13");
+        assert_eq!(exec_it("calcola 6 per 7"), "42");
+        assert_eq!(exec_it("quanto fa 100 diviso 4"), "25");
+    }
+
+    #[test]
+    fn italian_error_message() {
+        assert_eq!(
+            exec_it("calcola"),
+            "Mi spiace, non sono riuscito a calcolare quell'espressione."
+        );
+    }
+
+    #[test]
+    fn italian_trigger_scores() {
+        let skill = CalculatorSkill::new();
+        let mut it = SkillContext::default();
+        it.locale = "it".to_string();
+        assert_eq!(skill.score("calcola 2 + 2", &it), 0.95);
+    }
+
+    #[test]
+    fn italian_percent_phrases_do_not_return_wrong_answer() {
+        // Percentage phrases aren't supported; they must NOT yield a
+        // wrong number via the "per" -> "*" substitution. Graceful
+        // error is the correct behaviour.
+        let err = "Mi spiace, non sono riuscito a calcolare quell'espressione.";
+        assert_eq!(exec_it("quanto fa il 10 per cento di 200"), err);
+        assert_eq!(exec_it("quanto fa il 10 percento di 200"), err);
+        assert_eq!(exec_it("calcola il 20 percentuale di 50"), err);
+    }
+
 }
+

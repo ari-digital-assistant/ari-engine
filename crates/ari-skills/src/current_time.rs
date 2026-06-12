@@ -114,9 +114,6 @@ impl Skill for CurrentTimeSkill {
         // and avoids translating the AM/PM tokens.
         let response = match ctx.locale.as_str() {
             "it" => format!("Sono le {}.", now.format("%H:%M")),
-            "es" => format!("Son las {}.", now.format("%H:%M")),
-            "fr" => format!("Il est {}.", now.format("%H:%M")),
-            "de" => format!("Es ist {} Uhr.", now.format("%H:%M")),
             _ => format!("It's {}.", now.format("%-I:%M %p")),
         };
         Response::Text(response)
@@ -293,6 +290,18 @@ mod tests {
         let resp = skill.execute("what time is it", &other);
         match resp {
             Response::Text(s) => assert!(s.starts_with("It's "), "fallback to English: {s}"),
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn execute_spanish_falls_back_to_english_format() {
+        let skill = CurrentTimeSkill::new();
+        let mut es = SkillContext::default();
+        es.locale = "es".to_string();
+        let resp = skill.execute("what time is it", &es);
+        match resp {
+            Response::Text(s) => assert!(s.starts_with("It's "), "expected English fallback: {s}"),
             _ => panic!("expected Text response"),
         }
     }

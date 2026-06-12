@@ -87,11 +87,10 @@ impl Skill for DateSkill {
     fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {
         let words: Vec<&str> = input.split_whitespace().collect();
 
-        // English "time" / Italian "ora" / Spanish "hora" / French
-        // "heure" / German "uhr" — any of these in the input means
-        // the user wants the time skill, not date. Mirrors the
-        // English-only guard that was here before; same intent.
-        const TIME_WORDS: &[&str] = &["time", "ora", "ore", "hora", "heure", "uhr"];
+        // English "time" / Italian "ora"/"ore" — any of these in the
+        // input means the user wants the time skill, not date. Mirrors
+        // the English-only guard that was here before; same intent.
+        const TIME_WORDS: &[&str] = &["time", "ora", "ore"];
         if words.iter().any(|w| TIME_WORDS.contains(w)) {
             return 0.0;
         }
@@ -131,21 +130,6 @@ impl Skill for DateSkill {
                 let month = ITALIAN_MONTHS[month_idx];
                 format!("Oggi è {} {} {} {}.", weekday, day, month, year)
             }
-            "es" => {
-                let weekday = SPANISH_WEEKDAYS[weekday_idx];
-                let month = SPANISH_MONTHS[month_idx];
-                format!("Hoy es {} {} de {} de {}.", weekday, day, month, year)
-            }
-            "fr" => {
-                let weekday = FRENCH_WEEKDAYS[weekday_idx];
-                let month = FRENCH_MONTHS[month_idx];
-                format!("Nous sommes le {} {} {} {}.", weekday, day, month, year)
-            }
-            "de" => {
-                let weekday = GERMAN_WEEKDAYS[weekday_idx];
-                let month = GERMAN_MONTHS[month_idx];
-                format!("Heute ist {}, der {}. {} {}.", weekday, day, month, year)
-            }
             _ => {
                 let formatted = now.format("%A, %B %-d, %Y").to_string();
                 format!("Today is {}.", formatted)
@@ -159,32 +143,11 @@ impl Skill for DateSkill {
 const ITALIAN_WEEKDAYS: [&str; 7] = [
     "lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica",
 ];
-const SPANISH_WEEKDAYS: [&str; 7] = [
-    "lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo",
-];
-const FRENCH_WEEKDAYS: [&str; 7] = [
-    "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche",
-];
-const GERMAN_WEEKDAYS: [&str; 7] = [
-    "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag",
-];
 
 // Index 0 unused — months are 1..=12.
 const ITALIAN_MONTHS: [&str; 13] = [
     "", "gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio",
     "agosto", "settembre", "ottobre", "novembre", "dicembre",
-];
-const SPANISH_MONTHS: [&str; 13] = [
-    "", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
-    "agosto", "septiembre", "octubre", "noviembre", "diciembre",
-];
-const FRENCH_MONTHS: [&str; 13] = [
-    "", "janvier", "février", "mars", "avril", "mai", "juin", "juillet",
-    "août", "septembre", "octobre", "novembre", "décembre",
-];
-const GERMAN_MONTHS: [&str; 13] = [
-    "", "Januar", "Februar", "März", "April", "Mai", "Juni", "Juli",
-    "August", "September", "Oktober", "November", "Dezember",
 ];
 
 #[cfg(test)]
@@ -329,5 +292,17 @@ mod tests {
     #[test]
     fn specificity_is_high() {
         assert_eq!(DateSkill::new().specificity(), Specificity::High);
+    }
+
+    #[test]
+    fn execute_spanish_falls_back_to_english() {
+        let skill = DateSkill::new();
+        let mut es = SkillContext::default();
+        es.locale = "es".to_string();
+        let resp = skill.execute("what date is it", &es);
+        match resp {
+            Response::Text(s) => assert!(s.starts_with("Today is "), "expected English fallback: {s}"),
+            _ => panic!("expected Text"),
+        }
     }
 }

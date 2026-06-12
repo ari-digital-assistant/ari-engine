@@ -1,9 +1,8 @@
 use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 
-// English + Italian + Spanish + French + German trigger words. Same
-// union-dictionary approach as the reminder skill's parser — words
-// don't collide across these languages, so a single contains-check
-// disambiguates.
+// English + Italian trigger words. Same union-dictionary approach as
+// the reminder skill's parser — words don't collide across these
+// languages, so a single contains-check disambiguates.
 const GREETINGS: &[&str] = &[
     // English
     "hello", "hi", "hey", "heya", "howdy", "greetings", "good morning",
@@ -12,12 +11,6 @@ const GREETINGS: &[&str] = &[
     // Italian
     "ciao", "salve", "buongiorno", "buonasera", "buonanotte",
     "ciao ari", "salve ari",
-    // Spanish
-    "hola", "buenos días", "buenas tardes", "buenas noches",
-    // French
-    "bonjour", "salut", "bonsoir", "coucou",
-    // German
-    "hallo", "guten morgen", "guten tag", "guten abend",
 ];
 
 const HOW_ARE_YOU: &[&[&str]] = &[
@@ -30,14 +23,6 @@ const HOW_ARE_YOU: &[&[&str]] = &[
     // Italian
     &["come", "stai"],
     &["come", "va"],
-    // Spanish
-    &["cómo", "estás"],
-    &["qué", "tal"],
-    // French
-    &["comment", "vas"],
-    &["ça", "va"],
-    // German
-    &["wie", "geht"],
 ];
 
 const RESPONSES_EN: &[&str] = &[
@@ -54,33 +39,9 @@ const RESPONSES_IT: &[&str] = &[
     "Ciao! Sono qui quando vuoi.",
 ];
 
-const RESPONSES_ES: &[&str] = &[
-    "¡Hola! ¿Qué puedo hacer por ti?",
-    "¡Hola! ¿Cómo puedo ayudarte?",
-    "¡Hola! ¿En qué estás pensando?",
-    "¡Hola! Listo cuando quieras.",
-];
-
-const RESPONSES_FR: &[&str] = &[
-    "Salut ! Que puis-je faire pour toi ?",
-    "Bonjour ! Comment puis-je aider ?",
-    "Salut ! Qu'est-ce qui te trotte ?",
-    "Salut ! Prêt quand tu veux.",
-];
-
-const RESPONSES_DE: &[&str] = &[
-    "Hallo! Was kann ich für dich tun?",
-    "Hallo! Wie kann ich helfen?",
-    "Hallo! Was hast du vor?",
-    "Hallo! Bereit, wenn du es bist.",
-];
-
 fn responses_for_locale(locale: &str) -> &'static [&'static str] {
     match locale {
         "it" => RESPONSES_IT,
-        "es" => RESPONSES_ES,
-        "fr" => RESPONSES_FR,
-        "de" => RESPONSES_DE,
         _ => RESPONSES_EN,
     }
 }
@@ -88,9 +49,6 @@ fn responses_for_locale(locale: &str) -> &'static [&'static str] {
 fn how_are_you_response(locale: &str) -> &'static str {
     match locale {
         "it" => "Sto benissimo, grazie! Come posso aiutarti?",
-        "es" => "¡Estoy genial, gracias por preguntar! ¿Cómo puedo ayudarte?",
-        "fr" => "Je vais très bien, merci ! Comment puis-je t'aider ?",
-        "de" => "Mir geht es großartig, danke der Nachfrage! Wie kann ich helfen?",
         _ => "I'm doing great, thanks for asking! How can I help you?",
     }
 }
@@ -343,5 +301,19 @@ mod tests {
     #[test]
     fn specificity_is_low() {
         assert_eq!(GreetingSkill::new().specificity(), Specificity::Low);
+    }
+
+    #[test]
+    fn execute_spanish_locale_falls_back_to_english() {
+        let skill = GreetingSkill::new();
+        let mut es = SkillContext::default();
+        es.locale = "es".to_string();
+        // After the strip, "es" is no longer special-cased -> English responses.
+        // "hello" = 5 chars, 5 % 4 = 1 -> RESPONSES_EN[1].
+        let resp = skill.execute("hello", &es);
+        match resp {
+            Response::Text(s) => assert_eq!(s, "Hello! How can I help?"),
+            _ => panic!("expected Text"),
+        }
     }
 }

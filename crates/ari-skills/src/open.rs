@@ -1,21 +1,14 @@
 use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 
-// English + Italian + Spanish + French + German trigger verbs. Same
-// union-dictionary pattern as the other built-ins — words don't
-// collide across these languages so a single contains-check
-// disambiguates without a locale parameter.
+// English + Italian trigger verbs. Same union-dictionary pattern as
+// the other built-ins — words don't collide across these languages so
+// a single contains-check disambiguates without a locale parameter.
 const TRIGGER_WORDS: &[&str] = &[
     // English
     "open", "launch", "start", "run",
     // Italian: apri (open), avvia (start/launch), lancia (launch),
     // esegui (run)
     "apri", "avvia", "lancia", "esegui",
-    // Spanish: abre, abrir, inicia, ejecuta
-    "abre", "abrir", "inicia", "ejecuta",
-    // French: ouvre, ouvrir, lance, exécute
-    "ouvre", "ouvrir", "lance",
-    // German: öffne, starte
-    "öffne", "starte",
 ];
 
 pub struct OpenSkill;
@@ -140,9 +133,6 @@ impl Skill for OpenSkill {
             None => Response::Text(
                 match ctx.locale.as_str() {
                     "it" => "Cosa vuoi che apra?",
-                    "es" => "¿Qué quieres que abra?",
-                    "fr" => "Qu'est-ce que tu veux que j'ouvre ?",
-                    "de" => "Was soll ich öffnen?",
                     _ => "What would you like me to open?",
                 }
                 .to_string(),
@@ -314,6 +304,17 @@ mod tests {
         match response {
             Response::Action(v) => assert_eq!(v["launch_app"], "firefox"),
             other => panic!("expected Action via fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_no_target_spanish_falls_back_to_english() {
+        let skill = OpenSkill::new();
+        let mut es = SkillContext::default();
+        es.locale = "es".to_string();
+        match skill.execute("open", &es) {
+            Response::Text(s) => assert_eq!(s, "What would you like me to open?"),
+            other => panic!("expected Text, got {other:?}"),
         }
     }
 }

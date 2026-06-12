@@ -2,8 +2,8 @@
 //! `ari::format_date`, `ari::format_number`, and `ari::format_currency`
 //! WASM host imports.
 //!
-//! Hand-rolled lookup tables for the 5 supported locales (`en`, `it`,
-//! `es`, `fr`, `de`) rather than pulling in the full `icu` / `icu4x`
+//! Hand-rolled lookup tables for the 2 supported locales (`en`, `it`)
+//! rather than pulling in the full `icu` / `icu4x`
 //! crate stack. Trade-off:
 //!
 //! - **Hand-rolled (this module):** ~3 KB of binary impact, covers the
@@ -66,7 +66,7 @@ struct LocaleFormatter {
     month_full: [&'static str; 12],
     /// Short month names, Jan..Dec.
     month_short: [&'static str; 12],
-    /// Decimal point in numbers (`'.'` for en, `','` for it/de/es/fr).
+    /// Decimal point in numbers (`'.'` for en, `','` for it).
     decimal: char,
     /// Group separator for thousands. `' '` for fr (a U+00A0 non-
     /// breaking space in real CLDR data; ASCII space is good enough
@@ -110,51 +110,6 @@ const LOCALES: &[LocaleFormatter] = &[
         month_short: [
             "gen", "feb", "mar", "apr", "mag", "giu",
             "lug", "ago", "set", "ott", "nov", "dic",
-        ],
-        decimal: ',',
-        group: '.',
-        currency_position: CurrencyPosition::Suffix,
-        currency_space: true,
-    },
-    LocaleFormatter {
-        code: "es",
-        month_full: [
-            "enero", "febrero", "marzo", "abril", "mayo", "junio",
-            "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
-        ],
-        month_short: [
-            "ene", "feb", "mar", "abr", "may", "jun",
-            "jul", "ago", "sep", "oct", "nov", "dic",
-        ],
-        decimal: ',',
-        group: '.',
-        currency_position: CurrencyPosition::Suffix,
-        currency_space: true,
-    },
-    LocaleFormatter {
-        code: "fr",
-        month_full: [
-            "janvier", "février", "mars", "avril", "mai", "juin",
-            "juillet", "août", "septembre", "octobre", "novembre", "décembre",
-        ],
-        month_short: [
-            "janv.", "févr.", "mars", "avr.", "mai", "juin",
-            "juil.", "août", "sept.", "oct.", "nov.", "déc.",
-        ],
-        decimal: ',',
-        group: ' ',
-        currency_position: CurrencyPosition::Suffix,
-        currency_space: true,
-    },
-    LocaleFormatter {
-        code: "de",
-        month_full: [
-            "Januar", "Februar", "März", "April", "Mai", "Juni",
-            "Juli", "August", "September", "Oktober", "November", "Dezember",
-        ],
-        month_short: [
-            "Jan.", "Feb.", "März", "Apr.", "Mai", "Juni",
-            "Juli", "Aug.", "Sept.", "Okt.", "Nov.", "Dez.",
         ],
         decimal: ',',
         group: '.',
@@ -357,6 +312,14 @@ mod tests {
     fn format_currency_unknown_code_passes_through() {
         // No symbol entry → use the code verbatim.
         assert_eq!(format_currency(100.0, "XAU", "en"), "XAU100.00");
+    }
+
+    #[test]
+    fn format_date_spanish_falls_back_to_english() {
+        // Same timestamp as the English-long test; after trimming es from
+        // LOCALES, Spanish must format identically to English.
+        let s = format_date(TS_2026_04_30, "es", FormatStyle::Long);
+        assert_eq!(s, "30 April 2026");
     }
 
     #[test]
