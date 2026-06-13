@@ -31,6 +31,11 @@ pub struct HttpConfig {
     /// User-Agent header sent with every request. Cannot be overridden by
     /// the skill.
     pub user_agent: String,
+    /// When true, plain-`http` requests are permitted **only** to private,
+    /// loopback, or `.local`/`.lan` hosts (a LAN Home Assistant is almost
+    /// always `http://homeassistant.local:8123` or `http://<rfc1918-ip>:8123`).
+    /// Plain http to any public host is still rejected. HTTPS is unaffected.
+    pub allow_http_to_private_hosts: bool,
 }
 
 impl Default for HttpConfig {
@@ -48,6 +53,7 @@ impl HttpConfig {
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_redirects: DEFAULT_MAX_REDIRECTS,
             user_agent: DEFAULT_USER_AGENT.to_string(),
+            allow_http_to_private_hosts: true,
         }
     }
 
@@ -72,6 +78,39 @@ impl HttpConfig {
 
     pub fn allows_scheme(&self, scheme: &str) -> bool {
         self.allowed_schemes.iter().any(|s| s == scheme)
+    }
+
+    /// Whether the skill is allowed to fetch this URL. HTTPS is allowed if
+    /// `https` is in `allowed_schemes`. Plain `http` is allowed if it's in
+    /// `allowed_schemes` (test/permissive mode) OR
+    /// `allow_http_to_private_hosts` is set and the host is private/loopback/
+    /// `.local`. Any other scheme must be explicitly in `allowed_schemes`.
+    pub fn allows_url(&self, url: &url::Url) -> bool {
+        match url.scheme() {
+            "https" => self.allows_scheme("https"),
+            "http" => {
+                self.allows_scheme("http")
+                    || (self.allow_http_to_private_hosts && Self::is_private_host(url))
+            }
+            other => self.allows_scheme(other),
+        }
+    }
+
+    fn is_private_host(url: &url::Url) -> bool {
+        match url.host() {
+            Some(url::Host::Ipv4(ip)) => {
+                ip.is_private() || ip.is_loopback()
+            }
+            Some(url::Host::Ipv6(ip)) => {
+                // loopback (::1) or unique-local fc00::/7
+                ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00
+            }
+            Some(url::Host::Domain(d)) => {
+                let d = d.to_ascii_lowercase();
+                d == "localhost" || d.ends_with(".local") || d.ends_with(".lan")
+            }
+            None => false,
+        }
     }
 }
 
@@ -113,5 +152,55 @@ mod tests {
             .with_timeout(Duration::from_secs(2));
         assert_eq!(c.max_body_bytes, 2048);
         assert_eq!(c.timeout, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn https_allowed_anywhere() {
+        let c = HttpConfig::strict();
+        let u = url::Url::parse("https://example.com/api").unwrap();
+        assert!(c.allows_url(&u));
+    }
+
+    #[test]
+    fn http_allowed_to_private_and_local_hosts() {
+        let c = HttpConfig::strict();
+        for raw in [
+            "http://192.168.1.10:8123/api/",
+            "http://10.0.0.5:8123/api/",
+            "http://172.16.3.4:8123/",
+            "http://127.0.0.1:8123/",
+            "http://[::1]:8123/",
+            "http://[fd00::1]:8123/",
+            "http://homeassistant.local:8123/api/",
+            "http://hass.lan/api/",
+            "http://localhost:8123/",
+        ] {
+            let u = url::Url::parse(raw).unwrap();
+            assert!(c.allows_url(&u), "expected allowed: {raw}");
+        }
+    }
+
+    #[test]
+    fn http_blocked_to_public_hosts() {
+        let c = HttpConfig::strict();
+        for raw in [
+            "http://example.com/",
+            "http://8.8.8.8/",
+            "http://my.duckdns.org/",
+            "http://[2001:4860:4860::8888]/",
+            "http://evil.local.attacker.com/",
+            "http://169.254.169.254/",
+        ] {
+            let u = url::Url::parse(raw).unwrap();
+            assert!(!c.allows_url(&u), "expected blocked: {raw}");
+        }
+    }
+
+    #[test]
+    fn private_http_can_be_disabled() {
+        let mut c = HttpConfig::strict();
+        c.allow_http_to_private_hosts = false;
+        let u = url::Url::parse("http://192.168.1.10:8123/").unwrap();
+        assert!(!c.allows_url(&u));
     }
 }

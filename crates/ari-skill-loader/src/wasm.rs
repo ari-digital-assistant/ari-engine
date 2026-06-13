@@ -120,6 +120,7 @@ const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
     ("format_number", None),
     ("format_currency", None),
     ("http_fetch", Some(Capability::Http)),
+    ("http_request", Some(Capability::Http)),
     ("storage_get", Some(Capability::StorageKv)),
     ("storage_set", Some(Capability::StorageKv)),
     ("tasks_provider_installed", Some(Capability::Tasks)),
@@ -291,6 +292,19 @@ struct StoreData {
 struct HttpClientCtx {
     client: reqwest::blocking::Client,
     config: HttpConfig,
+}
+
+/// Host-side descriptor for `ari::http_request`. The SDK serialises a request
+/// into this shape (`{method,url,headers,body}`); `body` and `headers` are
+/// optional. Mirrors the SDK-side wrapper added in Task 2.
+#[derive(serde::Deserialize)]
+struct HttpRequestSpec {
+    method: String,
+    url: String,
+    #[serde(default)]
+    headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    body: Option<String>,
 }
 
 /// Per-skill storage state. The mutex protects the on-disk file: every
@@ -756,6 +770,18 @@ impl WasmSkill {
                     },
                 )
                 .map_err(|e| WasmError::Compile(e.to_string()))?;
+            linker
+                .func_wrap(
+                    "ari",
+                    "http_request",
+                    |mut caller: Caller<'_, StoreData>,
+                     req_ptr: i32,
+                     req_len: i32|
+                     -> i64 {
+                        http_request_impl(&mut caller, req_ptr, req_len)
+                    },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
         }
 
         // Wire up storage_get/storage_set only if the skill is allowed.
@@ -1206,10 +1232,43 @@ fn compile_module_on_big_stack(engine: &Engine, bytes: &[u8]) -> Result<Module, 
         .map_err(|_| WasmError::Compile("wasm compile thread panicked".to_string()))?
 }
 
+/// Outcome of evaluating one redirect hop against the host policy.
+#[derive(Debug, PartialEq, Eq)]
+enum RedirectDecision {
+    Follow,
+    Stop,
+    TooMany,
+}
+
+/// Decide whether to follow a redirect to `next` after `hops` already taken.
+/// `reqwest` follows redirects internally during `.send()`, so the per-request
+/// `allows_url` check (initial URL only) can be bypassed by a 302 to an
+/// internal host. This is consulted on every hop to close that SSRF gap.
+fn redirect_decision(config: &HttpConfig, next: &url::Url, hops: usize) -> RedirectDecision {
+    if hops > config.max_redirects as usize {
+        RedirectDecision::TooMany
+    } else if config.allows_url(next) {
+        RedirectDecision::Follow
+    } else {
+        RedirectDecision::Stop
+    }
+}
+
 fn build_reqwest_client(config: &HttpConfig) -> Result<reqwest::blocking::Client, WasmError> {
+    let policy_config = config.clone();
+    let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+        match redirect_decision(&policy_config, attempt.url(), attempt.previous().len()) {
+            RedirectDecision::Follow => attempt.follow(),
+            RedirectDecision::Stop => attempt.stop(),
+            RedirectDecision::TooMany => attempt.error(format!(
+                "too many redirects (>{})",
+                policy_config.max_redirects
+            )),
+        }
+    });
     reqwest::blocking::Client::builder()
         .timeout(config.timeout)
-        .redirect(reqwest::redirect::Policy::limited(config.max_redirects as usize))
+        .redirect(redirect_policy)
         .user_agent(&config.user_agent)
         .use_preconfigured_tls(crate::tls::webpki_roots_config())
         .build()
@@ -1266,40 +1325,83 @@ fn http_fetch_impl(caller: &mut Caller<'_, StoreData>, url_ptr: i32, url_len: i3
             );
         }
     };
-    if !http.config.allows_scheme(parsed.scheme()) {
+    if !http.config.allows_url(&parsed) {
         return write_response(
             caller,
             memory,
-            &error_json(&format!("scheme not allowed: {}", parsed.scheme())),
+            &error_json(&format!("scheme/host not allowed: {}", parsed.as_str())),
         );
     }
 
     // Step 4: do the request. Blocking.
     let json = match http.client.get(parsed).send() {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            // Read body up to the limit. We can't use `Response::bytes` directly
-            // with a cap, so read the underlying reader manually.
-            use std::io::Read;
-            let mut reader = resp.take(http.config.max_body_bytes as u64 + 1);
-            let mut buf: Vec<u8> = Vec::new();
-            match reader.read_to_end(&mut buf) {
-                Ok(_) if buf.len() > http.config.max_body_bytes => {
-                    error_json(&format!(
-                        "response body exceeds {} byte limit",
-                        http.config.max_body_bytes
-                    ))
-                }
-                Ok(_) => {
-                    let body = String::from_utf8_lossy(&buf).into_owned();
-                    success_json(status, &body)
-                }
-                Err(e) => error_json(&format!("body read failed: {e}")),
-            }
-        }
+        Ok(resp) => read_capped_response(resp, http.config.max_body_bytes),
         Err(e) => error_json(&format!("request failed: {e}")),
     };
 
+    write_response(caller, memory, &json)
+}
+
+/// Read a reqwest blocking response body up to `max_body_bytes`, returning the
+/// success JSON, or an error JSON if over the cap or the read fails. Shared by
+/// `http_fetch_impl` and `http_request_impl`.
+fn read_capped_response(resp: reqwest::blocking::Response, max_body_bytes: usize) -> String {
+    use std::io::Read;
+    let status = resp.status().as_u16();
+    let mut reader = resp.take(max_body_bytes as u64 + 1);
+    let mut buf: Vec<u8> = Vec::new();
+    match reader.read_to_end(&mut buf) {
+        Ok(_) if buf.len() > max_body_bytes => {
+            error_json(&format!("response body exceeds {} byte limit", max_body_bytes))
+        }
+        Ok(_) => success_json(status, &String::from_utf8_lossy(&buf)),
+        Err(e) => error_json(&format!("body read failed: {e}")),
+    }
+}
+
+/// Implementation of `ari::http_request`. Reads a JSON request descriptor
+/// (`{method,url,headers,body}`) from wasm memory, validates the URL against
+/// the host policy, performs a blocking request, and returns the same
+/// `{status,body}` / `{status:0,error}` JSON shape as `http_fetch`.
+fn http_request_impl(caller: &mut Caller<'_, StoreData>, req_ptr: i32, req_len: i32) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let raw = match read_utf8(&memory, &*caller, req_ptr, req_len) {
+        Some(s) => s,
+        None => return write_response(caller, memory, &error_json("could not read request from wasm memory")),
+    };
+    let spec: HttpRequestSpec = match serde_json::from_str(&raw) {
+        Ok(s) => s,
+        Err(e) => return write_response(caller, memory, &error_json(&format!("bad request json: {e}"))),
+    };
+    let http = match caller.data().http_client.clone() {
+        Some(h) => h,
+        None => return write_response(caller, memory, &error_json("http capability not available")),
+    };
+    let parsed = match url::Url::parse(&spec.url) {
+        Ok(u) => u,
+        Err(e) => return write_response(caller, memory, &error_json(&format!("invalid url: {e}"))),
+    };
+    if !http.config.allows_url(&parsed) {
+        return write_response(caller, memory, &error_json(&format!("scheme/host not allowed: {}", parsed.as_str())));
+    }
+    let method = match reqwest::Method::from_bytes(spec.method.to_ascii_uppercase().as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return write_response(caller, memory, &error_json(&format!("bad method: {}", spec.method))),
+    };
+    let mut rb = http.client.request(method, parsed);
+    for (k, v) in &spec.headers {
+        rb = rb.header(k, v);
+    }
+    if let Some(body) = spec.body {
+        rb = rb.body(body);
+    }
+    let json = match rb.send() {
+        Ok(resp) => read_capped_response(resp, http.config.max_body_bytes),
+        Err(e) => error_json(&format!("request failed: {e}")),
+    };
     write_response(caller, memory, &json)
 }
 
@@ -2069,6 +2171,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn http_request_spec_deserialises() {
+        let spec: super::HttpRequestSpec = serde_json::from_str(
+            r#"{"method":"POST","url":"http://x.local/api","headers":{"Authorization":"Bearer t"},"body":"{}"}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.method, "POST");
+        assert_eq!(spec.url, "http://x.local/api");
+        assert_eq!(spec.headers.get("Authorization").map(String::as_str), Some("Bearer t"));
+        assert_eq!(spec.body.as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn http_request_spec_defaults_missing_fields() {
+        let spec: super::HttpRequestSpec =
+            serde_json::from_str(r#"{"method":"GET","url":"https://x/y"}"#).unwrap();
+        assert!(spec.headers.is_empty());
+        assert!(spec.body.is_none());
+    }
+
+    #[test]
+    fn redirect_decision_blocks_internal_hosts() {
+        let cfg = super::HttpConfig::strict();
+        // public -> internal metadata endpoint must be stopped
+        assert_eq!(
+            super::redirect_decision(&cfg, &url::Url::parse("http://169.254.169.254/").unwrap(), 0),
+            super::RedirectDecision::Stop
+        );
+        // https public is fine
+        assert_eq!(
+            super::redirect_decision(&cfg, &url::Url::parse("https://example.com/").unwrap(), 0),
+            super::RedirectDecision::Follow
+        );
+        // private RFC1918 LAN target (e.g. Home Assistant) is allowed to follow
+        assert_eq!(
+            super::redirect_decision(&cfg, &url::Url::parse("http://192.168.1.50:8123/").unwrap(), 0),
+            super::RedirectDecision::Follow
+        );
+        // full budget: hops == max_redirects is still within budget and follows
+        let max = cfg.max_redirects as usize;
+        assert_eq!(
+            super::redirect_decision(&cfg, &url::Url::parse("https://example.com/").unwrap(), max),
+            super::RedirectDecision::Follow
+        );
+        // one past budget is too many
+        assert_eq!(
+            super::redirect_decision(&cfg, &url::Url::parse("https://example.com/").unwrap(), max + 1),
+            super::RedirectDecision::TooMany
+        );
+    }
+
     /// Build a minimal `AriExtension` for tests without going through YAML.
     fn fake_ari(custom_score: bool) -> AriExtension {
         AriExtension {
@@ -2659,10 +2812,12 @@ mod tests {
 
     #[test]
     fn http_fetch_rejects_disallowed_scheme() {
-        // Server speaks plain HTTP but config only allows https. The error
-        // arrives as a JSON envelope with status 0.
-        let server = TestServer::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
-        let url = format!("http://{}/", server.addr);
+        // Under the new `allows_url` policy plain-http to a *private* host is
+        // permitted (LAN Home Assistant), so to exercise the rejection path we
+        // point at a public http host: plain-http to a public host is still
+        // blocked. The error arrives as a JSON envelope with status 0 and no
+        // request is dispatched (no server needed).
+        let url = "http://example.com/".to_string();
 
         let bytes = wat::parse_str(&http_fetch_wat(&url)).unwrap();
         let mut ari = fake_ari(false);
@@ -2683,7 +2838,7 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["status"], 0);
-        assert!(v["error"].as_str().unwrap().contains("scheme not allowed"));
+        assert!(v["error"].as_str().unwrap().contains("scheme/host not allowed"));
     }
 
     #[test]
