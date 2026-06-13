@@ -169,6 +169,8 @@ mod tests {
             "http://10.0.0.5:8123/api/",
             "http://172.16.3.4:8123/",
             "http://127.0.0.1:8123/",
+            "http://[::1]:8123/",
+            "http://[fd00::1]:8123/",
             "http://homeassistant.local:8123/api/",
             "http://hass.lan/api/",
             "http://localhost:8123/",
@@ -181,7 +183,13 @@ mod tests {
     #[test]
     fn http_blocked_to_public_hosts() {
         let c = HttpConfig::strict();
-        for raw in ["http://example.com/", "http://8.8.8.8/", "http://my.duckdns.org/"] {
+        for raw in [
+            "http://example.com/",
+            "http://8.8.8.8/",
+            "http://my.duckdns.org/",
+            "http://[2001:4860:4860::8888]/",
+            "http://evil.local.attacker.com/",
+        ] {
             let u = url::Url::parse(raw).unwrap();
             assert!(!c.allows_url(&u), "expected blocked: {raw}");
         }
