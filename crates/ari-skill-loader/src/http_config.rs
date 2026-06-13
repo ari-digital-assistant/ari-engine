@@ -99,7 +99,7 @@ impl HttpConfig {
     fn is_private_host(url: &url::Url) -> bool {
         match url.host() {
             Some(url::Host::Ipv4(ip)) => {
-                ip.is_private() || ip.is_loopback() || ip.is_link_local()
+                ip.is_private() || ip.is_loopback()
             }
             Some(url::Host::Ipv6(ip)) => {
                 // loopback (::1) or unique-local fc00::/7
@@ -189,6 +189,7 @@ mod tests {
             "http://my.duckdns.org/",
             "http://[2001:4860:4860::8888]/",
             "http://evil.local.attacker.com/",
+            "http://169.254.169.254/",
         ] {
             let u = url::Url::parse(raw).unwrap();
             assert!(!c.allows_url(&u), "expected blocked: {raw}");
