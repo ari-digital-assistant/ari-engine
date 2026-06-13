@@ -1245,7 +1245,7 @@ enum RedirectDecision {
 /// `allows_url` check (initial URL only) can be bypassed by a 302 to an
 /// internal host. This is consulted on every hop to close that SSRF gap.
 fn redirect_decision(config: &HttpConfig, next: &url::Url, hops: usize) -> RedirectDecision {
-    if hops >= config.max_redirects as usize {
+    if hops > config.max_redirects as usize {
         RedirectDecision::TooMany
     } else if config.allows_url(next) {
         RedirectDecision::Follow
@@ -2204,9 +2204,20 @@ mod tests {
             super::redirect_decision(&cfg, &url::Url::parse("https://example.com/").unwrap(), 0),
             super::RedirectDecision::Follow
         );
-        // too many hops
+        // private RFC1918 LAN target (e.g. Home Assistant) is allowed to follow
         assert_eq!(
-            super::redirect_decision(&cfg, &url::Url::parse("https://example.com/").unwrap(), cfg.max_redirects as usize),
+            super::redirect_decision(&cfg, &url::Url::parse("http://192.168.1.50:8123/").unwrap(), 0),
+            super::RedirectDecision::Follow
+        );
+        // full budget: hops == max_redirects is still within budget and follows
+        let max = cfg.max_redirects as usize;
+        assert_eq!(
+            super::redirect_decision(&cfg, &url::Url::parse("https://example.com/").unwrap(), max),
+            super::RedirectDecision::Follow
+        );
+        // one past budget is too many
+        assert_eq!(
+            super::redirect_decision(&cfg, &url::Url::parse("https://example.com/").unwrap(), max + 1),
             super::RedirectDecision::TooMany
         );
     }
