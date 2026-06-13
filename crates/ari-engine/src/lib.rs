@@ -2051,4 +2051,19 @@ mod tests {
             other => panic!("expected fallback text, got {other:?}"),
         }
     }
+
+    #[test]
+    fn ha_skill_registered_but_unconfigured_does_not_hijack() {
+        // HA skill present, but NO config_store set → gate is false → the
+        // utterance must fall through to the normal fallback text, not the
+        // HA action.
+        let mut e = Engine::new();
+        e.register_skill(Box::new(FakeHaSkill { no_match: false }));
+        // deliberately do NOT call set_config_store
+        let (resp, _) = e.process_input_traced("asdf qwer");
+        match resp {
+            Response::Text(t) => assert_eq!(t, fallback_response_for("en")),
+            other => panic!("expected fallback text, got {other:?}"),
+        }
+    }
 }
