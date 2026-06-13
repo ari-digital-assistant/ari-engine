@@ -476,14 +476,17 @@ fn build_engine_with_builtins() -> Engine {
 impl AriEngine {
     #[uniffi::constructor]
     pub fn new() -> Self {
+        let config_store: Arc<dyn ConfigStore> = Arc::new(MemoryConfigStore::new());
+        let mut engine = build_engine_with_builtins();
+        engine.set_config_store(Some(config_store.clone()));
         Self {
-            inner: Mutex::new(build_engine_with_builtins()),
+            inner: Mutex::new(engine),
             log_sink: Arc::new(NullLogSink),
             tasks_provider: Arc::new(NullTasksProvider),
             calendar_provider: Arc::new(NullCalendarProvider),
             local_clock: Arc::new(UtcLocalClock),
             locale_provider: Arc::new(EnglishLocaleProvider),
-            config_store: Arc::new(MemoryConfigStore::new()),
+            config_store,
             envelope_sink: None,
         }
     }
@@ -495,8 +498,10 @@ impl AriEngine {
     #[uniffi::constructor]
     pub fn with_log_sink(sink: Arc<dyn FfiLogSink>) -> Self {
         let log_sink: Arc<dyn LogSink> = Arc::new(ForeignLogSinkAdapter(sink));
+        let config_store: Arc<dyn ConfigStore> = Arc::new(MemoryConfigStore::new());
         let mut engine = build_engine_with_builtins();
         engine.set_log_sink(Some(log_sink.clone()));
+        engine.set_config_store(Some(config_store.clone()));
         Self {
             inner: Mutex::new(engine),
             log_sink,
@@ -504,7 +509,7 @@ impl AriEngine {
             calendar_provider: Arc::new(NullCalendarProvider),
             local_clock: Arc::new(UtcLocalClock),
             locale_provider: Arc::new(EnglishLocaleProvider),
-            config_store: Arc::new(MemoryConfigStore::new()),
+            config_store,
             envelope_sink: None,
         }
     }
@@ -554,6 +559,7 @@ impl AriEngine {
             .map(|es| Arc::new(ForeignEnvelopeSinkAdapter(es)) as Arc<dyn EnvelopeSink>);
         let mut engine = build_engine_with_builtins();
         engine.set_log_sink(Some(log_sink.clone()));
+        engine.set_config_store(Some(config_store.clone()));
         if let Some(ref es) = adapted_envelope_sink {
             engine.set_envelope_sink(Some(es.clone()));
         }
@@ -693,6 +699,7 @@ impl AriEngine {
         // reload_community_skills call (that is: for every session
         // at all on Android, since EngineModule always reloads).
         fresh.set_log_sink(Some(self.log_sink.clone()));
+        fresh.set_config_store(Some(self.config_store.clone()));
         if let Some(ref es) = self.envelope_sink {
             fresh.set_envelope_sink(Some(es.clone()));
         }
