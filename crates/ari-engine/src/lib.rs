@@ -122,6 +122,10 @@ pub struct Engine {
     /// installed skill set. Empty when no community assistants are
     /// installed (or none declare aliases).
     named_assistants: Vec<NamedAssistantBinding>,
+    /// Config store for reading skill settings from engine-internal paths
+    /// (currently the Home Assistant fallback tier's "is it configured?"
+    /// check). `None` in bare/test engines that never wired one.
+    config_store: Option<Arc<dyn ConfigStore>>,
 }
 
 impl Engine {
@@ -137,6 +141,7 @@ impl Engine {
             log_sink: None,
             envelope_sink: None,
             named_assistants: Vec::new(),
+            config_store: None,
         }
     }
 
@@ -221,6 +226,22 @@ impl Engine {
     /// through to the assistant. Pass `None` to disable.
     pub fn set_router(&mut self, router: Option<Box<dyn SkillRouter>>) {
         self.router = router;
+    }
+
+    /// Install the config store used to read skill settings from
+    /// engine-internal paths (the Home Assistant fallback tier).
+    pub fn set_config_store(&mut self, store: Option<Arc<dyn ConfigStore>>) {
+        self.config_store = store;
+    }
+
+    /// True when the Home Assistant skill has a non-empty `base_url` setting.
+    #[allow(dead_code)]
+    fn home_assistant_configured(&self) -> bool {
+        self.config_store
+            .as_ref()
+            .and_then(|cs| cs.get("dev.heyari.homeassistant", "base_url"))
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
     }
 
     pub fn process_input(&self, input: &str) -> Response {
@@ -1930,5 +1951,25 @@ mod tests {
             fallback_response_for("ja"),
             "Sorry, I didn't understand that."
         );
+    }
+
+    #[test]
+    fn config_store_is_settable_and_used_for_ha_gate() {
+        use ari_skill_loader::assistant::MemoryConfigStore;
+        use std::sync::Arc;
+        let mut store = MemoryConfigStore::new();
+        store.set("dev.heyari.homeassistant", "base_url", "http://hass.local:8123");
+        let mut engine = Engine::new();
+        engine.set_config_store(Some(Arc::new(store)));
+        assert!(engine.home_assistant_configured());
+    }
+
+    #[test]
+    fn ha_not_configured_without_base_url() {
+        let mut engine = Engine::new();
+        engine.set_config_store(Some(std::sync::Arc::new(
+            ari_skill_loader::assistant::MemoryConfigStore::new(),
+        )));
+        assert!(!engine.home_assistant_configured());
     }
 }
