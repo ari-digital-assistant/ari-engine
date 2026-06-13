@@ -235,7 +235,6 @@ impl Engine {
     }
 
     /// True when the Home Assistant skill has a non-empty `base_url` setting.
-    #[allow(dead_code)]
     fn home_assistant_configured(&self) -> bool {
         self.config_store
             .as_ref()
@@ -497,6 +496,31 @@ impl Engine {
                     return (Response::Action(action), Some(trace));
                 }
                     RouteResult::NoMatch => {}
+                }
+            }
+        }
+
+        // Home Assistant fallback tier. When the HA skill is configured and
+        // nothing else matched, forward the raw utterance to it (it offloads
+        // to HA's conversation API). If HA reports no match (envelope carries
+        // `_ari_no_match`), fall through to the assistant below.
+        if self.home_assistant_configured() {
+            if let Some(skill) = self
+                .skills
+                .iter()
+                .find(|s| s.id() == "dev.heyari.homeassistant")
+                .cloned()
+            {
+                let response = skill.execute(&normalized, &self.ctx);
+                let fell_through = matches!(
+                    &response,
+                    Response::Action(v)
+                        if v.get("_ari_no_match").and_then(|b| b.as_bool()).unwrap_or(false)
+                );
+                if !fell_through {
+                    trace.winner = Some("home_assistant_fallback".to_string());
+                    let response = self.maybe_intercept_consult(skill, response);
+                    return (response, Some(trace));
                 }
             }
         }
@@ -1971,5 +1995,60 @@ mod tests {
             ari_skill_loader::assistant::MemoryConfigStore::new(),
         )));
         assert!(!engine.home_assistant_configured());
+    }
+
+    // --- Home Assistant fallback tier ---
+
+    struct FakeHaSkill {
+        no_match: bool,
+    }
+
+    impl Skill for FakeHaSkill {
+        fn id(&self) -> &str { "dev.heyari.homeassistant" }
+        fn description(&self) -> &str { "fake ha" }
+        fn specificity(&self) -> Specificity { Specificity::Medium }
+        fn score(&self, _input: &str, _ctx: &SkillContext) -> f32 { 0.0 }
+        fn execute(&self, _input: &str, _ctx: &SkillContext) -> Response {
+            if self.no_match {
+                Response::Action(serde_json::json!({
+                    "v": 1, "speak": "no", "_ari_no_match": true
+                }))
+            } else {
+                Response::Action(serde_json::json!({
+                    "v": 1, "speak": "Turned on the lights"
+                }))
+            }
+        }
+    }
+
+    fn engine_with_ha(no_match: bool) -> Engine {
+        use ari_skill_loader::assistant::MemoryConfigStore;
+        use std::sync::Arc;
+        let mut store = MemoryConfigStore::new();
+        store.set("dev.heyari.homeassistant", "base_url", "http://hass.local:8123");
+        let mut e = Engine::new();
+        e.register_skill(Box::new(FakeHaSkill { no_match }));
+        e.set_config_store(Some(Arc::new(store)));
+        e
+    }
+
+    #[test]
+    fn ha_fallback_handles_unmatched_when_configured() {
+        let e = engine_with_ha(false);
+        let (resp, _) = e.process_input_traced("asdf qwer");
+        match resp {
+            Response::Action(v) => assert_eq!(v["speak"], "Turned on the lights"),
+            other => panic!("expected action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ha_fallback_falls_through_on_no_match() {
+        let e = engine_with_ha(true);
+        let (resp, _) = e.process_input_traced("asdf qwer");
+        match resp {
+            Response::Text(t) => assert_eq!(t, fallback_response_for("en")),
+            other => panic!("expected fallback text, got {other:?}"),
+        }
     }
 }
