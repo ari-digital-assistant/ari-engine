@@ -82,6 +82,34 @@ pub enum Response {
     Binary { mime: String, data: Vec<u8> },
 }
 
+/// Result of a settings-time `settings_query` invocation. Mirrors the JSON the
+/// skill returns: success with options (dynamic_select), success with a message
+/// (validate), or failure with an error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsQueryResult {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub options: Vec<SettingsOption>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsOption {
+    pub value: String,
+    pub label: String,
+}
+
+impl SettingsQueryResult {
+    pub fn unsupported() -> Self {
+        SettingsQueryResult {
+            ok: false,
+            error: Some("settings_query unsupported by this skill".to_string()),
+            options: Vec::new(),
+            message: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SkillContext {
     pub locale: String,
@@ -248,6 +276,13 @@ pub trait Skill: Send + Sync {
             }
         });
         self.execute(&payload.to_string(), ctx)
+    }
+
+    /// Settings-time invocation (outside the utterance pipeline). `field` is the
+    /// settings field key being queried; `values_json` is `{ "<dep_key>": "<val>", ... }`.
+    /// Default: unsupported. WASM skills override to call their `settings_query` export.
+    fn settings_query(&self, _field: &str, _values_json: &str) -> SettingsQueryResult {
+        SettingsQueryResult::unsupported()
     }
 }
 
@@ -472,6 +507,24 @@ fn strip_italian_elisions(lower: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- settings_query ---
+
+    #[test]
+    fn settings_query_default_is_unsupported() {
+        struct S;
+        impl Skill for S {
+            fn id(&self) -> &str { "x" }
+            fn specificity(&self) -> Specificity { Specificity::Low }
+            fn score(&self, _: &str, _: &SkillContext) -> f32 { 0.0 }
+            fn execute(&self, _: &str, _: &SkillContext) -> Response {
+                Response::Text(String::new())
+            }
+        }
+        let r = S.settings_query("agent_id", "{}");
+        assert_eq!(r.ok, false);
+        assert!(r.error.as_deref().unwrap_or("").contains("unsupported"));
+    }
 
     // --- normalize_input ---
 
