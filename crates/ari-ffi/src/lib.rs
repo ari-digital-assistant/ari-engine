@@ -634,7 +634,22 @@ impl AriEngine {
         field: String,
         values: std::collections::HashMap<String, String>,
     ) -> FfiSettingsQueryResult {
-        let values_json = serde_json::to_string(&values).unwrap_or_else(|_| "{}".to_string());
+        // The UI masks `secret` fields as a bullet placeholder and never
+        // round-trips their real value across the FFI (see
+        // `SkillRegistry::get_skill_settings`). So `values` carries
+        // "••••••••" for a token, which the skill would otherwise forward
+        // upstream verbatim and get rejected. Resolve each dep from the
+        // shared config store — the same source `ari::setting_get` and the
+        // execute path read — so settings-time queries see the real
+        // committed values. UI-passed values stay as a fallback for keys
+        // not yet persisted to the store.
+        let mut merged = values;
+        for (key, slot) in merged.iter_mut() {
+            if let Some(real) = self.config_store.get(&skill_id, key.as_str()) {
+                *slot = real;
+            }
+        }
+        let values_json = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".to_string());
         let engine = self.inner.lock().expect("engine mutex poisoned");
         map_settings_result(engine.query_skill_setting(&skill_id, &field, &values_json))
     }
