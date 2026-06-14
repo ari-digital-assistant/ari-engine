@@ -256,6 +256,14 @@ pub struct ConfigField {
     /// reminders to' is `tasks` or `both`" without the frontend
     /// needing skill-specific logic.
     pub show_when: Option<ShowWhen>,
+    /// When true, the frontend runs the skill's `settings_query` for this
+    /// field on `depends_on` change and shows a ✓/✗ validity result.
+    pub validate: bool,
+    /// Other field keys whose (committed) values this field's
+    /// `dynamic_select`/`validate` query depends on. A change to any of them
+    /// (when all are non-empty) re-runs the query. Passed to the skill as the
+    /// `values` map.
+    pub depends_on: Vec<String>,
 }
 
 /// Declarative visibility gate on a [`ConfigField`]. The frontend
@@ -285,6 +293,11 @@ pub enum ConfigFieldType {
     /// `DeviceCalendar` — manifest declares with no options, renderer
     /// fills them in, persisted value is the task list id as a string.
     DeviceTaskList,
+    /// Skill-populated dropdown: the options are fetched by the skill at
+    /// settings-time via the `settings_query` export. Manifest declares the
+    /// field with no static `options:` (the skill supplies them). Persisted
+    /// value is the chosen option's `value` string.
+    DynamicSelect,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1098,6 +1111,16 @@ impl ConfigField {
                 }
                 ConfigFieldType::DeviceTaskList
             }
+            Some("dynamic_select") => {
+                if !raw.options.is_empty() {
+                    return Err(ManifestError::YamlParse(
+                        "dynamic_select field must not declare `options:` — \
+                         the skill populates them at runtime via settings_query"
+                            .into(),
+                    ));
+                }
+                ConfigFieldType::DynamicSelect
+            }
             Some(other) => {
                 return Err(ManifestError::YamlParse(format!(
                     "unknown config field type: {other}"
@@ -1139,6 +1162,8 @@ impl ConfigField {
             required: raw.required,
             default: raw.default.clone(),
             show_when,
+            validate: raw.validate,
+            depends_on: raw.depends_on.clone(),
         })
     }
 }
@@ -1382,6 +1407,10 @@ struct RawConfigField {
     show_when: Option<RawShowWhen>,
     #[serde(default)]
     options: Vec<RawSelectOption>,
+    #[serde(default)]
+    validate: bool,
+    #[serde(default)]
+    depends_on: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2614,6 +2643,95 @@ metadata:
             }
             other => panic!("expected YamlParse error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dynamic_select_field_parses_with_depends_on() {
+        let src = r#"---
+name: t
+description: "x. y."
+metadata:
+  ari:
+    id: ai.example.t
+    version: "0.1.0"
+    engine: ">=0.1"
+    capabilities: [http]
+    languages: [en]
+    specificity: low
+    matching:
+      patterns:
+        - keywords: [t]
+    examples:
+      - text: a
+      - text: b
+      - text: c
+      - text: d
+      - text: e
+    settings:
+      - key: base_url
+        label: URL
+        type: text
+      - key: agent_id
+        label: Agent
+        type: dynamic_select
+        depends_on: [base_url, token]
+      - key: token
+        label: Token
+        type: secret
+        validate: true
+        depends_on: [base_url, token]
+    wasm:
+      module: skill.wasm
+---
+# T
+"#;
+        let sf = Skillfile::parse(src, None).expect("must parse");
+        let ari = sf.ari_extension.unwrap();
+        let agent = &ari.settings[1];
+        assert_eq!(agent.field_type, ConfigFieldType::DynamicSelect);
+        assert_eq!(agent.depends_on, vec!["base_url".to_string(), "token".to_string()]);
+        assert_eq!(agent.validate, false);
+        let token = &ari.settings[2];
+        assert_eq!(token.validate, true);
+        assert_eq!(token.depends_on, vec!["base_url".to_string(), "token".to_string()]);
+    }
+
+    #[test]
+    fn dynamic_select_with_static_options_is_rejected() {
+        let src = r#"---
+name: t
+description: "x. y."
+metadata:
+  ari:
+    id: ai.example.t
+    version: "0.1.0"
+    engine: ">=0.1"
+    languages: [en]
+    specificity: low
+    matching:
+      patterns:
+        - keywords: [t]
+    examples:
+      - text: a
+      - text: b
+      - text: c
+      - text: d
+      - text: e
+    settings:
+      - key: agent_id
+        label: Agent
+        type: dynamic_select
+        options:
+          - value: x
+            label: X
+    wasm:
+      module: skill.wasm
+---
+# T
+"#;
+        let err = Skillfile::parse(src, None).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("dynamic_select") && msg.contains("options"), "got: {msg}");
     }
 
     #[test]
