@@ -660,6 +660,14 @@ impl WasmSkill {
         instance
             .get_typed_func::<(i32, i32), i64>(&mut store, "execute")
             .map_err(|_| WasmError::BadExportSignature("execute"))?;
+        // `settings_query` is optional. If a skill ships it, it must carry the
+        // same `(i32, i32) -> i64` signature as `execute`; skills without it
+        // load and validate fine.
+        if instance.get_func(&mut store, "settings_query").is_some() {
+            instance
+                .get_typed_func::<(i32, i32), i64>(&mut store, "settings_query")
+                .map_err(|_| WasmError::BadExportSignature("settings_query"))?;
+        }
         Ok(())
     }
 
@@ -1138,6 +1146,52 @@ fn decode_execute_return(packed: i64) -> (u8, i32, i32) {
     let ptr = (((packed as u64) >> 32) & 0x00FF_FFFF) as i32;
     let len = (packed as u64 & 0xFFFF_FFFF) as i32;
     (tag, ptr, len)
+}
+
+/// Decode the JSON a `settings_query` export returns into a
+/// `SettingsQueryResult`. Malformed payloads degrade to `ok:false` with a
+/// descriptive error rather than panicking — a misbehaving skill must never
+/// take down the host.
+fn decode_settings_result(payload: &str) -> ari_core::SettingsQueryResult {
+    #[derive(serde::Deserialize)]
+    struct RawOpt {
+        #[serde(default)]
+        value: String,
+        #[serde(default)]
+        label: String,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct Raw {
+        #[serde(default)]
+        ok: bool,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        options: Vec<RawOpt>,
+    }
+    match serde_json::from_str::<Raw>(payload) {
+        Ok(r) => ari_core::SettingsQueryResult {
+            ok: r.ok,
+            error: r.error,
+            message: r.message,
+            options: r
+                .options
+                .into_iter()
+                .map(|o| ari_core::SettingsOption {
+                    value: o.value,
+                    label: o.label,
+                })
+                .collect(),
+        },
+        Err(e) => ari_core::SettingsQueryResult {
+            ok: false,
+            error: Some(format!("malformed settings_query result: {e}")),
+            options: Vec::new(),
+            message: None,
+        },
+    }
 }
 
 fn now_ms_impl() -> i64 {
@@ -2038,6 +2092,10 @@ impl Skill for WasmSkill {
         self.execute_inner(input, None)
     }
 
+    fn settings_query(&self, field: &str, values_json: &str) -> ari_core::SettingsQueryResult {
+        self.settings_query_inner(field, values_json)
+    }
+
     fn execute_with_args(
         &self,
         input: &str,
@@ -2123,6 +2181,64 @@ impl WasmSkill {
                 }
             },
             fallback(),
+        )
+    }
+
+    /// Invoke the optional `settings_query` WASM export. Mirrors
+    /// `execute_inner`'s instantiate → write_input → call → read_utf8 dance,
+    /// only the export name and the decode differ. A skill that doesn't ship
+    /// the export gets `SettingsQueryResult::unsupported()`; any other failure
+    /// degrades to a generic `ok:false` so the host stays upright.
+    fn settings_query_inner(&self, field: &str, values_json: &str) -> ari_core::SettingsQueryResult {
+        let input = serde_json::json!({
+            "field": field,
+            "values": serde_json::from_str::<serde_json::Value>(values_json)
+                .unwrap_or(serde_json::Value::Object(Default::default())),
+        })
+        .to_string();
+        let log_sink = self.log_sink.clone();
+        let skill_id = self.id.clone();
+        let warn = |msg: &str| {
+            log_sink.log(&skill_id, LogLevel::Warn, msg);
+        };
+        let on_error = ari_core::SettingsQueryResult {
+            ok: false,
+            error: Some("settings_query failed".to_string()),
+            options: Vec::new(),
+            message: None,
+        };
+        self.with_instance(
+            |store, instance| {
+                let Some((memory, ptr, len)) =
+                    WasmSkill::write_input(store, instance, &input)
+                else {
+                    warn("settings_query: write_input failed");
+                    return on_error.clone();
+                };
+                let query_fn =
+                    match instance.get_typed_func::<(i32, i32), i64>(&mut *store, "settings_query") {
+                        Ok(f) => f,
+                        // Export absent (or wrong signature): the skill simply
+                        // doesn't support interactive settings queries.
+                        Err(_) => return ari_core::SettingsQueryResult::unsupported(),
+                    };
+                let packed = match query_fn.call(&mut *store, (ptr, len)) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn(&format!("settings_query: WASM trap/panic: {e}"));
+                        return on_error.clone();
+                    }
+                };
+                let (_tag, resp_ptr, resp_len) = decode_execute_return(packed);
+                let Some(payload) = read_utf8(&memory, &*store, resp_ptr, resp_len) else {
+                    warn(&format!(
+                        "settings_query: read_utf8 failed (ptr={resp_ptr} len={resp_len})"
+                    ));
+                    return on_error.clone();
+                };
+                decode_settings_result(&payload)
+            },
+            on_error.clone(),
         )
     }
 }
@@ -2417,6 +2533,21 @@ mod tests {
         // A ptr that would overflow 24 bits: tag 0, ptr = 0x00FFFFFF (max)
         let packed = (0x00FF_FFFF_i64 << 32) | 7;
         assert_eq!(decode_execute_return(packed), (0x00, 0x00FF_FFFF, 7));
+    }
+
+    #[test]
+    fn decode_settings_result_options_and_error() {
+        let ok = super::decode_settings_result(
+            r#"{"ok":true,"options":[{"value":"conversation.x","label":"X"}]}"#);
+        assert_eq!(ok.ok, true);
+        assert_eq!(ok.options.len(), 1);
+        assert_eq!(ok.options[0].value, "conversation.x");
+        let err = super::decode_settings_result(r#"{"ok":false,"error":"bad token"}"#);
+        assert_eq!(err.ok, false);
+        assert_eq!(err.error.as_deref(), Some("bad token"));
+        // malformed → ok:false, never panics
+        let bad = super::decode_settings_result("not json");
+        assert_eq!(bad.ok, false);
     }
 
     /// WAT fixture that emits an action response: tag byte 0x01 in the high
