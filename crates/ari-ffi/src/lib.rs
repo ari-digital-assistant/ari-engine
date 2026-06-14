@@ -424,6 +424,44 @@ pub enum FfiResponse {
     NotUnderstood { body: String },
 }
 
+/// Result of a settings-time skill invocation, mirrored from
+/// [`ari_core::SettingsQueryResult`] across the UniFFI boundary. `options`
+/// reuses [`FfiSelectOption`] (the same record `dynamic_select` config
+/// fields expose), so the frontend can render query results with the same
+/// option-list UI it already uses for static selects.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSettingsQueryResult {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub options: Vec<FfiSelectOption>,
+    pub message: Option<String>,
+}
+
+/// Convert an engine-side [`ari_core::SettingsQueryResult`] into the
+/// UniFFI-exportable [`FfiSettingsQueryResult`]. The engine's
+/// `SettingsOption` only carries `value`/`label`; the richer
+/// `FfiSelectOption` download fields don't apply to query results, so
+/// they're `None`.
+pub(crate) fn map_settings_result(
+    r: ari_core::SettingsQueryResult,
+) -> FfiSettingsQueryResult {
+    FfiSettingsQueryResult {
+        ok: r.ok,
+        error: r.error,
+        message: r.message,
+        options: r
+            .options
+            .into_iter()
+            .map(|o| FfiSelectOption {
+                value: o.value,
+                label: o.label,
+                download_url: None,
+                download_bytes: None,
+            })
+            .collect(),
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct AriEngine {
     // Wrapped in Mutex because `reload_community_skills` mutates the
@@ -585,6 +623,22 @@ impl AriEngine {
         self.locale_provider.current_locale()
     }
 
+    /// Settings-time skill invocation: run `skill_id`'s `settings_query` for
+    /// `field`, passing the current `values` (the field's `depends_on`
+    /// siblings). The host calls this from the settings UI to populate a
+    /// `dynamic_select` field's options or to validate a field whose value
+    /// depends on a server round-trip.
+    pub fn query_skill_setting(
+        &self,
+        skill_id: String,
+        field: String,
+        values: std::collections::HashMap<String, String>,
+    ) -> FfiSettingsQueryResult {
+        let values_json = serde_json::to_string(&values).unwrap_or_else(|_| "{}".to_string());
+        let engine = self.inner.lock().expect("engine mutex poisoned");
+        map_settings_result(engine.query_skill_setting(&skill_id, &field, &values_json))
+    }
+
     pub fn process_input(&self, input: String) -> FfiResponse {
         // Refresh the engine's locale on every call so per-locale
         // skill scorers and responses pick up live changes from the
@@ -735,6 +789,23 @@ impl AriEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_settings_result_carries_options_and_error() {
+        let r = ari_core::SettingsQueryResult {
+            ok: true,
+            error: None,
+            message: None,
+            options: vec![ari_core::SettingsOption {
+                value: "v".into(),
+                label: "L".into(),
+            }],
+        };
+        let f = super::map_settings_result(r);
+        assert_eq!(f.ok, true);
+        assert_eq!(f.options[0].value, "v");
+        assert_eq!(f.options[0].label, "L");
+    }
 
     #[test]
     fn engine_creates_and_responds_to_greeting() {
