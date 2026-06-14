@@ -243,6 +243,25 @@ impl Engine {
             .unwrap_or(false)
     }
 
+    /// Settings-time invocation: route to a loaded skill by id and run its
+    /// `settings_query`. Returns an error result if the skill isn't loaded.
+    pub fn query_skill_setting(
+        &self,
+        skill_id: &str,
+        field: &str,
+        values_json: &str,
+    ) -> ari_core::SettingsQueryResult {
+        match self.skills.iter().find(|s| s.id() == skill_id) {
+            Some(skill) => skill.settings_query(field, values_json),
+            None => ari_core::SettingsQueryResult {
+                ok: false,
+                error: Some(format!("skill not loaded: {skill_id}")),
+                options: Vec::new(),
+                message: None,
+            },
+        }
+    }
+
     pub fn process_input(&self, input: &str) -> Response {
         self.process_input_with_skill(input).0
     }
@@ -2065,5 +2084,33 @@ mod tests {
             Response::Text(t) => assert_eq!(t, fallback_response_for("en")),
             other => panic!("expected fallback text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn query_skill_setting_routes_to_skill_by_id() {
+        use ari_core::SettingsQueryResult;
+        struct FakeSettingsSkill;
+        impl Skill for FakeSettingsSkill {
+            fn id(&self) -> &str { "dev.example.s" }
+            fn score(&self, _: &str, _: &SkillContext) -> f32 { 0.0 }
+            fn specificity(&self) -> Specificity { Specificity::Low }
+            fn execute(&self, _: &str, _: &SkillContext) -> Response { Response::Text(String::new()) }
+            fn settings_query(&self, field: &str, values_json: &str) -> SettingsQueryResult {
+                SettingsQueryResult {
+                    ok: true,
+                    error: None,
+                    message: Some(format!("{field}|{values_json}")),
+                    options: vec![],
+                }
+            }
+        }
+        let mut e = Engine::new();
+        e.register_skill(Box::new(FakeSettingsSkill));
+        let r = e.query_skill_setting("dev.example.s", "agent_id", r#"{"base_url":"h"}"#);
+        assert_eq!(r.ok, true);
+        assert_eq!(r.message.as_deref(), Some("agent_id|{\"base_url\":\"h\"}"));
+        // unknown skill → ok:false, no panic
+        let miss = e.query_skill_setting("nope", "x", "{}");
+        assert_eq!(miss.ok, false);
     }
 }
