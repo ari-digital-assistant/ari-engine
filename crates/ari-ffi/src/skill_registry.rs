@@ -596,6 +596,7 @@ impl SkillRegistry {
                         ConfigFieldType::Select { .. } => "select".to_string(),
                         ConfigFieldType::DeviceCalendar => "device_calendar".to_string(),
                         ConfigFieldType::DeviceTaskList => "device_task_list".to_string(),
+                        ConfigFieldType::DynamicSelect => "dynamic_select".to_string(),
                     },
                     required: field.required,
                     default_value: field.default.clone(),
@@ -618,6 +619,8 @@ impl SkillRegistry {
                         .as_ref()
                         .map(|s| s.equals.clone())
                         .unwrap_or_default(),
+                    depends_on: field.depends_on.clone(),
+                    validate: field.validate,
                 }
             })
             .collect())

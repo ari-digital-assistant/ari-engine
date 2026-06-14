@@ -97,6 +97,13 @@ pub struct FfiConfigField {
     /// flag + a list.
     pub show_when_key: Option<String>,
     pub show_when_equals: Vec<String>,
+    /// Other field keys whose committed values this field's
+    /// `dynamic_select`/`validate` query depends on. A change to any of
+    /// them (when all are non-empty) re-runs the query.
+    pub depends_on: Vec<String>,
+    /// When true, the frontend runs the skill's `settings_query` for this
+    /// field on `depends_on` change and shows a validity result.
+    pub validate: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -308,6 +315,8 @@ impl AssistantRegistry {
                         .as_ref()
                         .map(|s| s.equals.clone())
                         .unwrap_or_default(),
+                    depends_on: field.depends_on.clone(),
+                    validate: field.validate,
                 }
             })
             .collect()
@@ -400,6 +409,7 @@ fn field_type_str(ft: &ConfigFieldType) -> String {
         ConfigFieldType::Select { .. } => "select".to_string(),
         ConfigFieldType::DeviceCalendar => "device_calendar".to_string(),
         ConfigFieldType::DeviceTaskList => "device_task_list".to_string(),
+        ConfigFieldType::DynamicSelect => "dynamic_select".to_string(),
     }
 }
 
@@ -428,6 +438,14 @@ mod tests {
             _ => panic!("expected select config field"),
         }
         assert!(!body.is_empty());
+    }
+
+    #[test]
+    fn field_type_str_covers_dynamic_select() {
+        assert_eq!(
+            super::field_type_str(&ConfigFieldType::DynamicSelect),
+            "dynamic_select"
+        );
     }
 
     #[test]
