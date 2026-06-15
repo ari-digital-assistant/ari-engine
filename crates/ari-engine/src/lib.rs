@@ -123,8 +123,8 @@ pub struct Engine {
     /// installed (or none declare aliases).
     named_assistants: Vec<NamedAssistantBinding>,
     /// Config store for reading skill settings from engine-internal paths
-    /// (currently the Home Assistant fallback tier's "is it configured?"
-    /// check). `None` in bare/test engines that never wired one.
+    /// (used by the fallback tier(s)' required-setting gate). `None` in
+    /// bare/test engines that never wired one.
     config_store: Option<Arc<dyn ConfigStore>>,
 }
 
