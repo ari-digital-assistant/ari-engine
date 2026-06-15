@@ -375,15 +375,17 @@ impl LocaleProvider for EnglishLocaleProvider {
 /// calling skill's id by the host import — the trait takes `skill_id`
 /// explicitly so a single impl serves every skill.
 pub trait SettingWriter: Send + Sync {
-    /// Persist `value` under `(skill_id, key)`. Returns true on success.
-    fn set_value(&self, skill_id: &str, key: &str, value: &str) -> bool;
+    /// Persist `value` under `(skill_id, key)`. `is_secret` reflects the
+    /// skill manifest's field type (`ConfigFieldType::Secret`) so the host
+    /// can route to encrypted vs plain storage. Returns true on success.
+    fn set_value(&self, skill_id: &str, key: &str, value: &str, is_secret: bool) -> bool;
 }
 
 /// No-op default for CLI/tests: nothing persists.
 pub struct NullSettingWriter;
 
 impl SettingWriter for NullSettingWriter {
-    fn set_value(&self, _skill_id: &str, _key: &str, _value: &str) -> bool {
+    fn set_value(&self, _skill_id: &str, _key: &str, _value: &str, _is_secret: bool) -> bool {
         false
     }
 }
@@ -477,10 +479,12 @@ mod tests {
         assert!(!p.delete(42));
     }
 
+
     #[test]
-    fn null_setting_writer_reports_failure() {
+    fn null_setting_writer_reports_failure_with_secret_flag() {
         let w = NullSettingWriter;
-        assert_eq!(w.set_value("skill", "k", "v"), false);
+        assert_eq!(w.set_value("skill", "k", "v", true), false);
+        assert_eq!(w.set_value("skill", "k", "v", false), false);
     }
 
     #[test]

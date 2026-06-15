@@ -89,7 +89,7 @@
 
 use crate::host_capabilities::capability_name;
 use crate::http_config::HttpConfig;
-use crate::manifest::{AriExtension, Behaviour, Capability, Skillfile, WasmBehaviour};
+use crate::manifest::{AriExtension, Behaviour, Capability, ConfigFieldType, Skillfile, WasmBehaviour};
 use crate::scoring::{PatternScorer, ScorerError};
 use crate::storage_config::StorageConfig;
 use ari_core::{Response, Skill, SkillContext, Specificity};
@@ -140,6 +140,19 @@ const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
 /// Default fuel budget per call. Tuned for "tens of milliseconds of compute
 /// on modern hardware". Configurable via a future manifest field if needed.
 const DEFAULT_FUEL_PER_CALL: u64 = 50_000_000;
+
+/// The set of setting keys a skill marks as `ConfigFieldType::Secret` in its
+/// manifest. Computed once per `WasmSkill` from `ari.settings` and threaded to
+/// the `setting_set` host import so the frontend can route secret values to
+/// encrypted storage without re-deriving secret-ness itself (which would
+/// deadlock — the engine mutex is held during the host call).
+fn secret_keys_of(settings: &[crate::manifest::ConfigField]) -> std::collections::HashSet<String> {
+    settings
+        .iter()
+        .filter(|f| matches!(f.field_type, ConfigFieldType::Secret))
+        .map(|f| f.key.clone())
+        .collect()
+}
 
 #[derive(Debug, Error)]
 pub enum WasmError {
@@ -254,6 +267,11 @@ struct StoreData {
     /// capabilities). `get_capability` returns 1 iff the requested name is
     /// in this set. Computed once per `WasmSkill` and cloned into each store.
     granted_capabilities: Arc<HashSet<Capability>>,
+    /// The skill's manifest-declared secret setting keys (fields with
+    /// `ConfigFieldType::Secret`). Cloned into each store so the
+    /// `setting_set` host import can tell the writer whether a value
+    /// should go to encrypted storage. Computed once per `WasmSkill`.
+    secret_setting_keys: Arc<std::collections::HashSet<String>>,
     /// Reqwest blocking client and policy. Only present when the skill has
     /// the http capability granted; otherwise None and the http_fetch import
     /// is never wired into the linker.
@@ -345,6 +363,11 @@ pub struct WasmSkill {
     /// Intersection of declared and host-granted capabilities. Cloned into
     /// every store so the `get_capability` host import can answer queries.
     granted_capabilities: Arc<HashSet<Capability>>,
+    /// Manifest-declared secret setting keys (fields whose `field_type` is
+    /// `ConfigFieldType::Secret`). Computed once from `ari.settings` and
+    /// cloned into every store so the `setting_set` host import can pass
+    /// `is_secret` to the `SettingWriter`.
+    secret_setting_keys: Arc<std::collections::HashSet<String>>,
     /// Pre-built reqwest client honouring `HttpConfig`. Only `Some` when the
     /// skill has the `http` capability granted. Cloned into each store.
     http_client: Option<Arc<HttpClientCtx>>,
@@ -591,6 +614,10 @@ impl WasmSkill {
         }
         let granted: HashSet<Capability> = ari.capabilities.iter().copied().collect();
 
+        // Compute the manifest-declared secret setting keys once. Threaded
+        // into each store so `setting_set` can pass `is_secret` to the writer.
+        let secret_setting_keys = Arc::new(secret_keys_of(&ari.settings));
+
         // Sneak guard: scan the module's `ari::*` imports against the
         // declared capability list. A module that imports a capability-bound
         // host function without declaring the corresponding capability is
@@ -641,6 +668,7 @@ impl WasmSkill {
             memory_limit_bytes,
             log_sink,
             granted_capabilities: Arc::new(granted),
+            secret_setting_keys,
             http_client,
             storage,
             tasks_provider,
@@ -700,6 +728,7 @@ impl WasmSkill {
                 log_sink: self.log_sink.clone(),
                 limits,
                 granted_capabilities: self.granted_capabilities.clone(),
+                secret_setting_keys: self.secret_setting_keys.clone(),
                 http_client: self.http_client.clone(),
                 storage: self.storage.clone(),
                 tasks_provider: if self.granted_capabilities.contains(&Capability::Tasks) {
@@ -1937,8 +1966,9 @@ fn setting_set_impl(
         None => return 1,
     };
     let skill_id = caller.data().skill_id.clone();
+    let is_secret = caller.data().secret_setting_keys.contains(&key);
     let writer = caller.data().setting_writer.clone();
-    if writer.set_value(&skill_id, &key, &value) {
+    if writer.set_value(&skill_id, &key, &value, is_secret) {
         0
     } else {
         1
@@ -2452,6 +2482,31 @@ impl WasmSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_keys_of_selects_only_secret_fields() {
+        use crate::manifest::{ConfigField, ConfigFieldType};
+        let mk = |key: &str, ft: ConfigFieldType| ConfigField {
+            key: key.into(),
+            label: key.into(),
+            field_type: ft,
+            required: false,
+            default: None,
+            show_when: None,
+            validate: false,
+            depends_on: vec![],
+            help_text: None,
+            collapsed_group: None,
+        };
+        let fields = vec![
+            mk("token", ConfigFieldType::Secret),
+            mk("base_url", ConfigFieldType::Text),
+        ];
+        let got = secret_keys_of(&fields);
+        assert!(got.contains("token"));
+        assert!(!got.contains("base_url"));
+        assert_eq!(got.len(), 1);
+    }
     use crate::host_capabilities::HostCapabilities;
     use crate::manifest::{Capability, MatchPattern, Matching, SkillType, SpecificityLevel};
     use std::sync::atomic::{AtomicU64, Ordering};
