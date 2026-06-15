@@ -170,6 +170,7 @@ mod tests {
         assert!(!h.provides(Capability::Http));
         assert!(!h.provides(Capability::Location));
         assert!(!h.provides(Capability::StorageKv));
+        assert!(!h.provides(Capability::Authorize));
     }
 
     #[test]
@@ -230,6 +231,11 @@ mod tests {
         // explicitly rather than relying on the `Debug` impl.
         assert_eq!(capability_name(Capability::Calendar), "calendar");
         assert_eq!(capability_name(Capability::Tasks), "tasks");
+        assert_eq!(capability_name(Capability::Authorize), "authorize");
+        // Reverse direction — parse must round-trip back.
+        assert_eq!(parse_capability("calendar"), Some(Capability::Calendar));
+        assert_eq!(parse_capability("tasks"), Some(Capability::Tasks));
+        assert_eq!(parse_capability("authorize"), Some(Capability::Authorize));
     }
 
     #[test]
@@ -239,10 +245,4 @@ mod tests {
         assert_eq!(parse_capability("HTTP"), None); // case-sensitive
     }
 
-    #[test]
-    fn authorize_capability_round_trips_name_and_parse() {
-        use crate::manifest::Capability;
-        assert_eq!(parse_capability("authorize"), Some(Capability::Authorize));
-        assert_eq!(capability_name(Capability::Authorize), "authorize");
-    }
 }
