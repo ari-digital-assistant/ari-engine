@@ -399,7 +399,12 @@ pub struct AuthorizeInput {
     /// The host MUST validate the inbound redirect's scheme+host+path
     /// against this before returning.
     pub redirect_uri: String,
-    /// How long to wait for the redirect before giving up.
+    /// How long to wait for the redirect before giving up, in milliseconds.
+    /// The concrete provider decides behaviour on expiry (close the browser tab,
+    /// return `error: "timeout"`, etc.). Callers always pass an explicit value —
+    /// the OAuth flow uses 5 minutes (300_000 ms). The `#[serde(default)]` 0 on
+    /// the wire-side struct is a last-resort fallback meaning "provider's
+    /// discretion"; it is never intentionally sent by the SDK/skill.
     pub timeout_ms: u64,
 }
 

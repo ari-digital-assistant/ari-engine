@@ -1987,6 +1987,9 @@ fn authorize_impl(caller: &mut Caller<'_, StoreData>, req_ptr: i32, req_len: i32
     });
     let json = serde_json::json!({
         "ok": out.ok,
+        // OAuth callback params have unique keys (code/state/error/error_description),
+        // so collapsing the Vec<(String,String)> into a JSON object is intentional and
+        // lossless for this contract.
         "params": out.params.into_iter().collect::<std::collections::HashMap<_, _>>(),
         "error": out.error,
     })
