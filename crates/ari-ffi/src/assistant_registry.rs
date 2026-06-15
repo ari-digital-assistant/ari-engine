@@ -104,6 +104,12 @@ pub struct FfiConfigField {
     /// When true, the frontend runs the skill's `settings_query` for this
     /// field on `depends_on` change and shows a validity result.
     pub validate: bool,
+    /// Optional guidance shown near the field in Settings. Null = no help.
+    pub help_text: Option<String>,
+    /// Optional disclosure-group label. Fields sharing a non-null value are
+    /// rendered collapsed under one expander carrying this label. Null =
+    /// always shown at top level.
+    pub collapsed_group: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -317,6 +323,8 @@ impl AssistantRegistry {
                         .unwrap_or_default(),
                     depends_on: field.depends_on.clone(),
                     validate: field.validate,
+                    help_text: field.help_text.clone(),
+                    collapsed_group: field.collapsed_group.clone(),
                 }
             })
             .collect()
@@ -410,6 +418,7 @@ fn field_type_str(ft: &ConfigFieldType) -> String {
         ConfigFieldType::DeviceCalendar => "device_calendar".to_string(),
         ConfigFieldType::DeviceTaskList => "device_task_list".to_string(),
         ConfigFieldType::DynamicSelect => "dynamic_select".to_string(),
+        ConfigFieldType::Action => "action".to_string(),
     }
 }
 
@@ -446,6 +455,11 @@ mod tests {
             super::field_type_str(&ConfigFieldType::DynamicSelect),
             "dynamic_select"
         );
+    }
+
+    #[test]
+    fn field_type_str_covers_action() {
+        assert_eq!(super::field_type_str(&ConfigFieldType::Action), "action");
     }
 
     #[test]
