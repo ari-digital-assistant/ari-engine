@@ -366,6 +366,28 @@ impl LocaleProvider for EnglishLocaleProvider {
     }
 }
 
+// ── Setting writer ─────────────────────────────────────────────────────
+
+/// Host-backed persistence of a skill's *own* settings (the same store
+/// `setting_get` reads). Frontend impls write through to durable,
+/// possibly-encrypted storage AND update the in-memory mirror so a later
+/// `setting_get` in the same process sees the new value. Scoped to the
+/// calling skill's id by the host import — the trait takes `skill_id`
+/// explicitly so a single impl serves every skill.
+pub trait SettingWriter: Send + Sync {
+    /// Persist `value` under `(skill_id, key)`. Returns true on success.
+    fn set_value(&self, skill_id: &str, key: &str, value: &str) -> bool;
+}
+
+/// No-op default for CLI/tests: nothing persists.
+pub struct NullSettingWriter;
+
+impl SettingWriter for NullSettingWriter {
+    fn set_value(&self, _skill_id: &str, _key: &str, _value: &str) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +424,12 @@ mod tests {
             })
             .is_none());
         assert!(!p.delete(42));
+    }
+
+    #[test]
+    fn null_setting_writer_reports_failure() {
+        let w = NullSettingWriter;
+        assert_eq!(w.set_value("skill", "k", "v"), false);
     }
 
     #[test]

@@ -2284,6 +2284,7 @@ mod tests {
             local_clock: Arc::new(crate::UtcLocalClock),
             config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
             locale_provider: Arc::new(crate::EnglishLocaleProvider),
+            setting_writer: Arc::new(crate::NullSettingWriter),
         }
     }
 
@@ -3176,6 +3177,7 @@ mod tests {
                 local_clock: Arc::new(crate::UtcLocalClock),
                 config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
                 locale_provider: Arc::new(crate::EnglishLocaleProvider),
+                setting_writer: Arc::new(crate::NullSettingWriter),
             },
         )
         .unwrap()
@@ -3286,6 +3288,7 @@ mod tests {
                 local_clock: Arc::new(crate::UtcLocalClock),
                 config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
                 locale_provider: Arc::new(crate::EnglishLocaleProvider),
+                setting_writer: Arc::new(crate::NullSettingWriter),
             },
         )
         .unwrap();

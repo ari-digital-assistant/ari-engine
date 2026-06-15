@@ -154,6 +154,10 @@ pub struct LoadOptions {
     /// CLI engine; the Android host wires a real provider that mirrors
     /// the user's settings flow.
     pub locale_provider: Arc<dyn crate::platform_capabilities::LocaleProvider>,
+    /// Backs `ari::setting_set` — frontend-persisted writes to a skill's
+    /// own settings. Defaults to [`NullSettingWriter`] (no persistence) so
+    /// the CLI/tests run without a frontend.
+    pub setting_writer: Arc<dyn crate::platform_capabilities::SettingWriter>,
 }
 
 impl Default for LoadOptions {
@@ -168,6 +172,7 @@ impl Default for LoadOptions {
             local_clock: Arc::new(crate::platform_capabilities::UtcLocalClock),
             config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
             locale_provider: Arc::new(crate::platform_capabilities::EnglishLocaleProvider),
+            setting_writer: Arc::new(crate::platform_capabilities::NullSettingWriter),
         }
     }
 }

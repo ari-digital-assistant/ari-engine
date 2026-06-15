@@ -47,7 +47,8 @@ pub use localized_strings::{
 pub use platform_capabilities::{
     Calendar, CalendarEventRow, CalendarProvider, EnglishLocaleProvider, InsertCalendarEventParams,
     InsertTaskParams, LocalClock, LocalTimeComponents, LocaleProvider, NullCalendarProvider,
-    NullTasksProvider, TaskList, TaskRow, TasksProvider, UtcLocalClock,
+    NullSettingWriter, NullTasksProvider, SettingWriter, TaskList, TaskRow, TasksProvider,
+    UtcLocalClock,
 };
 pub use storage_config::StorageConfig;
 pub use store::{InstalledSkill, SkillStore, StoreError};
