@@ -134,6 +134,7 @@ const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
     ("calendar_insert", Some(Capability::Calendar)),
     ("calendar_delete", Some(Capability::Calendar)),
     ("calendar_query_in_range", Some(Capability::Calendar)),
+    ("authorize", Some(Capability::Authorize)),
 ];
 
 /// Default fuel budget per call. Tuned for "tens of milliseconds of compute
@@ -266,6 +267,8 @@ struct StoreData {
     /// skills that didn't declare the cap can't invoke the imports.
     tasks_provider: Option<Arc<dyn crate::platform_capabilities::TasksProvider>>,
     calendar_provider: Option<Arc<dyn crate::platform_capabilities::CalendarProvider>>,
+    /// Authorize provider — `Some` only when `Capability::Authorize` granted.
+    authorize_provider: Option<Arc<dyn crate::platform_capabilities::AuthorizeProvider>>,
     /// Local clock — ungated; every skill can read the wall clock.
     local_clock: Arc<dyn crate::platform_capabilities::LocalClock>,
     /// Config store — ungated; every skill can read its own settings.
@@ -355,6 +358,10 @@ pub struct WasmSkill {
     tasks_provider: Arc<dyn crate::platform_capabilities::TasksProvider>,
     /// Platform calendar capability. Same pattern as `tasks_provider`.
     calendar_provider: Arc<dyn crate::platform_capabilities::CalendarProvider>,
+    /// Browser round-trip capability (`ari::authorize`). Always present
+    /// (possibly Null); gated into the store only when `Capability::Authorize`
+    /// is granted. Same pattern as `tasks_provider`.
+    authorize_provider: Arc<dyn crate::platform_capabilities::AuthorizeProvider>,
     /// Wall-clock reader used for local-time host imports. Doesn't
     /// require any capability grant — every skill can read the clock.
     local_clock: Arc<dyn crate::platform_capabilities::LocalClock>,
@@ -550,6 +557,7 @@ impl WasmSkill {
         let storage_config = &options.storage_config;
         let tasks_provider = options.tasks_provider.clone();
         let calendar_provider = options.calendar_provider.clone();
+        let authorize_provider = options.authorize_provider.clone();
         let local_clock = options.local_clock.clone();
         let config_store = options.config_store.clone();
         let setting_writer = options.setting_writer.clone();
@@ -637,6 +645,7 @@ impl WasmSkill {
             storage,
             tasks_provider,
             calendar_provider,
+            authorize_provider,
             local_clock,
             config_store,
             setting_writer,
@@ -700,6 +709,11 @@ impl WasmSkill {
                 },
                 calendar_provider: if self.granted_capabilities.contains(&Capability::Calendar) {
                     Some(self.calendar_provider.clone())
+                } else {
+                    None
+                },
+                authorize_provider: if self.granted_capabilities.contains(&Capability::Authorize) {
+                    Some(self.authorize_provider.clone())
                 } else {
                     None
                 },
@@ -952,6 +966,23 @@ impl WasmSkill {
                      limit: i32|
                      -> i64 {
                         calendar_query_in_range_impl(&mut caller, start_ms, end_ms, limit)
+                    },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
+        }
+
+        // Authorize — gated on `Capability::Authorize`. A dumb browser
+        // round-trip the host implements; carries no OAuth knowledge.
+        if self.granted_capabilities.contains(&Capability::Authorize) {
+            linker
+                .func_wrap(
+                    "ari",
+                    "authorize",
+                    |mut caller: Caller<'_, StoreData>,
+                     req_ptr: i32,
+                     req_len: i32|
+                     -> i64 {
+                        authorize_impl(&mut caller, req_ptr, req_len)
                     },
                 )
                 .map_err(|e| WasmError::Compile(e.to_string()))?;
@@ -1914,6 +1945,55 @@ fn setting_set_impl(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct AuthorizeReqSpec {
+    auth_url: String,
+    redirect_uri: String,
+    #[serde(default)]
+    timeout_ms: u64,
+}
+
+/// Implementation of `ari::authorize`. Opens a browser round-trip via the
+/// host-supplied [`AuthorizeProvider`] and returns the callback params as
+/// JSON via the packed-i64 data convention. Gated on `Capability::Authorize`
+/// — the provider is only `Some` in the store when the cap was granted.
+fn authorize_impl(caller: &mut Caller<'_, StoreData>, req_ptr: i32, req_len: i32) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let raw = match read_utf8(&memory, &*caller, req_ptr, req_len) {
+        Some(s) => s,
+        None => {
+            return write_response(caller, memory, r#"{"ok":false,"error":"bad_request"}"#)
+        }
+    };
+    let spec: AuthorizeReqSpec = match serde_json::from_str(&raw) {
+        Ok(s) => s,
+        Err(_) => {
+            return write_response(caller, memory, r#"{"ok":false,"error":"bad_request"}"#)
+        }
+    };
+    let provider = match caller.data().authorize_provider.clone() {
+        Some(p) => p,
+        None => {
+            return write_response(caller, memory, r#"{"ok":false,"error":"no_browser"}"#)
+        }
+    };
+    let out = provider.authorize(crate::platform_capabilities::AuthorizeInput {
+        auth_url: spec.auth_url,
+        redirect_uri: spec.redirect_uri,
+        timeout_ms: spec.timeout_ms,
+    });
+    let json = serde_json::json!({
+        "ok": out.ok,
+        "params": out.params.into_iter().collect::<std::collections::HashMap<_, _>>(),
+        "error": out.error,
+    })
+    .to_string();
+    write_response(caller, memory, &json)
+}
+
 /// Implementation of `ari::get_locale`. Returns the user's currently
 /// active language as an ISO 639-1 lowercase string (e.g. `"en"`,
 /// `"it"`). Reads through the [`LocaleProvider`] the host supplied via
@@ -2318,6 +2398,14 @@ mod tests {
         assert_eq!(entry, Some(&("setting_set", None)));
     }
 
+    #[test]
+    fn authorize_is_a_gated_known_import() {
+        let entry = HOST_IMPORT_CAPABILITY_TABLE
+            .iter()
+            .find(|(name, _)| *name == "authorize");
+        assert_eq!(entry, Some(&("authorize", Some(Capability::Authorize))));
+    }
+
     /// A unique storage root per test invocation, so concurrent tests don't
     /// share state. Cleaned up by `Drop`-ing the helper if needed; for now we
     /// rely on the OS to reap /tmp.
@@ -2353,6 +2441,7 @@ mod tests {
             config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
             locale_provider: Arc::new(crate::EnglishLocaleProvider),
             setting_writer: Arc::new(crate::NullSettingWriter),
+            authorize_provider: Arc::new(crate::NullAuthorizeProvider),
         }
     }
 
@@ -3246,6 +3335,7 @@ mod tests {
                 config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
                 locale_provider: Arc::new(crate::EnglishLocaleProvider),
                 setting_writer: Arc::new(crate::NullSettingWriter),
+                authorize_provider: Arc::new(crate::NullAuthorizeProvider),
             },
         )
         .unwrap()
@@ -3357,6 +3447,7 @@ mod tests {
                 config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
                 locale_provider: Arc::new(crate::EnglishLocaleProvider),
                 setting_writer: Arc::new(crate::NullSettingWriter),
+                authorize_provider: Arc::new(crate::NullAuthorizeProvider),
             },
         )
         .unwrap();

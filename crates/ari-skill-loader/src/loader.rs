@@ -158,6 +158,8 @@ pub struct LoadOptions {
     /// own settings. Defaults to [`NullSettingWriter`] (no persistence) so
     /// the CLI/tests run without a frontend.
     pub setting_writer: Arc<dyn crate::platform_capabilities::SettingWriter>,
+    /// Backs `ari::authorize`. Defaults to [`NullAuthorizeProvider`].
+    pub authorize_provider: Arc<dyn crate::platform_capabilities::AuthorizeProvider>,
 }
 
 impl Default for LoadOptions {
@@ -173,6 +175,7 @@ impl Default for LoadOptions {
             config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
             locale_provider: Arc::new(crate::platform_capabilities::EnglishLocaleProvider),
             setting_writer: Arc::new(crate::platform_capabilities::NullSettingWriter),
+            authorize_provider: Arc::new(crate::platform_capabilities::NullAuthorizeProvider),
         }
     }
 }

@@ -45,8 +45,9 @@ pub use localized_strings::{
     parse_strings_directory, LocalizedStrings, LocalizedStringsError,
 };
 pub use platform_capabilities::{
-    Calendar, CalendarEventRow, CalendarProvider, EnglishLocaleProvider, InsertCalendarEventParams,
-    InsertTaskParams, LocalClock, LocalTimeComponents, LocaleProvider, NullCalendarProvider,
+    AuthorizeInput, AuthorizeOutput, AuthorizeProvider, Calendar, CalendarEventRow,
+    CalendarProvider, EnglishLocaleProvider, InsertCalendarEventParams, InsertTaskParams,
+    LocalClock, LocalTimeComponents, LocaleProvider, NullAuthorizeProvider, NullCalendarProvider,
     NullSettingWriter, NullTasksProvider, SettingWriter, TaskList, TaskRow, TasksProvider,
     UtcLocalClock,
 };

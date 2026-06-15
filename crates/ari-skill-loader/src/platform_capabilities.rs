@@ -388,6 +388,52 @@ impl SettingWriter for NullSettingWriter {
     }
 }
 
+// ── Authorize (OAuth browser round-trip) ───────────────────────────────
+
+/// Request for [`AuthorizeProvider::authorize`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizeInput {
+    /// Fully-built authorization URL to open in the system browser.
+    pub auth_url: String,
+    /// Exact redirect URI the host should expect the browser to return to.
+    /// The host MUST validate the inbound redirect's scheme+host+path
+    /// against this before returning.
+    pub redirect_uri: String,
+    /// How long to wait for the redirect before giving up.
+    pub timeout_ms: u64,
+}
+
+/// Result of an authorize round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizeOutput {
+    pub ok: bool,
+    /// Callback query params (`code`, `state`, or `error`/`error_description`)
+    /// when `ok`. Empty on failure.
+    pub params: Vec<(String, String)>,
+    /// One of `cancelled`, `timeout`, `no_browser`, `mismatch` on failure.
+    pub error: Option<String>,
+}
+
+/// Host-supplied browser round-trip. Carries NO OAuth protocol knowledge —
+/// it opens `auth_url`, waits for the redirect to `redirect_uri`, and hands
+/// back the callback params. The skill builds the URL and interprets `code`.
+pub trait AuthorizeProvider: Send + Sync {
+    fn authorize(&self, input: AuthorizeInput) -> AuthorizeOutput;
+}
+
+/// No-op default: no browser available (CLI/tests).
+pub struct NullAuthorizeProvider;
+
+impl AuthorizeProvider for NullAuthorizeProvider {
+    fn authorize(&self, _input: AuthorizeInput) -> AuthorizeOutput {
+        AuthorizeOutput {
+            ok: false,
+            params: Vec::new(),
+            error: Some("no_browser".to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +476,19 @@ mod tests {
     fn null_setting_writer_reports_failure() {
         let w = NullSettingWriter;
         assert_eq!(w.set_value("skill", "k", "v"), false);
+    }
+
+    #[test]
+    fn null_authorize_provider_reports_no_browser() {
+        let p = NullAuthorizeProvider;
+        let out = p.authorize(AuthorizeInput {
+            auth_url: "https://x/authorize".into(),
+            redirect_uri: "https://x/cb".into(),
+            timeout_ms: 1000,
+        });
+        assert_eq!(out.ok, false);
+        assert_eq!(out.error.as_deref(), Some("no_browser"));
+        assert!(out.params.is_empty());
     }
 
     #[test]
