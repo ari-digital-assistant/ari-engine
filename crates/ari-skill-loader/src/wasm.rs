@@ -1997,6 +1997,76 @@ struct AuthorizeReqSpec {
     timeout_ms: u64,
 }
 
+/// Mint a 128-bit nonce as 32 lowercase hex chars (alphabet excludes `.`).
+fn mint_nonce() -> String {
+    let mut buf = [0u8; 16];
+    if getrandom::getrandom(&mut buf).is_err() {
+        // Mirror rand_u64_impl's fallback: still-bad entropy is still entropy.
+        let t = now_ms_impl() as u64;
+        buf[..8].copy_from_slice(&t.to_le_bytes());
+        buf[8..].copy_from_slice(&t.rotate_left(7).to_le_bytes());
+    }
+    let mut s = String::with_capacity(32);
+    for b in buf {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+    }
+    s
+}
+
+/// Append `nonce` to the `state` query param of `auth_url` (adding `state` if
+/// absent). Only `state` is touched — its shape is identical across OAuth2 and
+/// IndieAuth, so the host does no provider-specific URL surgery. On parse
+/// failure the URL is returned unchanged; the subsequent nonce check will then
+/// fail closed.
+fn inject_nonce(auth_url: &str, nonce: &str) -> String {
+    let mut parsed = match url::Url::parse(auth_url) {
+        Ok(u) => u,
+        Err(_) => return auth_url.to_string(),
+    };
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    let mut saw_state = false;
+    {
+        let mut qp = parsed.query_pairs_mut();
+        qp.clear();
+        for (k, v) in &pairs {
+            if k == "state" {
+                saw_state = true;
+                qp.append_pair("state", &format!("{v}.{nonce}"));
+            } else {
+                qp.append_pair(k, v);
+            }
+        }
+        if !saw_state {
+            qp.append_pair("state", nonce);
+        }
+    }
+    parsed.to_string()
+}
+
+/// Verify the trailing `.<nonce>` on the returned `state` and strip it,
+/// restoring the skill's original state value. Returns false if `state` is
+/// absent or the nonce doesn't match.
+fn verify_and_strip_nonce(params: &mut [(String, String)], nonce: &str) -> bool {
+    for (k, v) in params.iter_mut() {
+        if k == "state" {
+            if v == nonce {
+                v.clear();
+                return true;
+            }
+            if let Some(stripped) = v.strip_suffix(&format!(".{nonce}")) {
+                *v = stripped.to_string();
+                return true;
+            }
+            return false;
+        }
+    }
+    false
+}
+
 /// Implementation of `ari::authorize`. Opens a browser round-trip via the
 /// host-supplied [`AuthorizeProvider`] and returns the callback params as
 /// JSON via the packed-i64 data convention. Gated on `Capability::Authorize`
@@ -3736,5 +3806,81 @@ mod tests {
                 _thread: thread,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod nonce_tests {
+    use super::{inject_nonce, mint_nonce, verify_and_strip_nonce};
+    use url::Url;
+
+    fn state_of(url: &str) -> Option<String> {
+        Url::parse(url)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.into_owned())
+    }
+
+    #[test]
+    fn inject_appends_to_existing_state() {
+        let out = inject_nonce(
+            "https://ha.test/auth?client_id=x&state=ABC&foo=1",
+            "NONCE123",
+        );
+        assert_eq!(state_of(&out).as_deref(), Some("ABC.NONCE123"));
+        // other params preserved
+        let u = Url::parse(&out).unwrap();
+        assert_eq!(
+            u.query_pairs()
+                .find(|(k, _)| k == "foo")
+                .map(|(_, v)| v.into_owned())
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn inject_adds_state_when_absent() {
+        let out = inject_nonce("https://ha.test/auth?client_id=x", "NONCE123");
+        assert_eq!(state_of(&out).as_deref(), Some("NONCE123"));
+    }
+
+    #[test]
+    fn verify_strips_nonce_from_compound_state() {
+        let mut params = vec![
+            ("code".to_string(), "C".to_string()),
+            ("state".to_string(), "ABC.NONCE123".to_string()),
+        ];
+        assert!(verify_and_strip_nonce(&mut params, "NONCE123"));
+        assert_eq!(params.iter().find(|(k, _)| k == "state").unwrap().1, "ABC");
+    }
+
+    #[test]
+    fn verify_strips_nonce_only_state() {
+        let mut params = vec![("state".to_string(), "NONCE123".to_string())];
+        assert!(verify_and_strip_nonce(&mut params, "NONCE123"));
+        assert_eq!(params.iter().find(|(k, _)| k == "state").unwrap().1, "");
+    }
+
+    #[test]
+    fn verify_rejects_wrong_nonce() {
+        let mut params = vec![("state".to_string(), "ABC.WRONG".to_string())];
+        assert!(!verify_and_strip_nonce(&mut params, "NONCE123"));
+    }
+
+    #[test]
+    fn verify_rejects_missing_state() {
+        let mut params = vec![("code".to_string(), "C".to_string())];
+        assert!(!verify_and_strip_nonce(&mut params, "NONCE123"));
+    }
+
+    #[test]
+    fn mint_nonce_is_32_lowercase_hex() {
+        let n = mint_nonce();
+        assert_eq!(n.len(), 32);
+        assert!(n
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 }
