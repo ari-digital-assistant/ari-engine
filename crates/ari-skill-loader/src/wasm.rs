@@ -2650,6 +2650,7 @@ mod tests {
             assistant: None,
             examples: Vec::new(),
             settings: Vec::new(),
+            fallback: None,
         }
     }
 

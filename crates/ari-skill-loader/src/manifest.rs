@@ -519,6 +519,9 @@ pub struct AriExtension {
     /// runtime shape. The deprecated sub-location stays readable but
     /// new skills should put settings at the top level.
     pub settings: Vec<ConfigField>,
+    /// Fallback-tier declaration, or `None` if this skill is not a fallback.
+    /// Parsed from `metadata.ari.fallback`.
+    pub fallback: Option<ari_core::FallbackTier>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -821,6 +824,9 @@ impl AriExtension {
             assistant,
             examples,
             settings,
+            fallback: raw.fallback.as_ref().map(|f| ari_core::FallbackTier {
+                requires_setting: f.requires_setting.clone(),
+            }),
         })
     }
 }
@@ -1355,6 +1361,14 @@ struct RawAriExtension {
     /// for back-compat — see [`AriExtension::from_raw`]).
     #[serde(default)]
     settings: Vec<RawConfigField>,
+    #[serde(default)]
+    fallback: Option<RawFallback>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFallback {
+    #[serde(default)]
+    requires_setting: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3030,5 +3044,79 @@ metadata:
     #[test]
     fn response_path_rejects_double_dot() {
         assert!(parse_response_path("a..b").is_err());
+    }
+
+    // --- fallback parsing ---
+
+    #[test]
+    fn parses_fallback_with_required_setting() {
+        let md = r#"---
+name: t
+description: "Test skill. Use when testing fallback parsing."
+metadata:
+  ari:
+    id: a.b.c
+    version: "1"
+    engine: ">=0.3"
+    fallback:
+      requires_setting: base_url
+    matching:
+      patterns:
+        - keywords: [xyzzy]
+    declarative:
+      response: "test"
+---
+body
+"#;
+        let sf = crate::manifest::Skillfile::parse(md, None).expect("parse");
+        let ext = sf.ari_extension.expect("ari ext");
+        let fb = ext.fallback.expect("fallback");
+        assert_eq!(fb.requires_setting.as_deref(), Some("base_url"));
+    }
+
+    #[test]
+    fn parses_fallback_without_required_setting() {
+        let md = r#"---
+name: t
+description: "Test skill. Use when testing fallback parsing."
+metadata:
+  ari:
+    id: a.b.c
+    version: "1"
+    engine: ">=0.3"
+    fallback: {}
+    matching:
+      patterns:
+        - keywords: [xyzzy]
+    declarative:
+      response: "test"
+---
+body
+"#;
+        let sf = crate::manifest::Skillfile::parse(md, None).expect("parse");
+        let fb = sf.ari_extension.unwrap().fallback.expect("fallback");
+        assert_eq!(fb.requires_setting, None);
+    }
+
+    #[test]
+    fn absent_fallback_is_none() {
+        let md = r#"---
+name: t
+description: "Test skill. Use when testing fallback parsing."
+metadata:
+  ari:
+    id: a.b.c
+    version: "1"
+    engine: ">=0.3"
+    matching:
+      patterns:
+        - keywords: [xyzzy]
+    declarative:
+      response: "test"
+---
+body
+"#;
+        let sf = crate::manifest::Skillfile::parse(md, None).expect("parse");
+        assert!(sf.ari_extension.unwrap().fallback.is_none());
     }
 }
