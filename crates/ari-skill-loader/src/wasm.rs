@@ -120,6 +120,7 @@ const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
     ("format_date", None),
     ("format_number", None),
     ("format_currency", None),
+    ("oauth_redirect_uri", None),
     ("http_fetch", Some(Capability::Http)),
     ("http_request", Some(Capability::Http)),
     ("storage_get", Some(Capability::StorageKv)),
@@ -1026,6 +1027,20 @@ impl WasmSkill {
                 )
                 .map_err(|e| WasmError::Compile(e.to_string()))?;
         }
+
+        // OAuth redirect URI — ungated. Returns the host's canonical
+        // redirect (the verified App Link on Android). Empty when no
+        // authorize provider is wired (CLI/tests, or a skill without the
+        // `authorize` capability). Skills use it instead of hardcoding a URL.
+        linker
+            .func_wrap(
+                "ari",
+                "oauth_redirect_uri",
+                |mut caller: Caller<'_, StoreData>| -> i64 {
+                    oauth_redirect_uri_impl(&mut caller)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
 
         // Local clock — ungated; every skill can read the wall clock.
         linker
@@ -2094,20 +2109,35 @@ fn authorize_impl(caller: &mut Caller<'_, StoreData>, req_ptr: i32, req_len: i32
             return write_response(caller, memory, r#"{"ok":false,"error":"no_browser"}"#)
         }
     };
+    let nonce = mint_nonce();
     let out = provider.authorize(crate::platform_capabilities::AuthorizeInput {
-        auth_url: spec.auth_url,
+        auth_url: inject_nonce(&spec.auth_url, &nonce),
         redirect_uri: spec.redirect_uri,
         timeout_ms: spec.timeout_ms,
     });
-    let json = serde_json::json!({
-        "ok": out.ok,
-        // OAuth callback params have unique keys (code/state/error/error_description),
-        // so collapsing the Vec<(String,String)> into a JSON object is intentional and
-        // lossless for this contract.
-        "params": out.params.into_iter().collect::<std::collections::HashMap<_, _>>(),
-        "error": out.error,
-    })
-    .to_string();
+    let json = if out.ok {
+        let mut params = out.params;
+        if verify_and_strip_nonce(&mut params, &nonce) {
+            serde_json::json!({
+                "ok": true,
+                // OAuth callback params have unique keys (code/state/error/error_description),
+                // so collapsing the Vec<(String,String)> into a JSON object is intentional and
+                // lossless for this contract.
+                "params": params.into_iter().collect::<std::collections::HashMap<_, _>>(),
+                "error": serde_json::Value::Null,
+            })
+            .to_string()
+        } else {
+            r#"{"ok":false,"error":"state_mismatch"}"#.to_string()
+        }
+    } else {
+        serde_json::json!({
+            "ok": false,
+            "params": serde_json::Map::new(),
+            "error": out.error,
+        })
+        .to_string()
+    };
     write_response(caller, memory, &json)
 }
 
@@ -2122,6 +2152,21 @@ fn get_locale_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
     };
     let locale = caller.data().locale_provider.current_locale();
     write_response(caller, memory, &locale)
+}
+
+/// Implementation of `ari::oauth_redirect_uri`. Returns the host's canonical
+/// OAuth redirect URI (the verified App Link on Android) via the
+/// [`AuthorizeProvider`]. Empty when no provider is wired.
+fn oauth_redirect_uri_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let uri = match caller.data().authorize_provider.clone() {
+        Some(p) => p.redirect_uri(),
+        None => String::new(),
+    };
+    write_response(caller, memory, &uri)
 }
 
 /// Implementation of `ari::t`. Reads `key` and `args_json` from the
