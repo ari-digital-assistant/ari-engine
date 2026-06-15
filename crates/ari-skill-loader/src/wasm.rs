@@ -404,6 +404,11 @@ pub struct WasmSkill {
     /// at construction time. Ungated; backs `ari::t`. Empty when the
     /// skill bundle shipped no strings directory.
     localized_strings: Arc<crate::localized_strings::LocalizedStrings>,
+    /// Manifest-declared fallback-tier opt-in, parsed from
+    /// `metadata.ari.fallback`. `Some` when the skill acts as a fallback
+    /// NLU tier; surfaced verbatim from [`Skill::fallback_tier`]. `None`
+    /// for ordinary skills.
+    fallback_tier: Option<ari_core::FallbackTier>,
 }
 
 impl std::fmt::Debug for WasmSkill {
@@ -618,6 +623,10 @@ impl WasmSkill {
         // into each store so `setting_set` can pass `is_secret` to the writer.
         let secret_setting_keys = Arc::new(secret_keys_of(&ari.settings));
 
+        // Manifest fallback-tier opt-in (Task 2 populated `ari.fallback`).
+        // Carried on the skill so `fallback_tier()` can return it.
+        let fallback_tier = ari.fallback.clone();
+
         // Sneak guard: scan the module's `ari::*` imports against the
         // declared capability list. A module that imports a capability-bound
         // host function without declaring the corresponding capability is
@@ -679,6 +688,7 @@ impl WasmSkill {
             setting_writer,
             locale_provider,
             localized_strings,
+            fallback_tier,
         };
         skill.validate_exports()?;
         Ok(skill)
@@ -2277,6 +2287,10 @@ impl Skill for WasmSkill {
         self.settings_action_inner(action, values_json)
     }
 
+    fn fallback_tier(&self) -> Option<ari_core::FallbackTier> {
+        self.fallback_tier.clone()
+    }
+
     fn execute_with_args(
         &self,
         input: &str,
@@ -2728,6 +2742,46 @@ mod tests {
         let _ = build_skill(false, Arc::new(NullLogSink));
         // No assertion beyond "build_skill did not panic" — the validator runs
         // inside from_module_bytes and would error if any export was missing.
+    }
+
+    #[test]
+    fn fallback_tier_threads_through_from_parts() {
+        use ari_core::Skill;
+        // A real WasmSkill (built from in-memory WAT via the standard
+        // from_module_bytes seam) must surface the manifest's parsed
+        // `metadata.ari.fallback` verbatim from `fallback_tier()`.
+        let bytes = wat::parse_str(echo_wat()).unwrap();
+        let mut ari = fake_ari(false);
+        ari.fallback = Some(ari_core::FallbackTier {
+            requires_setting: Some("base_url".into()),
+        });
+        let skill = WasmSkill::from_module_bytes(
+            &ari,
+            "",
+            behaviour(&ari),
+            &bytes,
+            &test_options(Arc::new(NullLogSink), HostCapabilities::all(), HttpConfig::strict()),
+        )
+        .unwrap();
+        assert_eq!(
+            skill.fallback_tier(),
+            Some(ari_core::FallbackTier {
+                requires_setting: Some("base_url".into()),
+            })
+        );
+        assert_eq!(
+            skill.fallback_tier().and_then(|t| t.requires_setting).as_deref(),
+            Some("base_url")
+        );
+    }
+
+    #[test]
+    fn fallback_tier_none_when_manifest_omits_it() {
+        use ari_core::Skill;
+        // A manifest with no `metadata.ari.fallback` yields None — the
+        // default for a non-fallback skill.
+        let skill = build_skill(false, Arc::new(NullLogSink));
+        assert_eq!(skill.fallback_tier(), None);
     }
 
     #[test]
