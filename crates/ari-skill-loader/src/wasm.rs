@@ -3883,4 +3883,14 @@ mod nonce_tests {
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
+
+    #[test]
+    fn verify_strips_nonce_preserving_dotted_original_state() {
+        let mut params = vec![
+            ("code".to_string(), "C".to_string()),
+            ("state".to_string(), "a.b.NONCE123".to_string()),
+        ];
+        assert!(verify_and_strip_nonce(&mut params, "NONCE123"));
+        assert_eq!(params.iter().find(|(k, _)| k == "state").unwrap().1, "a.b");
+    }
 }
