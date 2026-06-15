@@ -147,6 +147,17 @@ pub struct ExampleUtterance {
     pub args: &'static str,
 }
 
+/// A skill's opt-in declaration that it acts as a fallback NLU tier: when the
+/// router and keyword scorers all miss, the engine forwards the raw utterance
+/// to it. Parsed from `metadata.ari.fallback` in the skill manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackTier {
+    /// When `Some(key)`, the engine engages this fallback only while the
+    /// skill's own setting `key` is non-empty (generic config gate). `None`
+    /// means always engage.
+    pub requires_setting: Option<String>,
+}
+
 /// The core skill trait. Every skill — built-in Rust, declarative, WASM —
 /// implements this at the engine boundary.
 ///
@@ -293,6 +304,12 @@ pub trait Skill: Send + Sync {
     /// Effectful settings action (button press). Default: unsupported.
     fn settings_action(&self, _action: &str, _values_json: &str) -> SettingsQueryResult {
         SettingsQueryResult::unsupported()
+    }
+
+    /// Returns this skill's fallback-tier declaration, or `None` if it is not
+    /// a fallback skill. Default: not a fallback.
+    fn fallback_tier(&self) -> Option<FallbackTier> {
+        None
     }
 }
 
@@ -540,6 +557,22 @@ mod tests {
         let r = S.settings_query("agent_id", "{}");
         assert_eq!(r.ok, false);
         assert!(r.error.as_deref().unwrap_or("").contains("unsupported"));
+    }
+
+    // --- fallback_tier ---
+
+    #[test]
+    fn fallback_tier_default_is_none() {
+        struct Bare;
+        impl Skill for Bare {
+            fn id(&self) -> &str { "bare" }
+            fn specificity(&self) -> Specificity { Specificity::Low }
+            fn score(&self, _: &str, _: &SkillContext) -> f32 { 0.0 }
+            fn execute(&self, _: &str, _: &SkillContext) -> Response {
+                Response::Text(String::new())
+            }
+        }
+        assert!(Bare.fallback_tier().is_none());
     }
 
     // --- normalize_input ---
