@@ -264,6 +264,12 @@ pub struct ConfigField {
     /// (when all are non-empty) re-runs the query. Passed to the skill as the
     /// `values` map.
     pub depends_on: Vec<String>,
+    /// Optional guidance shown near the field in Settings. `None` = no help.
+    pub help_text: Option<String>,
+    /// Optional disclosure-group label. Fields sharing a non-`None` value are
+    /// rendered collapsed under one expander carrying this label. `None` =
+    /// always shown at top level.
+    pub collapsed_group: Option<String>,
 }
 
 /// Declarative visibility gate on a [`ConfigField`]. The frontend
@@ -298,6 +304,12 @@ pub enum ConfigFieldType {
     /// field with no static `options:` (the skill supplies them). Persisted
     /// value is the chosen option's `value` string.
     DynamicSelect,
+    /// A button that invokes the skill's `settings_action` export with the
+    /// current form values. Effectful (unlike `validate`/`dynamic_select`,
+    /// which are read-only). The frontend renders a button + a ✓/✗ result
+    /// line. Declares no `options:`. Persists nothing itself; the action's
+    /// side effects (e.g. writing a token via `setting_set`) do the work.
+    Action,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1126,6 +1138,16 @@ impl ConfigField {
                 }
                 ConfigFieldType::DynamicSelect
             }
+            Some("action") => {
+                if !raw.options.is_empty() {
+                    return Err(ManifestError::YamlParse(
+                        "action field must not declare `options:` — it is a \
+                         button, not a picker"
+                            .into(),
+                    ));
+                }
+                ConfigFieldType::Action
+            }
             Some(other) => {
                 return Err(ManifestError::YamlParse(format!(
                     "unknown config field type: {other}"
@@ -1169,6 +1191,8 @@ impl ConfigField {
             show_when,
             validate: raw.validate,
             depends_on: raw.depends_on.clone(),
+            help_text: raw.help_text.clone(),
+            collapsed_group: raw.collapsed_group.clone(),
         })
     }
 }
@@ -1416,6 +1440,10 @@ struct RawConfigField {
     validate: bool,
     #[serde(default)]
     depends_on: Vec<String>,
+    #[serde(default)]
+    help_text: Option<String>,
+    #[serde(default)]
+    collapsed_group: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1461,6 +1489,58 @@ impl<'de> serde::Deserialize<'de> for RawShowWhenEquals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_action_field_with_help_and_group() {
+        let md = r#"---
+name: t
+description: Test skill for action field parsing. Use when testing the action field type.
+metadata:
+  ari:
+    id: ai.example.action-test
+    version: "0.1.0"
+    type: assistant
+    engine: ">=0.3"
+    settings:
+      - key: sign_in
+        label: "Sign in with Home Assistant"
+        type: action
+      - key: token
+        label: "Long-lived token"
+        type: secret
+        help_text: "Create one in your HA profile page."
+        collapsed_group: "Use token authentication instead"
+    assistant:
+      provider: api
+      privacy: cloud
+      api:
+        endpoint: https://api.anthropic.com/v1/messages
+        auth: bearer
+        auth_config_key: token
+        model_config_key: token
+        default_model: m
+        system_prompt: "p"
+        response_path: "content[0].text"
+---
+body
+"#;
+        let sf = Skillfile::parse(md, None).expect("parse");
+        let ari = sf.ari_extension.expect("ari extension required");
+        let fields = &ari.settings;
+        let action = fields.iter().find(|f| f.key == "sign_in").unwrap();
+        assert_eq!(action.field_type, ConfigFieldType::Action);
+        let token = fields.iter().find(|f| f.key == "token").unwrap();
+        assert_eq!(
+            token.help_text.as_deref(),
+            Some("Create one in your HA profile page.")
+        );
+        assert_eq!(
+            token.collapsed_group.as_deref(),
+            Some("Use token authentication instead")
+        );
+        assert_eq!(action.help_text, None);
+        assert_eq!(action.collapsed_group, None);
+    }
 
     fn coin_flip_source() -> &'static str {
         r#"---
