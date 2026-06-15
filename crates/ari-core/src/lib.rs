@@ -91,6 +91,10 @@ pub struct SettingsQueryResult {
     pub error: Option<String>,
     pub options: Vec<SettingsOption>,
     pub message: Option<String>,
+    /// When true, the frontend should re-run its dependent settings queries
+    /// (dynamic_select / validate) — e.g. after an action mints credentials
+    /// that those queries need. Defaults false.
+    pub refresh: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,6 +110,7 @@ impl SettingsQueryResult {
             error: Some("settings_query unsupported by this skill".to_string()),
             options: Vec::new(),
             message: None,
+            refresh: false,
         }
     }
 }
@@ -514,6 +519,12 @@ mod tests {
     use super::*;
 
     // --- settings_query ---
+
+    #[test]
+    fn settings_query_result_has_refresh_default_false() {
+        let r = SettingsQueryResult::unsupported();
+        assert_eq!(r.refresh, false);
+    }
 
     #[test]
     fn settings_query_default_is_unsupported() {

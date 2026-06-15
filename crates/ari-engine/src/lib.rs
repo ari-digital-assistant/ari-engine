@@ -258,6 +258,7 @@ impl Engine {
                 error: Some(format!("skill not loaded: {skill_id}")),
                 options: Vec::new(),
                 message: None,
+                refresh: false,
             },
         }
     }
@@ -279,6 +280,7 @@ impl Engine {
                 error: Some(format!("skill not loaded: {skill_id}")),
                 options: Vec::new(),
                 message: None,
+                refresh: false,
             },
         }
     }
@@ -2122,6 +2124,7 @@ mod tests {
                     error: None,
                     message: Some(format!("{field}|{values_json}")),
                     options: vec![],
+                    refresh: false,
                 }
             }
         }

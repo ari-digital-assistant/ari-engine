@@ -500,6 +500,7 @@ pub struct FfiSettingsQueryResult {
     pub error: Option<String>,
     pub options: Vec<FfiSelectOption>,
     pub message: Option<String>,
+    pub refresh: bool,
 }
 
 /// Convert an engine-side [`ari_core::SettingsQueryResult`] into the
@@ -514,6 +515,7 @@ pub(crate) fn map_settings_result(
         ok: r.ok,
         error: r.error,
         message: r.message,
+        refresh: r.refresh,
         options: r
             .options
             .into_iter()
@@ -962,6 +964,7 @@ mod tests {
             ok: true,
             error: None,
             message: None,
+            refresh: false,
             options: vec![ari_core::SettingsOption {
                 value: "v".into(),
                 label: "L".into(),

@@ -1258,6 +1258,8 @@ fn decode_settings_result(payload: &str) -> ari_core::SettingsQueryResult {
         message: Option<String>,
         #[serde(default)]
         options: Vec<RawOpt>,
+        #[serde(default)]
+        refresh: bool,
     }
     match serde_json::from_str::<Raw>(payload) {
         Ok(r) => ari_core::SettingsQueryResult {
@@ -1272,12 +1274,14 @@ fn decode_settings_result(payload: &str) -> ari_core::SettingsQueryResult {
                     label: o.label,
                 })
                 .collect(),
+            refresh: r.refresh,
         },
         Err(e) => ari_core::SettingsQueryResult {
             ok: false,
             error: Some(format!("malformed settings_query result: {e}")),
             options: Vec::new(),
             message: None,
+            refresh: false,
         },
     }
 }
@@ -2383,6 +2387,7 @@ impl WasmSkill {
             error: Some("settings_query failed".to_string()),
             options: Vec::new(),
             message: None,
+            refresh: false,
         };
         self.with_instance(
             |store, instance| {
@@ -2442,6 +2447,7 @@ impl WasmSkill {
             error: Some("settings_action failed".to_string()),
             options: Vec::new(),
             message: None,
+            refresh: false,
         };
         self.with_instance(
             |store, instance| {
@@ -2827,6 +2833,16 @@ mod tests {
         // malformed → ok:false, never panics
         let bad = super::decode_settings_result("not json");
         assert_eq!(bad.ok, false);
+    }
+
+    #[test]
+    fn decode_settings_result_reads_refresh() {
+        let with = super::decode_settings_result(
+            r#"{"ok":true,"message":"done","refresh":true}"#,
+        );
+        assert_eq!(with.refresh, true);
+        let without = super::decode_settings_result(r#"{"ok":true,"message":"done"}"#);
+        assert_eq!(without.refresh, false);
     }
 
     /// WAT fixture that emits an action response: tag byte 0x01 in the high
