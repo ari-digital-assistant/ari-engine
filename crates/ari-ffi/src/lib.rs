@@ -6,8 +6,8 @@ use ari_skill_loader::{
     load_skill_directory_with, Calendar, CalendarEventRow, CalendarProvider, Capability,
     EnglishLocaleProvider, HostCapabilities, HttpConfig, InsertCalendarEventParams,
     InsertTaskParams, LoadOptions, LocalClock, LocalTimeComponents, LocaleProvider, LogLevel,
-    LogSink, NullCalendarProvider, NullLogSink, NullTasksProvider, StorageConfig, TaskList,
-    TaskRow, TasksProvider, UtcLocalClock,
+    LogSink, NullCalendarProvider, NullLogSink, NullSettingWriter, NullTasksProvider,
+    SettingWriter, StorageConfig, TaskList, TaskRow, TasksProvider, UtcLocalClock,
 };
 use ari_skills::{
     CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill,
@@ -52,6 +52,7 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
         local_clock: Arc::new(UtcLocalClock),
         config_store: Arc::new(MemoryConfigStore::new()),
         locale_provider: Arc::new(EnglishLocaleProvider),
+        setting_writer: Arc::new(NullSettingWriter),
     }
 }
 
@@ -272,6 +273,14 @@ pub trait FfiLocaleProvider: Send + Sync {
     fn current_locale(&self) -> String;
 }
 
+/// Foreign-implemented setting writer. The frontend persists the value
+/// durably (encrypted for secret fields) and updates the in-memory
+/// settings mirror so a later `setting_get` sees it.
+#[uniffi::export(with_foreign)]
+pub trait FfiSettingWriter: Send + Sync {
+    fn set_value(&self, skill_id: String, key: String, value: String) -> bool;
+}
+
 // Adapters from the foreign FFI traits to the engine's internal
 // traits. Engine code only sees the internal trait object; these
 // adapters handle the `Arc<dyn FfiFoo>` → `Arc<dyn Foo>` conversion
@@ -405,6 +414,15 @@ impl LocaleProvider for ForeignLocaleProviderAdapter {
     }
 }
 
+struct ForeignSettingWriterAdapter(Arc<dyn FfiSettingWriter>);
+
+impl SettingWriter for ForeignSettingWriterAdapter {
+    fn set_value(&self, skill_id: &str, key: &str, value: &str) -> bool {
+        self.0
+            .set_value(skill_id.to_string(), key.to_string(), value.to_string())
+    }
+}
+
 #[derive(uniffi::Enum)]
 pub enum FfiResponse {
     Text { body: String },
@@ -491,6 +509,11 @@ pub struct AriEngine {
     /// the shared `SkillSettingsStore`'s inner map so skills see
     /// live UI-written values.
     pub(crate) config_store: Arc<dyn ConfigStore>,
+    /// Setting writer backing `ari::setting_set` in WASM skills.
+    /// Defaults to [`NullSettingWriter`] (no-op) for callers that don't
+    /// supply a real one (CLI, tests). The Android host wires a writer
+    /// that persists durably and updates the in-memory settings mirror.
+    pub(crate) setting_writer: Arc<dyn SettingWriter>,
     /// Envelope sink the engine uses to push phase-2 Layer C envelopes
     /// asynchronously. Stored here (not just on [`Engine`]) so
     /// `reload_community_skills` can re-attach it to the fresh engine
@@ -525,6 +548,7 @@ impl AriEngine {
             local_clock: Arc::new(UtcLocalClock),
             locale_provider: Arc::new(EnglishLocaleProvider),
             config_store,
+            setting_writer: Arc::new(NullSettingWriter),
             envelope_sink: None,
         }
     }
@@ -548,6 +572,7 @@ impl AriEngine {
             local_clock: Arc::new(UtcLocalClock),
             locale_provider: Arc::new(EnglishLocaleProvider),
             config_store,
+            setting_writer: Arc::new(NullSettingWriter),
             envelope_sink: None,
         }
     }
@@ -568,6 +593,7 @@ impl AriEngine {
         settings: Option<Arc<SkillSettingsStore>>,
         envelope_sink: Option<Arc<dyn FfiEnvelopeSink>>,
         locale: Option<Arc<dyn FfiLocaleProvider>>,
+        setting_writer: Option<Arc<dyn FfiSettingWriter>>,
     ) -> Self {
         let log_sink: Arc<dyn LogSink> = match sink {
             Some(s) => Arc::new(ForeignLogSinkAdapter(s)),
@@ -593,6 +619,10 @@ impl AriEngine {
             Some(s) => s.as_config_store(),
             None => Arc::new(MemoryConfigStore::new()),
         };
+        let setting_writer: Arc<dyn SettingWriter> = match setting_writer {
+            Some(w) => Arc::new(ForeignSettingWriterAdapter(w)),
+            None => Arc::new(NullSettingWriter),
+        };
         let adapted_envelope_sink: Option<Arc<dyn EnvelopeSink>> = envelope_sink
             .map(|es| Arc::new(ForeignEnvelopeSinkAdapter(es)) as Arc<dyn EnvelopeSink>);
         let mut engine = build_engine_with_builtins();
@@ -609,6 +639,7 @@ impl AriEngine {
             local_clock,
             locale_provider,
             config_store,
+            setting_writer,
             envelope_sink: adapted_envelope_sink,
         }
     }
@@ -785,6 +816,7 @@ impl AriEngine {
         options.local_clock = self.local_clock.clone();
         options.config_store = self.config_store.clone();
         options.locale_provider = self.locale_provider.clone();
+        options.setting_writer = self.setting_writer.clone();
         let loaded: u32 =
             match load_skill_directory_with(&PathBuf::from(&skill_store_dir), &options) {
                 Ok(report) => {
@@ -804,6 +836,20 @@ impl AriEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct OkWriter;
+    impl FfiSettingWriter for OkWriter {
+        fn set_value(&self, _skill_id: String, _key: String, _value: String) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn setting_writer_adapter_delegates() {
+        use ari_skill_loader::platform_capabilities::SettingWriter;
+        let adapter = ForeignSettingWriterAdapter(std::sync::Arc::new(OkWriter));
+        assert!(adapter.set_value("s", "k", "v"));
+    }
 
     #[test]
     fn map_settings_result_carries_options_and_error() {
