@@ -42,7 +42,8 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
         .with(Capability::Http)
         .with(Capability::StorageKv)
         .with(Capability::Tasks)
-        .with(Capability::Calendar);
+        .with(Capability::Calendar)
+        .with(Capability::Authorize);
     LoadOptions {
         log_sink: Arc::new(NullLogSink),
         host_capabilities: host_caps,
@@ -1046,5 +1047,11 @@ mod tests {
         );
         assert_eq!(r.ok, false);
         assert!(r.error.is_some());
+    }
+
+    #[test]
+    fn android_host_grants_authorize_capability() {
+        let opts = android_load_options("/tmp/ignored");
+        assert!(opts.host_capabilities.provides(Capability::Authorize));
     }
 }
