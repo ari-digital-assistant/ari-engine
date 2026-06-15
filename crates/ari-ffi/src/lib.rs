@@ -3,11 +3,12 @@
 use ari_engine::{fallback_response_for, Engine, EnvelopeSink, FALLBACK_RESPONSE};
 use ari_skill_loader::assistant::{ConfigStore, MemoryConfigStore};
 use ari_skill_loader::{
-    load_skill_directory_with, Calendar, CalendarEventRow, CalendarProvider, Capability,
-    EnglishLocaleProvider, HostCapabilities, HttpConfig, InsertCalendarEventParams,
-    InsertTaskParams, LoadOptions, LocalClock, LocalTimeComponents, LocaleProvider, LogLevel,
-    LogSink, NullCalendarProvider, NullLogSink, NullSettingWriter, NullTasksProvider,
-    SettingWriter, StorageConfig, TaskList, TaskRow, TasksProvider, UtcLocalClock,
+    load_skill_directory_with, AuthorizeInput, AuthorizeOutput, AuthorizeProvider, Calendar,
+    CalendarEventRow, CalendarProvider, Capability, EnglishLocaleProvider, HostCapabilities,
+    HttpConfig, InsertCalendarEventParams, InsertTaskParams, LoadOptions, LocalClock,
+    LocalTimeComponents, LocaleProvider, LogLevel, LogSink, NullAuthorizeProvider,
+    NullCalendarProvider, NullLogSink, NullSettingWriter, NullTasksProvider, SettingWriter,
+    StorageConfig, TaskList, TaskRow, TasksProvider, UtcLocalClock,
 };
 use ari_skills::{
     CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill,
@@ -53,6 +54,7 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
         config_store: Arc::new(MemoryConfigStore::new()),
         locale_provider: Arc::new(EnglishLocaleProvider),
         setting_writer: Arc::new(NullSettingWriter),
+        authorize_provider: Arc::new(NullAuthorizeProvider),
     }
 }
 
@@ -423,6 +425,50 @@ impl SettingWriter for ForeignSettingWriterAdapter {
     }
 }
 
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAuthorizeRequest {
+    pub auth_url: String,
+    pub redirect_uri: String,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAuthorizeParam {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAuthorizeResult {
+    pub ok: bool,
+    pub params: Vec<FfiAuthorizeParam>,
+    pub error: Option<String>,
+}
+
+/// Foreign-implemented browser round-trip. Opens `auth_url`, waits for the
+/// redirect to `redirect_uri`, returns the callback params.
+#[uniffi::export(with_foreign)]
+pub trait FfiAuthorizeProvider: Send + Sync {
+    fn authorize(&self, req: FfiAuthorizeRequest) -> FfiAuthorizeResult;
+}
+
+struct ForeignAuthorizeProviderAdapter(Arc<dyn FfiAuthorizeProvider>);
+
+impl AuthorizeProvider for ForeignAuthorizeProviderAdapter {
+    fn authorize(&self, input: AuthorizeInput) -> AuthorizeOutput {
+        let res = self.0.authorize(FfiAuthorizeRequest {
+            auth_url: input.auth_url,
+            redirect_uri: input.redirect_uri,
+            timeout_ms: input.timeout_ms,
+        });
+        AuthorizeOutput {
+            ok: res.ok,
+            params: res.params.into_iter().map(|p| (p.key, p.value)).collect(),
+            error: res.error,
+        }
+    }
+}
+
 #[derive(uniffi::Enum)]
 pub enum FfiResponse {
     Text { body: String },
@@ -514,6 +560,11 @@ pub struct AriEngine {
     /// supply a real one (CLI, tests). The Android host wires a writer
     /// that persists durably and updates the in-memory settings mirror.
     pub(crate) setting_writer: Arc<dyn SettingWriter>,
+    /// Authorize provider backing `ari::authorize` in WASM skills.
+    /// Defaults to [`NullAuthorizeProvider`] (no browser) for callers that
+    /// don't supply a real one (CLI, tests). The Android host wires a
+    /// provider that opens the system browser and returns callback params.
+    pub(crate) authorize_provider: Arc<dyn AuthorizeProvider>,
     /// Envelope sink the engine uses to push phase-2 Layer C envelopes
     /// asynchronously. Stored here (not just on [`Engine`]) so
     /// `reload_community_skills` can re-attach it to the fresh engine
@@ -549,6 +600,7 @@ impl AriEngine {
             locale_provider: Arc::new(EnglishLocaleProvider),
             config_store,
             setting_writer: Arc::new(NullSettingWriter),
+            authorize_provider: Arc::new(NullAuthorizeProvider),
             envelope_sink: None,
         }
     }
@@ -573,6 +625,7 @@ impl AriEngine {
             locale_provider: Arc::new(EnglishLocaleProvider),
             config_store,
             setting_writer: Arc::new(NullSettingWriter),
+            authorize_provider: Arc::new(NullAuthorizeProvider),
             envelope_sink: None,
         }
     }
@@ -594,6 +647,7 @@ impl AriEngine {
         envelope_sink: Option<Arc<dyn FfiEnvelopeSink>>,
         locale: Option<Arc<dyn FfiLocaleProvider>>,
         setting_writer: Option<Arc<dyn FfiSettingWriter>>,
+        authorize: Option<Arc<dyn FfiAuthorizeProvider>>,
     ) -> Self {
         let log_sink: Arc<dyn LogSink> = match sink {
             Some(s) => Arc::new(ForeignLogSinkAdapter(s)),
@@ -623,6 +677,10 @@ impl AriEngine {
             Some(w) => Arc::new(ForeignSettingWriterAdapter(w)),
             None => Arc::new(NullSettingWriter),
         };
+        let authorize_provider: Arc<dyn AuthorizeProvider> = match authorize {
+            Some(a) => Arc::new(ForeignAuthorizeProviderAdapter(a)),
+            None => Arc::new(NullAuthorizeProvider),
+        };
         let adapted_envelope_sink: Option<Arc<dyn EnvelopeSink>> = envelope_sink
             .map(|es| Arc::new(ForeignEnvelopeSinkAdapter(es)) as Arc<dyn EnvelopeSink>);
         let mut engine = build_engine_with_builtins();
@@ -640,6 +698,7 @@ impl AriEngine {
             locale_provider,
             config_store,
             setting_writer,
+            authorize_provider,
             envelope_sink: adapted_envelope_sink,
         }
     }
@@ -817,6 +876,7 @@ impl AriEngine {
         options.config_store = self.config_store.clone();
         options.locale_provider = self.locale_provider.clone();
         options.setting_writer = self.setting_writer.clone();
+        options.authorize_provider = self.authorize_provider.clone();
         let loaded: u32 =
             match load_skill_directory_with(&PathBuf::from(&skill_store_dir), &options) {
                 Ok(report) => {
@@ -849,6 +909,30 @@ mod tests {
         use ari_skill_loader::platform_capabilities::SettingWriter;
         let adapter = ForeignSettingWriterAdapter(std::sync::Arc::new(OkWriter));
         assert!(adapter.set_value("s", "k", "v"));
+    }
+
+    struct CancelProvider;
+    impl FfiAuthorizeProvider for CancelProvider {
+        fn authorize(&self, _req: FfiAuthorizeRequest) -> FfiAuthorizeResult {
+            FfiAuthorizeResult {
+                ok: false,
+                params: vec![],
+                error: Some("cancelled".into()),
+            }
+        }
+    }
+
+    #[test]
+    fn authorize_adapter_maps_result() {
+        use ari_skill_loader::platform_capabilities::{AuthorizeInput, AuthorizeProvider};
+        let adapter = ForeignAuthorizeProviderAdapter(std::sync::Arc::new(CancelProvider));
+        let out = adapter.authorize(AuthorizeInput {
+            auth_url: "u".into(),
+            redirect_uri: "r".into(),
+            timeout_ms: 5,
+        });
+        assert_eq!(out.ok, false);
+        assert_eq!(out.error.as_deref(), Some("cancelled"));
     }
 
     #[test]
