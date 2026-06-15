@@ -113,6 +113,7 @@ const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
     ("local_now_components", None),
     ("local_timezone_id", None),
     ("setting_get", None),
+    ("setting_set", None),
     ("args", None),
     ("get_locale", None),
     ("t", None),
@@ -269,6 +270,8 @@ struct StoreData {
     local_clock: Arc<dyn crate::platform_capabilities::LocalClock>,
     /// Config store — ungated; every skill can read its own settings.
     config_store: Arc<dyn crate::assistant::ConfigStore>,
+    /// Setting writer — ungated; every skill may persist its own settings.
+    setting_writer: Arc<dyn crate::platform_capabilities::SettingWriter>,
     /// Locale provider — ungated; backs `ari::get_locale` and
     /// `ari::t` (which reads the current locale to pick the right
     /// `strings/{locale}.json` table). Cloned from the WasmSkill,
@@ -359,6 +362,10 @@ pub struct WasmSkill {
     /// user-configurable settings declared in `metadata.ari.settings`.
     /// Ungated; every skill can read its own settings.
     config_store: Arc<dyn crate::assistant::ConfigStore>,
+    /// Backing writer for `ari::setting_set` — persists the skill's own
+    /// settings. Ungated; every skill can write its own settings namespace
+    /// (symmetry with `setting_get`). Threaded from `LoadOptions.setting_writer`.
+    setting_writer: Arc<dyn crate::platform_capabilities::SettingWriter>,
     /// Locale source for `ari::get_locale` and `ari::t`. Threaded
     /// from `LoadOptions.locale_provider` at construction time.
     /// Ungated; every skill can read the active locale.
@@ -545,6 +552,7 @@ impl WasmSkill {
         let calendar_provider = options.calendar_provider.clone();
         let local_clock = options.local_clock.clone();
         let config_store = options.config_store.clone();
+        let setting_writer = options.setting_writer.clone();
         let locale_provider = options.locale_provider.clone();
 
         let mut config = wasmtime::Config::new();
@@ -631,6 +639,7 @@ impl WasmSkill {
             calendar_provider,
             local_clock,
             config_store,
+            setting_writer,
             locale_provider,
             localized_strings,
         };
@@ -696,6 +705,7 @@ impl WasmSkill {
                 },
                 local_clock: self.local_clock.clone(),
                 config_store: self.config_store.clone(),
+                setting_writer: self.setting_writer.clone(),
                 locale_provider: self.locale_provider.clone(),
                 localized_strings: self.localized_strings.clone(),
                 args_json: None,
@@ -978,6 +988,24 @@ impl WasmSkill {
                 "setting_get",
                 |mut caller: Caller<'_, StoreData>, key_ptr: i32, key_len: i32| -> i64 {
                     setting_get_impl(&mut caller, key_ptr, key_len)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+
+        // Skill settings write — ungated; every skill may persist its own
+        // settings namespace (symmetry with `setting_get`). Returns an i32
+        // status (0 = success, non-zero = failure).
+        linker
+            .func_wrap(
+                "ari",
+                "setting_set",
+                |mut caller: Caller<'_, StoreData>,
+                 key_ptr: i32,
+                 key_len: i32,
+                 val_ptr: i32,
+                 val_len: i32|
+                 -> i32 {
+                    setting_set_impl(&mut caller, key_ptr, key_len, val_ptr, val_len)
                 },
             )
             .map_err(|e| WasmError::Compile(e.to_string()))?;
@@ -1854,6 +1882,38 @@ fn setting_get_impl(caller: &mut Caller<'_, StoreData>, key_ptr: i32, key_len: i
     }
 }
 
+/// Implementation of `ari::setting_set`. Persists a single value under the
+/// calling skill's own settings namespace. Ungated — symmetry with
+/// `setting_get`. Returns an i32 status (0 = success, non-zero = failure),
+/// mirroring `storage_set_impl`.
+fn setting_set_impl(
+    caller: &mut Caller<'_, StoreData>,
+    key_ptr: i32,
+    key_len: i32,
+    val_ptr: i32,
+    val_len: i32,
+) -> i32 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 1,
+    };
+    let key = match read_utf8(&memory, &*caller, key_ptr, key_len) {
+        Some(s) => s,
+        None => return 1,
+    };
+    let value = match read_utf8(&memory, &*caller, val_ptr, val_len) {
+        Some(s) => s,
+        None => return 1,
+    };
+    let skill_id = caller.data().skill_id.clone();
+    let writer = caller.data().setting_writer.clone();
+    if writer.set_value(&skill_id, &key, &value) {
+        0
+    } else {
+        1
+    }
+}
+
 /// Implementation of `ari::get_locale`. Returns the user's currently
 /// active language as an ISO 639-1 lowercase string (e.g. `"en"`,
 /// `"it"`). Reads through the [`LocaleProvider`] the host supplied via
@@ -2249,6 +2309,14 @@ mod tests {
     use crate::host_capabilities::HostCapabilities;
     use crate::manifest::{Capability, MatchPattern, Matching, SkillType, SpecificityLevel};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn setting_set_is_an_ungated_known_import() {
+        let entry = HOST_IMPORT_CAPABILITY_TABLE
+            .iter()
+            .find(|(name, _)| *name == "setting_set");
+        assert_eq!(entry, Some(&("setting_set", None)));
+    }
 
     /// A unique storage root per test invocation, so concurrent tests don't
     /// share state. Cleaned up by `Drop`-ing the helper if needed; for now we
