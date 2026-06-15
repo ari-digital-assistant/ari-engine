@@ -547,6 +547,11 @@ pub enum Capability {
     /// Board / etc). Lets a skill enumerate the user's task lists and
     /// insert VTODOs — the default destination for the reminder skill.
     Tasks,
+    /// Permission to launch an external authorization (OAuth/IndieAuth)
+    /// browser round-trip via `ari::authorize`. The host opens a URL in
+    /// the system browser and returns the redirect's callback query
+    /// params. Generic — carries no protocol knowledge.
+    Authorize,
 }
 
 #[derive(Debug, Clone, PartialEq)]

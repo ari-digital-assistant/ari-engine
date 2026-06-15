@@ -50,6 +50,7 @@ impl HostCapabilities {
             Capability::StorageKv,
             Capability::Calendar,
             Capability::Tasks,
+            Capability::Authorize,
         ] {
             s.granted.insert(cap);
         }
@@ -116,6 +117,7 @@ pub fn parse_capability(s: &str) -> Option<Capability> {
         "storage_kv" => Some(Capability::StorageKv),
         "calendar" => Some(Capability::Calendar),
         "tasks" => Some(Capability::Tasks),
+        "authorize" => Some(Capability::Authorize),
         _ => None,
     }
 }
@@ -132,6 +134,7 @@ pub fn capability_name(cap: Capability) -> &'static str {
         Capability::StorageKv => "storage_kv",
         Capability::Calendar => "calendar",
         Capability::Tasks => "tasks",
+        Capability::Authorize => "authorize",
     }
 }
 
@@ -213,6 +216,7 @@ mod tests {
             Capability::StorageKv,
             Capability::Calendar,
             Capability::Tasks,
+            Capability::Authorize,
         ] {
             assert_eq!(parse_capability(capability_name(cap)), Some(cap));
         }
@@ -233,5 +237,12 @@ mod tests {
         assert_eq!(parse_capability("ftp"), None);
         assert_eq!(parse_capability(""), None);
         assert_eq!(parse_capability("HTTP"), None); // case-sensitive
+    }
+
+    #[test]
+    fn authorize_capability_round_trips_name_and_parse() {
+        use crate::manifest::Capability;
+        assert_eq!(parse_capability("authorize"), Some(Capability::Authorize));
+        assert_eq!(capability_name(Capability::Authorize), "authorize");
     }
 }
