@@ -281,7 +281,7 @@ pub trait FfiLocaleProvider: Send + Sync {
 /// settings mirror so a later `setting_get` sees it.
 #[uniffi::export(with_foreign)]
 pub trait FfiSettingWriter: Send + Sync {
-    fn set_value(&self, skill_id: String, key: String, value: String) -> bool;
+    fn set_value(&self, skill_id: String, key: String, value: String, is_secret: bool) -> bool;
 }
 
 // Adapters from the foreign FFI traits to the engine's internal
@@ -420,9 +420,9 @@ impl LocaleProvider for ForeignLocaleProviderAdapter {
 struct ForeignSettingWriterAdapter(Arc<dyn FfiSettingWriter>);
 
 impl SettingWriter for ForeignSettingWriterAdapter {
-    fn set_value(&self, skill_id: &str, key: &str, value: &str) -> bool {
+    fn set_value(&self, skill_id: &str, key: &str, value: &str, is_secret: bool) -> bool {
         self.0
-            .set_value(skill_id.to_string(), key.to_string(), value.to_string())
+            .set_value(skill_id.to_string(), key.to_string(), value.to_string(), is_secret)
     }
 }
 
@@ -922,16 +922,14 @@ mod tests {
 
     struct OkWriter;
     impl FfiSettingWriter for OkWriter {
-        fn set_value(&self, _skill_id: String, _key: String, _value: String) -> bool {
-            true
-        }
+        fn set_value(&self, _skill_id: String, _key: String, _value: String, _is_secret: bool) -> bool { true }
     }
 
     #[test]
-    fn setting_writer_adapter_delegates() {
+    fn setting_writer_adapter_delegates_with_secret_flag() {
         use ari_skill_loader::platform_capabilities::SettingWriter;
         let adapter = ForeignSettingWriterAdapter(std::sync::Arc::new(OkWriter));
-        assert!(adapter.set_value("s", "k", "v"));
+        assert!(adapter.set_value("s", "k", "v", true));
     }
 
     struct CancelProvider;
