@@ -451,6 +451,7 @@ pub struct FfiAuthorizeResult {
 #[uniffi::export(with_foreign)]
 pub trait FfiAuthorizeProvider: Send + Sync {
     fn authorize(&self, req: FfiAuthorizeRequest) -> FfiAuthorizeResult;
+    fn redirect_uri(&self) -> String;
 }
 
 struct ForeignAuthorizeProviderAdapter(Arc<dyn FfiAuthorizeProvider>);
@@ -467,6 +468,9 @@ impl AuthorizeProvider for ForeignAuthorizeProviderAdapter {
             params: res.params.into_iter().map(|p| (p.key, p.value)).collect(),
             error: res.error,
         }
+    }
+    fn redirect_uri(&self) -> String {
+        self.0.redirect_uri()
     }
 }
 

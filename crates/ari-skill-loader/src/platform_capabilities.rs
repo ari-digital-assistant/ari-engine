@@ -426,6 +426,10 @@ pub struct AuthorizeOutput {
 /// back the callback params. The skill builds the URL and interprets `code`.
 pub trait AuthorizeProvider: Send + Sync {
     fn authorize(&self, input: AuthorizeInput) -> AuthorizeOutput;
+    /// The canonical redirect URI this host intercepts (e.g. the verified
+    /// App Link on Android). Skills read it via `ari::oauth_redirect_uri()`
+    /// instead of hardcoding a domain. Empty when the host has no browser.
+    fn redirect_uri(&self) -> String;
 }
 
 /// No-op default: no browser available (CLI/tests).
@@ -438,6 +442,9 @@ impl AuthorizeProvider for NullAuthorizeProvider {
             params: Vec::new(),
             error: Some("no_browser".to_string()),
         }
+    }
+    fn redirect_uri(&self) -> String {
+        String::new()
     }
 }
 
@@ -532,5 +539,15 @@ mod tests {
     #[test]
     fn english_locale_provider_returns_en() {
         assert_eq!(EnglishLocaleProvider.current_locale(), "en");
+    }
+}
+
+#[cfg(test)]
+mod authorize_provider_tests {
+    use super::*;
+
+    #[test]
+    fn null_provider_has_empty_redirect_uri() {
+        assert_eq!(NullAuthorizeProvider.redirect_uri(), "");
     }
 }
