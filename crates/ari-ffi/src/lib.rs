@@ -744,6 +744,28 @@ impl AriEngine {
         map_settings_result(engine.query_skill_setting(&skill_id, &field, &values_json))
     }
 
+    /// Effectful settings-time skill invocation: run `skill_id`'s `settings_action`
+    /// for `action`, passing the current `values` (sibling field values the
+    /// skill reads during the action — e.g. `base_url`/`token` for HA sign-in).
+    /// Secret-masked values are resolved from the config store before the call,
+    /// identical to the resolution step in [`AriEngine::query_skill_setting`].
+    pub fn settings_action(
+        &self,
+        skill_id: String,
+        action: String,
+        values: std::collections::HashMap<String, String>,
+    ) -> FfiSettingsQueryResult {
+        let mut merged = values;
+        for (key, slot) in merged.iter_mut() {
+            if let Some(real) = self.config_store.get(&skill_id, key.as_str()) {
+                *slot = real;
+            }
+        }
+        let values_json = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".to_string());
+        let engine = self.inner.lock().expect("engine mutex poisoned");
+        map_settings_result(engine.settings_action(&skill_id, &action, &values_json))
+    }
+
     pub fn process_input(&self, input: String) -> FfiResponse {
         // Refresh the engine's locale on every call so per-locale
         // skill scorers and responses pick up live changes from the
@@ -1012,5 +1034,17 @@ mod tests {
             }
             _ => panic!("expected NotUnderstood fallback"),
         }
+    }
+
+    #[test]
+    fn ffi_settings_action_unknown_skill_is_error() {
+        let engine = AriEngine::new();
+        let r = engine.settings_action(
+            "nope".into(),
+            "sign_in".into(),
+            std::collections::HashMap::new(),
+        );
+        assert_eq!(r.ok, false);
+        assert!(r.error.is_some());
     }
 }
