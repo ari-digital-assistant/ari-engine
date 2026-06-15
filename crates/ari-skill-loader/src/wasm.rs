@@ -2239,6 +2239,10 @@ impl Skill for WasmSkill {
         self.settings_query_inner(field, values_json)
     }
 
+    fn settings_action(&self, action: &str, values_json: &str) -> ari_core::SettingsQueryResult {
+        self.settings_action_inner(action, values_json)
+    }
+
     fn execute_with_args(
         &self,
         input: &str,
@@ -2376,6 +2380,65 @@ impl WasmSkill {
                 let Some(payload) = read_utf8(&memory, &*store, resp_ptr, resp_len) else {
                     warn(&format!(
                         "settings_query: read_utf8 failed (ptr={resp_ptr} len={resp_len})"
+                    ));
+                    return on_error.clone();
+                };
+                decode_settings_result(&payload)
+            },
+            on_error.clone(),
+        )
+    }
+
+    /// Invoke the optional `settings_action` WASM export — the effectful
+    /// sibling of `settings_query_inner`. Same instantiate → write_input →
+    /// call → read_utf8 dance, only the input verb (`action`) and export name
+    /// differ. A skill that doesn't ship the export gets
+    /// `SettingsQueryResult::unsupported()`; any other failure degrades to a
+    /// generic `ok:false` so the host stays upright.
+    fn settings_action_inner(&self, action: &str, values_json: &str) -> ari_core::SettingsQueryResult {
+        let input = serde_json::json!({
+            "action": action,
+            "values": serde_json::from_str::<serde_json::Value>(values_json)
+                .unwrap_or(serde_json::Value::Object(Default::default())),
+        })
+        .to_string();
+        let log_sink = self.log_sink.clone();
+        let skill_id = self.id.clone();
+        let warn = |msg: &str| {
+            log_sink.log(&skill_id, LogLevel::Warn, msg);
+        };
+        let on_error = ari_core::SettingsQueryResult {
+            ok: false,
+            error: Some("settings_action failed".to_string()),
+            options: Vec::new(),
+            message: None,
+        };
+        self.with_instance(
+            |store, instance| {
+                let Some((memory, ptr, len)) =
+                    WasmSkill::write_input(store, instance, &input)
+                else {
+                    warn("settings_action: write_input failed");
+                    return on_error.clone();
+                };
+                let action_fn =
+                    match instance.get_typed_func::<(i32, i32), i64>(&mut *store, "settings_action") {
+                        Ok(f) => f,
+                        // Export absent (or wrong signature): the skill simply
+                        // doesn't support interactive settings actions.
+                        Err(_) => return ari_core::SettingsQueryResult::unsupported(),
+                    };
+                let packed = match action_fn.call(&mut *store, (ptr, len)) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn(&format!("settings_action: WASM trap/panic: {e}"));
+                        return on_error.clone();
+                    }
+                };
+                let (_tag, resp_ptr, resp_len) = decode_execute_return(packed);
+                let Some(payload) = read_utf8(&memory, &*store, resp_ptr, resp_len) else {
+                    warn(&format!(
+                        "settings_action: read_utf8 failed (ptr={resp_ptr} len={resp_len})"
                     ));
                     return on_error.clone();
                 };

@@ -284,6 +284,11 @@ pub trait Skill: Send + Sync {
     fn settings_query(&self, _field: &str, _values_json: &str) -> SettingsQueryResult {
         SettingsQueryResult::unsupported()
     }
+
+    /// Effectful settings action (button press). Default: unsupported.
+    fn settings_action(&self, _action: &str, _values_json: &str) -> SettingsQueryResult {
+        SettingsQueryResult::unsupported()
+    }
 }
 
 pub fn words_to_number(word: &str) -> Option<i64> {

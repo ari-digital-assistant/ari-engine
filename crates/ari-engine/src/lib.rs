@@ -262,6 +262,27 @@ impl Engine {
         }
     }
 
+    /// Settings-time effectful invocation: route to a loaded skill by id and
+    /// run its `settings_action` (e.g. a "Sign in" button). Reuses the
+    /// `SettingsQueryResult` shape. Returns an error result if the skill isn't
+    /// loaded.
+    pub fn settings_action(
+        &self,
+        skill_id: &str,
+        action: &str,
+        values_json: &str,
+    ) -> ari_core::SettingsQueryResult {
+        match self.skills.iter().find(|s| s.id() == skill_id) {
+            Some(skill) => skill.settings_action(action, values_json),
+            None => ari_core::SettingsQueryResult {
+                ok: false,
+                error: Some(format!("skill not loaded: {skill_id}")),
+                options: Vec::new(),
+                message: None,
+            },
+        }
+    }
+
     pub fn process_input(&self, input: &str) -> Response {
         self.process_input_with_skill(input).0
     }
@@ -2112,5 +2133,13 @@ mod tests {
         // unknown skill → ok:false, no panic
         let miss = e.query_skill_setting("nope", "x", "{}");
         assert_eq!(miss.ok, false);
+    }
+
+    #[test]
+    fn settings_action_unknown_skill_returns_error() {
+        let engine = Engine::new();
+        let r = engine.settings_action("does.not.exist", "sign_in", "{}");
+        assert_eq!(r.ok, false);
+        assert!(r.error.unwrap().contains("does.not.exist"));
     }
 }
