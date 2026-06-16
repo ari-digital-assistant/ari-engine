@@ -239,6 +239,70 @@ impl CalendarProvider for NullCalendarProvider {
     }
 }
 
+// ── Location ───────────────────────────────────────────────────────────
+
+/// Typed outcome of a location request. `Ok` is the only status with
+/// meaningful coordinates; every other status carries zeroed fields so
+/// a skill that ignores `status` still gets safe (if useless) numbers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LocationStatus {
+    Ok,
+    PermissionDenied,
+    Unavailable,
+    Timeout,
+}
+
+impl LocationStatus {
+    /// The wire string used in the host-import JSON and the SDK.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LocationStatus::Ok => "ok",
+            LocationStatus::PermissionDenied => "permission_denied",
+            LocationStatus::Unavailable => "unavailable",
+            LocationStatus::Timeout => "timeout",
+        }
+    }
+}
+
+/// A coarse location fix (or the reason there isn't one).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LocationResult {
+    pub status: LocationStatus,
+    /// Decimal degrees. Valid only when `status == Ok`.
+    pub lat: f64,
+    pub lon: f64,
+    /// Horizontal accuracy estimate in metres.
+    pub accuracy_m: f64,
+    /// UTC epoch ms the fix was taken. 0 when `status != Ok`.
+    pub timestamp_ms: i64,
+}
+
+impl LocationResult {
+    /// A non-`Ok` result with zeroed coordinates.
+    pub fn err(status: LocationStatus) -> Self {
+        LocationResult { status, lat: 0.0, lon: 0.0, accuracy_m: 0.0, timestamp_ms: 0 }
+    }
+}
+
+/// Host-supplied access to the device's coarse location.
+pub trait LocationProvider: Send + Sync {
+    /// Return a coarse fix. Implementations should return a cached
+    /// last-known fix no older than `max_age_ms`, else request a single
+    /// fix and give up after `timeout_ms` (returning `Timeout`). Never
+    /// blocks longer than `timeout_ms`. Coarse accuracy only.
+    fn current(&self, max_age_ms: i64, timeout_ms: i64) -> LocationResult;
+}
+
+/// Default provider for hosts without a location implementation
+/// (CLI engine, Linux until its app exists). Always `Unavailable`.
+pub struct NullLocationProvider;
+
+impl LocationProvider for NullLocationProvider {
+    fn current(&self, _max_age_ms: i64, _timeout_ms: i64) -> LocationResult {
+        LocationResult::err(LocationStatus::Unavailable)
+    }
+}
+
 // ── Local clock ────────────────────────────────────────────────────────
 
 /// Components of the current local datetime, as seen by the host.
@@ -539,6 +603,17 @@ mod tests {
     #[test]
     fn english_locale_provider_returns_en() {
         assert_eq!(EnglishLocaleProvider.current_locale(), "en");
+    }
+
+    #[test]
+    fn null_location_provider_is_unavailable() {
+        let p = NullLocationProvider;
+        let r = p.current(600_000, 5_000);
+        assert_eq!(r.status, LocationStatus::Unavailable);
+        assert_eq!(r.lat, 0.0);
+        assert_eq!(r.lon, 0.0);
+        assert_eq!(r.accuracy_m, 0.0);
+        assert_eq!(r.timestamp_ms, 0);
     }
 }
 
