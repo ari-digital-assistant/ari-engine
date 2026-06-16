@@ -6,9 +6,10 @@ use ari_skill_loader::{
     load_skill_directory_with, AuthorizeInput, AuthorizeOutput, AuthorizeProvider, Calendar,
     CalendarEventRow, CalendarProvider, Capability, EnglishLocaleProvider, HostCapabilities,
     HttpConfig, InsertCalendarEventParams, InsertTaskParams, LoadOptions, LocalClock,
-    LocalTimeComponents, LocaleProvider, LogLevel, LogSink, NullAuthorizeProvider,
-    NullCalendarProvider, NullLogSink, NullSettingWriter, NullTasksProvider, SettingWriter,
-    StorageConfig, TaskList, TaskRow, TasksProvider, UtcLocalClock,
+    LocalTimeComponents, LocaleProvider, LocationProvider, LocationResult, LocationStatus, LogLevel,
+    LogSink, NullAuthorizeProvider, NullCalendarProvider, NullLocationProvider, NullLogSink,
+    NullSettingWriter, NullTasksProvider, SettingWriter, StorageConfig, TaskList, TaskRow,
+    TasksProvider, UtcLocalClock,
 };
 use ari_skills::{
     CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill,
@@ -43,6 +44,7 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
         .with(Capability::StorageKv)
         .with(Capability::Tasks)
         .with(Capability::Calendar)
+        .with(Capability::Location)
         .with(Capability::Authorize);
     LoadOptions {
         log_sink: Arc::new(NullLogSink),
@@ -51,6 +53,7 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
         storage_config: StorageConfig::new(PathBuf::from(storage_dir)),
         tasks_provider: Arc::new(NullTasksProvider),
         calendar_provider: Arc::new(NullCalendarProvider),
+        location_provider: Arc::new(NullLocationProvider),
         local_clock: Arc::new(UtcLocalClock),
         config_store: Arc::new(MemoryConfigStore::new()),
         locale_provider: Arc::new(EnglishLocaleProvider),
@@ -202,6 +205,23 @@ pub struct FfiCalendarEventRow {
     pub calendar_id: u64,
 }
 
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FfiLocationStatus {
+    Ok,
+    PermissionDenied,
+    Unavailable,
+    Timeout,
+}
+
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct FfiLocationResult {
+    pub status: FfiLocationStatus,
+    pub lat: f64,
+    pub lon: f64,
+    pub accuracy_m: f64,
+    pub timestamp_ms: i64,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiLocalTimeComponents {
     pub year: i32,
@@ -254,6 +274,14 @@ pub trait FfiCalendarProvider: Send + Sync {
         end_ms: i64,
         limit: u32,
     ) -> Vec<FfiCalendarEventRow>;
+}
+
+/// Foreign-implemented coarse location provider.
+#[uniffi::export(with_foreign)]
+pub trait FfiLocationProvider: Send + Sync {
+    /// Coarse fix; returns a cached last-known location no older than
+    /// `max_age_ms` else a single fresh fix, giving up after `timeout_ms`.
+    fn current(&self, max_age_ms: i64, timeout_ms: i64) -> FfiLocationResult;
 }
 
 /// Foreign-implemented wall-clock reader. Needed so skills can
@@ -385,6 +413,27 @@ impl CalendarProvider for ForeignCalendarProviderAdapter {
                 calendar_id: r.calendar_id,
             })
             .collect()
+    }
+}
+
+struct ForeignLocationProviderAdapter(Arc<dyn FfiLocationProvider>);
+
+impl LocationProvider for ForeignLocationProviderAdapter {
+    fn current(&self, max_age_ms: i64, timeout_ms: i64) -> LocationResult {
+        let r = self.0.current(max_age_ms, timeout_ms);
+        let status = match r.status {
+            FfiLocationStatus::Ok => LocationStatus::Ok,
+            FfiLocationStatus::PermissionDenied => LocationStatus::PermissionDenied,
+            FfiLocationStatus::Unavailable => LocationStatus::Unavailable,
+            FfiLocationStatus::Timeout => LocationStatus::Timeout,
+        };
+        LocationResult {
+            status,
+            lat: r.lat,
+            lon: r.lon,
+            accuracy_m: r.accuracy_m,
+            timestamp_ms: r.timestamp_ms,
+        }
     }
 }
 
@@ -550,6 +599,7 @@ pub struct AriEngine {
     // via [`AriEngine::with_platform_providers`].
     pub(crate) tasks_provider: Arc<dyn TasksProvider>,
     pub(crate) calendar_provider: Arc<dyn CalendarProvider>,
+    pub(crate) location_provider: Arc<dyn LocationProvider>,
     pub(crate) local_clock: Arc<dyn LocalClock>,
     /// Locale source of truth — engine reads through this whenever it
     /// needs to dispatch on language. Defaults to [`EnglishLocaleProvider`]
@@ -603,6 +653,7 @@ impl AriEngine {
             log_sink: Arc::new(NullLogSink),
             tasks_provider: Arc::new(NullTasksProvider),
             calendar_provider: Arc::new(NullCalendarProvider),
+            location_provider: Arc::new(NullLocationProvider),
             local_clock: Arc::new(UtcLocalClock),
             locale_provider: Arc::new(EnglishLocaleProvider),
             config_store,
@@ -628,6 +679,7 @@ impl AriEngine {
             log_sink,
             tasks_provider: Arc::new(NullTasksProvider),
             calendar_provider: Arc::new(NullCalendarProvider),
+            location_provider: Arc::new(NullLocationProvider),
             local_clock: Arc::new(UtcLocalClock),
             locale_provider: Arc::new(EnglishLocaleProvider),
             config_store,
@@ -649,6 +701,7 @@ impl AriEngine {
         sink: Option<Arc<dyn FfiLogSink>>,
         tasks: Option<Arc<dyn FfiTasksProvider>>,
         calendar: Option<Arc<dyn FfiCalendarProvider>>,
+        location: Option<Arc<dyn FfiLocationProvider>>,
         clock: Option<Arc<dyn FfiLocalClock>>,
         settings: Option<Arc<SkillSettingsStore>>,
         envelope_sink: Option<Arc<dyn FfiEnvelopeSink>>,
@@ -667,6 +720,10 @@ impl AriEngine {
         let calendar_provider: Arc<dyn CalendarProvider> = match calendar {
             Some(c) => Arc::new(ForeignCalendarProviderAdapter(c)),
             None => Arc::new(NullCalendarProvider),
+        };
+        let location_provider: Arc<dyn LocationProvider> = match location {
+            Some(l) => Arc::new(ForeignLocationProviderAdapter(l)),
+            None => Arc::new(NullLocationProvider),
         };
         let local_clock: Arc<dyn LocalClock> = match clock {
             Some(c) => Arc::new(ForeignLocalClockAdapter(c)),
@@ -701,6 +758,7 @@ impl AriEngine {
             log_sink,
             tasks_provider,
             calendar_provider,
+            location_provider,
             local_clock,
             locale_provider,
             config_store,
@@ -901,6 +959,7 @@ impl AriEngine {
         options.log_sink = self.log_sink.clone();
         options.tasks_provider = self.tasks_provider.clone();
         options.calendar_provider = self.calendar_provider.clone();
+        options.location_provider = self.location_provider.clone();
         options.local_clock = self.local_clock.clone();
         options.config_store = self.config_store.clone();
         options.locale_provider = self.locale_provider.clone();
@@ -947,6 +1006,9 @@ mod tests {
                 error: Some("cancelled".into()),
             }
         }
+        fn redirect_uri(&self) -> String {
+            "https://heyari.dev/oauth/callback".into()
+        }
     }
 
     #[test]
@@ -960,6 +1022,29 @@ mod tests {
         });
         assert_eq!(out.ok, false);
         assert_eq!(out.error.as_deref(), Some("cancelled"));
+    }
+
+    struct DeniedLocation;
+    impl FfiLocationProvider for DeniedLocation {
+        fn current(&self, _max_age_ms: i64, _timeout_ms: i64) -> FfiLocationResult {
+            FfiLocationResult {
+                status: FfiLocationStatus::PermissionDenied,
+                lat: 0.0,
+                lon: 0.0,
+                accuracy_m: 0.0,
+                timestamp_ms: 0,
+            }
+        }
+    }
+
+    #[test]
+    fn location_adapter_maps_status_and_coords() {
+        use ari_skill_loader::platform_capabilities::{LocationProvider, LocationStatus};
+        let adapter = ForeignLocationProviderAdapter(std::sync::Arc::new(DeniedLocation));
+        let r = adapter.current(600_000, 5_000);
+        assert_eq!(r.status, LocationStatus::PermissionDenied);
+        assert_eq!(r.lat, 0.0);
+        assert_eq!(r.timestamp_ms, 0);
     }
 
     #[test]

@@ -47,7 +47,8 @@ pub use localized_strings::{
 pub use platform_capabilities::{
     AuthorizeInput, AuthorizeOutput, AuthorizeProvider, Calendar, CalendarEventRow,
     CalendarProvider, EnglishLocaleProvider, InsertCalendarEventParams, InsertTaskParams,
-    LocalClock, LocalTimeComponents, LocaleProvider, NullAuthorizeProvider, NullCalendarProvider,
+    LocalClock, LocalTimeComponents, LocaleProvider, LocationProvider, LocationResult,
+    LocationStatus, NullAuthorizeProvider, NullCalendarProvider, NullLocationProvider,
     NullSettingWriter, NullTasksProvider, SettingWriter, TaskList, TaskRow, TasksProvider,
     UtcLocalClock,
 };
