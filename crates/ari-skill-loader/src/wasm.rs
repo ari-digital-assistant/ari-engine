@@ -135,6 +135,7 @@ const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
     ("calendar_insert", Some(Capability::Calendar)),
     ("calendar_delete", Some(Capability::Calendar)),
     ("calendar_query_in_range", Some(Capability::Calendar)),
+    ("location_current", Some(Capability::Location)),
     ("authorize", Some(Capability::Authorize)),
 ];
 
@@ -286,6 +287,7 @@ struct StoreData {
     /// skills that didn't declare the cap can't invoke the imports.
     tasks_provider: Option<Arc<dyn crate::platform_capabilities::TasksProvider>>,
     calendar_provider: Option<Arc<dyn crate::platform_capabilities::CalendarProvider>>,
+    location_provider: Option<Arc<dyn crate::platform_capabilities::LocationProvider>>,
     /// Authorize provider — `Some` only when `Capability::Authorize` granted.
     authorize_provider: Option<Arc<dyn crate::platform_capabilities::AuthorizeProvider>>,
     /// Local clock — ungated; every skill can read the wall clock.
@@ -382,6 +384,8 @@ pub struct WasmSkill {
     tasks_provider: Arc<dyn crate::platform_capabilities::TasksProvider>,
     /// Platform calendar capability. Same pattern as `tasks_provider`.
     calendar_provider: Arc<dyn crate::platform_capabilities::CalendarProvider>,
+    /// Platform location capability. Same pattern as `tasks_provider`.
+    location_provider: Arc<dyn crate::platform_capabilities::LocationProvider>,
     /// Browser round-trip capability (`ari::authorize`). Always present
     /// (possibly Null); gated into the store only when `Capability::Authorize`
     /// is granted. Same pattern as `tasks_provider`.
@@ -586,6 +590,7 @@ impl WasmSkill {
         let storage_config = &options.storage_config;
         let tasks_provider = options.tasks_provider.clone();
         let calendar_provider = options.calendar_provider.clone();
+        let location_provider = options.location_provider.clone();
         let authorize_provider = options.authorize_provider.clone();
         let local_clock = options.local_clock.clone();
         let config_store = options.config_store.clone();
@@ -683,6 +688,7 @@ impl WasmSkill {
             storage,
             tasks_provider,
             calendar_provider,
+            location_provider,
             authorize_provider,
             local_clock,
             config_store,
@@ -749,6 +755,11 @@ impl WasmSkill {
                 },
                 calendar_provider: if self.granted_capabilities.contains(&Capability::Calendar) {
                     Some(self.calendar_provider.clone())
+                } else {
+                    None
+                },
+                location_provider: if self.granted_capabilities.contains(&Capability::Location) {
+                    Some(self.location_provider.clone())
                 } else {
                     None
                 },
@@ -1006,6 +1017,19 @@ impl WasmSkill {
                      limit: i32|
                      -> i64 {
                         calendar_query_in_range_impl(&mut caller, start_ms, end_ms, limit)
+                    },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
+        }
+
+        // Location host import — gated on the Location capability.
+        if self.granted_capabilities.contains(&Capability::Location) {
+            linker
+                .func_wrap(
+                    "ari",
+                    "location_current",
+                    |mut caller: Caller<'_, StoreData>, max_age_ms: i64, timeout_ms: i64| -> i64 {
+                        location_current_impl(&mut caller, max_age_ms, timeout_ms)
                     },
                 )
                 .map_err(|e| WasmError::Compile(e.to_string()))?;
@@ -1834,6 +1858,31 @@ fn calendar_query_in_range_impl(
     write_response(caller, memory, &json)
 }
 
+fn location_current_impl(
+    caller: &mut Caller<'_, StoreData>,
+    max_age_ms: i64,
+    timeout_ms: i64,
+) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let provider = match caller.data().location_provider.clone() {
+        Some(p) => p,
+        None => return 0,
+    };
+    let r = provider.current(max_age_ms, timeout_ms);
+    let json = serde_json::json!({
+        "status": r.status.as_str(),
+        "lat": r.lat,
+        "lon": r.lon,
+        "accuracy_m": r.accuracy_m,
+        "timestamp_ms": r.timestamp_ms,
+    })
+    .to_string();
+    write_response(caller, memory, &json)
+}
+
 fn calendar_list_calendars_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
     let memory = match caller.get_export("memory") {
         Some(wasmtime::Extern::Memory(m)) => m,
@@ -2619,6 +2668,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn location_current_is_gated_on_location_capability() {
+        let cap = HOST_IMPORT_CAPABILITY_TABLE
+            .iter()
+            .find(|(name, _)| *name == "location_current")
+            .map(|(_, cap)| *cap);
+        assert_eq!(cap, Some(Some(Capability::Location)));
+    }
+
+    #[test]
     fn secret_keys_of_selects_only_secret_fields() {
         use crate::manifest::{ConfigField, ConfigFieldType};
         let mk = |key: &str, ft: ConfigFieldType| ConfigField {
@@ -2693,6 +2751,7 @@ mod tests {
             storage_config: test_storage_config(),
             tasks_provider: Arc::new(crate::NullTasksProvider),
             calendar_provider: Arc::new(crate::NullCalendarProvider),
+            location_provider: Arc::new(crate::platform_capabilities::NullLocationProvider),
             local_clock: Arc::new(crate::UtcLocalClock),
             config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
             locale_provider: Arc::new(crate::EnglishLocaleProvider),
@@ -3638,6 +3697,7 @@ mod tests {
                 storage_config: storage.clone(),
                 tasks_provider: Arc::new(crate::NullTasksProvider),
                 calendar_provider: Arc::new(crate::NullCalendarProvider),
+                location_provider: Arc::new(crate::platform_capabilities::NullLocationProvider),
                 local_clock: Arc::new(crate::UtcLocalClock),
                 config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
                 locale_provider: Arc::new(crate::EnglishLocaleProvider),
@@ -3750,6 +3810,7 @@ mod tests {
                 storage_config: storage.clone(),
                 tasks_provider: Arc::new(crate::NullTasksProvider),
                 calendar_provider: Arc::new(crate::NullCalendarProvider),
+                location_provider: Arc::new(crate::platform_capabilities::NullLocationProvider),
                 local_clock: Arc::new(crate::UtcLocalClock),
                 config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
                 locale_provider: Arc::new(crate::EnglishLocaleProvider),
