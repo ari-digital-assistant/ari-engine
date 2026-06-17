@@ -8,7 +8,8 @@
 
 use std::time::Duration;
 
-const DEFAULT_USER_AGENT: &str = concat!("ari-skill/", env!("CARGO_PKG_VERSION"));
+const DEFAULT_USER_AGENT: &str =
+    concat!("Ari/", env!("CARGO_PKG_VERSION"), " (+https://heyari.dev)");
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024; // 1 MiB
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_MAX_REDIRECTS: u32 = 5;
@@ -142,7 +143,12 @@ mod tests {
         assert_eq!(c.max_body_bytes, 1024 * 1024);
         assert_eq!(c.timeout, Duration::from_secs(10));
         assert_eq!(c.max_redirects, 5);
-        assert!(c.user_agent.starts_with("ari-skill/"));
+    }
+
+    #[test]
+    fn default_user_agent_identifies_ari_with_contact() {
+        let c = HttpConfig::strict();
+        assert_eq!(c.user_agent, concat!("Ari/", env!("CARGO_PKG_VERSION"), " (+https://heyari.dev)"));
     }
 
     #[test]
