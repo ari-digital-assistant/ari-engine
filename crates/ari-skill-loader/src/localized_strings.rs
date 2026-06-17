@@ -228,20 +228,29 @@ fn substitute_placeholders(template: &str, args: &BTreeMap<String, String>) -> S
     let mut out = String::with_capacity(template.len());
     let bytes = template.as_bytes();
     let mut i = 0;
+    // Start of the current run of literal (non-placeholder) bytes. We copy
+    // literal runs as whole string slices rather than byte-by-byte: scanning
+    // for the ASCII `{`/`}` braces is byte-safe (they never appear inside a
+    // multi-byte UTF-8 sequence), and slicing at those ASCII boundaries keeps
+    // multi-byte characters (°, —, accents) intact. Pushing bytes `as char`
+    // here would Latin-1-decode UTF-8 and mangle every non-ASCII character.
+    let mut literal_start = 0;
     while i < bytes.len() {
         if bytes[i] == b'{' {
             if let Some(end) = find_matching_brace(bytes, i + 1) {
                 let key = &template[i + 1..end];
                 if let Some(replacement) = args.get(key) {
+                    out.push_str(&template[literal_start..i]);
                     out.push_str(replacement);
                     i = end + 1;
+                    literal_start = i;
                     continue;
                 }
             }
         }
-        out.push(template.as_bytes()[i] as char);
         i += 1;
     }
+    out.push_str(&template[literal_start..]);
     out
 }
 
@@ -436,6 +445,28 @@ mod tests {
         args.insert("count".to_string(), "3".to_string());
         let rendered = strings.render("en", "greet", &args).unwrap();
         assert_eq!(rendered, "Hi Keith, you have 3 messages.");
+    }
+
+    #[test]
+    fn render_preserves_non_ascii_in_template() {
+        // Regression: the substitution pass walked the template byte-by-byte
+        // and pushed each byte `as char` (a Latin-1 decode), mangling every
+        // multi-byte UTF-8 char — "°" (C2 B0) became "Â°", em-dash "—" split
+        // into garbage, all Italian accents broke. Literal runs must be
+        // copied as UTF-8.
+        let td = TempDir::new();
+        let dir = make_strings_dir(td.path());
+        write(
+            dir.join("en.json"),
+            r#"{"line": "Feels like {temp}° — perfetto"}"#,
+        )
+        .unwrap();
+
+        let strings = parse_strings_directory(td.path()).expect("should parse");
+        let mut args = BTreeMap::new();
+        args.insert("temp".to_string(), "20".to_string());
+        let rendered = strings.render("en", "line", &args).unwrap();
+        assert_eq!(rendered, "Feels like 20° — perfetto");
     }
 
     #[test]
