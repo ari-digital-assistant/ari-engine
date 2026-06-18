@@ -92,6 +92,9 @@ pub struct FfiBrowseEntry {
     pub version: String,
     pub name: String,
     pub description: String,
+    /// "skill" or "assistant" — from the registry index. Lets the browse
+    /// UI filter assistants without substring-matching id/name/description.
+    pub skill_type: String,
     pub installed: bool,
     pub license: Option<String>,
     pub author: Option<String>,
@@ -342,6 +345,7 @@ impl SkillRegistry {
                     version: entry.version,
                     name: entry.name,
                     description: entry.description,
+                    skill_type: entry.skill_type,
                     license: entry.license,
                     author: entry.author,
                     homepage: entry.homepage,

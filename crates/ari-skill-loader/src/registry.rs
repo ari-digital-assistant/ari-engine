@@ -111,6 +111,10 @@ pub struct Index {
     pub skills: Vec<IndexEntry>,
 }
 
+fn default_skill_type() -> String {
+    "skill".to_string()
+}
+
 /// One row of `index.json`.
 ///
 /// All of the descriptive fields after `description` are optional with
@@ -125,6 +129,11 @@ pub struct IndexEntry {
     pub version: String,
     pub name: String,
     pub description: String,
+    /// "skill" (default) or "assistant", mirrored from the manifest's
+    /// metadata.ari.type. Defaults to "skill" for index_version:1 entries
+    /// written before this field existed.
+    #[serde(rename = "type", default = "default_skill_type")]
+    pub skill_type: String,
     #[serde(default)]
     pub license: Option<String>,
     /// Free-text author / maintainer string from SKILL.md frontmatter.
@@ -682,6 +691,24 @@ metadata:
     }
 
     #[test]
+    fn index_entry_defaults_type_to_skill_when_absent() {
+        let index = r#"{"index_version":1,"generated_at":"x","skills":[
+            {"id":"a","version":"1","name":"a","description":"d","bundle":"b","signature":"s","sha256":"h"}
+        ]}"#;
+        let parsed: Index = serde_json::from_str(index).unwrap();
+        assert_eq!(parsed.skills[0].skill_type, "skill");
+    }
+
+    #[test]
+    fn index_entry_reads_explicit_type() {
+        let index = r#"{"index_version":1,"generated_at":"x","skills":[
+            {"id":"a","version":"1","name":"a","description":"d","type":"assistant","bundle":"b","signature":"s","sha256":"h"}
+        ]}"#;
+        let parsed: Index = serde_json::from_str(index).unwrap();
+        assert_eq!(parsed.skills[0].skill_type, "assistant");
+    }
+
+    #[test]
     fn fetch_index_rejects_unsupported_version() {
         let index = r#"{"index_version":99,"generated_at":"x","skills":[]}"#;
         let mut routes = HashMap::new();
@@ -739,6 +766,7 @@ metadata:
                     version: "0.2.0".into(),
                     name: "coin-flip".into(),
                     description: "".into(),
+                    skill_type: "skill".into(),
                     license: None,
                     author: None,
                     homepage: None,
@@ -755,6 +783,7 @@ metadata:
                     version: "5.0.0".into(),
                     name: "counter".into(),
                     description: "".into(),
+                    skill_type: "skill".into(),
                     license: None,
                     author: None,
                     homepage: None,
@@ -801,6 +830,7 @@ metadata:
             version: "0.2.0".into(),
             name: "coin-flip".into(),
             description: "".into(),
+            skill_type: "skill".into(),
             license: None,
             author: None,
             homepage: None,
@@ -1128,6 +1158,7 @@ metadata:
             version: "0.3.0".into(),
             name: "coin-flip".into(),
             description: "".into(),
+            skill_type: "skill".into(),
             license: None,
             author: None,
             homepage: None,
@@ -1151,6 +1182,7 @@ metadata:
             version: "0.1.0".into(),
             name: "legacy".into(),
             description: "".into(),
+            skill_type: "skill".into(),
             license: None,
             author: None,
             homepage: None,
