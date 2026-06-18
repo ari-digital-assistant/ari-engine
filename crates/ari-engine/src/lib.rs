@@ -321,6 +321,27 @@ impl Engine {
         (response, skill_id)
     }
 
+    /// True when a skill is usable for routing. A skill that declares a
+    /// `fallback.requires_setting` is only "ready" while that setting holds
+    /// a non-empty value — an unconfigured gated skill (e.g. Home Assistant
+    /// before its `base_url` is set) is excluded from BOTH the keyword scorer
+    /// and the router catalog so it can't shadow or destabilise routing for
+    /// unrelated utterances. Skills without a `requires_setting` are always
+    /// ready. Mirrors the gate the fallback-tier loop already applies.
+    fn skill_is_ready(&self, skill: &dyn Skill) -> bool {
+        let Some(tier) = skill.fallback_tier() else {
+            return true;
+        };
+        let Some(key) = tier.requires_setting else {
+            return true;
+        };
+        self.config_store
+            .as_ref()
+            .and_then(|cs| cs.get(skill.id(), &key))
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    }
+
     pub fn process_input_traced(&self, input: &str) -> (Response, Option<DebugTrace>) {
         let normalized = normalize_input(input.trim(), &self.ctx.locale);
         if normalized.is_empty() {
@@ -359,6 +380,7 @@ impl Engine {
         let scores: Vec<SkillScore> = self
             .skills
             .iter()
+            .filter(|s| self.skill_is_ready(s.as_ref()))
             .map(|s| SkillScore {
                 skill_id: s.id().to_string(),
                 specificity: s.specificity(),
@@ -419,6 +441,7 @@ impl Engine {
         let skill_catalog: Vec<(String, String, String)> = self
             .skills
             .iter()
+            .filter(|s| self.skill_is_ready(s.as_ref()))
             .map(|s| (
                 s.id().to_string(),
                 s.description().to_string(),
@@ -1346,6 +1369,7 @@ mod tests {
         specificity: Specificity,
         fixed_score: f32,
         response: &'static str,
+        requires_setting: Option<&'static str>, // NEW: gates readiness
     }
 
     impl Skill for MockSkill {
@@ -1355,6 +1379,54 @@ mod tests {
         fn execute(&self, _input: &str, _ctx: &SkillContext) -> Response {
             Response::Text(self.response.to_string())
         }
+        fn fallback_tier(&self) -> Option<FallbackTier> {
+            self.requires_setting.map(|k| FallbackTier {
+                requires_setting: Some(k.to_string()),
+            })
+        }
+    }
+
+    // --- Readiness gate (skill_is_ready) ---
+
+    #[test]
+    fn unconfigured_gated_skill_is_excluded_from_scorer() {
+        use ari_skill_loader::assistant::MemoryConfigStore;
+        use std::sync::Arc;
+
+        let mut engine = Engine::new();
+        // A high-specificity skill that would win at its score, but is gated
+        // on `base_url` which is NOT set in the config store.
+        engine.register_skill(Box::new(MockSkill {
+            id: "gated", specificity: Specificity::High, fixed_score: 1.0,
+            response: "gated-ran", requires_setting: Some("base_url"),
+        }));
+        // Empty config store → "base_url" unset → skill not ready.
+        engine.set_config_store(Some(Arc::new(MemoryConfigStore::new())));
+
+        let (resp, trace) = engine.process_input_traced("test");
+        // The gated skill must NOT win the scorer round even at score 1.0.
+        let trace = trace.unwrap();
+        assert_eq!(trace.winner, None, "unready gated skill must not win scoring");
+        assert!(matches!(resp, Response::Text(ref s) if s == FALLBACK_RESPONSE));
+    }
+
+    #[test]
+    fn configured_gated_skill_participates_in_scorer() {
+        use ari_skill_loader::assistant::MemoryConfigStore;
+        use std::sync::Arc;
+
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(MockSkill {
+            id: "gated", specificity: Specificity::High, fixed_score: 0.85,
+            response: "gated-ran", requires_setting: Some("base_url"),
+        }));
+        let mut store = MemoryConfigStore::new();
+        store.set("gated", "base_url", "http://homeassistant.local:8123");
+        engine.set_config_store(Some(Arc::new(store)));
+
+        let (resp, trace) = engine.process_input_traced("test");
+        assert_eq!(trace.unwrap().winner.as_deref(), Some("gated"));
+        assert!(matches!(resp, Response::Text(ref s) if s == "gated-ran"));
     }
 
     // --- Named-assistant API error extraction ---
@@ -1428,6 +1500,7 @@ mod tests {
         let mut engine = Engine::new();
         engine.register_skill(Box::new(MockSkill {
             id: "weak", specificity: Specificity::High, fixed_score: 0.3, response: "nope",
+            requires_setting: None,
         }));
         let (resp, trace) = engine.process_input_traced("test");
         assert!(matches!(resp, Response::Text(ref s) if s == FALLBACK_RESPONSE));
@@ -1445,6 +1518,7 @@ mod tests {
         let mut engine = Engine::new();
         engine.register_skill(Box::new(MockSkill {
             id: "high", specificity: Specificity::High, fixed_score: 0.85, response: "high",
+            requires_setting: None,
         }));
         let (_, trace) = engine.process_input_traced("test");
         let trace = trace.unwrap();
@@ -1457,6 +1531,7 @@ mod tests {
         let mut engine = Engine::new();
         engine.register_skill(Box::new(MockSkill {
             id: "high", specificity: Specificity::High, fixed_score: 0.84, response: "high",
+            requires_setting: None,
         }));
         let (_, trace) = engine.process_input_traced("test");
         let trace = trace.unwrap();
@@ -1469,6 +1544,7 @@ mod tests {
         let mut engine = Engine::new();
         engine.register_skill(Box::new(MockSkill {
             id: "med", specificity: Specificity::Medium, fixed_score: 0.99, response: "med",
+            requires_setting: None,
         }));
         let (_, trace) = engine.process_input_traced("test");
         let trace = trace.unwrap();
@@ -1481,6 +1557,7 @@ mod tests {
         let mut engine = Engine::new();
         engine.register_skill(Box::new(MockSkill {
             id: "low", specificity: Specificity::Low, fixed_score: 0.99, response: "low",
+            requires_setting: None,
         }));
         let (_, trace) = engine.process_input_traced("test");
         let trace = trace.unwrap();
@@ -1493,6 +1570,7 @@ mod tests {
         let mut engine = Engine::new();
         engine.register_skill(Box::new(MockSkill {
             id: "low", specificity: Specificity::Low, fixed_score: 0.79, response: "low",
+            requires_setting: None,
         }));
         let (resp, trace) = engine.process_input_traced("test");
         assert!(matches!(resp, Response::Text(ref s) if s == FALLBACK_RESPONSE));
@@ -1504,9 +1582,11 @@ mod tests {
         let mut engine = Engine::new();
         engine.register_skill(Box::new(MockSkill {
             id: "high", specificity: Specificity::High, fixed_score: 0.86, response: "high wins",
+            requires_setting: None,
         }));
         engine.register_skill(Box::new(MockSkill {
             id: "low", specificity: Specificity::Low, fixed_score: 0.95, response: "low wins",
+            requires_setting: None,
         }));
         // High at 0.86 wins round 1. Low at 0.95 can't enter until round 3.
         let (resp, trace) = engine.process_input_traced("test");
@@ -1519,9 +1599,11 @@ mod tests {
         let mut engine = Engine::new();
         engine.register_skill(Box::new(MockSkill {
             id: "a", specificity: Specificity::High, fixed_score: 0.86, response: "a",
+            requires_setting: None,
         }));
         engine.register_skill(Box::new(MockSkill {
             id: "b", specificity: Specificity::High, fixed_score: 0.92, response: "b",
+            requires_setting: None,
         }));
         let resp = engine.process_input("test");
         assert!(matches!(resp, Response::Text(ref s) if s == "b"));
@@ -1534,12 +1616,15 @@ mod tests {
         let mut engine = Engine::new();
         engine.register_skill(Box::new(MockSkill {
             id: "a", specificity: Specificity::High, fixed_score: 0.9, response: "a",
+            requires_setting: None,
         }));
         engine.register_skill(Box::new(MockSkill {
             id: "b", specificity: Specificity::Medium, fixed_score: 0.5, response: "b",
+            requires_setting: None,
         }));
         engine.register_skill(Box::new(MockSkill {
             id: "c", specificity: Specificity::Low, fixed_score: 0.1, response: "c",
+            requires_setting: None,
         }));
         let (_, trace) = engine.process_input_traced("test");
         let trace = trace.unwrap();
@@ -1559,6 +1644,7 @@ mod tests {
         let mut engine = Engine::new();
         engine.register_skill(Box::new(MockSkill {
             id: "any", specificity: Specificity::High, fixed_score: 0.95, response: "ok",
+            requires_setting: None,
         }));
         let (_, trace) = engine.process_input_traced("What's the TIME?!");
         assert_eq!(trace.unwrap().normalized_input, "what is the time");
@@ -1569,6 +1655,7 @@ mod tests {
         let mut engine = Engine::new();
         engine.register_skill(Box::new(MockSkill {
             id: "x", specificity: Specificity::High, fixed_score: 0.1, response: "x",
+            requires_setting: None,
         }));
         let (_, trace) = engine.process_input_traced("test");
         let trace = trace.unwrap();
@@ -1711,6 +1798,7 @@ mod tests {
         let mut engine = Engine::new();
         engine.register_skill(Box::new(MockSkill {
             id: "text.skill", specificity: Specificity::High, fixed_score: 0.95, response: "plain",
+            requires_setting: None,
         }));
         let (resp, _) = engine.process_input_traced("anything");
         assert!(matches!(resp, Response::Text(ref s) if s == "plain"));
