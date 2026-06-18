@@ -601,7 +601,7 @@ impl WasmSkill {
         config.consume_fuel(true);
         let engine = Engine::new(&config).map_err(|e| WasmError::Compile(e.to_string()))?;
 
-        let module = compile_module_on_big_stack(&engine, bytes)?;
+        let module = compile_module_cached(&engine, bytes, options.compile_cache_dir.as_deref())?;
 
         let memory_limit_bytes = wasm.memory_limit_mb.max(1) as usize * 1024 * 1024;
         let matching = ari.matching.as_ref().ok_or(WasmError::NotWasm)?;
@@ -1397,22 +1397,26 @@ fn validate_module_imports(
     Ok(())
 }
 
-/// Compile a WASM module on a dedicated thread with an 8 MB stack.
+/// Cache-file name for a module's bytes: the lowercase hex SHA-256 of the
+/// raw `.wasm`, with a `.cwasm` extension. Content-addressed, so a changed
+/// skill (new bytes) lands at a new key and the stale entry is simply left
+/// behind — wasmtime never reads it again. A handful of orphans for the
+/// handful of installed skills isn't worth a GC pass.
+fn wasm_cache_key(bytes: &[u8]) -> String {
+    format!("{}.cwasm", crate::bundle::sha256_hex(bytes))
+}
+
+/// Run the actual cranelift compile on a dedicated 8 MB-stack thread.
 ///
-/// **Why:** `wasmtime::Module::new` runs cranelift synchronously on the
-/// calling thread. Cranelift allocates significant stack frames for its IR
-/// transforms — desktop threads have ~8 MB and handle it fine, but Android
-/// coroutine workers (`Dispatchers.IO` etc.) can have as little as a few
-/// hundred KB and blow the stack with SIGSEGV / "stack pointer is not in
-/// a rw map". We hit this trying to install a WASM skill through the
-/// Android UI and it killed the app instantly.
-///
-/// Rather than telling every caller to be mindful of their stack, we
-/// always compile on a fresh `std::thread` sized to match desktop. The
-/// overhead is one thread spawn + join per WasmSkill construction, which
-/// is measured in microseconds — cranelift itself dominates by orders of
-/// magnitude, so the wrapper cost is invisible.
-fn compile_module_on_big_stack(engine: &Engine, bytes: &[u8]) -> Result<Module, WasmError> {
+/// **Why the thread:** `wasmtime::Module::new` runs cranelift synchronously
+/// on the calling thread, and cranelift allocates significant stack frames
+/// for its IR transforms. Desktop threads have ~8 MB and handle it fine, but
+/// Android coroutine workers (`Dispatchers.IO` etc.) can have as little as a
+/// few hundred KB and blow the stack with SIGSEGV / "stack pointer is not in
+/// a rw map". We hit this installing a WASM skill through the Android UI and
+/// it killed the app instantly. Rather than asking every caller to mind its
+/// stack, we always compile on a fresh thread sized to match desktop.
+fn compile_on_big_stack(engine: &Engine, bytes: &[u8]) -> Result<Module, WasmError> {
     let engine_clone = engine.clone();
     let bytes_vec = bytes.to_vec();
     let handle = std::thread::Builder::new()
@@ -1425,6 +1429,72 @@ fn compile_module_on_big_stack(engine: &Engine, bytes: &[u8]) -> Result<Module, 
     handle
         .join()
         .map_err(|_| WasmError::Compile("wasm compile thread panicked".to_string()))?
+}
+
+/// Obtain a compiled [`Module`] for `bytes`, using a persistent cwasm cache
+/// when `cache_dir` is set.
+///
+/// The compile path (cranelift) is the multi-second cost behind the Android
+/// startup ANR — and it ran on every process start because nothing persisted
+/// the result. With a cache dir, the first launch compiles and serialises the
+/// module; every later launch `mmap`-deserialises it in ~milliseconds.
+///
+/// Serialised modules are version- and config-stamped by wasmtime, and
+/// [`Module::deserialize_file`] *validates* that stamp — a wasmtime upgrade or
+/// a corrupt file yields `Err`, not UB, so we treat any deserialise failure as
+/// a cache miss and recompile (overwriting the stale entry). The cache lives
+/// in app-private storage, so the file is as trustworthy as the rest of the
+/// skill payload we already loaded.
+///
+/// Caching is strictly best-effort: a missing/unwritable cache dir, a
+/// serialise error, or a write error all fall back to a plain compile. We
+/// never fail a skill load just because we couldn't cache it.
+fn compile_module_cached(
+    engine: &Engine,
+    bytes: &[u8],
+    cache_dir: Option<&Path>,
+) -> Result<Module, WasmError> {
+    let Some(dir) = cache_dir else {
+        return compile_on_big_stack(engine, bytes);
+    };
+
+    let cache_path = dir.join(wasm_cache_key(bytes));
+    if cache_path.is_file() {
+        // SAFETY: the file was produced by this app's `Module::serialize`.
+        // `deserialize_file` checks the embedded version/config fingerprint
+        // and returns `Err` (not UB) on any mismatch, which we handle as a
+        // miss below.
+        match unsafe { Module::deserialize_file(engine, &cache_path) } {
+            Ok(module) => return Ok(module),
+            Err(_) => {
+                // Stale (wasmtime upgraded) or corrupt — fall through and
+                // recompile, overwriting the bad entry.
+            }
+        }
+    }
+
+    let module = compile_on_big_stack(engine, bytes)?;
+    if let Ok(serialized) = module.serialize() {
+        write_cache_atomically(dir, &cache_path, &serialized);
+    }
+    Ok(module)
+}
+
+/// Best-effort atomic cache write: write to a sibling temp file, then rename
+/// over the final path so a crash mid-write can never leave a truncated
+/// cwasm that a later launch would try to `mmap`. All failures are swallowed
+/// — the caller already holds a usable in-memory module.
+fn write_cache_atomically(dir: &Path, final_path: &Path, bytes: &[u8]) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let tmp_path = final_path.with_extension("cwasm.tmp");
+    if std::fs::write(&tmp_path, bytes).is_err() {
+        return;
+    }
+    if std::fs::rename(&tmp_path, final_path).is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
 }
 
 /// Outcome of evaluating one redirect hop against the host policy.
@@ -2757,7 +2827,101 @@ mod tests {
             locale_provider: Arc::new(crate::EnglishLocaleProvider),
             setting_writer: Arc::new(crate::NullSettingWriter),
             authorize_provider: Arc::new(crate::NullAuthorizeProvider),
+            compile_cache_dir: None,
         }
+    }
+
+    /// Engine config used by the compile-cache tests. Must match the config
+    /// `WasmSkill::from_parts` builds, otherwise a cwasm serialised here
+    /// wouldn't deserialise on the production path (and vice-versa).
+    fn cache_test_engine() -> Engine {
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        Engine::new(&config).unwrap()
+    }
+
+    fn unique_cache_dir() -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("ari-wasm-cache-test-{nanos}-{n}"));
+        dir
+    }
+
+    fn export_names(module: &Module) -> Vec<String> {
+        module.exports().map(|e| e.name().to_string()).collect()
+    }
+
+    #[test]
+    fn wasm_cache_key_is_sha256_hex_with_cwasm_ext() {
+        let bytes = wat::parse_str(echo_wat()).unwrap();
+        let expected = format!("{}.cwasm", crate::bundle::sha256_hex(&bytes));
+        assert_eq!(wasm_cache_key(&bytes), expected);
+        // Different bytes → different key.
+        let other = wat::parse_str(action_wat()).unwrap();
+        assert_ne!(wasm_cache_key(&other), wasm_cache_key(&bytes));
+    }
+
+    #[test]
+    fn compile_cache_writes_one_deserializable_cwasm() {
+        let bytes = wat::parse_str(echo_wat()).unwrap();
+        let engine = cache_test_engine();
+        let dir = unique_cache_dir();
+
+        let module = compile_module_cached(&engine, &bytes, Some(&dir)).unwrap();
+        assert!(export_names(&module).contains(&"execute".to_string()));
+
+        // Exactly one file, named by the content hash.
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap()).collect();
+        assert_eq!(entries.len(), 1);
+        let cwasm = dir.join(wasm_cache_key(&bytes));
+        assert!(cwasm.is_file());
+
+        // The written bytes are a genuine wasmtime artifact: a fresh engine
+        // with the same config deserialises them into the same module.
+        let fresh = cache_test_engine();
+        let restored = unsafe { Module::deserialize_file(&fresh, &cwasm) }.unwrap();
+        assert!(export_names(&restored).contains(&"execute".to_string()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compile_cache_hit_loads_from_disk_not_recompile() {
+        // A module whose export set is distinguishable from echo_wat's, so we
+        // can tell which one we got back.
+        let marker_wat = r#"(module (func (export "marker_export")))"#;
+        let echo_bytes = wat::parse_str(echo_wat()).unwrap();
+        let engine = cache_test_engine();
+        let dir = unique_cache_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Plant the marker module's cwasm AT echo's cache key. If the hit
+        // path is taken, asking to compile echo's bytes must return the
+        // marker module (read from disk) — never echo (recompiled).
+        let marker = compile_module_cached(&engine, &wat::parse_str(marker_wat).unwrap(), None)
+            .unwrap();
+        let planted = dir.join(wasm_cache_key(&echo_bytes));
+        std::fs::write(&planted, marker.serialize().unwrap()).unwrap();
+
+        let got = compile_module_cached(&engine, &echo_bytes, Some(&dir)).unwrap();
+        let names = export_names(&got);
+        assert!(names.contains(&"marker_export".to_string()), "expected disk hit, got {names:?}");
+        assert!(!names.contains(&"execute".to_string()), "recompiled echo instead of hitting cache");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compile_without_cache_dir_writes_nothing() {
+        let bytes = wat::parse_str(echo_wat()).unwrap();
+        let engine = cache_test_engine();
+        let module = compile_module_cached(&engine, &bytes, None).unwrap();
+        assert!(export_names(&module).contains(&"execute".to_string()));
     }
 
     #[test]
@@ -3703,6 +3867,7 @@ mod tests {
                 locale_provider: Arc::new(crate::EnglishLocaleProvider),
                 setting_writer: Arc::new(crate::NullSettingWriter),
                 authorize_provider: Arc::new(crate::NullAuthorizeProvider),
+                compile_cache_dir: None,
             },
         )
         .unwrap()
@@ -3816,6 +3981,7 @@ mod tests {
                 locale_provider: Arc::new(crate::EnglishLocaleProvider),
                 setting_writer: Arc::new(crate::NullSettingWriter),
                 authorize_provider: Arc::new(crate::NullAuthorizeProvider),
+                compile_cache_dir: None,
             },
         )
         .unwrap();

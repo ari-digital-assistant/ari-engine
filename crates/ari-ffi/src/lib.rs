@@ -59,6 +59,12 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
         locale_provider: Arc::new(EnglishLocaleProvider),
         setting_writer: Arc::new(NullSettingWriter),
         authorize_provider: Arc::new(NullAuthorizeProvider),
+        // Persist cranelift output so skill compilation is a one-time cost
+        // per skill version, not a per-launch one. Without this, every
+        // process start recompiled every installed WASM skill on the main
+        // thread — the root of the startup ANR. The dir sits under the
+        // app-private storage root the host already hands us.
+        compile_cache_dir: Some(PathBuf::from(storage_dir).join("wasm-cache")),
     }
 }
 

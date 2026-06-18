@@ -163,6 +163,15 @@ pub struct LoadOptions {
     pub setting_writer: Arc<dyn crate::platform_capabilities::SettingWriter>,
     /// Backs `ari::authorize`. Defaults to [`NullAuthorizeProvider`].
     pub authorize_provider: Arc<dyn crate::platform_capabilities::AuthorizeProvider>,
+    /// Directory for the compiled-module (cwasm) cache. When set, each
+    /// WASM skill's Cranelift output is serialised here keyed by the
+    /// hash of its bytes and `mmap`-loaded on subsequent launches,
+    /// turning a multi-second cold compile into a near-instant
+    /// deserialise. `None` (the default) compiles from scratch every
+    /// time — fine for the CLI and tests, but the Android host always
+    /// wires a cache dir because it reloads skills on every process
+    /// start (see `android_load_options`).
+    pub compile_cache_dir: Option<PathBuf>,
 }
 
 impl Default for LoadOptions {
@@ -180,6 +189,7 @@ impl Default for LoadOptions {
             locale_provider: Arc::new(crate::platform_capabilities::EnglishLocaleProvider),
             setting_writer: Arc::new(crate::platform_capabilities::NullSettingWriter),
             authorize_provider: Arc::new(crate::platform_capabilities::NullAuthorizeProvider),
+            compile_cache_dir: None,
         }
     }
 }
