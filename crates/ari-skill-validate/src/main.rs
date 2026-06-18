@@ -176,6 +176,11 @@ struct Row {
     path: PathBuf,
     ok: bool,
     id: Option<String>,
+    /// "skill" (default) or "assistant", from metadata.ari.type. Lets the
+    /// registry index carry a real type so clients can filter without
+    /// substring-matching the id/name/description. Emitted as the JSON key
+    /// `type` by `render_json` (this crate hand-rolls JSON — no serde derive).
+    skill_type: String,
     version: Option<String>,
     name: Option<String>,
     description: Option<String>,
@@ -208,6 +213,7 @@ impl Row {
             path: path.to_path_buf(),
             ok: false,
             id: None,
+            skill_type: "skill".to_string(),
             version: None,
             name: None,
             description: None,
@@ -227,6 +233,7 @@ impl Row {
             path: path.to_path_buf(),
             ok: false,
             id: None,
+            skill_type: "skill".to_string(),
             version: None,
             name: None,
             description: None,
@@ -256,6 +263,7 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             path: path.to_path_buf(),
             ok: true,
             id: Some(skill.id().to_string()),
+            skill_type: "skill".to_string(),
             version: fields.version,
             name: fields.name,
             description: fields.description,
@@ -279,6 +287,7 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             path: path.to_path_buf(),
             ok: true,
             id: Some(entry.id.clone()),
+            skill_type: "assistant".to_string(),
             version: fields.version,
             name: Some(entry.name.clone()),
             description: Some(entry.description.clone()),
@@ -299,6 +308,7 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             path: path.to_path_buf(),
             ok: false,
             id: None,
+            skill_type: "skill".to_string(),
             version: None,
             name: None,
             description: None,
@@ -318,6 +328,7 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
         path: path.to_path_buf(),
         ok: false,
         id: None,
+        skill_type: "skill".to_string(),
         version: None,
         name: None,
         description: None,
@@ -544,6 +555,13 @@ fn render_pr_comment(rows: &[Row], ok: usize, failed: usize) {
 }
 
 fn render_json(rows: &[Row]) {
+    print!("{}", json_for_rows(rows));
+}
+
+/// Build the machine-readable JSON array for `rows`. Split out from
+/// `render_json` so tests can assert the exact emitted shape without
+/// capturing stdout.
+fn json_for_rows(rows: &[Row]) -> String {
     // Hand-rolled JSON to keep the validator crate dependency-free (it only
     // pulls in ari-skill-loader, nothing else). The shape is small and
     // fixed, so serde here would be overkill.
@@ -556,6 +574,7 @@ fn render_json(rows: &[Row]) {
         push_json_kv(&mut out, "path", &row.path.display().to_string(), true);
         push_json_bool(&mut out, "ok", row.ok, true);
         push_json_opt(&mut out, "id", row.id.as_deref(), true);
+        push_json_kv(&mut out, "type", &row.skill_type, true);
         push_json_opt(&mut out, "version", row.version.as_deref(), true);
         push_json_opt(&mut out, "name", row.name.as_deref(), true);
         push_json_opt(&mut out, "description", row.description.as_deref(), true);
@@ -597,7 +616,7 @@ fn render_json(rows: &[Row]) {
         out.push_str("  }");
     }
     out.push_str("\n]\n");
-    print!("{out}");
+    out
 }
 
 fn push_json_kv(out: &mut String, key: &str, value: &str, trailing_comma: bool) {
@@ -885,5 +904,107 @@ metadata:
     fn escape_pipe_doubles_up_pipes_for_markdown_tables() {
         assert_eq!(escape_pipe("a|b"), "a\\|b");
         assert_eq!(escape_pipe("plain"), "plain");
+    }
+
+    /// Validate a written-out skill dir end-to-end (loader → rows) and
+    /// return the single resulting row. Mirrors `main`'s single-skill path.
+    fn row_for_skill_md(slug: &str, md: &str) -> Row {
+        use std::fs;
+        let dir = tempdir_lite::TempDir::new("ari-validate-type-test");
+        let skill = dir.path().join(slug);
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.en.md"), md).unwrap();
+
+        let options = LoadOptions {
+            host_capabilities: HostCapabilities::all(),
+            ..LoadOptions::default()
+        };
+        let report = load_single_skill_dir_with(&skill, &options);
+        let mut rows: Vec<Row> = Vec::new();
+        push_rows_from_report(&mut rows, &skill, &report);
+        assert_eq!(rows.len(), 1, "expected exactly one row, got {rows:?}");
+        rows.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn emits_type_skill_for_regular_manifest() {
+        let md = r#"---
+name: greet
+description: Greets the user.
+metadata:
+  ari:
+    id: ai.example.greet
+    version: "0.1.0"
+    engine: ">=0.3"
+    languages: [en]
+    matching:
+      patterns:
+        - keywords: [hello, hi]
+          weight: 0.95
+    examples:
+      - text: "hello"
+      - text: "hi there"
+      - text: "good morning"
+      - text: "hey"
+      - text: "greetings"
+    declarative:
+      response: "Hello!"
+---
+Greet skill.
+"#;
+        let row = row_for_skill_md("greet", md);
+        assert!(row.ok, "regular skill must load ok, failures: {:?}", row.failures);
+        assert_eq!(row.id.as_deref(), Some("ai.example.greet"));
+        assert_eq!(row.skill_type, "skill");
+
+        let json = json_for_rows(std::slice::from_ref(&row));
+        assert!(
+            json.contains("\"type\": \"skill\""),
+            "JSON must carry the skill type, got:\n{json}"
+        );
+    }
+
+    #[test]
+    fn emits_type_assistant_for_assistant_manifest() {
+        // Mirrors ari-skill-loader's `chatgpt_assistant_md` fixture: a
+        // `metadata.ari.type: assistant` manifest with the required
+        // `assistant:` block. Such manifests land in `report.assistants`.
+        let md = r#"---
+name: chatgpt
+description: Use OpenAI's ChatGPT to answer general questions.
+metadata:
+  ari:
+    id: dev.heyari.assistant.chatgpt
+    version: "0.1.0"
+    type: assistant
+    engine: ">=0.3"
+    assistant:
+      provider: api
+      privacy: cloud
+      api:
+        endpoint: https://api.openai.com/v1/chat/completions
+        auth: bearer
+        auth_config_key: api_key
+        default_model: gpt-4o-mini
+        system_prompt: You are Ari.
+        response_path: "choices[0].message.content"
+      config:
+        - key: api_key
+          label: API Key
+          type: secret
+          required: true
+---
+ChatGPT assistant.
+"#;
+        let row = row_for_skill_md("chatgpt", md);
+        assert!(row.ok, "assistant must load ok, failures: {:?}", row.failures);
+        assert_eq!(row.id.as_deref(), Some("dev.heyari.assistant.chatgpt"));
+        assert_eq!(row.skill_type, "assistant");
+
+        let json = json_for_rows(std::slice::from_ref(&row));
+        assert!(
+            json.contains("\"type\": \"assistant\""),
+            "JSON must carry the assistant type, got:\n{json}"
+        );
     }
 }
