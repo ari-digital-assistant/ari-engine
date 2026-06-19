@@ -177,6 +177,62 @@ pub enum FfiRegistryError {
 
     #[error("trust key: {message}")]
     TrustKey { message: String },
+
+    /// Couldn't reach the registry / a transport-level failure. This is the
+    /// only variant that genuinely warrants a "check your connection" hint.
+    #[error("network error: {message}")]
+    Network { message: String },
+
+    /// The registry host answered, but with a non-success HTTP status
+    /// (404 for a missing bundle, 5xx for an outage, …).
+    #[error("registry returned status {status}")]
+    BadStatus { status: u32 },
+
+    /// The bundle exceeds the install size cap. Distinct from a network
+    /// failure so the UI can tell the user the skill is too large rather
+    /// than blaming their connection.
+    #[error("skill bundle is too large to install (limit {limit_bytes} bytes)")]
+    TooLarge { limit_bytes: u64 },
+
+    /// The downloaded bundle failed verification — sha256 mismatch, bad
+    /// signature, unsafe tar entry, or a corrupt archive. The skill was
+    /// not installed.
+    #[error("skill failed verification: {message}")]
+    Integrity { message: String },
+}
+
+/// Map a low-level [`RegistryError`] to the FFI-facing [`FfiRegistryError`]
+/// so the UI can show an accurate reason instead of assuming every failure
+/// is a dropped network connection (the old behaviour: every non-NotFound
+/// error collapsed into [`FfiRegistryError::Registry`], which the Android
+/// layer rendered as "check your connection" — so an oversized or
+/// tampered-with bundle looked identical to being offline).
+///
+/// `#[uniffi(flat_error)]` means only the variant and its Display string
+/// cross the FFI boundary, which is all the Kotlin mapping needs.
+fn map_registry_error(e: RegistryError) -> FfiRegistryError {
+    match e {
+        RegistryError::NotFound { id } => FfiRegistryError::NotFound { id },
+        RegistryError::ManifestUnavailable { id } => {
+            FfiRegistryError::ManifestUnavailable { id }
+        }
+        RegistryError::Http(message) => FfiRegistryError::Network { message },
+        RegistryError::BadStatus { status, .. } => {
+            FfiRegistryError::BadStatus { status: u32::from(status) }
+        }
+        RegistryError::TooLarge { limit, .. } => {
+            FfiRegistryError::TooLarge { limit_bytes: limit as u64 }
+        }
+        // sha mismatch or any bundle-level failure (bad signature, unsafe
+        // tar entry, corrupt archive) → the skill couldn't be safely
+        // verified. Don't blame the network.
+        e @ (RegistryError::ShaMismatch { .. } | RegistryError::Install(_)) => {
+            FfiRegistryError::Integrity { message: e.to_string() }
+        }
+        // Parse / UnsupportedIndexVersion: a genuine registry-format
+        // problem; keep the generic bucket.
+        other => FfiRegistryError::Registry { message: other.to_string() },
+    }
 }
 
 fn trust_root() -> Result<TrustRoot, FfiRegistryError> {
@@ -256,9 +312,7 @@ impl SkillRegistry {
     /// Blocks on the network — callers must run this off the main thread.
     pub fn check_for_updates(&self) -> Result<Vec<FfiSkillUpdate>, FfiRegistryError> {
         let client = RegistryClient::new();
-        let index = client.fetch_index().map_err(|e| FfiRegistryError::Registry {
-            message: e.to_string(),
-        })?;
+        let index = client.fetch_index().map_err(map_registry_error)?;
         let store = self.store.lock().expect("skill store mutex poisoned");
         let updates = check_updates(&store, &index);
         Ok(updates
@@ -284,9 +338,7 @@ impl SkillRegistry {
         id: String,
     ) -> Result<FfiInstalledSkill, FfiRegistryError> {
         let client = RegistryClient::new();
-        let index = client.fetch_index().map_err(|e| FfiRegistryError::Registry {
-            message: e.to_string(),
-        })?;
+        let index = client.fetch_index().map_err(map_registry_error)?;
         let entry = index
             .skills
             .iter()
@@ -298,9 +350,7 @@ impl SkillRegistry {
         let options = android_load_options(&self.storage_dir);
         let mut store = self.store.lock().expect("skill store mutex poisoned");
         let installed = install_update(&client, &entry, &mut store, &trust, &options)
-            .map_err(|e| FfiRegistryError::Registry {
-                message: e.to_string(),
-            })?;
+            .map_err(map_registry_error)?;
         let languages = derive_supported_locales(&installed.install_dir);
         Ok(FfiInstalledSkill {
             id: installed.id,
@@ -318,9 +368,7 @@ impl SkillRegistry {
     /// Blocks on the network — callers must run this off the main thread.
     pub fn browse_registry(&self) -> Result<Vec<FfiBrowseEntry>, FfiRegistryError> {
         let client = RegistryClient::new();
-        let index = client.fetch_index().map_err(|e| FfiRegistryError::Registry {
-            message: e.to_string(),
-        })?;
+        let index = client.fetch_index().map_err(map_registry_error)?;
         let store = self.store.lock().expect("skill store mutex poisoned");
         let mut out: Vec<FfiBrowseEntry> = index
             .skills
@@ -370,9 +418,7 @@ impl SkillRegistry {
         id: String,
     ) -> Result<FfiInstalledSkill, FfiRegistryError> {
         let client = RegistryClient::new();
-        let index = client.fetch_index().map_err(|e| FfiRegistryError::Registry {
-            message: e.to_string(),
-        })?;
+        let index = client.fetch_index().map_err(map_registry_error)?;
         let trust = trust_root()?;
         let options = android_load_options(&self.storage_dir);
         let mut store = self.store.lock().expect("skill store mutex poisoned");
@@ -384,12 +430,7 @@ impl SkillRegistry {
             &trust,
             &options,
         )
-        .map_err(|e| match e {
-            RegistryError::NotFound { id } => FfiRegistryError::NotFound { id },
-            other => FfiRegistryError::Registry {
-                message: other.to_string(),
-            },
-        })?;
+        .map_err(map_registry_error)?;
         let languages = derive_supported_locales(&installed.install_dir);
         Ok(FfiInstalledSkill {
             id: installed.id,
@@ -427,22 +468,13 @@ impl SkillRegistry {
         id: String,
     ) -> Result<FfiSkillManifest, FfiRegistryError> {
         let client = RegistryClient::new();
-        let index = client.fetch_index().map_err(|e| FfiRegistryError::Registry {
-            message: e.to_string(),
-        })?;
+        let index = client.fetch_index().map_err(map_registry_error)?;
         let entry: IndexEntry = index
             .skills
             .into_iter()
             .find(|e| e.id == id)
             .ok_or_else(|| FfiRegistryError::NotFound { id: id.clone() })?;
-        let source = client.fetch_manifest(&entry).map_err(|e| match e {
-            RegistryError::ManifestUnavailable { id } => {
-                FfiRegistryError::ManifestUnavailable { id }
-            }
-            other => FfiRegistryError::Registry {
-                message: other.to_string(),
-            },
-        })?;
+        let source = client.fetch_manifest(&entry).map_err(map_registry_error)?;
         // parent_dir_name = None: the sidecar sits at manifests/<id>-<version>.md,
         // not in a directory named after the skill, so the AgentSkills
         // name-must-match-parent-dir check doesn't apply here.
@@ -674,6 +706,73 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("ari-ffi-registry-test-{label}-{nanos}-{n}"));
         p
+    }
+
+    #[test]
+    fn registry_errors_map_to_accurate_ffi_variants() {
+        use ari_skill_loader::BundleError;
+
+        // Transport failure → Network. The ONLY variant that should
+        // produce a "check your connection" hint in the UI.
+        assert!(matches!(
+            map_registry_error(RegistryError::Http("connection refused".into())),
+            FfiRegistryError::Network { .. }
+        ));
+
+        // Non-success HTTP status → BadStatus, carrying the code.
+        match map_registry_error(RegistryError::BadStatus {
+            url: "https://x/y".into(),
+            status: 503,
+        }) {
+            FfiRegistryError::BadStatus { status } => assert_eq!(status, 503),
+            other => panic!("expected BadStatus, got {other:?}"),
+        }
+
+        // Over the size cap → TooLarge, carrying the limit. This is the
+        // weather-skill bug: it used to surface as "check your connection".
+        match map_registry_error(RegistryError::TooLarge {
+            url: "https://x/y".into(),
+            limit: 8 * 1024 * 1024,
+        }) {
+            FfiRegistryError::TooLarge { limit_bytes } => {
+                assert_eq!(limit_bytes, 8 * 1024 * 1024)
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+
+        // sha mismatch and any bundle-level failure → Integrity.
+        assert!(matches!(
+            map_registry_error(RegistryError::ShaMismatch {
+                id: "dev.heyari.weather".into(),
+                expected: "aaa".into(),
+                actual: "bbb".into(),
+            }),
+            FfiRegistryError::Integrity { .. }
+        ));
+        assert!(matches!(
+            map_registry_error(RegistryError::Install(BundleError::HashMismatch {
+                expected: "aaa".into(),
+                actual: "bbb".into(),
+            })),
+            FfiRegistryError::Integrity { .. }
+        ));
+
+        // Pass-through identities.
+        assert!(matches!(
+            map_registry_error(RegistryError::NotFound { id: "x".into() }),
+            FfiRegistryError::NotFound { .. }
+        ));
+        assert!(matches!(
+            map_registry_error(RegistryError::ManifestUnavailable { id: "x".into() }),
+            FfiRegistryError::ManifestUnavailable { .. }
+        ));
+
+        // Genuine registry-format problem → generic Registry bucket,
+        // explicitly NOT a network claim.
+        assert!(matches!(
+            map_registry_error(RegistryError::Parse("bad json".into())),
+            FfiRegistryError::Registry { .. }
+        ));
     }
 
     #[test]
