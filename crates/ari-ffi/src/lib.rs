@@ -8,8 +8,8 @@ use ari_skill_loader::{
     HttpConfig, InsertCalendarEventParams, InsertTaskParams, LoadOptions, LocalClock,
     LocalTimeComponents, LocaleProvider, LocationProvider, LocationResult, LocationStatus, LogLevel,
     LogSink, NullAuthorizeProvider, NullCalendarProvider, NullLocationProvider, NullLogSink,
-    NullSettingWriter, NullTasksProvider, SettingWriter, StorageConfig, TaskList, TaskRow,
-    TasksProvider, UtcLocalClock,
+    MediaServicesProvider, NullMediaServicesProvider, NullSettingWriter, NullTasksProvider,
+    SettingWriter, StorageConfig, TaskList, TaskRow, TasksProvider, UtcLocalClock,
 };
 use ari_skills::{
     CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, MusicSkill, OpenSkill, SearchSkill,
@@ -55,6 +55,7 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
         tasks_provider: Arc::new(NullTasksProvider),
         calendar_provider: Arc::new(NullCalendarProvider),
         location_provider: Arc::new(NullLocationProvider),
+        media_services_provider: Arc::new(NullMediaServicesProvider),
         local_clock: Arc::new(UtcLocalClock),
         config_store: Arc::new(MemoryConfigStore::new()),
         locale_provider: Arc::new(EnglishLocaleProvider),
@@ -607,6 +608,7 @@ pub struct AriEngine {
     pub(crate) tasks_provider: Arc<dyn TasksProvider>,
     pub(crate) calendar_provider: Arc<dyn CalendarProvider>,
     pub(crate) location_provider: Arc<dyn LocationProvider>,
+    pub(crate) media_services_provider: Arc<dyn MediaServicesProvider>,
     pub(crate) local_clock: Arc<dyn LocalClock>,
     /// Locale source of truth — engine reads through this whenever it
     /// needs to dispatch on language. Defaults to [`EnglishLocaleProvider`]
@@ -662,6 +664,7 @@ impl AriEngine {
             tasks_provider: Arc::new(NullTasksProvider),
             calendar_provider: Arc::new(NullCalendarProvider),
             location_provider: Arc::new(NullLocationProvider),
+            media_services_provider: Arc::new(NullMediaServicesProvider),
             local_clock: Arc::new(UtcLocalClock),
             locale_provider: Arc::new(EnglishLocaleProvider),
             config_store,
@@ -688,6 +691,7 @@ impl AriEngine {
             tasks_provider: Arc::new(NullTasksProvider),
             calendar_provider: Arc::new(NullCalendarProvider),
             location_provider: Arc::new(NullLocationProvider),
+            media_services_provider: Arc::new(NullMediaServicesProvider),
             local_clock: Arc::new(UtcLocalClock),
             locale_provider: Arc::new(EnglishLocaleProvider),
             config_store,
@@ -767,6 +771,7 @@ impl AriEngine {
             tasks_provider,
             calendar_provider,
             location_provider,
+            media_services_provider: Arc::new(NullMediaServicesProvider),
             local_clock,
             locale_provider,
             config_store,
@@ -968,6 +973,7 @@ impl AriEngine {
         options.tasks_provider = self.tasks_provider.clone();
         options.calendar_provider = self.calendar_provider.clone();
         options.location_provider = self.location_provider.clone();
+        options.media_services_provider = self.media_services_provider.clone();
         options.local_clock = self.local_clock.clone();
         options.config_store = self.config_store.clone();
         options.locale_provider = self.locale_provider.clone();

@@ -136,6 +136,7 @@ const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
     ("calendar_delete", Some(Capability::Calendar)),
     ("calendar_query_in_range", Some(Capability::Calendar)),
     ("location_current", Some(Capability::Location)),
+    ("media_services", Some(Capability::MediaServices)),
     ("authorize", Some(Capability::Authorize)),
 ];
 
@@ -288,6 +289,7 @@ struct StoreData {
     tasks_provider: Option<Arc<dyn crate::platform_capabilities::TasksProvider>>,
     calendar_provider: Option<Arc<dyn crate::platform_capabilities::CalendarProvider>>,
     location_provider: Option<Arc<dyn crate::platform_capabilities::LocationProvider>>,
+    media_services_provider: Option<Arc<dyn crate::platform_capabilities::MediaServicesProvider>>,
     /// Authorize provider — `Some` only when `Capability::Authorize` granted.
     authorize_provider: Option<Arc<dyn crate::platform_capabilities::AuthorizeProvider>>,
     /// Local clock — ungated; every skill can read the wall clock.
@@ -386,6 +388,8 @@ pub struct WasmSkill {
     calendar_provider: Arc<dyn crate::platform_capabilities::CalendarProvider>,
     /// Platform location capability. Same pattern as `tasks_provider`.
     location_provider: Arc<dyn crate::platform_capabilities::LocationProvider>,
+    /// Platform media services capability. Same pattern as `tasks_provider`.
+    media_services_provider: Arc<dyn crate::platform_capabilities::MediaServicesProvider>,
     /// Browser round-trip capability (`ari::authorize`). Always present
     /// (possibly Null); gated into the store only when `Capability::Authorize`
     /// is granted. Same pattern as `tasks_provider`.
@@ -591,6 +595,7 @@ impl WasmSkill {
         let tasks_provider = options.tasks_provider.clone();
         let calendar_provider = options.calendar_provider.clone();
         let location_provider = options.location_provider.clone();
+        let media_services_provider = options.media_services_provider.clone();
         let authorize_provider = options.authorize_provider.clone();
         let local_clock = options.local_clock.clone();
         let config_store = options.config_store.clone();
@@ -689,6 +694,7 @@ impl WasmSkill {
             tasks_provider,
             calendar_provider,
             location_provider,
+            media_services_provider,
             authorize_provider,
             local_clock,
             config_store,
@@ -760,6 +766,11 @@ impl WasmSkill {
                 },
                 location_provider: if self.granted_capabilities.contains(&Capability::Location) {
                     Some(self.location_provider.clone())
+                } else {
+                    None
+                },
+                media_services_provider: if self.granted_capabilities.contains(&Capability::MediaServices) {
+                    Some(self.media_services_provider.clone())
                 } else {
                     None
                 },
@@ -1031,6 +1042,17 @@ impl WasmSkill {
                     |mut caller: Caller<'_, StoreData>, max_age_ms: i64, timeout_ms: i64| -> i64 {
                         location_current_impl(&mut caller, max_age_ms, timeout_ms)
                     },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
+        }
+
+        // Media services host import — gated on the MediaServices capability.
+        if self.granted_capabilities.contains(&Capability::MediaServices) {
+            linker
+                .func_wrap(
+                    "ari",
+                    "media_services",
+                    |mut caller: Caller<'_, StoreData>| -> i64 { media_services_impl(&mut caller) },
                 )
                 .map_err(|e| WasmError::Compile(e.to_string()))?;
         }
@@ -1953,6 +1975,20 @@ fn location_current_impl(
     write_response(caller, memory, &json)
 }
 
+fn media_services_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let provider = match caller.data().media_services_provider.clone() {
+        Some(p) => p,
+        None => return 0,
+    };
+    let ids = provider.installed_services();
+    let json = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string());
+    write_response(caller, memory, &json)
+}
+
 fn calendar_list_calendars_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
     let memory = match caller.get_export("memory") {
         Some(wasmtime::Extern::Memory(m)) => m,
@@ -2822,6 +2858,7 @@ mod tests {
             tasks_provider: Arc::new(crate::NullTasksProvider),
             calendar_provider: Arc::new(crate::NullCalendarProvider),
             location_provider: Arc::new(crate::platform_capabilities::NullLocationProvider),
+            media_services_provider: Arc::new(crate::platform_capabilities::NullMediaServicesProvider),
             local_clock: Arc::new(crate::UtcLocalClock),
             config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
             locale_provider: Arc::new(crate::EnglishLocaleProvider),
@@ -3862,6 +3899,7 @@ mod tests {
                 tasks_provider: Arc::new(crate::NullTasksProvider),
                 calendar_provider: Arc::new(crate::NullCalendarProvider),
                 location_provider: Arc::new(crate::platform_capabilities::NullLocationProvider),
+                media_services_provider: Arc::new(crate::platform_capabilities::NullMediaServicesProvider),
                 local_clock: Arc::new(crate::UtcLocalClock),
                 config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
                 locale_provider: Arc::new(crate::EnglishLocaleProvider),
@@ -3976,6 +4014,7 @@ mod tests {
                 tasks_provider: Arc::new(crate::NullTasksProvider),
                 calendar_provider: Arc::new(crate::NullCalendarProvider),
                 location_provider: Arc::new(crate::platform_capabilities::NullLocationProvider),
+                media_services_provider: Arc::new(crate::platform_capabilities::NullMediaServicesProvider),
                 local_clock: Arc::new(crate::UtcLocalClock),
                 config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
                 locale_provider: Arc::new(crate::EnglishLocaleProvider),
@@ -4078,6 +4117,14 @@ mod tests {
                 _thread: thread,
             }
         }
+    }
+
+    #[test]
+    fn media_services_is_a_known_gated_import() {
+        let found = HOST_IMPORT_CAPABILITY_TABLE
+            .iter()
+            .find(|(name, _)| *name == "media_services");
+        assert_eq!(found, Some(&("media_services", Some(Capability::MediaServices))));
     }
 }
 

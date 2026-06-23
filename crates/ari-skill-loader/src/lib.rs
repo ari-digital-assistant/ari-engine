@@ -48,9 +48,9 @@ pub use platform_capabilities::{
     AuthorizeInput, AuthorizeOutput, AuthorizeProvider, Calendar, CalendarEventRow,
     CalendarProvider, EnglishLocaleProvider, InsertCalendarEventParams, InsertTaskParams,
     LocalClock, LocalTimeComponents, LocaleProvider, LocationProvider, LocationResult,
-    LocationStatus, NullAuthorizeProvider, NullCalendarProvider, NullLocationProvider,
-    NullSettingWriter, NullTasksProvider, SettingWriter, TaskList, TaskRow, TasksProvider,
-    UtcLocalClock,
+    LocationStatus, MediaServicesProvider, NullAuthorizeProvider, NullCalendarProvider,
+    NullLocationProvider, NullMediaServicesProvider, NullSettingWriter, NullTasksProvider,
+    SettingWriter, TaskList, TaskRow, TasksProvider, UtcLocalClock,
 };
 pub use storage_config::StorageConfig;
 pub use store::{InstalledSkill, SkillStore, StoreError};
