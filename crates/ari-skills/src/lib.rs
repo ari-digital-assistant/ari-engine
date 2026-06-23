@@ -19,6 +19,7 @@ mod calculator;
 mod current_time;
 mod date;
 mod greeting;
+mod music;
 mod open;
 mod search;
 
