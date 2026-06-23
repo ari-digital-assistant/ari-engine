@@ -567,6 +567,10 @@ pub enum Capability {
     /// the system browser and returns the redirect's callback query
     /// params. Generic — carries no protocol knowledge.
     Authorize,
+    /// Permission to emit a `play_media` action — the frontend plays a
+    /// free-text query in the user's default or a named music app. Pure
+    /// frontend: no WASM host import.
+    PlayMedia,
 }
 
 #[derive(Debug, Clone, PartialEq)]

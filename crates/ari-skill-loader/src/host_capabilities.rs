@@ -51,6 +51,7 @@ impl HostCapabilities {
             Capability::Calendar,
             Capability::Tasks,
             Capability::Authorize,
+            Capability::PlayMedia,
         ] {
             s.granted.insert(cap);
         }
@@ -74,6 +75,7 @@ impl HostCapabilities {
         s.granted.insert(Capability::Tts);
         s.granted.insert(Capability::Calendar);
         s.granted.insert(Capability::Tasks);
+        s.granted.insert(Capability::PlayMedia);
         s
     }
 
@@ -118,6 +120,7 @@ pub fn parse_capability(s: &str) -> Option<Capability> {
         "calendar" => Some(Capability::Calendar),
         "tasks" => Some(Capability::Tasks),
         "authorize" => Some(Capability::Authorize),
+        "play_media" => Some(Capability::PlayMedia),
         _ => None,
     }
 }
@@ -135,6 +138,7 @@ pub fn capability_name(cap: Capability) -> &'static str {
         Capability::Calendar => "calendar",
         Capability::Tasks => "tasks",
         Capability::Authorize => "authorize",
+        Capability::PlayMedia => "play_media",
     }
 }
 
@@ -243,6 +247,14 @@ mod tests {
         assert_eq!(parse_capability("ftp"), None);
         assert_eq!(parse_capability(""), None);
         assert_eq!(parse_capability("HTTP"), None); // case-sensitive
+    }
+
+    #[test]
+    fn play_media_roundtrips_and_is_pure_frontend() {
+        assert_eq!(parse_capability("play_media"), Some(Capability::PlayMedia));
+        assert_eq!(capability_name(Capability::PlayMedia), "play_media");
+        assert!(HostCapabilities::pure_frontend().provides(Capability::PlayMedia));
+        assert!(HostCapabilities::all().provides(Capability::PlayMedia));
     }
 
 }
