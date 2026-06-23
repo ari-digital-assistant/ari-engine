@@ -12,7 +12,7 @@ use ari_skill_loader::{
     SettingWriter, StorageConfig, TaskList, TaskRow, TasksProvider, UtcLocalClock,
 };
 use ari_skills::{
-    CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, MusicSkill, OpenSkill, SearchSkill,
+    CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -661,7 +661,6 @@ fn build_engine_with_builtins() -> Engine {
     engine.register_skill(Box::new(DateSkill::new()));
     engine.register_skill(Box::new(CalculatorSkill::new()));
     engine.register_skill(Box::new(GreetingSkill::new()));
-    engine.register_skill(Box::new(MusicSkill::new()));
     engine.register_skill(Box::new(OpenSkill::new()));
     engine.register_skill(Box::new(SearchSkill::new()));
     engine

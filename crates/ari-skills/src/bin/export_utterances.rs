@@ -25,7 +25,7 @@
 
 use ari_core::{Skill, Specificity};
 use ari_skills::{
-    CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, MusicSkill, OpenSkill, SearchSkill,
+    CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill,
 };
 use serde_json::json;
 
@@ -68,7 +68,6 @@ fn main() {
         Box::new(DateSkill::new()),
         Box::new(CalculatorSkill::new()),
         Box::new(GreetingSkill::new()),
-        Box::new(MusicSkill::new()),
         Box::new(OpenSkill::new()),
         Box::new(SearchSkill::new()),
     ];

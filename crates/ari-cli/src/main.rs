@@ -3,7 +3,7 @@ use ari_skill_loader::{
     load_single_skill_dir_with, load_skill_directory_with, parse_capability, HostCapabilities,
     LoadOptions, StorageConfig,
 };
-use ari_skills::{CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, MusicSkill, OpenSkill, SearchSkill};
+use ari_skills::{CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill};
 use std::io::{self, BufRead};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -42,7 +42,6 @@ fn main() -> ExitCode {
     engine.register_skill(Box::new(DateSkill::new()));
     engine.register_skill(Box::new(CalculatorSkill::new()));
     engine.register_skill(Box::new(GreetingSkill::new()));
-    engine.register_skill(Box::new(MusicSkill::new()));
     engine.register_skill(Box::new(OpenSkill::new()));
     engine.register_skill(Box::new(SearchSkill::new()));
 
@@ -179,7 +178,7 @@ impl ParsedArgs {
                 .map(String::as_str)
                 .collect()
         } else {
-            vec!["notifications", "launch_app", "clipboard", "play_media", "tts (default: pure_frontend)"]
+            vec!["notifications", "launch_app", "clipboard", "tts (default: pure_frontend)"]
         }
     }
 }
