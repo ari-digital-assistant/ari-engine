@@ -277,6 +277,15 @@ mod tests {
     }
 
     #[test]
+    fn italian_service_only_no_query_asks_clarification() {
+        match MusicSkill::new().execute("metti su spotify", &ctx()) {
+            Response::Text(s) => assert_eq!(s, "What would you like me to play?"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert_eq!(MusicSkill::new().score("metti su spotify", &ctx()), 0.3);
+    }
+
+    #[test]
     fn canonical_service_resolves_aliases_and_case() {
         assert_eq!(canonical_service("Spotify"), Some("spotify".to_string()));
         assert_eq!(canonical_service("apple music"), Some("apple_music".to_string()));
