@@ -303,6 +303,26 @@ impl LocationProvider for NullLocationProvider {
     }
 }
 
+// ── Media services ───────────────────────────────────────────────────────
+
+/// Host-supplied list of which music services are installed. Returns the
+/// canonical ids the host recognises AND finds installed (e.g. `"spotify"`,
+/// `"youtube_music"`). The engine treats the ids as opaque; the mapping from
+/// id to package/app lives entirely on the host side.
+pub trait MediaServicesProvider: Send + Sync {
+    fn installed_services(&self) -> Vec<String>;
+}
+
+/// Default for hosts without a media implementation (CLI, tests): nothing
+/// installed.
+pub struct NullMediaServicesProvider;
+
+impl MediaServicesProvider for NullMediaServicesProvider {
+    fn installed_services(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 // ── Local clock ────────────────────────────────────────────────────────
 
 /// Components of the current local datetime, as seen by the host.
@@ -614,6 +634,12 @@ mod tests {
         assert_eq!(r.lon, 0.0);
         assert_eq!(r.accuracy_m, 0.0);
         assert_eq!(r.timestamp_ms, 0);
+    }
+
+    #[test]
+    fn null_media_services_provider_is_empty() {
+        let p = NullMediaServicesProvider;
+        assert!(p.installed_services().is_empty());
     }
 }
 
