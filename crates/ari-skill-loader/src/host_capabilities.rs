@@ -51,7 +51,8 @@ impl HostCapabilities {
             Capability::Calendar,
             Capability::Tasks,
             Capability::Authorize,
-            Capability::PlayMedia,
+            Capability::MediaControl,
+            Capability::MediaServices,
         ] {
             s.granted.insert(cap);
         }
@@ -75,7 +76,7 @@ impl HostCapabilities {
         s.granted.insert(Capability::Tts);
         s.granted.insert(Capability::Calendar);
         s.granted.insert(Capability::Tasks);
-        s.granted.insert(Capability::PlayMedia);
+        s.granted.insert(Capability::MediaControl);
         s
     }
 
@@ -120,7 +121,8 @@ pub fn parse_capability(s: &str) -> Option<Capability> {
         "calendar" => Some(Capability::Calendar),
         "tasks" => Some(Capability::Tasks),
         "authorize" => Some(Capability::Authorize),
-        "play_media" => Some(Capability::PlayMedia),
+        "media_control" => Some(Capability::MediaControl),
+        "media_services" => Some(Capability::MediaServices),
         _ => None,
     }
 }
@@ -138,7 +140,8 @@ pub fn capability_name(cap: Capability) -> &'static str {
         Capability::Calendar => "calendar",
         Capability::Tasks => "tasks",
         Capability::Authorize => "authorize",
-        Capability::PlayMedia => "play_media",
+        Capability::MediaControl => "media_control",
+        Capability::MediaServices => "media_services",
     }
 }
 
@@ -250,11 +253,21 @@ mod tests {
     }
 
     #[test]
-    fn play_media_roundtrips_and_is_pure_frontend() {
-        assert_eq!(parse_capability("play_media"), Some(Capability::PlayMedia));
-        assert_eq!(capability_name(Capability::PlayMedia), "play_media");
-        assert!(HostCapabilities::pure_frontend().provides(Capability::PlayMedia));
-        assert!(HostCapabilities::all().provides(Capability::PlayMedia));
+    fn media_control_roundtrips_and_is_pure_frontend() {
+        assert_eq!(parse_capability("media_control"), Some(Capability::MediaControl));
+        assert_eq!(capability_name(Capability::MediaControl), "media_control");
+        assert!(HostCapabilities::pure_frontend().provides(Capability::MediaControl));
+        assert!(HostCapabilities::all().provides(Capability::MediaControl));
+        // play_media no longer exists as a token
+        assert_eq!(parse_capability("play_media"), None);
+    }
+
+    #[test]
+    fn media_services_is_host_import_not_pure_frontend() {
+        assert_eq!(parse_capability("media_services"), Some(Capability::MediaServices));
+        assert_eq!(capability_name(Capability::MediaServices), "media_services");
+        assert!(HostCapabilities::all().provides(Capability::MediaServices));
+        assert!(!HostCapabilities::pure_frontend().provides(Capability::MediaServices));
     }
 
 }

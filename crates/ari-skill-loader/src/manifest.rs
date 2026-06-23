@@ -567,10 +567,13 @@ pub enum Capability {
     /// the system browser and returns the redirect's callback query
     /// params. Generic — carries no protocol knowledge.
     Authorize,
-    /// Permission to emit a `play_media` action — the frontend plays a
-    /// free-text query in the user's default or a named music app. Pure
-    /// frontend: no WASM host import.
-    PlayMedia,
+    /// Permission to emit a `media` action — the frontend plays/controls a
+    /// free-text query in a music app. Pure frontend: no WASM host import.
+    MediaControl,
+    /// Permission to call `ari::media_services()` — returns the canonical ids
+    /// of installed music services. Host-import capability (needs the WASM
+    /// import); granted only by hosts that implement it.
+    MediaServices,
 }
 
 #[derive(Debug, Clone, PartialEq)]

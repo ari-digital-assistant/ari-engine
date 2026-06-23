@@ -45,7 +45,8 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
         .with(Capability::Tasks)
         .with(Capability::Calendar)
         .with(Capability::Location)
-        .with(Capability::Authorize);
+        .with(Capability::Authorize)
+        .with(Capability::MediaServices);
     LoadOptions {
         log_sink: Arc::new(NullLogSink),
         host_capabilities: host_caps,
