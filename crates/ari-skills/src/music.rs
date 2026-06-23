@@ -1,4 +1,4 @@
-use ari_core::{Response, Skill, SkillContext, Specificity};
+use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 
 /// Trigger phrases, longest first so a multi-word phrase wins over any
 /// single word it might contain. Matched against post-normalised input
@@ -175,6 +175,56 @@ impl Skill for MusicSkill {
             None => clarify(ctx),
         }
     }
+
+    fn parameters_schema(&self) -> &'static str {
+        r#"{"type":"object","properties":{"query":{"type":"string","description":"The song, artist, album, or playlist to play."},"service":{"type":"string","enum":["spotify","apple_music","youtube_music","tidal","deezer","youtube","amazon_music"],"description":"Optional music service to play on."}},"required":["query"]}"#
+    }
+
+    fn execute_with_args(&self, input: &str, args_json: &str, ctx: &SkillContext) -> Response {
+        let parsed = serde_json::from_str::<serde_json::Value>(args_json).ok();
+        let query = parsed
+            .as_ref()
+            .and_then(|v| v.get("query").and_then(|q| q.as_str()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let service = parsed
+            .as_ref()
+            .and_then(|v| v.get("service").and_then(|s| s.as_str()))
+            .and_then(canonical_service);
+        match query {
+            Some(q) => play_action(q, service.as_deref()),
+            None => self.execute(input, ctx),
+        }
+    }
+
+    fn example_utterances(&self) -> &[ExampleUtterance] {
+        &[
+            ExampleUtterance { text: "play hotel california", args: r#"{"query":"hotel california"}"# },
+            ExampleUtterance { text: "play some pink floyd", args: r#"{"query":"pink floyd"}"# },
+            ExampleUtterance { text: "put on comfortably numb", args: r#"{"query":"comfortably numb"}"# },
+            ExampleUtterance { text: "listen to the beatles", args: r#"{"query":"the beatles"}"# },
+            ExampleUtterance { text: "play bohemian rhapsody", args: r#"{"query":"bohemian rhapsody"}"# },
+            ExampleUtterance { text: "play knockin on heavens door", args: r#"{"query":"knockin on heavens door"}"# },
+            ExampleUtterance { text: "i want to hear some jazz", args: r#"{"query":"jazz"}"# },
+            ExampleUtterance { text: "put on the latest taylor swift album", args: r#"{"query":"latest taylor swift album"}"# },
+            ExampleUtterance { text: "play my workout playlist", args: r#"{"query":"my workout playlist"}"# },
+            ExampleUtterance { text: "play hotel california on spotify", args: r#"{"query":"hotel california","service":"spotify"}"# },
+            ExampleUtterance { text: "play stairway to heaven on apple music", args: r#"{"query":"stairway to heaven","service":"apple_music"}"# },
+            ExampleUtterance { text: "play lofi beats on youtube music", args: r#"{"query":"lofi beats","service":"youtube_music"}"# },
+            ExampleUtterance { text: "put on some adele on tidal", args: r#"{"query":"adele","service":"tidal"}"# },
+            ExampleUtterance { text: "play daft punk on deezer", args: r#"{"query":"daft punk","service":"deezer"}"# },
+            ExampleUtterance { text: "play the news theme on youtube", args: r#"{"query":"the news theme","service":"youtube"}"# },
+            ExampleUtterance { text: "play christmas songs on amazon music", args: r#"{"query":"christmas songs","service":"amazon_music"}"# },
+            ExampleUtterance { text: "listen to wish you were here on spotify", args: r#"{"query":"wish you were here","service":"spotify"}"# },
+            ExampleUtterance { text: "can you play some classical music", args: r#"{"query":"classical music"}"# },
+            ExampleUtterance { text: "play michael jackson thriller", args: r#"{"query":"michael jackson thriller"}"# },
+            ExampleUtterance { text: "put on radiohead on apple music", args: r#"{"query":"radiohead","service":"apple_music"}"# },
+            ExampleUtterance { text: "metti hotel california", args: r#"{"query":"hotel california"}"# },
+            ExampleUtterance { text: "riproduci i queen", args: r#"{"query":"i queen"}"# },
+            ExampleUtterance { text: "metti hotel california su spotify", args: r#"{"query":"hotel california","service":"spotify"}"# },
+            ExampleUtterance { text: "ascolta un po di jazz", args: r#"{"query":"un po di jazz"}"# },
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -291,5 +341,64 @@ mod tests {
         assert_eq!(canonical_service("apple music"), Some("apple_music".to_string()));
         assert_eq!(canonical_service("yt music"), Some("youtube_music".to_string()));
         assert_eq!(canonical_service("pandora"), None);
+    }
+
+    #[test]
+    fn execute_with_args_uses_slots_verbatim() {
+        let r = MusicSkill::new().execute_with_args(
+            "play hotel california on spotify",
+            r#"{"query":"hotel california","service":"spotify"}"#,
+            &ctx(),
+        );
+        match r {
+            Response::Action(v) => {
+                assert_eq!(v["play_media"]["query"], "hotel california");
+                assert_eq!(v["play_media"]["service"], "spotify");
+            }
+            other => panic!("expected Action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_with_args_drops_unknown_service() {
+        let r = MusicSkill::new().execute_with_args(
+            "play x on pandora",
+            r#"{"query":"x","service":"pandora"}"#,
+            &ctx(),
+        );
+        match r {
+            Response::Action(v) => {
+                assert_eq!(v["play_media"]["query"], "x");
+                assert!(v["play_media"].get("service").is_none());
+            }
+            other => panic!("expected Action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_with_args_blank_query_falls_back_to_execute() {
+        // Empty query slot → keyword path parses the raw input instead.
+        let r = MusicSkill::new().execute_with_args(
+            "play hotel california",
+            r#"{"query":"  "}"#,
+            &ctx(),
+        );
+        match r {
+            Response::Action(v) => assert_eq!(v["play_media"]["query"], "hotel california"),
+            other => panic!("expected Action via fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_lists_query_and_service() {
+        let s = MusicSkill::new().parameters_schema();
+        assert!(s.contains("\"query\""));
+        assert!(s.contains("\"service\""));
+        assert!(s.contains("youtube_music"));
+    }
+
+    #[test]
+    fn has_example_utterances() {
+        assert!(MusicSkill::new().example_utterances().len() >= 20);
     }
 }
