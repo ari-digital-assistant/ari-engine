@@ -1,7 +1,7 @@
 use ari_core::Response;
 use ari_engine::Engine;
 use ari_skills::{
-    CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill,
+    CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, MusicSkill, OpenSkill, SearchSkill,
 };
 
 fn full_engine() -> Engine {
@@ -10,6 +10,7 @@ fn full_engine() -> Engine {
     engine.register_skill(Box::new(DateSkill::new()));
     engine.register_skill(Box::new(CalculatorSkill::new()));
     engine.register_skill(Box::new(GreetingSkill::new()));
+    engine.register_skill(Box::new(MusicSkill::new()));
     engine.register_skill(Box::new(OpenSkill::new()));
     engine.register_skill(Box::new(SearchSkill::new()));
     engine
@@ -115,6 +116,16 @@ fn greeting_responds_to_how_are_you() {
     let engine = full_engine();
     let resp = engine.process_input("how are you");
     assert_eq!(text(&resp), "I'm doing great, thanks for asking! How can I help you?");
+}
+
+// --- Music returns Action ---
+
+#[test]
+fn play_command_routes_to_music_skill() {
+    let engine = full_engine();
+    let resp = engine.process_input("play hotel california");
+    let json = action(&resp);
+    assert_eq!(json["play_media"]["query"], "hotel california");
 }
 
 // --- Open returns Action ---

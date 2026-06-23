@@ -27,5 +27,6 @@ pub use calculator::CalculatorSkill;
 pub use current_time::CurrentTimeSkill;
 pub use date::DateSkill;
 pub use greeting::GreetingSkill;
+pub use music::MusicSkill;
 pub use open::OpenSkill;
 pub use search::SearchSkill;

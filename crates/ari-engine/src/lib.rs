@@ -86,6 +86,7 @@ pub enum ActiveAssistant {
     /// the size tier of the loaded model so Layer C can gate
     /// consultation: small is too dim for structured JSON, medium and
     /// large are eligible.
+    #[cfg(feature = "llm")]
     Builtin { tier: ari_llm::BuiltinTier },
     /// Use a cloud API via the generic adapter.
     Api {
@@ -592,6 +593,7 @@ impl Engine {
 
         // No skill matched. Delegate to the active assistant, if any.
         match &self.active_assistant {
+            #[cfg(feature = "llm")]
             Some(ActiveAssistant::Builtin { .. }) => {
                 #[cfg(feature = "llm")]
                 if let Some(ref llm) = self.llm {
@@ -735,8 +737,6 @@ impl Engine {
                     }
                 }
             }
-            #[cfg(not(feature = "llm"))]
-            Some(ActiveAssistant::Builtin { .. }) => return None,
             None => return None,
         };
         let picked = parse_assistant_routing_response(&response, skill_catalog);
@@ -1079,6 +1079,7 @@ const MAX_API_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// emulator without GPU passthrough it can be 30-60s. Hard enough that
 /// truly stuck inference still bails, loose enough that the realistic
 /// slow path can complete.
+#[cfg(feature = "llm")]
 const MAX_ONDEVICE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Conversational filler the engine speaks when the assistant takes
@@ -1123,6 +1124,7 @@ fn run_consult_phase_two(
     // gets a more generous budget because emulators and thermally-
     // throttled phones can run E2B/E4B much slower than a flagship.
     let max_wait = match assistant {
+        #[cfg(feature = "llm")]
         Some(ActiveAssistant::Builtin { .. }) => MAX_ONDEVICE_WAIT,
         _ => MAX_API_WAIT,
     };
@@ -1328,9 +1330,6 @@ fn call_assistant_for_consult(
                 Ok(text)
             }
         }
-        Some(ActiveAssistant::Builtin { .. }) => Err(
-            "on-device LLM not compiled in (llm feature disabled)".into(),
-        ),
         None => Err("no active assistant configured".into()),
     }
 }
