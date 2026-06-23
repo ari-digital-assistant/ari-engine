@@ -1,4 +1,4 @@
-use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
+use ari_core::{Response, Skill, SkillContext, Specificity};
 
 /// Trigger phrases, longest first so a multi-word phrase wins over any
 /// single word it might contain. Matched against post-normalised input
