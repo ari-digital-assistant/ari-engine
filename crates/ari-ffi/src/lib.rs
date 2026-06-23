@@ -292,6 +292,14 @@ pub trait FfiLocationProvider: Send + Sync {
     fn current(&self, max_age_ms: i64, timeout_ms: i64) -> FfiLocationResult;
 }
 
+/// Foreign-implemented media-services provider. The host lists
+/// whatever music/streaming apps are actually installed so the
+/// music skill can validate play requests against reality.
+#[uniffi::export(with_foreign)]
+pub trait FfiMediaServicesProvider: Send + Sync {
+    fn installed_services(&self) -> Vec<String>;
+}
+
 /// Foreign-implemented wall-clock reader. Needed so skills can
 /// resolve weekdays / "today" / local dates — WASM has no TZ
 /// database, the host does.
@@ -442,6 +450,14 @@ impl LocationProvider for ForeignLocationProviderAdapter {
             accuracy_m: r.accuracy_m,
             timestamp_ms: r.timestamp_ms,
         }
+    }
+}
+
+struct ForeignMediaServicesProviderAdapter(Arc<dyn FfiMediaServicesProvider>);
+
+impl MediaServicesProvider for ForeignMediaServicesProviderAdapter {
+    fn installed_services(&self) -> Vec<String> {
+        self.0.installed_services()
     }
 }
 
@@ -720,6 +736,7 @@ impl AriEngine {
         locale: Option<Arc<dyn FfiLocaleProvider>>,
         setting_writer: Option<Arc<dyn FfiSettingWriter>>,
         authorize: Option<Arc<dyn FfiAuthorizeProvider>>,
+        media_services: Option<Arc<dyn FfiMediaServicesProvider>>,
     ) -> Self {
         let log_sink: Arc<dyn LogSink> = match sink {
             Some(s) => Arc::new(ForeignLogSinkAdapter(s)),
@@ -757,6 +774,10 @@ impl AriEngine {
             Some(a) => Arc::new(ForeignAuthorizeProviderAdapter(a)),
             None => Arc::new(NullAuthorizeProvider),
         };
+        let media_services_provider: Arc<dyn MediaServicesProvider> = match media_services {
+            Some(p) => Arc::new(ForeignMediaServicesProviderAdapter(p)),
+            None => Arc::new(NullMediaServicesProvider),
+        };
         let adapted_envelope_sink: Option<Arc<dyn EnvelopeSink>> = envelope_sink
             .map(|es| Arc::new(ForeignEnvelopeSinkAdapter(es)) as Arc<dyn EnvelopeSink>);
         let mut engine = build_engine_with_builtins();
@@ -771,7 +792,7 @@ impl AriEngine {
             tasks_provider,
             calendar_provider,
             location_provider,
-            media_services_provider: Arc::new(NullMediaServicesProvider),
+            media_services_provider,
             local_clock,
             locale_provider,
             config_store,
@@ -1157,5 +1178,20 @@ mod tests {
     fn android_host_grants_authorize_capability() {
         let opts = android_load_options("/tmp/ignored");
         assert!(opts.host_capabilities.provides(Capability::Authorize));
+    }
+
+    #[test]
+    fn media_services_adapter_passes_ids_through() {
+        struct Fake;
+        impl FfiMediaServicesProvider for Fake {
+            fn installed_services(&self) -> Vec<String> {
+                vec!["spotify".to_string(), "youtube_music".to_string()]
+            }
+        }
+        let adapter = ForeignMediaServicesProviderAdapter(Arc::new(Fake));
+        assert_eq!(
+            adapter.installed_services(),
+            vec!["spotify".to_string(), "youtube_music".to_string()]
+        );
     }
 }
