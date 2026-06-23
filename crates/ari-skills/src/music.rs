@@ -74,6 +74,62 @@ fn clarify(ctx: &SkillContext) -> Response {
     )
 }
 
+/// Closed set of canonical service ids emitted in the action.
+const VALID_SERVICE_IDS: &[&str] = &[
+    "spotify", "apple_music", "youtube_music", "tidal", "deezer", "youtube", "amazon_music",
+];
+
+/// (canonical id, recognised alias). Longest aliases first so
+/// "youtube music" wins over "youtube".
+const SERVICE_ALIASES: &[(&str, &str)] = &[
+    ("youtube_music", "youtube music"),
+    ("youtube_music", "yt music"),
+    ("amazon_music", "amazon music"),
+    ("apple_music", "apple music"),
+    ("spotify", "spotify"),
+    ("tidal", "tidal"),
+    ("deezer", "deezer"),
+    ("youtube", "youtube"),
+];
+
+/// Connector words before a service name: EN "on", IT "su".
+const SERVICE_CONNECTORS: &[&str] = &["on", "su"];
+
+/// Resolve a free-text service name (alias or canonical id, any case) to a
+/// canonical id. `None` for anything not in the closed set.
+fn canonical_service(s: &str) -> Option<String> {
+    let s = s.trim().to_lowercase();
+    if VALID_SERVICE_IDS.contains(&s.as_str()) {
+        return Some(s);
+    }
+    SERVICE_ALIASES
+        .iter()
+        .find(|(_, alias)| *alias == s)
+        .map(|(id, _)| (*id).to_string())
+}
+
+/// Split a raw query into `(query, service_id)`. Only strips a trailing
+/// "<connector> <known alias>" — so a song title containing "on" survives.
+/// Also handles the case where raw is exactly "<connector> <alias>" (no
+/// preceding query), returning an empty query so the caller can clarify.
+fn split_service(raw: &str) -> (String, Option<String>) {
+    for conn in SERVICE_CONNECTORS {
+        for (id, alias) in SERVICE_ALIASES {
+            // Case 1: query before the connector — " on <alias>" suffix.
+            let suffix = format!(" {conn} {alias}");
+            if let Some(stripped) = raw.strip_suffix(&suffix) {
+                return (stripped.trim().to_string(), Some((*id).to_string()));
+            }
+            // Case 2: raw IS "<connector> <alias>" with no preceding query.
+            let exact = format!("{conn} {alias}");
+            if raw == exact {
+                return (String::new(), Some((*id).to_string()));
+            }
+        }
+    }
+    (raw.trim().to_string(), None)
+}
+
 pub struct MusicSkill;
 
 impl MusicSkill {
@@ -100,17 +156,22 @@ impl Skill for MusicSkill {
         if !has_trigger(input) {
             return 0.0;
         }
-        // Task 3 swaps this for the service-aware query check; for now any
-        // post-trigger content counts as a query.
         match after_trigger(input) {
-            Some(_) => 0.9,
-            None => 0.3,
+            Some(raw) if !split_service(raw).0.is_empty() => 0.9,
+            _ => 0.3,
         }
     }
 
     fn execute(&self, input: &str, ctx: &SkillContext) -> Response {
         match after_trigger(input) {
-            Some(query) => play_action(query, None),
+            Some(raw) => {
+                let (query, service) = split_service(raw);
+                if query.is_empty() {
+                    clarify(ctx)
+                } else {
+                    play_action(&query, service.as_deref())
+                }
+            }
             None => clarify(ctx),
         }
     }
@@ -159,5 +220,67 @@ mod tests {
             Response::Text(s) => assert_eq!(s, "What would you like me to play?"),
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn execute_named_service_splits_query_and_service() {
+        match MusicSkill::new().execute("play hotel california on spotify", &ctx()) {
+            Response::Action(v) => {
+                assert_eq!(v["play_media"]["query"], "hotel california");
+                assert_eq!(v["play_media"]["service"], "spotify");
+            }
+            other => panic!("expected Action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn youtube_music_beats_bare_youtube() {
+        match MusicSkill::new().execute("play lofi beats on youtube music", &ctx()) {
+            Response::Action(v) => {
+                assert_eq!(v["play_media"]["query"], "lofi beats");
+                assert_eq!(v["play_media"]["service"], "youtube_music");
+            }
+            other => panic!("expected Action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn song_title_containing_on_is_not_split() {
+        // "heavens door" is not a known service → no split.
+        match MusicSkill::new().execute("play knockin on heavens door", &ctx()) {
+            Response::Action(v) => {
+                assert_eq!(v["play_media"]["query"], "knockin on heavens door");
+                assert!(v["play_media"].get("service").is_none());
+            }
+            other => panic!("expected Action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn italian_su_connector_splits_service() {
+        match MusicSkill::new().execute("metti hotel california su spotify", &ctx()) {
+            Response::Action(v) => {
+                assert_eq!(v["play_media"]["query"], "hotel california");
+                assert_eq!(v["play_media"]["service"], "spotify");
+            }
+            other => panic!("expected Action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_only_no_query_asks_clarification() {
+        match MusicSkill::new().execute("play on spotify", &ctx()) {
+            Response::Text(s) => assert_eq!(s, "What would you like me to play?"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert_eq!(MusicSkill::new().score("play on spotify", &ctx()), 0.3);
+    }
+
+    #[test]
+    fn canonical_service_resolves_aliases_and_case() {
+        assert_eq!(canonical_service("Spotify"), Some("spotify".to_string()));
+        assert_eq!(canonical_service("apple music"), Some("apple_music".to_string()));
+        assert_eq!(canonical_service("yt music"), Some("youtube_music".to_string()));
+        assert_eq!(canonical_service("pandora"), None);
     }
 }
