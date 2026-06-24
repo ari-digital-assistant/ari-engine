@@ -4,7 +4,8 @@ use ari_core::{
 use ari_skill_loader::assistant::{AssistantApiError, ConfigStore};
 use ari_skill_loader::manifest::ApiConfig;
 use ari_skill_loader::wasm::{LogLevel, LogSink};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub mod named_assistant;
 pub use named_assistant::NamedAssistantBinding;
@@ -50,6 +51,51 @@ pub fn fallback_response_for(locale: &str) -> &'static str {
         "de" => "Entschuldigung, das habe ich nicht verstanden.",
         _ => FALLBACK_RESPONSE,
     }
+}
+
+/// How long a pending question stays answerable before a crash/missed cancel
+/// is treated as abandoned. Safety net only — the frontend cancels eagerly.
+const PENDING_TURN_TTL: Duration = Duration::from_secs(60);
+
+/// A skill is awaiting the user's reply to a question it just asked.
+#[derive(Clone, Debug)]
+pub struct PendingTurn {
+    pub skill_id: String,
+    pub context: String,
+    pub created_at: Instant,
+}
+
+/// Localized acknowledgement spoken when the user cancels a pending question.
+pub const CANCEL_ACK: &str = "Okay.";
+pub fn cancel_ack_for(locale: &str) -> &'static str {
+    match locale {
+        "it" => "Va bene.",
+        // es/fr/de: fall back to English until natively reviewed (see plan
+        // Global Constraints — do not machine-translate).
+        _ => CANCEL_ACK,
+    }
+}
+
+/// Phrases that cancel a pending question. Compared against the
+/// post-`normalize_input` utterance (lowercased, contractions expanded).
+fn cancel_phrases(locale: &str) -> &'static [&'static str] {
+    match locale {
+        // it: needs native review (see plan Global Constraints).
+        "it" => &["annulla", "lascia stare", "lascia perdere", "ferma", "ferma tutto", "stop"],
+        _ => &["cancel", "never mind", "nevermind", "stop", "forget it"],
+    }
+}
+
+fn is_cancel_phrase(normalized: &str, locale: &str) -> bool {
+    cancel_phrases(locale).contains(&normalized)
+}
+
+/// Strip an `await_reply` field from an action envelope, returning its
+/// `context` string if present. Mirrors the `consult_assistant` strip pattern.
+fn extract_await_reply(action: &mut serde_json::Value) -> Option<String> {
+    let obj = action.as_object_mut()?;
+    let v = obj.remove("await_reply")?;
+    v.get("context").and_then(|c| c.as_str()).map(|s| s.to_string())
 }
 
 struct RankingRound {
@@ -127,6 +173,12 @@ pub struct Engine {
     /// (used by the fallback tier(s)' required-setting gate). `None` in
     /// bare/test engines that never wired one.
     config_store: Option<Arc<dyn ConfigStore>>,
+    /// Per-instance multi-turn slot. When a skill's response carries an
+    /// `await_reply { context }` field, the engine records `(skill_id,
+    /// context)` here; the NEXT utterance bypasses routing and is handed to
+    /// that skill's `execute_reply`. Guarded by a TTL so a missed cancel
+    /// can't strand the slot. `&self` methods mutate it via the `Mutex`.
+    pending_turn: Mutex<Option<PendingTurn>>,
 }
 
 impl Engine {
@@ -143,7 +195,45 @@ impl Engine {
             envelope_sink: None,
             named_assistants: Vec::new(),
             config_store: None,
+            pending_turn: Mutex::new(None),
         }
+    }
+
+    fn set_pending_turn(&self, skill_id: &str, context: String) {
+        *self.pending_turn.lock().expect("pending_turn poisoned") = Some(PendingTurn {
+            skill_id: skill_id.to_string(),
+            context,
+            created_at: Instant::now(),
+        });
+    }
+
+    /// Take the pending turn iff it exists and is within the TTL. A stale
+    /// slot is taken (cleared) and `None` returned so input routes normally.
+    fn take_pending_turn_if_fresh(&self) -> Option<PendingTurn> {
+        let mut guard = self.pending_turn.lock().expect("pending_turn poisoned");
+        let p = guard.take()?;
+        if p.created_at.elapsed() < PENDING_TURN_TTL {
+            Some(p)
+        } else {
+            None
+        }
+    }
+
+    /// True when a fresh (within-TTL) pending turn is recorded. The FFI layer
+    /// surfaces this as the `rearm` signal after each `process_input`.
+    pub fn has_pending_turn(&self) -> bool {
+        self.pending_turn
+            .lock()
+            .expect("pending_turn poisoned")
+            .as_ref()
+            .map(|p| p.created_at.elapsed() < PENDING_TURN_TTL)
+            .unwrap_or(false)
+    }
+
+    /// Clear any pending turn. Called by the frontend on dismiss, listen
+    /// timeout, and fresh wake word; a no-op when nothing is pending.
+    pub fn clear_pending_turn(&self) {
+        *self.pending_turn.lock().expect("pending_turn poisoned") = None;
     }
 
     /// Install a log sink for engine-internal diagnostics. Currently only
@@ -346,6 +436,36 @@ impl Engine {
     pub fn process_input_traced(&self, input: &str) -> (Response, Option<DebugTrace>) {
         let normalized = normalize_input(input.trim(), &self.ctx.locale);
         if normalized.is_empty() {
+            return (
+                Response::Text(fallback_response_for(&self.ctx.locale).to_string()),
+                None,
+            );
+        }
+
+        // Multi-turn: if a skill is awaiting a reply, this utterance belongs
+        // to it — bypass all routing (scoring, router, assistant).
+        if let Some(pending) = self.take_pending_turn_if_fresh() {
+            // Verbal cancel escapes the pending turn.
+            if is_cancel_phrase(&normalized, &self.ctx.locale) {
+                return (
+                    Response::Text(cancel_ack_for(&self.ctx.locale).to_string()),
+                    None,
+                );
+            }
+            // The reply goes ONLY to the asking skill. If the skill vanished
+            // (e.g. a community-skill reload), fail cleanly.
+            if let Some(skill) = self
+                .skills
+                .iter()
+                .find(|s| s.id() == pending.skill_id)
+                .cloned()
+            {
+                let resp = skill.execute_reply(&pending.context, &normalized, &self.ctx);
+                // Route through the same chokepoint so a chained await_reply
+                // (the skill asks again) re-arms.
+                let resp = self.maybe_intercept_consult(skill, resp);
+                return (resp, None);
+            }
             return (
                 Response::Text(fallback_response_for(&self.ctx.locale).to_string()),
                 None,
@@ -775,6 +895,12 @@ impl Engine {
                     skill.id(),
                 ),
             );
+        }
+
+        // Multi-turn: a skill asking a question records a pending turn keyed
+        // by its id, and the field is stripped so the frontend never sees it.
+        if let Some(context) = extract_await_reply(&mut action) {
+            self.set_pending_turn(skill.id(), context);
         }
 
         let directive_value = match action
@@ -1459,6 +1585,98 @@ mod tests {
                 requires_setting: Some(k.to_string()),
             })
         }
+    }
+
+    // --- Multi-turn pending-turn ---
+
+    /// Asks a question on first input; on a reply (reserved `_ari_reply`
+    /// envelope) it plays the chosen service. Mirrors the music skill shape.
+    struct AskingSkill;
+    impl Skill for AskingSkill {
+        fn id(&self) -> &str { "asker" }
+        fn specificity(&self) -> Specificity { Specificity::High }
+        fn score(&self, _: &str, _: &SkillContext) -> f32 { 1.0 }
+        fn execute(&self, input: &str, _: &SkillContext) -> Response {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(input) {
+                if let Some(reply) = v.get("_ari_reply") {
+                    let ctx = reply["context"].as_str().unwrap_or("");
+                    let text = reply["text"].as_str().unwrap_or("");
+                    // Echo what we received as a plain action; no await_reply.
+                    return Response::Action(serde_json::json!({
+                        "v": 1, "speak": format!("ctx={ctx} text={text}")
+                    }));
+                }
+            }
+            // First turn: ask, and request a reply.
+            Response::Action(serde_json::json!({
+                "v": 1,
+                "speak": "which service?",
+                "await_reply": { "context": "Q1" }
+            }))
+        }
+    }
+
+    #[test]
+    fn question_sets_pending_turn_and_strips_await_reply() {
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(AskingSkill));
+        let (resp, _) = engine.process_input_traced("play music");
+        // await_reply must be stripped from the envelope the frontend sees.
+        match resp {
+            Response::Action(v) => {
+                assert!(v.get("await_reply").is_none(), "await_reply must be stripped");
+                assert_eq!(v["speak"], "which service?");
+            }
+            other => panic!("expected Action, got {other:?}"),
+        }
+        assert!(engine.has_pending_turn(), "a pending turn must be recorded");
+        let pending = engine.pending_turn.lock().unwrap().clone().unwrap();
+        assert_eq!(pending.skill_id, "asker");
+        assert_eq!(pending.context, "Q1");
+    }
+
+    #[test]
+    fn reply_bypasses_routing_and_reaches_asking_skill() {
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(AskingSkill));
+        let _ = engine.process_input_traced("play music"); // arm
+        let (resp, skill_id_trace) = engine.process_input_with_skill("spotify");
+        match resp {
+            Response::Action(v) => assert_eq!(v["speak"], "ctx=Q1 text=spotify"),
+            other => panic!("expected Action, got {other:?}"),
+        }
+        let _ = skill_id_trace; // skill_id attribution covered separately
+        assert!(!engine.has_pending_turn(), "slot must clear after the reply");
+    }
+
+    #[test]
+    fn cancel_word_clears_pending_and_acks() {
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(AskingSkill));
+        let _ = engine.process_input_traced("play music"); // arm
+        let (resp, _) = engine.process_input_traced("never mind");
+        assert!(matches!(resp, Response::Text(ref s) if s == cancel_ack_for("en")));
+        assert!(!engine.has_pending_turn(), "cancel must clear the slot");
+    }
+
+    #[test]
+    fn expired_pending_turn_is_ignored_and_input_routes_normally() {
+        use std::time::{Duration, Instant};
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(AskingSkill));
+        // Manually plant a stale pending turn (older than the TTL).
+        *engine.pending_turn.lock().unwrap() = Some(PendingTurn {
+            skill_id: "asker".to_string(),
+            context: "Q1".to_string(),
+            created_at: Instant::now()
+                .checked_sub(Duration::from_secs(120))
+                .expect("clock supports subtraction"),
+        });
+        assert!(!engine.has_pending_turn(), "stale slot must read as absent");
+        // "play music" routes normally → asks again (fresh pending).
+        let (resp, _) = engine.process_input_traced("play music");
+        assert!(matches!(resp, Response::Action(_)));
+        assert!(engine.has_pending_turn());
     }
 
     // --- Readiness gate (skill_is_ready) ---
