@@ -574,6 +574,14 @@ pub enum Capability {
     /// of installed music services. Host-import capability (needs the WASM
     /// import); granted only by hosts that implement it.
     MediaServices,
+    /// Permission to emit a critical, full-takeover alert — one that breaks
+    /// through Do Not Disturb and takes over the locked screen (the timer's
+    /// "your timer's up" alarm). Pure frontend: no WASM host import. On
+    /// Android the frontend maps this to the `USE_FULL_SCREEN_INTENT`
+    /// special-access permission and nudges the user to grant it when a
+    /// skill declaring the capability is installed. (Apple calls the same
+    /// concept "Critical Alerts".)
+    CriticalAlert,
 }
 
 #[derive(Debug, Clone, PartialEq)]

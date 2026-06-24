@@ -53,6 +53,7 @@ impl HostCapabilities {
             Capability::Authorize,
             Capability::MediaControl,
             Capability::MediaServices,
+            Capability::CriticalAlert,
         ] {
             s.granted.insert(cap);
         }
@@ -77,6 +78,7 @@ impl HostCapabilities {
         s.granted.insert(Capability::Calendar);
         s.granted.insert(Capability::Tasks);
         s.granted.insert(Capability::MediaControl);
+        s.granted.insert(Capability::CriticalAlert);
         s
     }
 
@@ -123,6 +125,7 @@ pub fn parse_capability(s: &str) -> Option<Capability> {
         "authorize" => Some(Capability::Authorize),
         "media_control" => Some(Capability::MediaControl),
         "media_services" => Some(Capability::MediaServices),
+        "critical_alert" => Some(Capability::CriticalAlert),
         _ => None,
     }
 }
@@ -142,6 +145,7 @@ pub fn capability_name(cap: Capability) -> &'static str {
         Capability::Authorize => "authorize",
         Capability::MediaControl => "media_control",
         Capability::MediaServices => "media_services",
+        Capability::CriticalAlert => "critical_alert",
     }
 }
 
@@ -260,6 +264,16 @@ mod tests {
         assert!(HostCapabilities::all().provides(Capability::MediaControl));
         // play_media no longer exists as a token
         assert_eq!(parse_capability("play_media"), None);
+    }
+
+    #[test]
+    fn critical_alert_roundtrips_and_is_pure_frontend() {
+        assert_eq!(parse_capability("critical_alert"), Some(Capability::CriticalAlert));
+        assert_eq!(capability_name(Capability::CriticalAlert), "critical_alert");
+        // Emitting an alert is a frontend-handled action with no WASM host
+        // import, so every frontend that honours actions provides it.
+        assert!(HostCapabilities::pure_frontend().provides(Capability::CriticalAlert));
+        assert!(HostCapabilities::all().provides(Capability::CriticalAlert));
     }
 
     #[test]
