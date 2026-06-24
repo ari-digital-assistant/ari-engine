@@ -606,6 +606,93 @@ pub(crate) fn map_settings_result(
     }
 }
 
+/// Collected platform providers for [`AriEngineBuilder`]. Each is optional;
+/// unset ones fall back to the Null/UTC defaults in `assemble_with_providers`.
+#[derive(Default)]
+struct EngineBuilderState {
+    sink: Option<Arc<dyn FfiLogSink>>,
+    tasks: Option<Arc<dyn FfiTasksProvider>>,
+    calendar: Option<Arc<dyn FfiCalendarProvider>>,
+    location: Option<Arc<dyn FfiLocationProvider>>,
+    clock: Option<Arc<dyn FfiLocalClock>>,
+    settings: Option<Arc<SkillSettingsStore>>,
+    envelope_sink: Option<Arc<dyn FfiEnvelopeSink>>,
+    locale: Option<Arc<dyn FfiLocaleProvider>>,
+    setting_writer: Option<Arc<dyn FfiSettingWriter>>,
+    authorize: Option<Arc<dyn FfiAuthorizeProvider>>,
+    media_services: Option<Arc<dyn FfiMediaServicesProvider>>,
+}
+
+/// Builds an [`AriEngine`] one provider at a time. This exists specifically to
+/// avoid a UniFFI/JNA arm64 calling-convention bug: a single constructor taking
+/// all 11 providers passes 11 by-value `RustBuffer` structs, and JNA mishandles
+/// the ones that spill onto the stack on AArch64 (benign on x86_64), crashing at
+/// startup on real devices. Each setter here is one FFI call with <=2 args, so
+/// nothing ever spills to the stack.
+#[derive(uniffi::Object)]
+pub struct AriEngineBuilder {
+    state: Mutex<EngineBuilderState>,
+}
+
+#[uniffi::export]
+impl AriEngineBuilder {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self { state: Mutex::new(EngineBuilderState::default()) })
+    }
+
+    pub fn sink(&self, v: Arc<dyn FfiLogSink>) {
+        self.state.lock().unwrap().sink = Some(v);
+    }
+    pub fn tasks(&self, v: Arc<dyn FfiTasksProvider>) {
+        self.state.lock().unwrap().tasks = Some(v);
+    }
+    pub fn calendar(&self, v: Arc<dyn FfiCalendarProvider>) {
+        self.state.lock().unwrap().calendar = Some(v);
+    }
+    pub fn location(&self, v: Arc<dyn FfiLocationProvider>) {
+        self.state.lock().unwrap().location = Some(v);
+    }
+    pub fn clock(&self, v: Arc<dyn FfiLocalClock>) {
+        self.state.lock().unwrap().clock = Some(v);
+    }
+    pub fn settings(&self, v: Arc<SkillSettingsStore>) {
+        self.state.lock().unwrap().settings = Some(v);
+    }
+    pub fn envelope_sink(&self, v: Arc<dyn FfiEnvelopeSink>) {
+        self.state.lock().unwrap().envelope_sink = Some(v);
+    }
+    pub fn locale(&self, v: Arc<dyn FfiLocaleProvider>) {
+        self.state.lock().unwrap().locale = Some(v);
+    }
+    pub fn setting_writer(&self, v: Arc<dyn FfiSettingWriter>) {
+        self.state.lock().unwrap().setting_writer = Some(v);
+    }
+    pub fn authorize(&self, v: Arc<dyn FfiAuthorizeProvider>) {
+        self.state.lock().unwrap().authorize = Some(v);
+    }
+    pub fn media_services(&self, v: Arc<dyn FfiMediaServicesProvider>) {
+        self.state.lock().unwrap().media_services = Some(v);
+    }
+
+    pub fn build(&self) -> Arc<AriEngine> {
+        let mut s = self.state.lock().unwrap();
+        Arc::new(assemble_with_providers(
+            s.sink.take(),
+            s.tasks.take(),
+            s.calendar.take(),
+            s.location.take(),
+            s.clock.take(),
+            s.settings.take(),
+            s.envelope_sink.take(),
+            s.locale.take(),
+            s.setting_writer.take(),
+            s.authorize.take(),
+            s.media_services.take(),
+        ))
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct AriEngine {
     // Wrapped in Mutex because `reload_community_skills` mutates the
@@ -666,6 +753,90 @@ fn build_engine_with_builtins() -> Engine {
     engine
 }
 
+/// Internal assembler shared by [`AriEngineBuilder::build`]. NOT a UniFFI
+/// entry point: exposing all 11 providers as one FFI call passes 11 by-value
+/// `RustBuffer` structs, which JNA mis-marshals on arm64 (args spill to the
+/// stack and get corrupted -> SIGSEGV at startup on real devices). The builder
+/// sets providers one per call (<=2 args each) to stay within the register arg
+/// budget; this free function does the actual assembly.
+#[allow(clippy::too_many_arguments)]
+fn assemble_with_providers(
+    sink: Option<Arc<dyn FfiLogSink>>,
+    tasks: Option<Arc<dyn FfiTasksProvider>>,
+    calendar: Option<Arc<dyn FfiCalendarProvider>>,
+    location: Option<Arc<dyn FfiLocationProvider>>,
+    clock: Option<Arc<dyn FfiLocalClock>>,
+    settings: Option<Arc<SkillSettingsStore>>,
+    envelope_sink: Option<Arc<dyn FfiEnvelopeSink>>,
+    locale: Option<Arc<dyn FfiLocaleProvider>>,
+    setting_writer: Option<Arc<dyn FfiSettingWriter>>,
+    authorize: Option<Arc<dyn FfiAuthorizeProvider>>,
+    media_services: Option<Arc<dyn FfiMediaServicesProvider>>,
+) -> AriEngine {
+    let log_sink: Arc<dyn LogSink> = match sink {
+        Some(s) => Arc::new(ForeignLogSinkAdapter(s)),
+        None => Arc::new(NullLogSink),
+    };
+    let tasks_provider: Arc<dyn TasksProvider> = match tasks {
+        Some(t) => Arc::new(ForeignTasksProviderAdapter(t)),
+        None => Arc::new(NullTasksProvider),
+    };
+    let calendar_provider: Arc<dyn CalendarProvider> = match calendar {
+        Some(c) => Arc::new(ForeignCalendarProviderAdapter(c)),
+        None => Arc::new(NullCalendarProvider),
+    };
+    let location_provider: Arc<dyn LocationProvider> = match location {
+        Some(l) => Arc::new(ForeignLocationProviderAdapter(l)),
+        None => Arc::new(NullLocationProvider),
+    };
+    let local_clock: Arc<dyn LocalClock> = match clock {
+        Some(c) => Arc::new(ForeignLocalClockAdapter(c)),
+        None => Arc::new(UtcLocalClock),
+    };
+    let locale_provider: Arc<dyn LocaleProvider> = match locale {
+        Some(l) => Arc::new(ForeignLocaleProviderAdapter(l)),
+        None => Arc::new(EnglishLocaleProvider),
+    };
+    let config_store: Arc<dyn ConfigStore> = match settings {
+        Some(s) => s.as_config_store(),
+        None => Arc::new(MemoryConfigStore::new()),
+    };
+    let setting_writer: Arc<dyn SettingWriter> = match setting_writer {
+        Some(w) => Arc::new(ForeignSettingWriterAdapter(w)),
+        None => Arc::new(NullSettingWriter),
+    };
+    let authorize_provider: Arc<dyn AuthorizeProvider> = match authorize {
+        Some(a) => Arc::new(ForeignAuthorizeProviderAdapter(a)),
+        None => Arc::new(NullAuthorizeProvider),
+    };
+    let media_services_provider: Arc<dyn MediaServicesProvider> = match media_services {
+        Some(p) => Arc::new(ForeignMediaServicesProviderAdapter(p)),
+        None => Arc::new(NullMediaServicesProvider),
+    };
+    let adapted_envelope_sink: Option<Arc<dyn EnvelopeSink>> = envelope_sink
+        .map(|es| Arc::new(ForeignEnvelopeSinkAdapter(es)) as Arc<dyn EnvelopeSink>);
+    let mut engine = build_engine_with_builtins();
+    engine.set_log_sink(Some(log_sink.clone()));
+    engine.set_config_store(Some(config_store.clone()));
+    if let Some(ref es) = adapted_envelope_sink {
+        engine.set_envelope_sink(Some(es.clone()));
+    }
+    AriEngine {
+        inner: Mutex::new(engine),
+        log_sink,
+        tasks_provider,
+        calendar_provider,
+        location_provider,
+        media_services_provider,
+        local_clock,
+        locale_provider,
+        config_store,
+        setting_writer,
+        authorize_provider,
+        envelope_sink: adapted_envelope_sink,
+    }
+}
+
 #[uniffi::export]
 impl AriEngine {
     #[uniffi::constructor]
@@ -723,84 +894,6 @@ impl AriEngine {
     /// the Null defaults. Any provider argument can be left `None`
     /// to fall back to the corresponding Null/UTC default — useful
     /// for frontends that only wire up part of the surface.
-    #[uniffi::constructor]
-    pub fn with_platform_providers(
-        sink: Option<Arc<dyn FfiLogSink>>,
-        tasks: Option<Arc<dyn FfiTasksProvider>>,
-        calendar: Option<Arc<dyn FfiCalendarProvider>>,
-        location: Option<Arc<dyn FfiLocationProvider>>,
-        clock: Option<Arc<dyn FfiLocalClock>>,
-        settings: Option<Arc<SkillSettingsStore>>,
-        envelope_sink: Option<Arc<dyn FfiEnvelopeSink>>,
-        locale: Option<Arc<dyn FfiLocaleProvider>>,
-        setting_writer: Option<Arc<dyn FfiSettingWriter>>,
-        authorize: Option<Arc<dyn FfiAuthorizeProvider>>,
-        media_services: Option<Arc<dyn FfiMediaServicesProvider>>,
-    ) -> Self {
-        let log_sink: Arc<dyn LogSink> = match sink {
-            Some(s) => Arc::new(ForeignLogSinkAdapter(s)),
-            None => Arc::new(NullLogSink),
-        };
-        let tasks_provider: Arc<dyn TasksProvider> = match tasks {
-            Some(t) => Arc::new(ForeignTasksProviderAdapter(t)),
-            None => Arc::new(NullTasksProvider),
-        };
-        let calendar_provider: Arc<dyn CalendarProvider> = match calendar {
-            Some(c) => Arc::new(ForeignCalendarProviderAdapter(c)),
-            None => Arc::new(NullCalendarProvider),
-        };
-        let location_provider: Arc<dyn LocationProvider> = match location {
-            Some(l) => Arc::new(ForeignLocationProviderAdapter(l)),
-            None => Arc::new(NullLocationProvider),
-        };
-        let local_clock: Arc<dyn LocalClock> = match clock {
-            Some(c) => Arc::new(ForeignLocalClockAdapter(c)),
-            None => Arc::new(UtcLocalClock),
-        };
-        let locale_provider: Arc<dyn LocaleProvider> = match locale {
-            Some(l) => Arc::new(ForeignLocaleProviderAdapter(l)),
-            None => Arc::new(EnglishLocaleProvider),
-        };
-        let config_store: Arc<dyn ConfigStore> = match settings {
-            Some(s) => s.as_config_store(),
-            None => Arc::new(MemoryConfigStore::new()),
-        };
-        let setting_writer: Arc<dyn SettingWriter> = match setting_writer {
-            Some(w) => Arc::new(ForeignSettingWriterAdapter(w)),
-            None => Arc::new(NullSettingWriter),
-        };
-        let authorize_provider: Arc<dyn AuthorizeProvider> = match authorize {
-            Some(a) => Arc::new(ForeignAuthorizeProviderAdapter(a)),
-            None => Arc::new(NullAuthorizeProvider),
-        };
-        let media_services_provider: Arc<dyn MediaServicesProvider> = match media_services {
-            Some(p) => Arc::new(ForeignMediaServicesProviderAdapter(p)),
-            None => Arc::new(NullMediaServicesProvider),
-        };
-        let adapted_envelope_sink: Option<Arc<dyn EnvelopeSink>> = envelope_sink
-            .map(|es| Arc::new(ForeignEnvelopeSinkAdapter(es)) as Arc<dyn EnvelopeSink>);
-        let mut engine = build_engine_with_builtins();
-        engine.set_log_sink(Some(log_sink.clone()));
-        engine.set_config_store(Some(config_store.clone()));
-        if let Some(ref es) = adapted_envelope_sink {
-            engine.set_envelope_sink(Some(es.clone()));
-        }
-        Self {
-            inner: Mutex::new(engine),
-            log_sink,
-            tasks_provider,
-            calendar_provider,
-            location_provider,
-            media_services_provider,
-            local_clock,
-            locale_provider,
-            config_store,
-            setting_writer,
-            authorize_provider,
-            envelope_sink: adapted_envelope_sink,
-        }
-    }
-
     /// The user's currently-active language, as seen by the engine.
     /// Reads through the [`LocaleProvider`] the host wired up at
     /// construction time. ISO 639-1 lowercase (e.g. `"en"`, `"it"`).
