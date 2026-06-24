@@ -549,14 +549,18 @@ impl AuthorizeProvider for ForeignAuthorizeProviderAdapter {
 
 #[derive(uniffi::Enum)]
 pub enum FfiResponse {
-    Text { body: String },
+    /// `rearm` true means the engine is awaiting a spoken reply — the host
+    /// should re-arm the mic without a wake word (see multi-turn design).
+    Text { body: String, rearm: bool },
     /// `skill_id` is the manifest id of the emitting skill (e.g.
     /// `dev.heyari.timer`), used by the frontend to resolve `asset:<path>`
     /// references back to the skill's bundle directory. Empty string if
     /// the engine couldn't attribute the response to a specific skill
     /// (router-direct actions, fallbacks) — treat that as "no bundle,
     /// asset references will fail to resolve".
-    Action { json: String, skill_id: String },
+    /// `rearm` true means the engine is awaiting a spoken reply — the host
+    /// should re-arm the mic without a wake word (see multi-turn design).
+    Action { json: String, skill_id: String, rearm: bool },
     Binary { mime: String, data: Vec<u8> },
     /// The engine couldn't match any skill to the input. The host can use
     /// this signal to retry the upstream STT (e.g. with a fresh sherpa
@@ -967,6 +971,7 @@ impl AriEngine {
         let mut engine = self.inner.lock().expect("engine mutex poisoned");
         engine.set_locale(locale.clone());
         let (response, skill_id) = engine.process_input_with_skill(&input);
+        let rearm = engine.has_pending_turn();
         match response {
             ari_core::Response::Text(s) => {
                 // The engine's fallback text is locale-specific
@@ -977,17 +982,27 @@ impl AriEngine {
                 let is_fallback =
                     s == fallback_response_for(&locale) || s == FALLBACK_RESPONSE;
                 if is_fallback {
+                    // A fallback never re-arms.
                     FfiResponse::NotUnderstood { body: s }
                 } else {
-                    FfiResponse::Text { body: s }
+                    FfiResponse::Text { body: s, rearm }
                 }
             }
             ari_core::Response::Action(v) => FfiResponse::Action {
                 json: serde_json::to_string(&v).unwrap_or_default(),
                 skill_id: skill_id.unwrap_or_default(),
+                rearm,
             },
             ari_core::Response::Binary { mime, data } => FfiResponse::Binary { mime, data },
         }
+    }
+
+    /// Discard any pending question the engine is awaiting a reply to. Called
+    /// by the host when the re-armed mic times out, the user dismisses, or a
+    /// fresh wake word starts a new session. No-op when nothing is pending.
+    pub fn cancel_pending_reply(&self) {
+        let engine = self.inner.lock().expect("engine mutex poisoned");
+        engine.clear_pending_turn();
     }
 
     /// Set the GGUF model path for the LLM fallback. The model is NOT
@@ -1197,7 +1212,7 @@ mod tests {
         let engine = AriEngine::new();
         let resp = engine.process_input("hello".to_string());
         match resp {
-            FfiResponse::Text { body } => {
+            FfiResponse::Text { body, .. } => {
                 assert!(!body.is_empty());
                 assert_ne!(body, "Sorry, I didn't understand that.");
             }
@@ -1210,7 +1225,7 @@ mod tests {
         let engine = AriEngine::new();
         let resp = engine.process_input("what time is it".to_string());
         match resp {
-            FfiResponse::Text { body } => {
+            FfiResponse::Text { body, .. } => {
                 assert!(body.starts_with("It's "), "response was: {body}");
             }
             _ => panic!("expected Text response for time"),
@@ -1222,7 +1237,7 @@ mod tests {
         let engine = AriEngine::new();
         let resp = engine.process_input("calculate 5 + 3".to_string());
         match resp {
-            FfiResponse::Text { body } => assert_eq!(body, "8"),
+            FfiResponse::Text { body, .. } => assert_eq!(body, "8"),
             _ => panic!("expected Text response for calculation"),
         }
     }
@@ -1232,7 +1247,7 @@ mod tests {
         let engine = AriEngine::new();
         let resp = engine.process_input("open spotify".to_string());
         match resp {
-            FfiResponse::Action { json, skill_id } => {
+            FfiResponse::Action { json, skill_id, .. } => {
                 let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(parsed["v"], 1);
                 assert_eq!(parsed["launch_app"], "spotify");
@@ -1285,5 +1300,19 @@ mod tests {
             adapter.installed_services(),
             vec!["spotify".to_string(), "youtube_music".to_string()]
         );
+    }
+
+    #[test]
+    fn ffi_response_action_carries_rearm_field() {
+        // Compile-level guarantee the variant has a `rearm` field.
+        let r = FfiResponse::Action {
+            json: "{}".to_string(),
+            skill_id: "x".to_string(),
+            rearm: true,
+        };
+        match r {
+            FfiResponse::Action { rearm, .. } => assert!(rearm),
+            _ => panic!("wrong variant"),
+        }
     }
 }

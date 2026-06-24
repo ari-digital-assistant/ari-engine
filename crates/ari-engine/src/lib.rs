@@ -1401,6 +1401,21 @@ fn run_consult_phase_two(
         &ctx,
     );
 
+    // Async await_reply (a skill asking a follow-up AFTER a background
+    // consult) is recognised and stripped to keep the pushed envelope
+    // clean, but the Android mic re-arm for the async path is not yet
+    // wired (see spec "Out of scope"). We deliberately do NOT set a
+    // pending turn here: nothing can answer it while the overlay is gone.
+    let mut continuation = continuation;
+    if let Response::Action(ref mut v) = continuation {
+        if extract_await_reply(v).is_some() {
+            log(
+                LogLevel::Info,
+                "multi-turn: async await_reply stripped (async mic re-arm not yet wired)",
+            );
+        }
+    }
+
     let envelope = match continuation {
         Response::Action(v) => {
             // Same capability enforcement as the phase-1 chokepoint — the
