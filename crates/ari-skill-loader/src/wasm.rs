@@ -2507,6 +2507,16 @@ impl Skill for WasmSkill {
         &self.description
     }
 
+    fn has_capability(&self, name: &str) -> bool {
+        // Check the granted set (declared ∩ host-provided). For a
+        // pure-frontend capability like `critical_alert` the host always
+        // provides it, so granted == declared — i.e. this answers "did the
+        // skill declare it?".
+        self.granted_capabilities
+            .iter()
+            .any(|c| capability_name(*c) == name)
+    }
+
     fn specificity(&self) -> Specificity {
         self.specificity
     }

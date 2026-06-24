@@ -762,6 +762,21 @@ impl Engine {
             other => return other,
         };
 
+        // Enforce declared capabilities before anything downstream sees the
+        // envelope: a skill that didn't declare `critical_alert` can't emit a
+        // lock-screen takeover alert, no matter what it put in the JSON.
+        let clamped =
+            clamp_undeclared_critical_alerts(&mut action, skill.has_capability(CRITICAL_ALERT_CAP));
+        if clamped > 0 {
+            self.log(
+                LogLevel::Warn,
+                &format!(
+                    "skill '{}' emitted {clamped} critical full-takeover alert(s) without declaring `{CRITICAL_ALERT_CAP}` — downgraded to high-priority",
+                    skill.id(),
+                ),
+            );
+        }
+
         let directive_value = match action
             .as_object_mut()
             .and_then(|obj| obj.remove("consult_assistant"))
@@ -1104,6 +1119,51 @@ fn pick_delay_phrase() -> &'static str {
     DELAY_PHRASES[idx]
 }
 
+/// The capability a skill must declare to emit a critical, full-takeover
+/// alert — one that breaks through Do Not Disturb and takes over the
+/// locked screen. Snake_case, matching the manifest spelling.
+const CRITICAL_ALERT_CAP: &str = "critical_alert";
+
+/// Demote any critical / full-takeover alert in an action envelope that the
+/// emitting skill never declared. A skill without the `critical_alert`
+/// capability may still raise alerts — they're just clamped to an ordinary
+/// high-priority one: the screen-takeover flag is stripped and `critical`
+/// urgency drops to `high`. Returns how many alerts were clamped (0 when the
+/// skill declared the capability, or there was nothing to clamp) so the
+/// caller can log it. The frontend trusts the envelope, so this is the
+/// engine's job — a skill must not be able to do what it never declared.
+fn clamp_undeclared_critical_alerts(action: &mut serde_json::Value, declared: bool) -> usize {
+    if declared {
+        return 0;
+    }
+    let alerts = match action.get_mut("alerts").and_then(|a| a.as_array_mut()) {
+        Some(a) => a,
+        None => return 0,
+    };
+    let mut clamped = 0;
+    for alert in alerts.iter_mut() {
+        let obj = match alert.as_object_mut() {
+            Some(o) => o,
+            None => continue,
+        };
+        let is_takeover = obj
+            .get("full_takeover")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let is_critical =
+            obj.get("urgency").and_then(serde_json::Value::as_str) == Some("critical");
+        if !is_takeover && !is_critical {
+            continue;
+        }
+        obj.remove("full_takeover");
+        if is_critical {
+            obj.insert("urgency".into(), serde_json::Value::String("high".into()));
+        }
+        clamped += 1;
+    }
+    clamped
+}
+
 fn run_consult_phase_two(
     skill: Arc<dyn Skill>,
     skill_id: String,
@@ -1216,7 +1276,23 @@ fn run_consult_phase_two(
     );
 
     let envelope = match continuation {
-        Response::Action(v) => strip_nested_consult(v, &log),
+        Response::Action(v) => {
+            // Same capability enforcement as the phase-1 chokepoint — the
+            // phase-2 envelope reaches the frontend via the sink, bypassing
+            // maybe_intercept_consult, so it has to be clamped here too.
+            let mut v = strip_nested_consult(v, &log);
+            let clamped =
+                clamp_undeclared_critical_alerts(&mut v, skill.has_capability(CRITICAL_ALERT_CAP));
+            if clamped > 0 {
+                log(
+                    LogLevel::Warn,
+                    &format!(
+                        "skill '{skill_id}' emitted {clamped} critical full-takeover alert(s) without declaring `{CRITICAL_ALERT_CAP}` — downgraded to high-priority"
+                    ),
+                );
+            }
+            v
+        }
         Response::Text(s) => serde_json::json!({ "v": 1, "speak": s }),
         Response::Binary { .. } => {
             log(
@@ -1677,6 +1753,133 @@ mod tests {
         fn execute(&self, _input: &str, _ctx: &SkillContext) -> Response {
             Response::Action(self.action.clone())
         }
+    }
+
+    // --- critical_alert capability enforcement ---
+
+    /// Like ActionSkill, but declares the `critical_alert` capability — the
+    /// stand-in for the timer skill.
+    struct CapableAlertSkill {
+        id: &'static str,
+        action: serde_json::Value,
+    }
+
+    impl Skill for CapableAlertSkill {
+        fn id(&self) -> &str { self.id }
+        fn has_capability(&self, name: &str) -> bool { name == CRITICAL_ALERT_CAP }
+        fn specificity(&self) -> Specificity { Specificity::High }
+        fn score(&self, _input: &str, _ctx: &SkillContext) -> f32 { 0.95 }
+        fn execute(&self, _input: &str, _ctx: &SkillContext) -> Response {
+            Response::Action(self.action.clone())
+        }
+    }
+
+    fn critical_takeover_envelope() -> serde_json::Value {
+        serde_json::json!({
+            "v": 1,
+            "alerts": [{
+                "id": "t", "title": "Timer", "urgency": "critical", "full_takeover": true
+            }]
+        })
+    }
+
+    #[test]
+    fn clamp_is_noop_when_skill_declared_capability() {
+        let mut env = critical_takeover_envelope();
+        let before = env.clone();
+        assert_eq!(clamp_undeclared_critical_alerts(&mut env, true), 0);
+        assert_eq!(env, before);
+    }
+
+    #[test]
+    fn clamp_strips_takeover_and_lowers_critical_when_undeclared() {
+        let mut env = critical_takeover_envelope();
+        assert_eq!(clamp_undeclared_critical_alerts(&mut env, false), 1);
+        let alert = &env["alerts"][0];
+        assert!(alert.get("full_takeover").is_none(), "takeover flag must be stripped");
+        assert_eq!(alert["urgency"], "high");
+        assert_eq!(alert["title"], "Timer", "non-privileged fields survive untouched");
+    }
+
+    #[test]
+    fn clamp_lowers_critical_without_takeover() {
+        let mut env = serde_json::json!({ "alerts": [{"id":"a","urgency":"critical"}] });
+        assert_eq!(clamp_undeclared_critical_alerts(&mut env, false), 1);
+        assert_eq!(env["alerts"][0]["urgency"], "high");
+    }
+
+    #[test]
+    fn clamp_strips_takeover_on_non_critical_alert() {
+        // full_takeover is a privilege in its own right, even at high urgency.
+        let mut env = serde_json::json!({ "alerts": [{"id":"a","urgency":"high","full_takeover":true}] });
+        assert_eq!(clamp_undeclared_critical_alerts(&mut env, false), 1);
+        let alert = &env["alerts"][0];
+        assert!(alert.get("full_takeover").is_none());
+        assert_eq!(alert["urgency"], "high");
+    }
+
+    #[test]
+    fn clamp_leaves_ordinary_alerts_untouched() {
+        let mut env = serde_json::json!({ "alerts": [{"id":"a","urgency":"normal"}] });
+        let before = env.clone();
+        assert_eq!(clamp_undeclared_critical_alerts(&mut env, false), 0);
+        assert_eq!(env, before);
+    }
+
+    #[test]
+    fn clamp_handles_envelope_without_alerts() {
+        let mut env = serde_json::json!({ "v": 1, "speak": "hi" });
+        let before = env.clone();
+        assert_eq!(clamp_undeclared_critical_alerts(&mut env, false), 0);
+        assert_eq!(env, before);
+    }
+
+    #[test]
+    fn clamp_only_touches_offending_alerts_in_a_batch() {
+        let mut env = serde_json::json!({
+            "alerts": [
+                {"id":"ok","urgency":"normal"},
+                {"id":"bad","urgency":"critical","full_takeover":true}
+            ]
+        });
+        assert_eq!(clamp_undeclared_critical_alerts(&mut env, false), 1);
+        assert_eq!(env["alerts"][0]["urgency"], "normal");
+        assert_eq!(env["alerts"][1]["urgency"], "high");
+        assert!(env["alerts"][1].get("full_takeover").is_none());
+    }
+
+    #[test]
+    fn engine_clamps_critical_alert_from_undeclared_skill() {
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(ActionSkill {
+            id: "rogue",
+            action: critical_takeover_envelope(),
+        }));
+        let resp = engine.process_input("trigger");
+        let v = match resp {
+            Response::Action(v) => v,
+            other => panic!("expected Action, got {other:?}"),
+        };
+        let alert = &v["alerts"][0];
+        assert!(alert.get("full_takeover").is_none(), "undeclared takeover must be stripped");
+        assert_eq!(alert["urgency"], "high", "undeclared critical must drop to high");
+    }
+
+    #[test]
+    fn engine_preserves_critical_alert_from_declared_skill() {
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(CapableAlertSkill {
+            id: "timer",
+            action: critical_takeover_envelope(),
+        }));
+        let resp = engine.process_input("trigger");
+        let v = match resp {
+            Response::Action(v) => v,
+            other => panic!("expected Action, got {other:?}"),
+        };
+        let alert = &v["alerts"][0];
+        assert_eq!(alert["full_takeover"], true, "declared skill keeps its takeover");
+        assert_eq!(alert["urgency"], "critical", "declared skill keeps critical urgency");
     }
 
     #[test]

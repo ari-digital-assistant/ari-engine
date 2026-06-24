@@ -209,6 +209,15 @@ pub trait Skill: Send + Sync {
     /// — see the trait-level docs.
     fn description(&self) -> &str { "" }
 
+    /// Whether this skill holds the named host capability (snake_case, as
+    /// spelled in the manifest — e.g. `"critical_alert"`). The engine uses
+    /// this to refuse privileged envelope content a skill never declared:
+    /// e.g. only a skill that declared `critical_alert` may emit a
+    /// critical, full-takeover alert — anything else gets clamped down to
+    /// an ordinary alert. Anything that doesn't override this holds no
+    /// capabilities (builtins, declarative skills), which is fail-closed.
+    fn has_capability(&self, _name: &str) -> bool { false }
+
     fn specificity(&self) -> Specificity;
     fn score(&self, input: &str, ctx: &SkillContext) -> f32;
     fn execute(&self, input: &str, ctx: &SkillContext) -> Response;
