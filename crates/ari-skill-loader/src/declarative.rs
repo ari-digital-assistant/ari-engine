@@ -17,10 +17,11 @@
 
 use crate::localized_manifest::{LocalizedManifestSet, CANONICAL_LOCALE};
 use crate::localized_strings::{parse_strings_directory, LocalizedStrings};
-use crate::manifest::{AriExtension, Behaviour, ResponseSpec, Skillfile};
+use crate::host_capabilities::capability_name;
+use crate::manifest::{AriExtension, Behaviour, Capability, ResponseSpec, Skillfile};
 use crate::scoring::{PatternScorer, ScorerError};
 use ari_core::{Response, Skill, SkillContext, Specificity};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -81,6 +82,13 @@ pub struct DeclarativeSkill {
     /// string that matches a key becomes its per-locale value, a
     /// non-key string renders verbatim (same contract as `t()`).
     strings: Arc<LocalizedStrings>,
+    /// The host capabilities this skill declared in its manifest. For a
+    /// loaded skill this equals the granted set — the loader rejects any
+    /// skill declaring a capability the host doesn't provide — so it
+    /// answers "did the skill declare this?". The engine uses it to gate
+    /// privileged envelope content (e.g. a declarative skill can only emit
+    /// a `critical_alert` takeover if it declared the capability).
+    capabilities: Arc<HashSet<Capability>>,
 }
 
 impl DeclarativeSkill {
@@ -106,6 +114,7 @@ impl DeclarativeSkill {
             by_locale,
             pick_counter: AtomicU64::new(seed_pick_counter()),
             strings: Arc::new(LocalizedStrings::default()),
+            capabilities: Arc::new(ari.capabilities.iter().copied().collect()),
         })
     }
 
@@ -153,6 +162,7 @@ impl DeclarativeSkill {
             by_locale,
             pick_counter: AtomicU64::new(seed_pick_counter()),
             strings: Arc::new(strings),
+            capabilities: Arc::new(canonical_ari.capabilities.iter().copied().collect()),
         })
     }
 
@@ -300,6 +310,12 @@ impl Skill for DeclarativeSkill {
         &self.canonical().description
     }
 
+    fn has_capability(&self, name: &str) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| capability_name(*c) == name)
+    }
+
     fn specificity(&self) -> Specificity {
         self.specificity
     }
@@ -346,6 +362,43 @@ metadata:
 ---
 "#;
         DeclarativeSkill::from_skillfile(&parse(src)).unwrap()
+    }
+
+    fn declares_critical_alert() -> DeclarativeSkill {
+        let src = r#"---
+name: alarm
+description: A static alarm skill used to exercise capability enforcement.
+metadata:
+  ari:
+    id: ai.example.alarm
+    version: "0.1.0"
+    engine: ">=0.3"
+    capabilities: [critical_alert]
+    languages: [en]
+    specificity: high
+    matching:
+      patterns:
+        - keywords: [alarm]
+          weight: 0.95
+    declarative:
+      response_pick: ["Alarm."]
+---
+"#;
+        DeclarativeSkill::from_skillfile(&parse(src)).unwrap()
+    }
+
+    #[test]
+    fn has_capability_reflects_declared_capabilities() {
+        // A skill that declared nothing holds nothing.
+        let bare = coin_flip();
+        assert!(!bare.has_capability("critical_alert"));
+        assert!(!bare.has_capability("http"));
+
+        // A skill that declared `critical_alert` holds exactly that.
+        let alarm = declares_critical_alert();
+        assert!(alarm.has_capability("critical_alert"));
+        assert!(!alarm.has_capability("http"));
+        assert!(!alarm.has_capability("not_a_capability"));
     }
 
     #[test]
