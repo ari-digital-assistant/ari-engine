@@ -303,6 +303,27 @@ pub trait Skill: Send + Sync {
         self.execute(&payload.to_string(), ctx)
     }
 
+    /// Deliver the user's spoken reply to a question this skill previously
+    /// asked (via an `await_reply` envelope). `context` is the opaque blob
+    /// the skill stored on its question; `user_text` is the (normalized)
+    /// reply. Mirrors `execute_continuation`: wraps both strings into a
+    /// reserved JSON envelope routed through the single `execute` export, so
+    /// WASM skills need no extra export and the host needs no new symbol.
+    fn execute_reply(
+        &self,
+        context: &str,
+        user_text: &str,
+        ctx: &SkillContext,
+    ) -> Response {
+        let payload = serde_json::json!({
+            "_ari_reply": {
+                "context": context,
+                "text": user_text,
+            }
+        });
+        self.execute(&payload.to_string(), ctx)
+    }
+
     /// Settings-time invocation (outside the utterance pipeline). `field` is the
     /// settings field key being queried; `values_json` is `{ "<dep_key>": "<val>", ... }`.
     /// Default: unsupported. WASM skills override to call their `settings_query` export.
@@ -859,5 +880,31 @@ mod tests {
     fn ordinal_hyphenated_day_of_month() {
         assert_eq!(parse_number_words(&["twenty-seventh"]), Some((27, 1)));
         assert_eq!(parse_number_words(&["thirty-first"]), Some((31, 1)));
+    }
+
+    // --- execute_reply ---
+
+    #[test]
+    fn execute_reply_wraps_context_and_text_into_reserved_envelope() {
+        use std::sync::Mutex;
+        struct Capture {
+            seen: Mutex<String>,
+        }
+        impl Skill for Capture {
+            fn id(&self) -> &str { "cap" }
+            fn specificity(&self) -> Specificity { Specificity::Low }
+            fn score(&self, _: &str, _: &SkillContext) -> f32 { 0.0 }
+            fn execute(&self, input: &str, _: &SkillContext) -> Response {
+                *self.seen.lock().unwrap() = input.to_string();
+                Response::Text(String::new())
+            }
+        }
+        let s = Capture { seen: Mutex::new(String::new()) };
+        let ctx = SkillContext::default();
+        s.execute_reply("ctx-blob", "spotify", &ctx);
+        let seen = s.seen.lock().unwrap().clone();
+        let v: serde_json::Value = serde_json::from_str(&seen).unwrap();
+        assert_eq!(v["_ari_reply"]["context"], "ctx-blob");
+        assert_eq!(v["_ari_reply"]["text"], "spotify");
     }
 }
