@@ -910,6 +910,34 @@ impl LoadedModel {
     }
 }
 
+/// Final dotted segment of a skill id (`dev.heyari.weather` → `weather`).
+fn last_segment(id: &str) -> &str {
+    id.rsplit('.').next().unwrap_or(id)
+}
+
+/// Map each skill id to a short, model-friendly alias for the router prompt.
+/// A 270M model reliably emits a single bare word but mangles reverse-DNS ids
+/// (`dev.heyari.weather` → `dev.weather`) — and the call-extraction regex only
+/// matches `\w+`, so a dotted name can't even be parsed back. So we show the
+/// final segment as the declaration name and resolve it to the full id on the
+/// way out. If two skills share a final segment, both keep their full ids so
+/// the mapping stays unambiguous. Returns (display, full_id) parallel to
+/// `skills`.
+fn router_alias_table(skills: &[(String, String, String)]) -> Vec<(String, String)> {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (id, _, _) in skills {
+        *counts.entry(last_segment(id)).or_insert(0) += 1;
+    }
+    skills
+        .iter()
+        .map(|(id, _, _)| {
+            let seg = last_segment(id);
+            let display = if counts[seg] == 1 { seg.to_string() } else { id.clone() };
+            (display, id.clone())
+        })
+        .collect()
+}
+
 /// Build the FunctionGemma prompt with tool declarations.
 ///
 /// Each tool declaration embeds the skill's actual parameter schema
@@ -920,8 +948,9 @@ impl LoadedModel {
 /// can produce typed args matching what the training data taught it.
 fn build_router_prompt(input: &str, skills: &[(String, String, String)]) -> String {
     let e = "<escape>";
+    let aliases = router_alias_table(skills);
     let mut declarations = String::new();
-    for (id, description, schema_json) in skills {
+    for ((_id, description, schema_json), (display, _full)) in skills.iter().zip(aliases.iter()) {
         // The schema is JSON like `{"type":"object","properties":{...}}`.
         // FunctionGemma's tool format wants Python-dict-ish keys
         // wrapped in <escape>...<escape> rather than JSON quotes —
@@ -929,9 +958,12 @@ fn build_router_prompt(input: &str, skills: &[(String, String, String)]) -> Stri
         // substitution. The training pipeline does the equivalent via
         // HuggingFace's apply_chat_template, but we reach the same
         // place by shape here.
+        //
+        // The declaration name is the short alias (see router_alias_table),
+        // not the full reverse-DNS id, so a small model can actually emit it.
         let schema_inline = json_schema_to_funcgemma(schema_json, e);
         declarations.push_str(&format!(
-            "<start_function_declaration>declaration:{id}{{description:{e}{description}{e},parameters:{schema_inline}}}<end_function_declaration>"
+            "<start_function_declaration>declaration:{display}{{description:{e}{description}{e},parameters:{schema_inline}}}<end_function_declaration>"
         ));
     }
     format!(
@@ -1026,30 +1058,39 @@ fn parse_router_output(
     skills: &[(String, String, String)],
     confidence: f32,
 ) -> RouteResult {
-    let skill_names: std::collections::HashSet<&str> =
-        skills.iter().map(|(id, _, _)| id.as_str()).collect();
+    let aliases = router_alias_table(skills);
 
     let Some((name, args_block)) = extract_call_block(output) else {
         // No function call — model declined.
         return RouteResult::NoMatch;
     };
 
-    if !skill_names.contains(name.as_str()) {
-        // Function name not in our skill list — could be a mobile action
-        // or a hallucination. For now, treat unknown names as NoMatch.
-        // TODO: map known mobile action names to RouteResult::Action
+    // Resolve the emitted name back to a full skill id. Accept the short alias
+    // we showed it, the full id, or a mangled dotted form with the right final
+    // segment (e.g. emitted `dev.weather` → `dev.heyari.weather`).
+    let Some(full_id) = aliases
+        .iter()
+        .find(|(display, full)| {
+            display.as_str() == name
+                || full.as_str() == name
+                || last_segment(full) == last_segment(&name)
+        })
+        .map(|(_, full)| full.clone())
+    else {
+        // Name resolves to nothing we offered — hallucination or mobile
+        // action. Treat as NoMatch (TODO: map known mobile actions).
         return RouteResult::NoMatch;
-    }
+    };
 
     // No args block (or model emitted just `name{}`) — pre-typed-args
     // shape, equivalent to RouteResult::Skill.
     let args_json = funcgemma_to_json(args_block.as_str()).unwrap_or_default();
     if args_json.is_empty() || args_json == "{}" {
-        return RouteResult::Skill { id: name, confidence };
+        return RouteResult::Skill { id: full_id, confidence };
     }
 
     RouteResult::SkillWithArgs {
-        id: name,
+        id: full_id,
         args_json,
         confidence,
     }
@@ -1060,7 +1101,9 @@ fn parse_router_output(
 /// output. The brace block is matched by counting braces / respecting
 /// the `<escape>...<escape>` string delimiter, so nested objects work.
 fn extract_call_block(output: &str) -> Option<(String, String)> {
-    let head_re = regex::Regex::new(r"<start_function_call>call:(\w+)\{").unwrap();
+    // `[\w.]+` (not `\w+`) so a dotted name the model might still emit
+    // (`dev.weather`) is captured rather than silently dropped.
+    let head_re = regex::Regex::new(r"<start_function_call>call:([\w.]+)\{").unwrap();
     let caps = head_re.captures(output)?;
     let name = caps.get(1)?.as_str().to_string();
     let head_match = caps.get(0)?;
@@ -1428,6 +1471,59 @@ mod tests {
             parse_router_output(out, &router_skill_catalog(), 0.0),
             RouteResult::NoMatch
         ));
+    }
+
+    fn community_catalog() -> Vec<(String, String, String)> {
+        vec![
+            (
+                "current_time".to_string(),
+                "Tells the current time.".to_string(),
+                r#"{"type":"object","properties":{}}"#.to_string(),
+            ),
+            (
+                "dev.heyari.weather".to_string(),
+                "Weather and forecasts.".to_string(),
+                r#"{"type":"object","properties":{}}"#.to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn router_alias_table_shortens_reverse_dns_ids() {
+        let table = router_alias_table(&community_catalog());
+        assert_eq!(table[0], ("current_time".to_string(), "current_time".to_string()));
+        assert_eq!(table[1], ("weather".to_string(), "dev.heyari.weather".to_string()));
+    }
+
+    #[test]
+    fn router_prompt_shows_alias_not_reverse_dns() {
+        let prompt = build_router_prompt("what is the weather like", &community_catalog());
+        assert!(prompt.contains("declaration:weather{"), "prompt: {prompt}");
+        assert!(
+            !prompt.contains("declaration:dev.heyari.weather"),
+            "must not put the reverse-DNS id in the declaration"
+        );
+    }
+
+    #[test]
+    fn parse_router_output_resolves_alias_to_full_id() {
+        // Model emits the short alias we showed it.
+        let out = "<start_function_call>call:weather{}<end_function_call>";
+        match parse_router_output(out, &community_catalog(), -0.1) {
+            RouteResult::Skill { id, .. } => assert_eq!(id, "dev.heyari.weather"),
+            other => panic!("expected Skill, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn parse_router_output_recovers_mangled_dotted_id() {
+        // The exact failure we saw on-device: the model dropped the middle
+        // segment, emitting `dev.weather`. The final-segment fallback recovers it.
+        let out = "<start_function_call>call:dev.weather{}<end_function_call>";
+        match parse_router_output(out, &community_catalog(), -0.075) {
+            RouteResult::Skill { id, .. } => assert_eq!(id, "dev.heyari.weather"),
+            other => panic!("expected recovered Skill, got {:?}", std::mem::discriminant(&other)),
+        }
     }
 
     #[test]
