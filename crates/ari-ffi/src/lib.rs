@@ -746,7 +746,10 @@ pub struct AriEngine {
     pub(crate) envelope_sink: Option<Arc<dyn EnvelopeSink>>,
 }
 
-fn build_engine_with_builtins() -> Engine {
+/// Build an [`Engine`] with the full set of built-in skills registered — the
+/// same catalogue used at runtime. Exposed so the `route-eval` binary can
+/// exercise the real router catalogue without duplicating the skill list.
+pub fn build_engine_with_builtins() -> Engine {
     let mut engine = Engine::new();
     engine.register_skill(Box::new(CurrentTimeSkill::new()));
     engine.register_skill(Box::new(DateSkill::new()));

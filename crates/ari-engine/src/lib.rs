@@ -489,6 +489,27 @@ impl Engine {
         format!("input: {normalized:?}\n{verdict}\nraw: {raw}")
     }
 
+    /// Router-only routing decision, mirroring the English FunctionGemma
+    /// branch of `process_input_traced`: run the router against the live
+    /// catalogue and apply the confidence gate. Returns the skill id that
+    /// WOULD be dispatched, or `None` for NoMatch / below-threshold (i.e.
+    /// "falls through to the assistant"). Backs the routing-eval promotion
+    /// gate; runs neither the keyword scorer nor the assistant.
+    pub fn route_decision(&self, input: &str) -> Option<String> {
+        let normalized = normalize_input(input.trim(), &self.ctx.locale);
+        if normalized.is_empty() {
+            return None;
+        }
+        let router = self.router.as_ref()?;
+        match router.route(&normalized, &self.router_catalog()) {
+            RouteResult::Skill { id, confidence }
+            | RouteResult::SkillWithArgs { id, confidence, .. } => {
+                (confidence >= ari_core::MIN_ROUTER_CONFIDENCE).then_some(id)
+            }
+            RouteResult::Action(_) | RouteResult::NoMatch => None,
+        }
+    }
+
     pub fn process_input_traced(&self, input: &str) -> (Response, Option<DebugTrace>) {
         let normalized = normalize_input(input.trim(), &self.ctx.locale);
         if normalized.is_empty() {
