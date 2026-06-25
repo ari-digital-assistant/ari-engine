@@ -346,11 +346,42 @@ struct StorageCtx {
     lock: Mutex<()>,
 }
 
+/// Derive a FunctionGemma parameter schema from a skill's example args. The
+/// manifest carries no explicit schema, so we infer string properties from the
+/// union of arg keys across the examples (every key required) — the same
+/// derivation generate-dataset.py does, so the runtime declaration matches what
+/// the model was trained on. Parameterless skills get an empty-properties schema.
+fn derive_parameters_schema(examples: &[crate::manifest::SkillExample]) -> String {
+    let mut keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for ex in examples {
+        if let Some(serde_json::Value::Object(map)) = &ex.args {
+            keys.extend(map.keys().map(String::as_str));
+        }
+    }
+    if keys.is_empty() {
+        return r#"{"type": "object", "properties": {}}"#.to_string();
+    }
+    let props: Vec<String> = keys
+        .iter()
+        .map(|k| format!(r#"{}: {{"type": "string"}}"#, serde_json::to_string(k).unwrap()))
+        .collect();
+    let required: Vec<String> = keys.iter().map(|k| serde_json::to_string(k).unwrap()).collect();
+    format!(
+        r#"{{"type": "object", "properties": {{{}}}, "required": [{}]}}"#,
+        props.join(", "),
+        required.join(", "),
+    )
+}
+
 /// A WASM skill, ready to plug into the engine. Owns a compiled `Module` and
 /// the configuration needed to instantiate it on demand.
 pub struct WasmSkill {
     id: String,
     description: String,
+    /// Parameter schema for the FunctionGemma router, derived at load time
+    /// from the manifest's example args (the manifest carries no explicit
+    /// schema). Mirrors generate-dataset.py so training and runtime agree.
+    parameters_schema: String,
     specificity: Specificity,
     custom_score: bool,
     /// Per-locale native pattern scorers used when `custom_score = false`.
@@ -680,6 +711,7 @@ impl WasmSkill {
         let skill = WasmSkill {
             id: ari.id.clone(),
             description: description.to_string(),
+            parameters_schema: derive_parameters_schema(&ari.examples),
             specificity: ari.specificity.as_core(),
             custom_score: matching.custom_score,
             scorers,
@@ -2507,6 +2539,10 @@ impl Skill for WasmSkill {
         &self.description
     }
 
+    fn parameters_schema(&self) -> &str {
+        &self.parameters_schema
+    }
+
     fn has_capability(&self, name: &str) -> bool {
         // Check the granted set (declared ∩ host-provided). For a
         // pure-frontend capability like `critical_alert` the host always
@@ -2782,6 +2818,37 @@ impl WasmSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derive_parameters_schema_unions_example_arg_keys() {
+        use crate::manifest::SkillExample;
+        let examples = vec![
+            SkillExample {
+                text: "x".into(),
+                args: Some(serde_json::json!({"location": "", "when": "now"})),
+            },
+            SkillExample {
+                text: "y".into(),
+                args: Some(serde_json::json!({"location": "tokyo", "when": "today"})),
+            },
+        ];
+        let v: serde_json::Value =
+            serde_json::from_str(&derive_parameters_schema(&examples)).unwrap();
+        assert_eq!(v["type"], "object");
+        assert_eq!(v["properties"]["location"]["type"], "string");
+        assert_eq!(v["properties"]["when"]["type"], "string");
+        let req: Vec<&str> =
+            v["required"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+        assert!(req.contains(&"location") && req.contains(&"when"));
+    }
+
+    #[test]
+    fn derive_parameters_schema_empty_for_no_args() {
+        let v: serde_json::Value = serde_json::from_str(&derive_parameters_schema(&[])).unwrap();
+        assert_eq!(v["type"], "object");
+        assert!(v["properties"].as_object().unwrap().is_empty());
+        assert!(v.get("required").is_none());
+    }
 
     #[test]
     fn location_current_is_gated_on_location_capability() {

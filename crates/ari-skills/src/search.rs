@@ -65,7 +65,7 @@ impl Skill for SearchSkill {
         Specificity::Low
     }
 
-    fn parameters_schema(&self) -> &'static str {
+    fn parameters_schema(&self) -> &str {
         r#"{"type": "object", "properties": {"query": {"type": "string", "description": "The search query."}}, "required": ["query"]}"#
     }
 

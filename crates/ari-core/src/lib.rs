@@ -276,7 +276,7 @@ pub trait Skill: Send + Sync {
     /// format. Used by the FunctionGemma router for both training data
     /// and inference. Default is `{"type": "object", "properties": {}}`
     /// for parameterless skills. Override for skills that take args.
-    fn parameters_schema(&self) -> &'static str {
+    fn parameters_schema(&self) -> &str {
         r#"{"type": "object", "properties": {}}"#
     }
 

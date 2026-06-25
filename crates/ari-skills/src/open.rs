@@ -53,7 +53,7 @@ impl Skill for OpenSkill {
         Specificity::Medium
     }
 
-    fn parameters_schema(&self) -> &'static str {
+    fn parameters_schema(&self) -> &str {
         r#"{"type": "object", "properties": {"app_name": {"type": "string", "description": "Name of the app to open."}}, "required": ["app_name"]}"#
     }
 

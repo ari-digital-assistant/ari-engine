@@ -124,7 +124,7 @@ impl Skill for CalculatorSkill {
         Specificity::High
     }
 
-    fn parameters_schema(&self) -> &'static str {
+    fn parameters_schema(&self) -> &str {
         r#"{"type": "object", "properties": {"expression": {"type": "string", "description": "The math expression to evaluate."}}, "required": ["expression"]}"#
     }
 
