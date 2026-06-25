@@ -528,60 +528,6 @@ impl Engine {
         }
     }
 
-    /// Debug helper for the `/route` chat command: force the assistant-routing
-    /// path (step 1 of the two-step) regardless of locale or FunctionGemma, and
-    /// report what the active assistant — cloud OR on-device — picks. Lets us
-    /// validate that a real LLM routes skills correctly AND abstains (NONE) on
-    /// general questions before FunctionGemma is removed. Does not run step 2
-    /// (the general-knowledge answer); a NONE here means production would fall
-    /// through to that answer.
-    pub fn debug_assistant_route(&self, input: &str) -> String {
-        let normalized = normalize_input(input.trim(), &self.ctx.locale);
-        if normalized.is_empty() {
-            return "empty input".to_string();
-        }
-        let backend = match &self.active_assistant {
-            Some(ActiveAssistant::Api {
-                skill_id,
-                config,
-                config_store,
-            }) => {
-                let model = config
-                    .model_config_key
-                    .as_ref()
-                    .and_then(|k| config_store.get(skill_id, k))
-                    .filter(|v| !v.trim().is_empty())
-                    .unwrap_or_else(|| config.default_model.clone());
-                format!("cloud ({skill_id} / {model})")
-            }
-            #[cfg(feature = "llm")]
-            Some(ActiveAssistant::Builtin { tier }) => {
-                let t = match tier {
-                    ari_llm::BuiltinTier::Small => "small",
-                    ari_llm::BuiltinTier::Medium => "medium",
-                    ari_llm::BuiltinTier::Large => "large",
-                };
-                format!("on-device ({t})")
-            }
-            None => {
-                return "no assistant configured — this query would be keyword-only \
-                        (no routing, no general-knowledge answer)."
-                    .to_string();
-            }
-        };
-        match self.route_or_answer(&normalized) {
-            Ok(RouteOrAnswer::Skill(id)) => format!(
-                "input: {normalized:?}\nvia {backend} (one-shot) → routed to skill: {id}"
-            ),
-            Ok(RouteOrAnswer::Answer(text)) => format!(
-                "input: {normalized:?}\nvia {backend} (one-shot) → answered directly:\n{text}"
-            ),
-            Err(reason) => {
-                format!("input: {normalized:?}\nvia {backend} → FAILED: {reason}")
-            }
-        }
-    }
-
     pub fn process_input_traced(&self, input: &str) -> (Response, Option<DebugTrace>) {
         let normalized = normalize_input(input.trim(), &self.ctx.locale);
         if normalized.is_empty() {
@@ -727,7 +673,45 @@ impl Engine {
         let use_assistant_routing =
             uses_assistant_routing(&self.ctx.locale, has_cloud_assistant);
 
-        if use_assistant_routing {
+        if use_assistant_routing && self.ctx.locale == "en" {
+            // English + cloud assistant: ONE-SHOT route-or-answer — a single
+            // call that either routes to a skill or answers directly, instead
+            // of route-then-separate-answer. The combined prompt is English
+            // only, so non-English keeps the translated two-step below.
+            match self.route_or_answer(&normalized) {
+                Ok(RouteOrAnswer::Skill(id)) => {
+                    if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
+                        trace.winner = Some(format!("router:assistant:{id}"));
+                        self.log(
+                            LogLevel::Info,
+                            &format!("router:assistant: one-shot routed skill={id}"),
+                        );
+                        let response = skill.execute(&normalized, &self.ctx);
+                        let response = self.maybe_intercept_consult(skill, response);
+                        return (response, Some(trace));
+                    }
+                }
+                Ok(RouteOrAnswer::Answer(text)) => {
+                    let label = match &self.active_assistant {
+                        Some(ActiveAssistant::Api { skill_id, .. }) => format!("assistant:{skill_id}"),
+                        _ => "assistant:one-shot".to_string(),
+                    };
+                    trace.winner = Some(label);
+                    return (Response::Text(text), Some(trace));
+                }
+                Err(reason) => {
+                    self.log(
+                        LogLevel::Warn,
+                        &format!("router:assistant: one-shot failed: {reason}; falling through"),
+                    );
+                }
+            }
+            // Unknown id / call failed — fall through to the fallback /
+            // assistant-answer path below.
+        } else if use_assistant_routing {
+            // Non-English: translated two-step routing prompt (FunctionGemma is
+            // English-only). A general question falls through to the
+            // assistant-answer path below.
             if let Some(picked_id) = self.try_assistant_route(&normalized, &skill_catalog) {
                 if let Some(skill) = self
                     .skills
@@ -739,8 +723,7 @@ impl Engine {
                     self.log(
                         LogLevel::Info,
                         &format!(
-                            "router:assistant: dispatching skill={picked_id} \
-                             (locale={})",
+                            "router:assistant: dispatching skill={picked_id} (locale={})",
                             self.ctx.locale
                         ),
                     );
@@ -749,9 +732,6 @@ impl Engine {
                     return (response, Some(trace));
                 }
             }
-            // No skill picked (NONE / unparseable / call failed) — do NOT fall
-            // back to FunctionGemma; let the query reach the assistant-answer
-            // path below so a general question gets answered.
         } else if self.ctx.locale == "en" {
             if let Some(ref router) = self.router {
                 let route_result = router.route(&normalized, &skill_catalog);
