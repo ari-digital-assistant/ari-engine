@@ -510,6 +510,78 @@ impl Engine {
         }
     }
 
+    /// Raw router emission for analysis: the function the router picked and its
+    /// confidence (mean per-token log-prob), BEFORE the confidence gate.
+    /// `None` when the router abstained (emitted no function call). Used by
+    /// route-eval's verbose mode to study whether misroutes sit at lower
+    /// confidence than correct routes.
+    pub fn route_raw(&self, input: &str) -> Option<(String, f32)> {
+        let normalized = normalize_input(input.trim(), &self.ctx.locale);
+        if normalized.is_empty() {
+            return None;
+        }
+        let router = self.router.as_ref()?;
+        match router.route(&normalized, &self.router_catalog()) {
+            RouteResult::Skill { id, confidence }
+            | RouteResult::SkillWithArgs { id, confidence, .. } => Some((id, confidence)),
+            RouteResult::Action(_) | RouteResult::NoMatch => None,
+        }
+    }
+
+    /// Debug helper for the `/route` chat command: force the assistant-routing
+    /// path (step 1 of the two-step) regardless of locale or FunctionGemma, and
+    /// report what the active assistant — cloud OR on-device — picks. Lets us
+    /// validate that a real LLM routes skills correctly AND abstains (NONE) on
+    /// general questions before FunctionGemma is removed. Does not run step 2
+    /// (the general-knowledge answer); a NONE here means production would fall
+    /// through to that answer.
+    pub fn debug_assistant_route(&self, input: &str) -> String {
+        let normalized = normalize_input(input.trim(), &self.ctx.locale);
+        if normalized.is_empty() {
+            return "empty input".to_string();
+        }
+        let backend = match &self.active_assistant {
+            Some(ActiveAssistant::Api {
+                skill_id,
+                config,
+                config_store,
+            }) => {
+                let model = config
+                    .model_config_key
+                    .as_ref()
+                    .and_then(|k| config_store.get(skill_id, k))
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| config.default_model.clone());
+                format!("cloud ({skill_id} / {model})")
+            }
+            #[cfg(feature = "llm")]
+            Some(ActiveAssistant::Builtin { tier }) => {
+                let t = match tier {
+                    ari_llm::BuiltinTier::Small => "small",
+                    ari_llm::BuiltinTier::Medium => "medium",
+                    ari_llm::BuiltinTier::Large => "large",
+                };
+                format!("on-device ({t})")
+            }
+            None => {
+                return "no assistant configured — this query would be keyword-only \
+                        (no routing, no general-knowledge answer)."
+                    .to_string();
+            }
+        };
+        match self.route_or_answer(&normalized) {
+            Ok(RouteOrAnswer::Skill(id)) => format!(
+                "input: {normalized:?}\nvia {backend} (one-shot) → routed to skill: {id}"
+            ),
+            Ok(RouteOrAnswer::Answer(text)) => format!(
+                "input: {normalized:?}\nvia {backend} (one-shot) → answered directly:\n{text}"
+            ),
+            Err(reason) => {
+                format!("input: {normalized:?}\nvia {backend} → FAILED: {reason}")
+            }
+        }
+    }
+
     pub fn process_input_traced(&self, input: &str) -> (Response, Option<DebugTrace>) {
         let normalized = normalize_input(input.trim(), &self.ctx.locale);
         if normalized.is_empty() {
@@ -901,43 +973,7 @@ impl Engine {
         skill_catalog: &[(String, String, String)],
     ) -> Option<String> {
         let prompt = build_assistant_routing_prompt(input, skill_catalog, &self.ctx.locale);
-        let response = match &self.active_assistant {
-            Some(ActiveAssistant::Api {
-                skill_id,
-                config,
-                config_store,
-            }) => match ari_skill_loader::call_assistant_api(
-                config,
-                skill_id,
-                config_store.as_ref(),
-                &prompt,
-                &self.ctx.locale,
-            ) {
-                Ok(text) => text,
-                Err(e) => {
-                    self.log(
-                        LogLevel::Warn,
-                        &format!("router:assistant: cloud call failed: {e}"),
-                    );
-                    return None;
-                }
-            },
-            #[cfg(feature = "llm")]
-            Some(ActiveAssistant::Builtin { .. }) => {
-                let llm = self.llm.as_ref()?;
-                match llm.run_prompt(&prompt) {
-                    Ok(text) => ari_llm::strip_thinking(&text),
-                    Err(e) => {
-                        self.log(
-                            LogLevel::Warn,
-                            &format!("router:assistant: built-in LLM failed: {e}"),
-                        );
-                        return None;
-                    }
-                }
-            }
-            None => return None,
-        };
+        let response = self.call_active_assistant(&prompt).ok()?;
         let picked = parse_assistant_routing_response(&response, skill_catalog);
         if picked.is_none() {
             let preview: String = response.chars().take(120).collect();
@@ -949,6 +985,62 @@ impl Engine {
             );
         }
         picked
+    }
+
+    /// Send `prompt` to whichever assistant backend is active (cloud API or
+    /// on-device LLM) and return its raw text reply. `None` when no assistant
+    /// is configured, the on-device LLM isn't loaded, or the call failed.
+    /// Shared by the routing prompt, the one-shot route-or-answer, and the
+    /// debug commands.
+    fn call_active_assistant(&self, prompt: &str) -> Result<String, String> {
+        let fail = |reason: String| -> Result<String, String> {
+            self.log(LogLevel::Warn, &format!("assistant: {reason}"));
+            Err(reason)
+        };
+        match &self.active_assistant {
+            Some(ActiveAssistant::Api {
+                skill_id,
+                config,
+                config_store,
+            }) => match ari_skill_loader::call_assistant_api(
+                config,
+                skill_id,
+                config_store.as_ref(),
+                prompt,
+                &self.ctx.locale,
+            ) {
+                Ok(text) => Ok(text),
+                Err(e) => fail(format!("cloud call failed: {e}")),
+            },
+            #[cfg(feature = "llm")]
+            Some(ActiveAssistant::Builtin { .. }) => {
+                let Some(llm) = self.llm.as_ref() else {
+                    return fail(
+                        "on-device LLM not loaded — wrapper is None (freed under memory \
+                         pressure, or never loaded). Nothing reloads it on demand."
+                            .to_string(),
+                    );
+                };
+                match llm.run_prompt(prompt) {
+                    Ok(text) => Ok(ari_llm::strip_thinking(&text)),
+                    Err(e) => fail(format!("on-device LLM error: {e}")),
+                }
+            }
+            None => fail("no assistant configured".to_string()),
+        }
+    }
+
+    /// One-shot routing: a single assistant call that either hands the request
+    /// to a skill or answers it directly — folding the old two-step (route,
+    /// then a separate answer call) into one round-trip. `input` must already
+    /// be normalised. `None` when no assistant is configured or the call
+    /// failed. English-instruction prompt for now; non-English callers should
+    /// keep the translated two-step until a localised combined prompt exists.
+    fn route_or_answer(&self, input: &str) -> Result<RouteOrAnswer, String> {
+        let catalog = self.router_catalog();
+        let prompt = build_combined_route_or_answer_prompt(input, &catalog);
+        let response = self.call_active_assistant(&prompt)?;
+        Ok(parse_combined_response(&response, &catalog))
     }
 
     fn maybe_intercept_consult(
@@ -1098,6 +1190,64 @@ fn assistant_display_name(skill_id: &str) -> String {
 /// assistant uses FunctionGemma as the only on-device option.
 fn uses_assistant_routing(locale: &str, has_cloud_assistant: bool) -> bool {
     locale != "en" || has_cloud_assistant
+}
+
+/// Outcome of a one-shot [`Engine::route_or_answer`]: either the assistant
+/// handed the request to a skill, or it answered directly.
+enum RouteOrAnswer {
+    Skill(String),
+    Answer(String),
+}
+
+/// One-shot prompt: ask the assistant to EITHER hand the request to a skill
+/// (by emitting a `SKILL: <id>` line) OR answer it directly — in a single
+/// call. English-only for now (don't fabricate translations); the catalogue
+/// ids are language-neutral. The personality/voice comes from the backend's
+/// own system prompt (cloud) so we keep the instructions terse here.
+fn build_combined_route_or_answer_prompt(input: &str, skills: &[(String, String, String)]) -> String {
+    let mut catalog = String::new();
+    for (id, description, _schema) in skills {
+        catalog.push_str(&format!("- {id}: {description}\n"));
+    }
+    format!(
+        "The user said:\n\"{input}\"\n\n\
+         You can either hand this request to one of your skills, or answer it \
+         yourself. Available skills:\n\
+         {catalog}\n\
+         If exactly one skill clearly handles the request, reply with ONLY this \
+         line and nothing else:\n\
+         SKILL: <skill id>\n\
+         using the id exactly as written above. Otherwise, answer the user's \
+         question directly and naturally — do not mention skills or this choice."
+    )
+}
+
+/// Parse a one-shot response: a leading `SKILL: <known id>` line means route;
+/// anything else is treated as a direct answer. Only the first non-empty line
+/// is inspected for the sentinel, so a general answer that merely contains the
+/// word "skill" isn't mistaken for a route.
+fn parse_combined_response(response: &str, skills: &[(String, String, String)]) -> RouteOrAnswer {
+    let known: std::collections::HashSet<&str> =
+        skills.iter().map(|(id, _, _)| id.as_str()).collect();
+    for line in response.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let sentinel = trimmed
+            .strip_prefix("SKILL:")
+            .or_else(|| trimmed.strip_prefix("skill:"));
+        if let Some(rest) = sentinel {
+            let id = rest.trim().trim_matches(|c: char| {
+                c == '`' || c == '"' || c == '\'' || c == '*' || c == '_'
+            });
+            if known.contains(id) {
+                return RouteOrAnswer::Skill(id.to_string());
+            }
+        }
+        break;
+    }
+    RouteOrAnswer::Answer(response.trim().to_string())
 }
 
 fn build_assistant_routing_prompt(
@@ -2605,6 +2755,50 @@ mod tests {
                 "{}".to_string(),
             ),
         ]
+    }
+
+    #[test]
+    fn parse_combined_routes_on_leading_sentinel() {
+        let skills = router_test_skills();
+        match parse_combined_response("SKILL: current_time", &skills) {
+            RouteOrAnswer::Skill(id) => assert_eq!(id, "current_time"),
+            RouteOrAnswer::Answer(_) => panic!("expected a route"),
+        }
+        // Markdown around the id is tolerated.
+        match parse_combined_response("SKILL: `current_time`", &skills) {
+            RouteOrAnswer::Skill(id) => assert_eq!(id, "current_time"),
+            RouteOrAnswer::Answer(_) => panic!("expected a route"),
+        }
+    }
+
+    #[test]
+    fn parse_combined_freeform_is_answer() {
+        let skills = router_test_skills();
+        let text = "The capital of the UAE is Abu Dhabi.";
+        match parse_combined_response(text, &skills) {
+            RouteOrAnswer::Answer(a) => assert_eq!(a, text),
+            RouteOrAnswer::Skill(_) => panic!("expected an answer"),
+        }
+    }
+
+    #[test]
+    fn parse_combined_unknown_id_is_answer() {
+        let skills = router_test_skills();
+        // Sentinel present but id not in catalogue → not a valid route.
+        match parse_combined_response("SKILL: not_a_real_skill", &skills) {
+            RouteOrAnswer::Answer(_) => {}
+            RouteOrAnswer::Skill(_) => panic!("must not route to an unknown id"),
+        }
+    }
+
+    #[test]
+    fn parse_combined_skill_word_mid_answer_is_answer() {
+        let skills = router_test_skills();
+        // "skill" mid-sentence must not be mistaken for the leading sentinel.
+        match parse_combined_response("I have no skill for that; the answer is 42.", &skills) {
+            RouteOrAnswer::Answer(_) => {}
+            RouteOrAnswer::Skill(_) => panic!("expected an answer"),
+        }
     }
 
     #[test]

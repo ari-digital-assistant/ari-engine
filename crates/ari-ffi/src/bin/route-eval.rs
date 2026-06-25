@@ -34,6 +34,11 @@ fn main() {
     let router = ari_llm::FunctionGemmaRouter::new(std::path::Path::new(&gguf));
     engine.set_router(Some(Box::new(router)));
 
+    // ROUTE_EVAL_VERBOSE=1 dumps a tab-separated line per case
+    // (category, confidence, expect, raw-pick, utterance) for confidence
+    // distribution analysis.
+    let verbose = std::env::var("ROUTE_EVAL_VERBOSE").is_ok();
+
     let file = std::fs::File::open(&eval_path)
         .unwrap_or_else(|e| panic!("cannot open eval set {eval_path}: {e}"));
 
@@ -52,13 +57,35 @@ fn main() {
         let utterance = case["utterance"].as_str().expect("utterance field");
         let expect = case["expect"].as_str().expect("expect field");
 
-        let got = engine.route_decision(utterance);
+        let raw = engine.route_raw(utterance);
+        // Post-threshold decision — identical to Engine::route_decision.
+        let got = raw
+            .as_ref()
+            .filter(|(_, c)| *c >= ari_core::MIN_ROUTER_CONFIDENCE)
+            .map(|(id, _)| id.clone());
         let abstaining = expect.eq_ignore_ascii_case("NONE");
         let pass = if abstaining {
             got.is_none()
         } else {
             got.as_deref() == Some(expect)
         };
+
+        if verbose {
+            let (pick, conf) = match &raw {
+                Some((id, c)) => (id.as_str(), *c),
+                None => ("NONE", f32::NAN),
+            };
+            let category = if abstaining {
+                if raw.is_none() { "ABSTAIN_OK" } else { "MISROUTE" }
+            } else if pass {
+                "POS_OK"
+            } else if raw.is_none() {
+                "POS_MISS"
+            } else {
+                "POS_WRONG"
+            };
+            println!("VERBOSE\t{category}\t{conf:.4}\t{expect}\t{pick}\t{utterance}");
+        }
 
         if abstaining {
             abstain_total += 1;

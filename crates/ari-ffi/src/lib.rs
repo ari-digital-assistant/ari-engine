@@ -1013,6 +1013,18 @@ impl AriEngine {
         engine.debug_route(&input)
     }
 
+    /// Force the assistant-routing path (cloud or on-device) for `input` and
+    /// return what it picks — a skill id, or NONE → general-knowledge answer.
+    /// Backs the `/route` chat command: lets us test the post-FunctionGemma
+    /// routing (especially the on-device LLM, which normal English routing
+    /// doesn't reach yet) before FunctionGemma is removed.
+    pub fn debug_assistant_route(&self, input: String) -> String {
+        let locale = self.locale_provider.current_locale();
+        let mut engine = self.inner.lock().expect("engine mutex poisoned");
+        engine.set_locale(locale);
+        engine.debug_assistant_route(&input)
+    }
+
     /// Discard any pending question the engine is awaiting a reply to. Called
     /// by the host when the re-armed mic times out, the user dismisses, or a
     /// fresh wake word starts a new session. No-op when nothing is pending.
