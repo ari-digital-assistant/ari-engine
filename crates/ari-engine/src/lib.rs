@@ -433,6 +433,62 @@ impl Engine {
             .unwrap_or(false)
     }
 
+    /// The skill catalogue handed to the semantic routers (FunctionGemma and
+    /// the assistant-routing path). Excludes unready gated skills and
+    /// keyword-only skills (`router_eligible() == false`) so neither router
+    /// can claim a query that belongs to the keyword scorer or the assistant.
+    fn router_catalog(&self) -> Vec<(String, String, String)> {
+        self.skills
+            .iter()
+            .filter(|s| self.skill_is_ready(s.as_ref()))
+            .filter(|s| s.router_eligible())
+            .map(|s| {
+                (
+                    s.id().to_string(),
+                    s.description().to_string(),
+                    s.parameters_schema().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Debug helper for the `/router` chat command: run ONLY the FunctionGemma
+    /// router against `input` and report its raw pick — bypassing the keyword
+    /// scorer, the assistant, and the confidence gate. Lets us inspect the
+    /// on-device router even when normal routing goes through a cloud
+    /// assistant (which skips FunctionGemma entirely).
+    pub fn debug_route(&self, input: &str) -> String {
+        let normalized = normalize_input(input.trim(), &self.ctx.locale);
+        if normalized.is_empty() {
+            return "empty input".to_string();
+        }
+        let Some(ref router) = self.router else {
+            return "router not loaded".to_string();
+        };
+        let catalog = self.router_catalog();
+        let result = router.route(&normalized, &catalog);
+        let raw = router.last_raw_output().unwrap_or_default();
+        let gate = |c: f32| {
+            if c < ari_core::MIN_ROUTER_CONFIDENCE {
+                "below threshold → would fall through"
+            } else {
+                "above threshold → would dispatch"
+            }
+        };
+        let verdict = match &result {
+            RouteResult::Skill { id, confidence } => {
+                format!("skill={id} (confidence {confidence:.3}, {})", gate(*confidence))
+            }
+            RouteResult::SkillWithArgs { id, args_json, confidence } => format!(
+                "skill={id} args={args_json} (confidence {confidence:.3}, {})",
+                gate(*confidence)
+            ),
+            RouteResult::Action(a) => format!("action={a}"),
+            RouteResult::NoMatch => "NoMatch → falls through to assistant".to_string(),
+        };
+        format!("input: {normalized:?}\n{verdict}\nraw: {raw}")
+    }
+
     pub fn process_input_traced(&self, input: &str) -> (Response, Option<DebugTrace>) {
         let normalized = normalize_input(input.trim(), &self.ctx.locale);
         if normalized.is_empty() {
@@ -559,22 +615,26 @@ impl Engine {
         //   maintain. Doesn't extract typed args today (skill's own
         //   parser handles the slot filling).
 
-        let skill_catalog: Vec<(String, String, String)> = self
-            .skills
-            .iter()
-            .filter(|s| self.skill_is_ready(s.as_ref()))
-            .map(|s| (
-                s.id().to_string(),
-                s.description().to_string(),
-                s.parameters_schema().to_string(),
-            ))
-            .collect();
+        let skill_catalog = self.router_catalog();
 
-        // Phase 5 non-English routing: ask the active assistant LLM
-        // to pick a skill_id. Runs INSTEAD OF FunctionGemma when the
-        // locale isn't English. Falls through to the existing
-        // assistant-answer path if no skill is picked.
-        if self.ctx.locale != "en" {
+        // Routing-backend choice for queries the keyword scorer didn't claim:
+        //
+        // - A cloud assistant (ChatGPT et al.) arbitrates — it picks a skill
+        //   or says NONE, and unlike the 270M FunctionGemma it reliably tells
+        //   a skill request from a general question. So a general "what is X"
+        //   falls through to the assistant-answer path instead of being
+        //   force-mapped onto the nearest skill.
+        // - Non-English ALSO routes via the assistant (FunctionGemma is
+        //   English-only and would return garbage otherwise), using whatever
+        //   backend is wired (cloud API or on-device Gemma).
+        // - English with no cloud assistant uses FunctionGemma — it's the
+        //   only router available on-device.
+        let has_cloud_assistant =
+            matches!(&self.active_assistant, Some(ActiveAssistant::Api { .. }));
+        let use_assistant_routing =
+            uses_assistant_routing(&self.ctx.locale, has_cloud_assistant);
+
+        if use_assistant_routing {
             if let Some(picked_id) = self.try_assistant_route(&normalized, &skill_catalog) {
                 if let Some(skill) = self
                     .skills
@@ -596,12 +656,10 @@ impl Engine {
                     return (response, Some(trace));
                 }
             }
-        }
-
-        // English: existing FunctionGemma path. Skipped for non-English
-        // locales — FunctionGemma is English-trained and would return
-        // garbage for Italian / Spanish / etc. utterances.
-        if self.ctx.locale == "en" {
+            // No skill picked (NONE / unparseable / call failed) — do NOT fall
+            // back to FunctionGemma; let the query reach the assistant-answer
+            // path below so a general question gets answered.
+        } else if self.ctx.locale == "en" {
             if let Some(ref router) = self.router {
                 let route_result = router.route(&normalized, &skill_catalog);
 
@@ -1012,6 +1070,15 @@ fn assistant_display_name(skill_id: &str) -> String {
 /// bulleted list, then the user's input fenced in quotes. Output
 /// constraint kept minimal so we get a parseable response on the
 /// first line even when the model insists on adding prose.
+/// Which backend routes a query the keyword scorer didn't claim. A cloud
+/// assistant arbitrates (it tells a skill request from a general question
+/// reliably, which the 270M FunctionGemma cannot); non-English always routes
+/// via the assistant (FunctionGemma is English-only); English without a cloud
+/// assistant uses FunctionGemma as the only on-device option.
+fn uses_assistant_routing(locale: &str, has_cloud_assistant: bool) -> bool {
+    locale != "en" || has_cloud_assistant
+}
+
 fn build_assistant_routing_prompt(
     input: &str,
     skills: &[(String, String, String)],
@@ -1692,6 +1759,66 @@ mod tests {
         let (resp, _) = engine.process_input_traced("play music");
         assert!(matches!(resp, Response::Action(_)));
         assert!(engine.has_pending_turn());
+    }
+
+    // --- Router catalogue eligibility ---
+
+    /// A router that records the skill catalogue it was handed and then
+    /// declines to route, so the test can inspect exactly which skills the
+    /// engine offered the model.
+    struct CatalogCapturingRouter {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SkillRouter for CatalogCapturingRouter {
+        fn route(&self, _input: &str, skills: &[(String, String, String)]) -> RouteResult {
+            *self.seen.lock().unwrap() = skills.iter().map(|(id, _, _)| id.clone()).collect();
+            RouteResult::NoMatch
+        }
+    }
+
+    #[test]
+    fn router_ineligible_skill_is_excluded_from_catalogue() {
+        use std::sync::{Arc, Mutex};
+
+        /// A keyword-only skill (like search): scores nothing here and opts
+        /// out of the router catalogue.
+        struct KeywordOnlySkill;
+        impl Skill for KeywordOnlySkill {
+            fn id(&self) -> &str { "keyword_only" }
+            fn description(&self) -> &str { "keyword only" }
+            fn specificity(&self) -> Specificity { Specificity::Low }
+            fn score(&self, _: &str, _: &SkillContext) -> f32 { 0.0 }
+            fn router_eligible(&self) -> bool { false }
+            fn execute(&self, _: &str, _: &SkillContext) -> Response {
+                Response::Text("keyword".into())
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(KeywordOnlySkill));
+        engine.register_skill(Box::new(MockSkill {
+            id: "eligible", specificity: Specificity::Low, fixed_score: 0.0,
+            response: "eligible", requires_setting: None,
+        }));
+        engine.set_router(Some(Box::new(CatalogCapturingRouter { seen: seen.clone() })));
+
+        // Neither skill scores, so the router runs and we can inspect the
+        // catalogue it received.
+        let _ = engine.process_input_traced(
+            "what is the capital city of the united arab emirates",
+        );
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.contains(&"eligible".to_string()),
+            "router-eligible skill must be offered to the router, got {seen:?}"
+        );
+        assert!(
+            !seen.contains(&"keyword_only".to_string()),
+            "router-ineligible skill must be filtered out, got {seen:?}"
+        );
     }
 
     // --- Readiness gate (skill_is_ready) ---
@@ -2457,6 +2584,17 @@ mod tests {
                 "{}".to_string(),
             ),
         ]
+    }
+
+    #[test]
+    fn routing_backend_choice() {
+        // English + cloud assistant → assistant arbitrates (skips FunctionGemma).
+        assert!(uses_assistant_routing("en", true));
+        // English + no cloud assistant → FunctionGemma (only on-device option).
+        assert!(!uses_assistant_routing("en", false));
+        // Non-English always routes via the assistant, with or without cloud.
+        assert!(uses_assistant_routing("it", true));
+        assert!(uses_assistant_routing("it", false));
     }
 
     #[test]

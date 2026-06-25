@@ -13,36 +13,6 @@ const TRIGGER_PHRASES: &[&[&str]] = &[
     &["trova"],
 ];
 
-const QUESTION_STARTERS: &[&[&str]] = &[
-    // English
-    &["where", "can"],
-    &["where", "do"],
-    &["where", "is"],
-    &["where", "are"],
-    &["how", "do"],
-    &["how", "to"],
-    &["how", "can"],
-    &["who", "is"],
-    &["who", "are"],
-    &["who", "was"],
-    &["why", "is"],
-    &["why", "do"],
-    &["why", "does"],
-    &["why", "are"],
-    // Italian — single interrogatives; the >=4-word floor in `score`
-    // and the index<3 guard in `is_question` keep these from
-    // over-matching short greetings like "come stai".
-    &["dove"],   // where
-    &["come"],   // how
-    &["chi"],    // who
-    &["perché"], // why (accented form survives normalize_input)
-    &["perche"], // why (de-accented fallback)
-    &["quando"], // when
-    &["quale"],  // which
-    &["quali"],  // which (plural)
-    &["cosa"],   // what
-];
-
 pub struct SearchSkill;
 
 impl SearchSkill {
@@ -78,22 +48,17 @@ fn extract_query_explicit(input: &str) -> Option<String> {
     Some(query_words.iter().map(|w| **w).collect::<Vec<&str>>().join(" "))
 }
 
-fn is_question(input: &str) -> bool {
-    let words: Vec<&str> = input.split_whitespace().collect();
-
-    QUESTION_STARTERS.iter().any(|starter| {
-        starter.iter().all(|kw| words.contains(kw))
-            && words.iter().position(|w| w == &starter[0]).unwrap_or(usize::MAX) < 3
-    })
-}
-
 impl Skill for SearchSkill {
     fn id(&self) -> &str {
         "search"
     }
 
     fn description(&self) -> &str {
-        "Searches the web. Use when the user asks to search, look up, google, or find information about something, but ALSO when they want to know about a topic without naming a search verb — phrases like 'what does the internet say about X', 'what's online about Y', 'tell me about Z', 'what is X', 'I want to know about Y', 'I'm curious about Z', 'fill me in on X', 'what's the latest on Y'. Anything that's a request for information about a topic Ari doesn't already know — route here. The query parameter captures whatever the user wants to know about."
+        "Searches the web. Use only when the user explicitly asks to search, look up, google, or find something on the web — phrases like 'search for X', 'look up Y', 'google Z', 'find information about W', 'what does the internet say about X'. Plain questions the assistant can answer ('what is X', 'tell me about Y') do NOT belong here. The query parameter captures what to search for."
+    }
+
+    fn router_eligible(&self) -> bool {
+        false
     }
 
     fn specificity(&self) -> Specificity {
@@ -136,24 +101,16 @@ impl Skill for SearchSkill {
             ExampleUtterance { text: "google who invented the telephone", args: r#"{"query": "who invented the telephone"}"# },
             ExampleUtterance { text: "search for free online courses", args: r#"{"query": "free online courses"}"# },
             ExampleUtterance { text: "look up currency exchange rates", args: r#"{"query": "currency exchange rates"}"# },
-            // Paraphrases without explicit search/look-up/google/find triggers —
-            // teach the router that information-seeking phrases also belong here.
+            // Explicit "search the web" intent phrased without a verb — the
+            // user still names the web/internet, so it's a search, not a
+            // question for the assistant.
             ExampleUtterance { text: "what does the internet say about async runtimes in rust", args: r#"{"query": "async runtimes in rust"}"# },
-            ExampleUtterance { text: "tell me about the history of jazz", args: r#"{"query": "history of jazz"}"# },
-            ExampleUtterance { text: "I want to know about black holes", args: r#"{"query": "black holes"}"# },
-            ExampleUtterance { text: "what is quantum computing", args: r#"{"query": "quantum computing"}"# },
-            ExampleUtterance { text: "I'm curious about the mariana trench", args: r#"{"query": "the mariana trench"}"# },
             ExampleUtterance { text: "what's online about climate change", args: r#"{"query": "climate change"}"# },
-            ExampleUtterance { text: "fill me in on the london marathon", args: r#"{"query": "london marathon"}"# },
-            ExampleUtterance { text: "what's the latest on the mars rover", args: r#"{"query": "the mars rover"}"# },
             ExampleUtterance { text: "what does the web say about kubernetes", args: r#"{"query": "kubernetes"}"# },
-            ExampleUtterance { text: "tell me about the great barrier reef", args: r#"{"query": "the great barrier reef"}"# },
             // Italian
             ExampleUtterance { text: "cerca ristoranti vicini", args: r#"{"query": "ristoranti vicini"}"# },
             ExampleUtterance { text: "trova una ricetta per la pizza", args: r#"{"query": "ricetta per la pizza"}"# },
             ExampleUtterance { text: "cerca su internet i voli per tokyo", args: r#"{"query": "voli per tokyo"}"# },
-            ExampleUtterance { text: "dove posso comprare un caffè", args: r#"{"query": "dove posso comprare un caffè"}"# },
-            ExampleUtterance { text: "chi ha vinto i mondiali", args: r#"{"query": "chi ha vinto i mondiali"}"# },
         ]
     }
 
@@ -172,10 +129,6 @@ impl Skill for SearchSkill {
                 }
                 return 0.4;
             }
-        }
-
-        if is_question(input) && words.len() >= 4 {
-            return 0.85;
         }
 
         0.0
@@ -210,8 +163,9 @@ mod tests {
         SkillContext::default()
     }
 
-    // Scoring: trigger + query = 0.90, trigger alone = 0.4,
-    //          question (>=4 words) = 0.85, nothing = 0.0
+    // Scoring: trigger + query = 0.90, trigger alone = 0.4, nothing = 0.0.
+    // Search fires ONLY on explicit triggers — bare questions go to the
+    // assistant, not here (search is also kept out of the router catalogue).
 
     #[test]
     fn score_explicit_trigger_with_query() {
@@ -236,19 +190,18 @@ mod tests {
     }
 
     #[test]
-    fn score_question_patterns() {
+    fn score_bare_questions_do_not_match() {
+        // Questions without an explicit search verb belong to the assistant,
+        // not search. The literal bug report is the UAE one.
         let skill = SearchSkill::new();
-        assert_eq!(skill.score("where can i get pizza in malta", &ctx()), 0.85);
-        assert_eq!(skill.score("how do i cook pasta", &ctx()), 0.85);
-        assert_eq!(skill.score("who is the president of france", &ctx()), 0.85);
-        assert_eq!(skill.score("why is the sky blue", &ctx()), 0.85);
-    }
-
-    #[test]
-    fn score_short_question_rejected() {
-        let skill = SearchSkill::new();
-        // "who is bob" = 3 words, below the 4-word minimum for questions
-        assert_eq!(skill.score("who is bob", &ctx()), 0.0);
+        assert_eq!(
+            skill.score("what is the capital city of the united arab emirates", &ctx()),
+            0.0
+        );
+        assert_eq!(skill.score("where can i get pizza in malta", &ctx()), 0.0);
+        assert_eq!(skill.score("how do i cook pasta", &ctx()), 0.0);
+        assert_eq!(skill.score("who is the president of france", &ctx()), 0.0);
+        assert_eq!(skill.score("why is the sky blue", &ctx()), 0.0);
     }
 
     #[test]
@@ -258,28 +211,11 @@ mod tests {
         assert_eq!(skill.score("open spotify", &ctx()), 0.0);
     }
 
-    // --- is_question ---
-
     #[test]
-    fn is_question_detects_starters() {
-        assert!(is_question("where can i find food"));
-        assert!(is_question("how do i reset my password"));
-        assert!(is_question("who is that person"));
-        assert!(is_question("why does this happen"));
-    }
-
-    #[test]
-    fn is_question_rejects_non_questions() {
-        assert!(!is_question("hello there"));
-        assert!(!is_question("open spotify"));
-    }
-
-    #[test]
-    fn is_question_starter_must_be_near_beginning() {
-        // "i wonder where can i find food" — "where" is at index 2, still < 3
-        assert!(is_question("i wonder where can i find food"));
-        // but at index 3 or beyond it should not match
-        assert!(!is_question("tell me please now where can i find food"));
+    fn not_router_eligible() {
+        // Search must never be offered to the semantic routers, or the LLM
+        // would claim general questions that belong to the assistant.
+        assert!(!SearchSkill::new().router_eligible());
     }
 
     // --- extract_query_explicit ---
@@ -358,12 +294,16 @@ mod tests {
     }
 
     #[test]
-    fn score_italian_question_patterns() {
+    fn score_italian_bare_questions_do_not_match() {
         let skill = SearchSkill::new();
-        // "dove posso trovare una pizza" = where can I find a pizza (5 words)
-        assert_eq!(skill.score("dove posso trovare una pizza", &ctx()), 0.85);
-        // "come si cuoce la pasta" = how do you cook pasta (5 words)
-        assert_eq!(skill.score("come si cuoce la pasta", &ctx()), 0.85);
+        // "come si cuoce la pasta" = how do you cook pasta — a question, so
+        // it goes to the assistant, not search.
+        assert_eq!(skill.score("come si cuoce la pasta", &ctx()), 0.0);
+        // "dove posso trovare una pizza" = where can I find a pizza — no exact
+        // trigger word ("trovare" != "trova"), so it's a question too.
+        assert_eq!(skill.score("dove posso trovare una pizza", &ctx()), 0.0);
+        // The explicit "trova" verb still triggers search.
+        assert_eq!(skill.score("trova una pizzeria", &ctx()), 0.90);
     }
 
     #[test]

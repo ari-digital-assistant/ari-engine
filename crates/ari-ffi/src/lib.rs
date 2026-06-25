@@ -997,6 +997,19 @@ impl AriEngine {
         }
     }
 
+    /// Run ONLY the on-device FunctionGemma router against `input` and return
+    /// a human-readable summary of its pick (skill + confidence, or NoMatch),
+    /// bypassing the keyword scorer and the assistant. Backs the `/router`
+    /// chat debug command — useful because a cloud-assistant user's normal
+    /// routing never reaches FunctionGemma, so there's otherwise no way to
+    /// see what the on-device router would have done.
+    pub fn debug_route(&self, input: String) -> String {
+        let locale = self.locale_provider.current_locale();
+        let mut engine = self.inner.lock().expect("engine mutex poisoned");
+        engine.set_locale(locale);
+        engine.debug_route(&input)
+    }
+
     /// Discard any pending question the engine is awaiting a reply to. Called
     /// by the host when the re-armed mic times out, the user dismisses, or a
     /// fresh wake word starts a new session. No-op when nothing is pending.

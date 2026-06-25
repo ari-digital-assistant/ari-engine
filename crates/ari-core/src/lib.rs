@@ -209,6 +209,16 @@ pub trait Skill: Send + Sync {
     /// — see the trait-level docs.
     fn description(&self) -> &str { "" }
 
+    /// Whether this skill may be offered to the semantic routers (the
+    /// FunctionGemma English router and the non-English assistant-routing
+    /// path). Skills that should only ever fire on explicit keyword
+    /// triggers — e.g. web search, which competes with the configured
+    /// assistant for any "what is X" question — override this to `false`
+    /// so they're filtered out of the router catalogue. They remain fully
+    /// reachable through the keyword scorer; they just can't be picked by
+    /// an LLM that's guessing at intent.
+    fn router_eligible(&self) -> bool { true }
+
     /// Whether this skill holds the named host capability (snake_case, as
     /// spelled in the manifest — e.g. `"critical_alert"`). The engine uses
     /// this to refuse privileged envelope content a skill never declared:

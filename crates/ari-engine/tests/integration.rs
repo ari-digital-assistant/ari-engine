@@ -140,12 +140,13 @@ fn open_does_not_steal_unrelated() {
 // --- Search handles questions ---
 
 #[test]
-fn search_handles_natural_question() {
+fn search_ignores_bare_question() {
+    // A question with no explicit search verb is NOT search's job — it belongs
+    // to the configured assistant. With no assistant wired up here, it falls
+    // through to the fallback rather than being grabbed by search.
     let engine = full_engine();
     let resp = engine.process_input("where can i get pizza in malta");
-    let v = action(&resp);
-    assert_eq!(v["v"], 1);
-    assert_eq!(v["search"], "where can i get pizza in malta");
+    assert_eq!(text(&resp), "Sorry, I didn't understand that.");
 }
 
 #[test]
