@@ -38,6 +38,42 @@ pub trait EnvelopeSink: Send + Sync {
 /// host uses that signal to trigger an STT retry path.
 pub const FALLBACK_RESPONSE: &str = "Sorry, I didn't understand that.";
 
+/// Engine-internal continuation signal the assistant emits inline at the
+/// end of an answer; parsed and stripped before the answer reaches the
+/// user. See docs/superpowers/specs/2026-06-26-conversation-continuation-design.md.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContinuationFlag {
+    Continuation,
+    New,
+}
+
+/// Split a trailing `[continuation]` / `[new]` marker off an assistant
+/// answer. Matched case-insensitively, tolerant of surrounding quotes,
+/// and only when it is the final bracketed token. Returns the cleaned
+/// answer (trailing whitespace trimmed) and the flag; a missing or
+/// unrecognised marker defaults to `Continuation` so context is kept.
+pub(crate) fn parse_continuation_flag(raw: &str) -> (String, ContinuationFlag) {
+    let trimmed = raw.trim_end();
+    if let Some(open) = trimmed.rfind('[') {
+        let inner = trimmed[open..]
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .trim()
+            .to_ascii_lowercase();
+        let flag = match inner.as_str() {
+            "new" => Some(ContinuationFlag::New),
+            "continuation" => Some(ContinuationFlag::Continuation),
+            _ => None,
+        };
+        if let Some(flag) = flag {
+            return (trimmed[..open].trim_end().to_string(), flag);
+        }
+    }
+    (trimmed.to_string(), ContinuationFlag::Continuation)
+}
+
 /// The locale-appropriate version of [`FALLBACK_RESPONSE`]. Used when
 /// every routing layer (skill regex → router → assistant) returned
 /// nothing — engine surfaces this so the user gets a graceful "I'm
@@ -3050,5 +3086,47 @@ mod tests {
         let r = engine.settings_action("does.not.exist", "sign_in", "{}");
         assert_eq!(r.ok, false);
         assert!(r.error.unwrap().contains("does.not.exist"));
+    }
+
+    #[test]
+    fn parse_flag_continuation_inline() {
+        let (text, flag) = parse_continuation_flag("Abu Dhabi is the capital. [continuation]");
+        assert_eq!(text, "Abu Dhabi is the capital.");
+        assert_eq!(flag, ContinuationFlag::Continuation);
+    }
+
+    #[test]
+    fn parse_flag_new_inline() {
+        let (text, flag) = parse_continuation_flag("27 times 3 is 81. [new]");
+        assert_eq!(text, "27 times 3 is 81.");
+        assert_eq!(flag, ContinuationFlag::New);
+    }
+
+    #[test]
+    fn parse_flag_case_and_quotes_tolerant() {
+        let (text, flag) = parse_continuation_flag("Sure. ['NEW']");
+        assert_eq!(text, "Sure.");
+        assert_eq!(flag, ContinuationFlag::New);
+    }
+
+    #[test]
+    fn parse_flag_missing_defaults_to_continuation() {
+        let (text, flag) = parse_continuation_flag("Just an answer with no marker.");
+        assert_eq!(text, "Just an answer with no marker.");
+        assert_eq!(flag, ContinuationFlag::Continuation);
+    }
+
+    #[test]
+    fn parse_flag_leaves_non_marker_brackets_intact() {
+        let (text, flag) = parse_continuation_flag("See item [3] on the list.");
+        assert_eq!(text, "See item [3] on the list.");
+        assert_eq!(flag, ContinuationFlag::Continuation);
+    }
+
+    #[test]
+    fn parse_flag_strips_trailing_newline_before_marker() {
+        let (text, flag) = parse_continuation_flag("Paris.\n[new]");
+        assert_eq!(text, "Paris.");
+        assert_eq!(flag, ContinuationFlag::New);
     }
 }
