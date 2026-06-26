@@ -47,6 +47,7 @@ pub trait Fallback: Send + Sync {
         input: &str,
         skills: &[SkillInfo],
         locale: &str,
+        history: &[(String, String)],
     ) -> Option<FallbackResult>;
 
     /// Run an arbitrary prompt and return the raw stripped output. Used
@@ -169,20 +170,20 @@ impl LoadedModel {
         Ok(LoadedModel { model })
     }
 
-    fn build_chat_prompt(&self, system: &str, user: &str) -> Option<String> {
+    fn build_chat_prompt(&self, system: &str, history: &[(String, String)], user: &str) -> Option<String> {
         let tmpl = self.model.chat_template(None).ok()?;
+        let mut messages = Vec::with_capacity(history.len() + 2);
         // Some Gemma chat templates raise on the system role outright
         // ("System role not supported") — drop the system message when
         // it's empty so apply_chat_template doesn't fall through to the
         // None branch and leave us sending an unwrapped prompt.
-        let messages = if system.is_empty() {
-            vec![LlamaChatMessage::new("user".to_string(), user.to_string()).ok()?]
-        } else {
-            vec![
-                LlamaChatMessage::new("system".to_string(), system.to_string()).ok()?,
-                LlamaChatMessage::new("user".to_string(), user.to_string()).ok()?,
-            ]
-        };
+        if !system.is_empty() {
+            messages.push(LlamaChatMessage::new("system".to_string(), system.to_string()).ok()?);
+        }
+        for (role, content) in history {
+            messages.push(LlamaChatMessage::new(role.clone(), content.clone()).ok()?);
+        }
+        messages.push(LlamaChatMessage::new("user".to_string(), user.to_string()).ok()?);
         self.model.apply_chat_template(&tmpl, &messages, true).ok()
     }
 
@@ -358,7 +359,7 @@ impl Fallback for LazyLlmFallback {
 
         let model = state.loaded.as_ref().unwrap();
         let wrapping;
-        let wrapped = match model.build_chat_prompt("", prompt) {
+        let wrapped = match model.build_chat_prompt("", &[], prompt) {
             Some(p) => {
                 wrapping = "native";
                 p
@@ -419,6 +420,7 @@ impl Fallback for LazyLlmFallback {
         input: &str,
         skills: &[SkillInfo],
         locale: &str,
+        history: &[(String, String)],
     ) -> Option<FallbackResult> {
         self.clear_error();
         let mut state = match self.inner.lock() {
@@ -454,11 +456,11 @@ impl Fallback for LazyLlmFallback {
         let now = Instant::now();
         state.last_used = Some(now);
 
-        let system_prompt = build_system_prompt(skills, locale);
+        let system_prompt = build_system_prompt(skills, locale, !history.is_empty());
         let user_prompt = build_user_prompt(input);
 
         let model = state.loaded.as_ref().unwrap();
-        let prompt = match model.build_chat_prompt(&system_prompt, &user_prompt) {
+        let prompt = match model.build_chat_prompt(&system_prompt, history, &user_prompt) {
             Some(p) => p,
             None => format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "),
         };
@@ -538,8 +540,8 @@ impl LlmFallback {
         })
     }
 
-    fn build_chat_prompt(&self, system: &str, user: &str) -> Option<String> {
-        self.loaded.build_chat_prompt(system, user)
+    fn build_chat_prompt(&self, system: &str, history: &[(String, String)], user: &str) -> Option<String> {
+        self.loaded.build_chat_prompt(system, history, user)
     }
 
     fn run_inference(&self, prompt: &str, stop_on_newline: bool) -> Result<String, LlmError> {
@@ -554,7 +556,7 @@ impl Fallback for LlmFallback {
             .lock()
             .map_err(|_| LlmError::Backend("inference mutex poisoned".into()))?;
 
-        let wrapped = match self.build_chat_prompt("", prompt) {
+        let wrapped = match self.build_chat_prompt("", &[], prompt) {
             Some(p) => p,
             None => prompt.to_string(),
         };
@@ -567,13 +569,14 @@ impl Fallback for LlmFallback {
         input: &str,
         skills: &[SkillInfo],
         locale: &str,
+        _history: &[(String, String)],
     ) -> Option<FallbackResult> {
         let _guard = self.inference_lock.lock().ok()?;
 
-        let system_prompt = build_system_prompt(skills, locale);
+        let system_prompt = build_system_prompt(skills, locale, false);
         let user_prompt = build_user_prompt(input);
 
-        let prompt = match self.build_chat_prompt(&system_prompt, &user_prompt) {
+        let prompt = match self.build_chat_prompt(&system_prompt, &[], &user_prompt) {
             Some(p) => p,
             None => format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "),
         };
@@ -620,7 +623,7 @@ const PROMPT_IT_SYSTEM: &str = include_str!("../prompts/it/system.md");
 /// for small models (Gemma 4 E2B occasionally bleeds in non-target-
 /// language tokens like `不` for "no" when the prompt isn't language-
 /// scoped).
-fn build_system_prompt(_skills: &[SkillInfo], locale: &str) -> String {
+fn build_system_prompt(_skills: &[SkillInfo], locale: &str, has_history: bool) -> String {
     let template = match locale {
         "en" => PROMPT_EN_SYSTEM,
         "it" => PROMPT_IT_SYSTEM,
@@ -632,7 +635,12 @@ fn build_system_prompt(_skills: &[SkillInfo], locale: &str) -> String {
             PROMPT_EN_SYSTEM
         }
     };
-    template.trim().to_string()
+    let mut prompt = template.trim().to_string();
+    if has_history {
+        prompt.push_str("\n\n");
+        prompt.push_str(ari_core::CONTINUATION_INSTRUCTION);
+    }
+    prompt
 }
 
 fn build_user_prompt(input: &str) -> String {
@@ -1339,7 +1347,7 @@ mod tests {
 
     #[test]
     fn system_prompt_english_is_concise_and_locale_fenced() {
-        let prompt = build_system_prompt(&test_skills(), "en");
+        let prompt = build_system_prompt(&test_skills(), "en", false);
         assert!(prompt.contains("Ari"));
         // Locale fence — the explicit "English" word matters for
         // small models that occasionally bleed in non-English tokens.
@@ -1351,7 +1359,7 @@ mod tests {
 
     #[test]
     fn system_prompt_italian_is_localized() {
-        let prompt = build_system_prompt(&test_skills(), "it");
+        let prompt = build_system_prompt(&test_skills(), "it", false);
         assert!(prompt.contains("Ari"));
         assert!(prompt.contains("italiano"));
         assert!(prompt.contains("breve frase"));
@@ -1362,7 +1370,7 @@ mod tests {
 
     #[test]
     fn system_prompt_unknown_locale_falls_back_to_english() {
-        let prompt = build_system_prompt(&test_skills(), "ja");
+        let prompt = build_system_prompt(&test_skills(), "ja", false);
         // "Ja" isn't shipped — should silently get the en template.
         assert!(prompt.contains("Ari"));
         assert!(prompt.contains("English"));
@@ -1583,7 +1591,7 @@ mod tests {
         eprintln!("Model loaded.");
 
         let skills = test_skills();
-        let system = build_system_prompt(&skills, "en");
+        let system = build_system_prompt(&skills, "en", false);
         let user = build_user_prompt("what is the capital of australia");
 
         eprintln!("--- System prompt ---");
@@ -1591,7 +1599,7 @@ mod tests {
         eprintln!("--- User prompt ---");
         eprintln!("{user}");
 
-        let prompt = match fallback.build_chat_prompt(&system, &user) {
+        let prompt = match fallback.build_chat_prompt(&system, &[], &user) {
             Some(p) => {
                 eprintln!("--- Chat template applied ---");
                 eprintln!("{p}");

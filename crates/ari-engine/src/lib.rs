@@ -38,6 +38,42 @@ pub trait EnvelopeSink: Send + Sync {
 /// host uses that signal to trigger an STT retry path.
 pub const FALLBACK_RESPONSE: &str = "Sorry, I didn't understand that.";
 
+/// Engine-internal continuation signal the assistant emits inline at the
+/// end of an answer; parsed and stripped before the answer reaches the
+/// user. See docs/superpowers/specs/2026-06-26-conversation-continuation-design.md.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContinuationFlag {
+    Continuation,
+    New,
+}
+
+/// Split a trailing `[continuation]` / `[new]` marker off an assistant
+/// answer. Matched case-insensitively, tolerant of surrounding quotes,
+/// and only when it is the final bracketed token. Returns the cleaned
+/// answer (trailing whitespace trimmed) and the flag; a missing or
+/// unrecognised marker defaults to `Continuation` so context is kept.
+pub(crate) fn parse_continuation_flag(raw: &str) -> (String, ContinuationFlag) {
+    let trimmed = raw.trim_end();
+    if let Some(open) = trimmed.rfind('[') {
+        let inner = trimmed[open..]
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .trim()
+            .to_ascii_lowercase();
+        let flag = match inner.as_str() {
+            "new" => Some(ContinuationFlag::New),
+            "continuation" => Some(ContinuationFlag::Continuation),
+            _ => None,
+        };
+        if let Some(flag) = flag {
+            return (trimmed[..open].trim_end().to_string(), flag);
+        }
+    }
+    (trimmed.to_string(), ContinuationFlag::Continuation)
+}
+
 /// The locale-appropriate version of [`FALLBACK_RESPONSE`]. Used when
 /// every routing layer (skill regex → router → assistant) returned
 /// nothing — engine surfaces this so the user gets a graceful "I'm
@@ -57,12 +93,34 @@ pub fn fallback_response_for(locale: &str) -> &'static str {
 /// is treated as abandoned. Safety net only — the frontend cancels eagerly.
 const PENDING_TURN_TTL: Duration = Duration::from_secs(60);
 
+/// Inactivity window after which a conversation's context is dropped and
+/// the next assistant turn starts fresh.
+const CONVERSATION_TTL: Duration = Duration::from_secs(90);
+/// Most recent exchanges retained (10 role/content entries).
+const MAX_CONVERSATION_TURNS: usize = 5;
+
 /// A skill is awaiting the user's reply to a question it just asked.
 #[derive(Clone, Debug)]
 pub struct PendingTurn {
     pub skill_id: String,
     pub context: String,
     pub created_at: Instant,
+}
+
+/// One recorded assistant exchange: the user's query and the assistant's
+/// answer (continuation marker already stripped).
+#[derive(Clone, Debug)]
+pub(crate) struct ConversationTurn {
+    pub(crate) user: String,
+    pub(crate) assistant: String,
+}
+
+/// Recent assistant conversation, in chronological order, plus the last
+/// time any turn touched it (drives the inactivity TTL).
+#[derive(Debug)]
+struct ConversationBuffer {
+    turns: Vec<ConversationTurn>,
+    last_activity: Instant,
 }
 
 /// Localized acknowledgement spoken when the user cancels a pending question.
@@ -179,6 +237,10 @@ pub struct Engine {
     /// that skill's `execute_reply`. Guarded by a TTL so a missed cancel
     /// can't strand the slot. `&self` methods mutate it via the `Mutex`.
     pending_turn: Mutex<Option<PendingTurn>>,
+    /// Passive multi-turn context for assistant-routed queries (behaviour
+    /// B). Unlike `pending_turn`, this never hijacks routing — it only
+    /// enriches assistant answers and is read non-destructively.
+    conversation: Mutex<Option<ConversationBuffer>>,
 }
 
 impl Engine {
@@ -196,6 +258,7 @@ impl Engine {
             named_assistants: Vec::new(),
             config_store: None,
             pending_turn: Mutex::new(None),
+            conversation: Mutex::new(None),
         }
     }
 
@@ -234,6 +297,49 @@ impl Engine {
     /// timeout, and fresh wake word; a no-op when nothing is pending.
     pub fn clear_pending_turn(&self) {
         *self.pending_turn.lock().expect("pending_turn poisoned") = None;
+    }
+
+    /// Recent assistant turns if the buffer is within its inactivity TTL,
+    /// refreshing the timer so any turn (skill or assistant) keeps the
+    /// conversation alive. A stale buffer is dropped and an empty list
+    /// returned. Non-destructive for a fresh buffer — behaviour B is
+    /// passive (contrast `take_pending_turn_if_fresh`).
+    pub(crate) fn conversation_context(&self) -> Vec<ConversationTurn> {
+        let mut guard = self.conversation.lock().expect("conversation poisoned");
+        match guard.as_mut() {
+            Some(buf) if buf.last_activity.elapsed() < CONVERSATION_TTL => {
+                buf.last_activity = Instant::now();
+                buf.turns.clone()
+            }
+            Some(_) => {
+                *guard = None;
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Record an assistant answer (marker already stripped) as the latest
+    /// turn. `New` starts a fresh conversation seeded with just this turn;
+    /// `Continuation` appends and trims to the most recent
+    /// `MAX_CONVERSATION_TURNS`.
+    pub(crate) fn record_assistant_turn(&self, user: &str, assistant: &str, flag: ContinuationFlag) {
+        let turn = ConversationTurn { user: user.to_string(), assistant: assistant.to_string() };
+        let mut guard = self.conversation.lock().expect("conversation poisoned");
+        match (flag, guard.as_mut()) {
+            (ContinuationFlag::Continuation, Some(buf)) => {
+                buf.turns.push(turn);
+                let len = buf.turns.len();
+                if len > MAX_CONVERSATION_TURNS {
+                    buf.turns.drain(0..len - MAX_CONVERSATION_TURNS);
+                }
+                buf.last_activity = Instant::now();
+            }
+            // `New`, or first turn of a fresh buffer: seed with this turn.
+            _ => {
+                *guard = Some(ConversationBuffer { turns: vec![turn], last_activity: Instant::now() });
+            }
+        }
     }
 
     /// Install a log sink for engine-internal diagnostics. Currently only
@@ -537,6 +643,13 @@ impl Engine {
             );
         }
 
+        // Behaviour B: read (and refresh) the conversation buffer for this
+        // turn. Any turn refreshes the inactivity timer; only assistant
+        // answers below extend the buffer. Pending-turn replies and skill
+        // wins are transparent (refresh, never record).
+        let conversation = self.conversation_context();
+        let history = history_messages(&conversation);
+
         // Multi-turn: if a skill is awaiting a reply, this utterance belongs
         // to it — bypass all routing (scoring, router, assistant).
         if let Some(pending) = self.take_pending_turn_if_fresh() {
@@ -678,7 +791,7 @@ impl Engine {
             // call that either routes to a skill or answers directly, instead
             // of route-then-separate-answer. The combined prompt is English
             // only, so non-English keeps the translated two-step below.
-            match self.route_or_answer(&normalized) {
+            match self.route_or_answer(&normalized, &history) {
                 Ok(RouteOrAnswer::Skill(id)) => {
                     if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
                         trace.winner = Some(format!("router:assistant:{id}"));
@@ -692,12 +805,14 @@ impl Engine {
                     }
                 }
                 Ok(RouteOrAnswer::Answer(text)) => {
+                    let (clean, flag) = parse_continuation_flag(&text);
+                    self.record_assistant_turn(&normalized, &clean, flag);
                     let label = match &self.active_assistant {
                         Some(ActiveAssistant::Api { skill_id, .. }) => format!("assistant:{skill_id}"),
                         _ => "assistant:one-shot".to_string(),
                     };
                     trace.winner = Some(label);
-                    return (Response::Text(text), Some(trace));
+                    return (Response::Text(clean), Some(trace));
                 }
                 Err(reason) => {
                     self.log(
@@ -864,19 +979,21 @@ impl Engine {
                             normalized.len()
                         ),
                     );
-                    let result = llm.try_answer(&normalized, &catalog, &self.ctx.locale);
+                    let result = llm.try_answer(&normalized, &catalog, &self.ctx.locale, &history);
                     match result {
                         Some(ari_llm::FallbackResult::DirectAnswer { text }) => {
-                            let preview: String = text.chars().take(160).collect();
+                            let (clean, flag) = parse_continuation_flag(&text);
+                            self.record_assistant_turn(&normalized, &clean, flag);
+                            let preview: String = clean.chars().take(160).collect();
                             self.log(
                                 LogLevel::Info,
                                 &format!(
                                     "assistant:builtin: try_answer returned answer ({} bytes): {preview:?}",
-                                    text.len()
+                                    clean.len()
                                 ),
                             );
                             trace.winner = Some("assistant:builtin".to_string());
-                            return (Response::Text(text), Some(trace));
+                            return (Response::Text(clean), Some(trace));
                         }
                         None => {
                             let detail = llm
@@ -909,10 +1026,13 @@ impl Engine {
                     config_store.as_ref(),
                     &normalized,
                     &self.ctx.locale,
+                    &history,
                 ) {
                     Ok(text) if !text.is_empty() => {
+                        let (clean, flag) = parse_continuation_flag(&text);
+                        self.record_assistant_turn(&normalized, &clean, flag);
                         trace.winner = Some(format!("assistant:{skill_id}"));
-                        return (Response::Text(text), Some(trace));
+                        return (Response::Text(clean), Some(trace));
                     }
                     _ => {}
                 }
@@ -953,7 +1073,7 @@ impl Engine {
         skill_catalog: &[(String, String, String)],
     ) -> Option<String> {
         let prompt = build_assistant_routing_prompt(input, skill_catalog, &self.ctx.locale);
-        let response = self.call_active_assistant(&prompt).ok()?;
+        let response = self.call_active_assistant(&prompt, &[]).ok()?;
         let picked = parse_assistant_routing_response(&response, skill_catalog);
         if picked.is_none() {
             let preview: String = response.chars().take(120).collect();
@@ -972,7 +1092,7 @@ impl Engine {
     /// is configured, the on-device LLM isn't loaded, or the call failed.
     /// Shared by the routing prompt, the one-shot route-or-answer, and the
     /// debug commands.
-    fn call_active_assistant(&self, prompt: &str) -> Result<String, String> {
+    fn call_active_assistant(&self, prompt: &str, history: &[(String, String)]) -> Result<String, String> {
         let fail = |reason: String| -> Result<String, String> {
             self.log(LogLevel::Warn, &format!("assistant: {reason}"));
             Err(reason)
@@ -988,6 +1108,7 @@ impl Engine {
                 config_store.as_ref(),
                 prompt,
                 &self.ctx.locale,
+                history,
             ) {
                 Ok(text) => Ok(text),
                 Err(e) => fail(format!("cloud call failed: {e}")),
@@ -1016,10 +1137,10 @@ impl Engine {
     /// be normalised. `None` when no assistant is configured or the call
     /// failed. English-instruction prompt for now; non-English callers should
     /// keep the translated two-step until a localised combined prompt exists.
-    fn route_or_answer(&self, input: &str) -> Result<RouteOrAnswer, String> {
+    fn route_or_answer(&self, input: &str, history: &[(String, String)]) -> Result<RouteOrAnswer, String> {
         let catalog = self.router_catalog();
         let prompt = build_combined_route_or_answer_prompt(input, &catalog);
-        let response = self.call_active_assistant(&prompt)?;
+        let response = self.call_active_assistant(&prompt, history)?;
         Ok(parse_combined_response(&response, &catalog))
     }
 
@@ -1321,6 +1442,7 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
         binding.config_store.as_ref(),
         prompt,
         locale,
+        &[],
     ) {
         Ok(text) if !text.is_empty() => Response::Text(text),
         Ok(_) => {
@@ -1695,6 +1817,7 @@ fn call_assistant_for_consult(
                 config_store.as_ref(),
                 prompt,
                 locale,
+                &[],
             )
             .map_err(|e| e.to_string())?;
             if text.trim().is_empty() {
@@ -1757,6 +1880,7 @@ fn call_assistant_for_consult(
                 config_store.as_ref(),
                 prompt,
                 locale,
+                &[],
             )
             .map_err(|e| e.to_string())?;
             if text.trim().is_empty() {
@@ -1785,6 +1909,18 @@ fn strip_nested_consult(
         }
     }
     action
+}
+
+/// Flatten conversation turns into chronological role/content message
+/// pairs (oldest first): each turn yields a `user` then an `assistant`
+/// message. The caller appends the current user turn last.
+fn history_messages(turns: &[ConversationTurn]) -> Vec<(String, String)> {
+    let mut msgs = Vec::with_capacity(turns.len() * 2);
+    for t in turns {
+        msgs.push(("user".to_string(), t.user.clone()));
+        msgs.push(("assistant".to_string(), t.assistant.clone()));
+    }
+    msgs
 }
 
 impl Default for Engine {
@@ -3050,5 +3186,244 @@ mod tests {
         let r = engine.settings_action("does.not.exist", "sign_in", "{}");
         assert_eq!(r.ok, false);
         assert!(r.error.unwrap().contains("does.not.exist"));
+    }
+
+    #[test]
+    fn parse_flag_continuation_inline() {
+        let (text, flag) = parse_continuation_flag("Abu Dhabi is the capital. [continuation]");
+        assert_eq!(text, "Abu Dhabi is the capital.");
+        assert_eq!(flag, ContinuationFlag::Continuation);
+    }
+
+    #[test]
+    fn parse_flag_new_inline() {
+        let (text, flag) = parse_continuation_flag("27 times 3 is 81. [new]");
+        assert_eq!(text, "27 times 3 is 81.");
+        assert_eq!(flag, ContinuationFlag::New);
+    }
+
+    #[test]
+    fn parse_flag_case_and_quotes_tolerant() {
+        let (text, flag) = parse_continuation_flag("Sure. ['NEW']");
+        assert_eq!(text, "Sure.");
+        assert_eq!(flag, ContinuationFlag::New);
+    }
+
+    #[test]
+    fn parse_flag_missing_defaults_to_continuation() {
+        let (text, flag) = parse_continuation_flag("Just an answer with no marker.");
+        assert_eq!(text, "Just an answer with no marker.");
+        assert_eq!(flag, ContinuationFlag::Continuation);
+    }
+
+    #[test]
+    fn parse_flag_leaves_non_marker_brackets_intact() {
+        let (text, flag) = parse_continuation_flag("See item [3] on the list.");
+        assert_eq!(text, "See item [3] on the list.");
+        assert_eq!(flag, ContinuationFlag::Continuation);
+    }
+
+    #[test]
+    fn parse_flag_strips_trailing_newline_before_marker() {
+        let (text, flag) = parse_continuation_flag("Paris.\n[new]");
+        assert_eq!(text, "Paris.");
+        assert_eq!(flag, ContinuationFlag::New);
+    }
+
+    #[test]
+    fn record_continuation_appends_turn() {
+        let engine = Engine::new();
+        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        engine.record_assistant_turn("q2", "a2", ContinuationFlag::Continuation);
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].user, "q1");
+        assert_eq!(turns[1].assistant, "a2");
+    }
+
+    #[test]
+    fn record_new_reseeds_buffer_with_single_turn() {
+        let engine = Engine::new();
+        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        engine.record_assistant_turn("q2", "a2", ContinuationFlag::Continuation);
+        engine.record_assistant_turn("27 times 3?", "81.", ContinuationFlag::New);
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user, "27 times 3?");
+        assert_eq!(turns[0].assistant, "81.");
+    }
+
+    #[test]
+    fn record_caps_to_five_most_recent_exchanges() {
+        let engine = Engine::new();
+        for i in 0..7 {
+            engine.record_assistant_turn(&format!("q{i}"), &format!("a{i}"), ContinuationFlag::Continuation);
+        }
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 5);
+        assert_eq!(turns[0].user, "q2"); // q0,q1 dropped
+        assert_eq!(turns[4].user, "q6");
+    }
+
+    #[test]
+    fn conversation_context_empty_when_no_buffer() {
+        let engine = Engine::new();
+        assert!(engine.conversation_context().is_empty());
+    }
+
+    #[test]
+    fn conversation_context_expires_stale_buffer() {
+        use std::time::{Duration, Instant};
+        let engine = Engine::new();
+        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        // Age the buffer past the TTL.
+        {
+            let mut g = engine.conversation.lock().unwrap();
+            g.as_mut().unwrap().last_activity =
+                Instant::now().checked_sub(Duration::from_secs(120)).unwrap();
+        }
+        assert!(engine.conversation_context().is_empty(), "stale buffer must read empty");
+        assert!(engine.conversation.lock().unwrap().is_none(), "stale buffer must be dropped");
+    }
+
+    #[test]
+    fn conversation_context_refreshes_activity_when_fresh() {
+        use std::time::{Duration, Instant};
+        let engine = Engine::new();
+        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        // Age it to 80s — still inside the 90s TTL.
+        {
+            let mut g = engine.conversation.lock().unwrap();
+            g.as_mut().unwrap().last_activity =
+                Instant::now().checked_sub(Duration::from_secs(80)).unwrap();
+        }
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 1, "fresh buffer returns its turns");
+        let elapsed = engine.conversation.lock().unwrap().as_ref().unwrap().last_activity.elapsed();
+        assert!(elapsed < Duration::from_secs(5), "activity timer must be refreshed");
+    }
+
+    #[cfg(feature = "llm")]
+    struct RecordingFallback {
+        last_history: std::sync::Mutex<Vec<(String, String)>>,
+        reply: &'static str,
+    }
+
+    #[cfg(feature = "llm")]
+    impl ari_llm::Fallback for RecordingFallback {
+        fn try_answer(
+            &self,
+            _input: &str,
+            _skills: &[ari_llm::SkillInfo],
+            _locale: &str,
+            history: &[(String, String)],
+        ) -> Option<ari_llm::FallbackResult> {
+            *self.last_history.lock().unwrap() = history.to_vec();
+            Some(ari_llm::FallbackResult::DirectAnswer { text: self.reply.to_string() })
+        }
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn assistant_turn_records_and_second_turn_carries_history() {
+        let mut engine = Engine::new();
+        let fb = std::sync::Arc::new(RecordingFallback {
+            last_history: std::sync::Mutex::new(Vec::new()),
+            reply: "Paris. [continuation]",
+        });
+        engine.set_llm(fb.clone());
+        engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
+
+        // Turn 1: no history yet; answer recorded; flag stripped from response.
+        let (resp, _) = engine.process_input_traced("what is the capital of france");
+        assert!(fb.last_history.lock().unwrap().is_empty(), "first turn sends no history");
+        match resp { Response::Text(t) => assert_eq!(t, "Paris."), o => panic!("{o:?}") }
+
+        // Turn 2: prior turn supplied as chronological role/content history.
+        let _ = engine.process_input_traced("what is the population");
+        let hist = fb.last_history.lock().unwrap().clone();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0], ("user".to_string(), "what is the capital of france".to_string()));
+        assert_eq!(hist[1], ("assistant".to_string(), "Paris.".to_string()));
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn new_flag_reseeds_conversation() {
+        let mut engine = Engine::new();
+        let fb = std::sync::Arc::new(RecordingFallback {
+            last_history: std::sync::Mutex::new(Vec::new()),
+            reply: "81. [new]",
+        });
+        engine.set_llm(fb.clone());
+        engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
+        engine.record_assistant_turn("capital of france", "Paris.", ContinuationFlag::Continuation);
+
+        let (resp, _) = engine.process_input_traced("what is 27 times 3");
+        match resp { Response::Text(t) => assert_eq!(t, "81."), o => panic!("{o:?}") }
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 1, "[new] reseeds to a single turn");
+        assert_eq!(turns[0].user, "what is 27 times 3");
+        assert_eq!(turns[0].assistant, "81.");
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn skill_win_refreshes_but_does_not_record() {
+        use std::time::{Duration, Instant};
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(MockSkill {
+            id: "weather", specificity: Specificity::High, fixed_score: 1.0,
+            response: "It is sunny.", requires_setting: None,
+        }));
+        // A live conversation from a prior assistant turn, aged to 80s.
+        engine.record_assistant_turn("capital of france", "Paris.", ContinuationFlag::Continuation);
+        {
+            let mut g = engine.conversation.lock().unwrap();
+            g.as_mut().unwrap().last_activity =
+                Instant::now().checked_sub(Duration::from_secs(80)).unwrap();
+        }
+        let _ = engine.process_input_traced("weather please"); // MockSkill wins
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 1, "skill turn must NOT record into the buffer");
+        let elapsed = engine.conversation.lock().unwrap().as_ref().unwrap().last_activity.elapsed();
+        assert!(elapsed < Duration::from_secs(5), "skill turn must refresh the timer");
+    }
+
+    #[test]
+    fn behaviour_a_reply_does_not_record() {
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(AskingSkill));
+        engine.record_assistant_turn("capital of france", "Paris.", ContinuationFlag::Continuation);
+
+        let _ = engine.process_input_traced("play music");   // AskingSkill asks → pending turn
+        let _ = engine.process_input_traced("spotify");       // reply via execute_reply
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 1, "behaviour-A reply must not enter the conversation buffer");
+        assert_eq!(turns[0].user, "capital of france");
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn expired_buffer_reseeds_on_next_assistant_turn() {
+        use std::time::{Duration, Instant};
+        let mut engine = Engine::new();
+        let fb = std::sync::Arc::new(RecordingFallback {
+            last_history: std::sync::Mutex::new(Vec::new()),
+            reply: "Fresh answer. [continuation]",
+        });
+        engine.set_llm(fb.clone());
+        engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
+        engine.record_assistant_turn("old question", "old answer", ContinuationFlag::Continuation);
+        {
+            let mut g = engine.conversation.lock().unwrap();
+            g.as_mut().unwrap().last_activity =
+                Instant::now().checked_sub(Duration::from_secs(120)).unwrap();
+        }
+        let _ = engine.process_input_traced("a brand new question");
+        assert!(fb.last_history.lock().unwrap().is_empty(), "expired buffer sends no history");
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user, "a brand new question", "buffer reseeds with the fresh turn only");
     }
 }

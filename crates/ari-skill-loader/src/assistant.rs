@@ -133,10 +133,11 @@ pub fn call_assistant_api(
     store: &dyn ConfigStore,
     user_input: &str,
     locale: &str,
+    history: &[(String, String)],
 ) -> Result<String, AssistantApiError> {
     let resolved = resolve_config(config, skill_id, store)?;
 
-    let body = build_request_body(config, &resolved, user_input, locale);
+    let body = build_request_body(config, &resolved, user_input, locale, history);
 
     let tls_config = tls::webpki_roots_config();
     let client = reqwest::blocking::Client::builder()
@@ -241,6 +242,7 @@ fn build_request_body(
     resolved: &ResolvedConfig,
     user_input: &str,
     locale: &str,
+    history: &[(String, String)],
 ) -> String {
     // Two-tier locale handling for cloud assistants:
     //   1. If the skill ships a `system_prompt` translation for this
@@ -266,6 +268,10 @@ fn build_request_body(
     } else {
         base_prompt.to_string()
     };
+    let mut system_prompt = system_prompt;
+    if !history.is_empty() {
+        system_prompt = format!("{system_prompt}\n\n{}", ari_core::CONTINUATION_INSTRUCTION);
+    }
     let system_prompt = system_prompt.as_str();
     let body = match config.request_format {
         RequestFormat::Openai => {
@@ -274,28 +280,31 @@ fn build_request_body(
             // reject `max_tokens` with HTTP 400, and the older ones
             // (gpt-4o, gpt-4o-mini, gpt-3.5-turbo) silently accept the
             // new name. One field name works across the current range.
+            let mut messages = vec![serde_json::json!({"role": "system", "content": system_prompt})];
+            for (role, content) in history {
+                messages.push(serde_json::json!({"role": role, "content": content}));
+            }
+            messages.push(serde_json::json!({"role": "user", "content": user_input}));
             serde_json::json!({
                 "model": resolved.model,
                 "max_completion_tokens": config.max_tokens,
                 "temperature": config.temperature,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_input}
-                ]
+                "messages": messages,
             })
         }
         RequestFormat::Anthropic => {
+            let mut messages = Vec::new();
+            for (role, content) in history {
+                messages.push(serde_json::json!({"role": role, "content": content}));
+            }
+            messages.push(serde_json::json!({"role": "user", "content": user_input}));
             let mut obj = serde_json::json!({
                 "model": resolved.model,
                 "max_tokens": config.max_tokens,
                 "system": system_prompt,
-                "messages": [
-                    {"role": "user", "content": user_input}
-                ]
+                "messages": messages,
             });
-            if let Some(ref temp) = Some(config.temperature) {
-                obj["temperature"] = serde_json::json!(temp);
-            }
+            obj["temperature"] = serde_json::json!(config.temperature);
             obj
         }
     };
@@ -392,7 +401,7 @@ mod tests {
             model: "gpt-4o-mini".into(),
             api_key: Some("sk-test".into()),
         };
-        let body = build_request_body(&config, &resolved, "What is 2+2?", "en");
+        let body = build_request_body(&config, &resolved, "What is 2+2?", "en", &[]);
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["model"], "gpt-4o-mini");
         assert_eq!(parsed["max_completion_tokens"], 256);
@@ -435,7 +444,7 @@ mod tests {
             model: "gpt-4o-mini".into(),
             api_key: Some("sk-test".into()),
         };
-        let body = build_request_body(&config, &resolved, "che ora è?", "it");
+        let body = build_request_body(&config, &resolved, "che ora è?", "it", &[]);
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
             parsed["messages"][0]["content"],
@@ -474,7 +483,7 @@ mod tests {
             model: "gpt-4o-mini".into(),
             api_key: Some("sk-test".into()),
         };
-        let body = build_request_body(&config, &resolved, "ciao", "it");
+        let body = build_request_body(&config, &resolved, "ciao", "it", &[]);
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["messages"][0]["content"], "Sei Ari.");
     }
@@ -503,7 +512,7 @@ mod tests {
             model: "gpt-4o-mini".into(),
             api_key: Some("sk-test".into()),
         };
-        let body = build_request_body(&config, &resolved, "what time?", "en");
+        let body = build_request_body(&config, &resolved, "what time?", "en", &[]);
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["messages"][0]["content"], "You are Ari.");
     }
@@ -532,12 +541,85 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             api_key: Some("sk-ant-test".into()),
         };
-        let body = build_request_body(&config, &resolved, "Hello", "en");
+        let body = build_request_body(&config, &resolved, "Hello", "en", &[]);
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["model"], "claude-sonnet-4-6");
         assert_eq!(parsed["system"], "You are Ari.");
         assert_eq!(parsed["messages"][0]["role"], "user");
         assert!(parsed["messages"].as_array().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn build_request_body_inserts_history_before_current_turn_openai() {
+        let config = ApiConfig {
+            endpoint: Some("https://api.example.com".into()),
+            endpoint_config_key: None,
+            default_endpoint: None,
+            auth: AuthScheme::Bearer,
+            auth_header: None,
+            auth_config_key: Some("api_key".into()),
+            model_config_key: None,
+            default_model: "gpt-4o-mini".into(),
+            system_prompt: "You are Ari.".into(),
+            request_format: RequestFormat::Openai,
+            response_path: "choices[0].message.content".into(),
+            api_version: None,
+            api_version_header: None,
+            max_tokens: 256,
+            temperature: 0.7,
+        };
+        let resolved = ResolvedConfig {
+            endpoint: "https://api.example.com".into(),
+            model: "gpt-4o-mini".into(),
+            api_key: Some("sk-test".into()),
+        };
+        let history = vec![
+            ("user".to_string(), "what is the capital of uae?".to_string()),
+            ("assistant".to_string(), "Abu Dhabi.".to_string()),
+        ];
+        let body = build_request_body(&config, &resolved, "what is the population?", "en", &history);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4); // system + 2 history + current user
+        assert_eq!(msgs[0]["role"], "system");
+        assert!(msgs[0]["content"].as_str().unwrap().contains("[continuation]"));
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "what is the capital of uae?");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["content"], "Abu Dhabi.");
+        assert_eq!(msgs[3]["role"], "user");
+        assert_eq!(msgs[3]["content"], "what is the population?");
+    }
+
+    #[test]
+    fn build_request_body_no_history_omits_instruction_openai() {
+        let config = ApiConfig {
+            endpoint: Some("https://api.example.com".into()),
+            endpoint_config_key: None,
+            default_endpoint: None,
+            auth: AuthScheme::Bearer,
+            auth_header: None,
+            auth_config_key: Some("api_key".into()),
+            model_config_key: None,
+            default_model: "gpt-4o-mini".into(),
+            system_prompt: "You are Ari.".into(),
+            request_format: RequestFormat::Openai,
+            response_path: "choices[0].message.content".into(),
+            api_version: None,
+            api_version_header: None,
+            max_tokens: 256,
+            temperature: 0.7,
+        };
+        let resolved = ResolvedConfig {
+            endpoint: "https://api.example.com".into(),
+            model: "gpt-4o-mini".into(),
+            api_key: Some("sk-test".into()),
+        };
+        let body = build_request_body(&config, &resolved, "hello", "en", &[]);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2); // system + user only
+        assert!(!msgs[0]["content"].as_str().unwrap().contains("[continuation]"));
     }
 
     #[test]
@@ -647,7 +729,7 @@ mod tests {
         let mut store = MemoryConfigStore::new();
         store.set(&entry.id, "api_key", &api_key);
 
-        let result = call_assistant_api(api, &entry.id, &store, "what is the capital of malta", "en");
+        let result = call_assistant_api(api, &entry.id, &store, "what is the capital of malta", "en", &[]);
         match result {
             Ok(text) => {
                 eprintln!("ChatGPT response: {text}");
@@ -680,5 +762,46 @@ mod tests {
 
         let err = resolve_config(&config, "test.id", &store).unwrap_err();
         assert!(matches!(err, AssistantApiError::MissingConfig { key } if key == "api_key"));
+    }
+
+    #[test]
+    fn build_request_body_inserts_history_before_current_turn_anthropic() {
+        let config = ApiConfig {
+            endpoint: Some("https://api.anthropic.com/v1/messages".into()),
+            endpoint_config_key: None,
+            default_endpoint: None,
+            auth: AuthScheme::Header,
+            auth_header: Some("x-api-key".into()),
+            auth_config_key: Some("api_key".into()),
+            model_config_key: None,
+            default_model: "claude-sonnet-4-6".into(),
+            system_prompt: "You are Ari.".into(),
+            request_format: RequestFormat::Anthropic,
+            response_path: "content[0].text".into(),
+            api_version: Some("2023-06-01".into()),
+            api_version_header: Some("anthropic-version".into()),
+            max_tokens: 256,
+            temperature: 0.7,
+        };
+        let resolved = ResolvedConfig {
+            endpoint: "https://api.anthropic.com/v1/messages".into(),
+            model: "claude-sonnet-4-6".into(),
+            api_key: Some("sk-ant-test".into()),
+        };
+        let history = vec![
+            ("user".to_string(), "what is the capital of uae?".to_string()),
+            ("assistant".to_string(), "Abu Dhabi.".to_string()),
+        ];
+        let body = build_request_body(&config, &resolved, "what is the population?", "en", &history);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3); // 2 history + current user
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "what is the capital of uae?");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"], "Abu Dhabi.");
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(msgs[2]["content"], "what is the population?");
+        assert!(v["system"].as_str().unwrap().contains("[continuation]"));
     }
 }

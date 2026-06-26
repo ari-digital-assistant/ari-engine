@@ -39,6 +39,18 @@ pub enum RouteResult {
 /// retune once we have empirical numbers from real routes.
 pub const MIN_ROUTER_CONFIDENCE: f32 = -3.0;
 
+/// Appended to the assistant system prompt when prior conversation turns
+/// are supplied, instructing the model to self-classify the turn. The
+/// engine parses and strips the trailing marker (see `ContinuationFlag`).
+/// Internal control directive — English source, NOT user-facing copy, so
+/// it is not localized. The marker is requested INLINE (same line) because
+/// the on-device path stops generation at the first newline.
+pub const CONTINUATION_INSTRUCTION: &str = "You may be shown earlier turns of this \
+conversation as prior messages. If the user's latest message refers to them, use that \
+context to answer. At the very end of your reply, append a single space and then exactly \
+[continuation] if this message continues the earlier conversation, or [new] if it begins \
+a new, unrelated topic. Keep the marker on the same line as your answer.";
+
 /// Trait for an LLM-based skill router that runs after the keyword
 /// matcher fails. The router sees the user input and the list of
 /// available skills, and either picks one, suggests a system action,
@@ -916,5 +928,12 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&seen).unwrap();
         assert_eq!(v["_ari_reply"]["context"], "ctx-blob");
         assert_eq!(v["_ari_reply"]["text"], "spotify");
+    }
+
+    #[test]
+    fn continuation_instruction_mentions_both_markers() {
+        assert!(crate::CONTINUATION_INSTRUCTION.contains("[continuation]"));
+        assert!(crate::CONTINUATION_INSTRUCTION.contains("[new]"));
+        assert!(!crate::CONTINUATION_INSTRUCTION.is_empty());
     }
 }
