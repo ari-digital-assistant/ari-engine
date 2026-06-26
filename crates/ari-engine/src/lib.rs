@@ -304,7 +304,6 @@ impl Engine {
     /// conversation alive. A stale buffer is dropped and an empty list
     /// returned. Non-destructive for a fresh buffer — behaviour B is
     /// passive (contrast `take_pending_turn_if_fresh`).
-    #[allow(dead_code)]
     pub(crate) fn conversation_context(&self) -> Vec<ConversationTurn> {
         let mut guard = self.conversation.lock().expect("conversation poisoned");
         match guard.as_mut() {
@@ -324,7 +323,6 @@ impl Engine {
     /// turn. `New` starts a fresh conversation seeded with just this turn;
     /// `Continuation` appends and trims to the most recent
     /// `MAX_CONVERSATION_TURNS`.
-    #[allow(dead_code)]
     pub(crate) fn record_assistant_turn(&self, user: &str, assistant: &str, flag: ContinuationFlag) {
         let turn = ConversationTurn { user: user.to_string(), assistant: assistant.to_string() };
         let mut guard = self.conversation.lock().expect("conversation poisoned");
@@ -645,6 +643,13 @@ impl Engine {
             );
         }
 
+        // Behaviour B: read (and refresh) the conversation buffer for this
+        // turn. Any turn refreshes the inactivity timer; only assistant
+        // answers below extend the buffer. Pending-turn replies and skill
+        // wins are transparent (refresh, never record).
+        let conversation = self.conversation_context();
+        let history = history_messages(&conversation);
+
         // Multi-turn: if a skill is awaiting a reply, this utterance belongs
         // to it — bypass all routing (scoring, router, assistant).
         if let Some(pending) = self.take_pending_turn_if_fresh() {
@@ -786,7 +791,7 @@ impl Engine {
             // call that either routes to a skill or answers directly, instead
             // of route-then-separate-answer. The combined prompt is English
             // only, so non-English keeps the translated two-step below.
-            match self.route_or_answer(&normalized, &[]) {
+            match self.route_or_answer(&normalized, &history) {
                 Ok(RouteOrAnswer::Skill(id)) => {
                     if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
                         trace.winner = Some(format!("router:assistant:{id}"));
@@ -800,12 +805,14 @@ impl Engine {
                     }
                 }
                 Ok(RouteOrAnswer::Answer(text)) => {
+                    let (clean, flag) = parse_continuation_flag(&text);
+                    self.record_assistant_turn(&normalized, &clean, flag);
                     let label = match &self.active_assistant {
                         Some(ActiveAssistant::Api { skill_id, .. }) => format!("assistant:{skill_id}"),
                         _ => "assistant:one-shot".to_string(),
                     };
                     trace.winner = Some(label);
-                    return (Response::Text(text), Some(trace));
+                    return (Response::Text(clean), Some(trace));
                 }
                 Err(reason) => {
                     self.log(
@@ -972,19 +979,21 @@ impl Engine {
                             normalized.len()
                         ),
                     );
-                    let result = llm.try_answer(&normalized, &catalog, &self.ctx.locale, &[]);
+                    let result = llm.try_answer(&normalized, &catalog, &self.ctx.locale, &history);
                     match result {
                         Some(ari_llm::FallbackResult::DirectAnswer { text }) => {
-                            let preview: String = text.chars().take(160).collect();
+                            let (clean, flag) = parse_continuation_flag(&text);
+                            self.record_assistant_turn(&normalized, &clean, flag);
+                            let preview: String = clean.chars().take(160).collect();
                             self.log(
                                 LogLevel::Info,
                                 &format!(
                                     "assistant:builtin: try_answer returned answer ({} bytes): {preview:?}",
-                                    text.len()
+                                    clean.len()
                                 ),
                             );
                             trace.winner = Some("assistant:builtin".to_string());
-                            return (Response::Text(text), Some(trace));
+                            return (Response::Text(clean), Some(trace));
                         }
                         None => {
                             let detail = llm
@@ -1017,11 +1026,13 @@ impl Engine {
                     config_store.as_ref(),
                     &normalized,
                     &self.ctx.locale,
-                    &[],
+                    &history,
                 ) {
                     Ok(text) if !text.is_empty() => {
+                        let (clean, flag) = parse_continuation_flag(&text);
+                        self.record_assistant_turn(&normalized, &clean, flag);
                         trace.winner = Some(format!("assistant:{skill_id}"));
-                        return (Response::Text(text), Some(trace));
+                        return (Response::Text(clean), Some(trace));
                     }
                     _ => {}
                 }
@@ -1898,6 +1909,18 @@ fn strip_nested_consult(
         }
     }
     action
+}
+
+/// Flatten conversation turns into chronological role/content message
+/// pairs (oldest first): each turn yields a `user` then an `assistant`
+/// message. The caller appends the current user turn last.
+fn history_messages(turns: &[ConversationTurn]) -> Vec<(String, String)> {
+    let mut msgs = Vec::with_capacity(turns.len() * 2);
+    for t in turns {
+        msgs.push(("user".to_string(), t.user.clone()));
+        msgs.push(("assistant".to_string(), t.assistant.clone()));
+    }
+    msgs
 }
 
 impl Default for Engine {
@@ -3278,5 +3301,69 @@ mod tests {
         assert_eq!(turns.len(), 1, "fresh buffer returns its turns");
         let elapsed = engine.conversation.lock().unwrap().as_ref().unwrap().last_activity.elapsed();
         assert!(elapsed < Duration::from_secs(5), "activity timer must be refreshed");
+    }
+
+    #[cfg(feature = "llm")]
+    struct RecordingFallback {
+        last_history: std::sync::Mutex<Vec<(String, String)>>,
+        reply: &'static str,
+    }
+
+    #[cfg(feature = "llm")]
+    impl ari_llm::Fallback for RecordingFallback {
+        fn try_answer(
+            &self,
+            _input: &str,
+            _skills: &[ari_llm::SkillInfo],
+            _locale: &str,
+            history: &[(String, String)],
+        ) -> Option<ari_llm::FallbackResult> {
+            *self.last_history.lock().unwrap() = history.to_vec();
+            Some(ari_llm::FallbackResult::DirectAnswer { text: self.reply.to_string() })
+        }
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn assistant_turn_records_and_second_turn_carries_history() {
+        let mut engine = Engine::new();
+        let fb = std::sync::Arc::new(RecordingFallback {
+            last_history: std::sync::Mutex::new(Vec::new()),
+            reply: "Paris. [continuation]",
+        });
+        engine.set_llm(fb.clone());
+        engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
+
+        // Turn 1: no history yet; answer recorded; flag stripped from response.
+        let (resp, _) = engine.process_input_traced("what is the capital of france");
+        assert!(fb.last_history.lock().unwrap().is_empty(), "first turn sends no history");
+        match resp { Response::Text(t) => assert_eq!(t, "Paris."), o => panic!("{o:?}") }
+
+        // Turn 2: prior turn supplied as chronological role/content history.
+        let _ = engine.process_input_traced("what is the population");
+        let hist = fb.last_history.lock().unwrap().clone();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0], ("user".to_string(), "what is the capital of france".to_string()));
+        assert_eq!(hist[1], ("assistant".to_string(), "Paris.".to_string()));
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn new_flag_reseeds_conversation() {
+        let mut engine = Engine::new();
+        let fb = std::sync::Arc::new(RecordingFallback {
+            last_history: std::sync::Mutex::new(Vec::new()),
+            reply: "81. [new]",
+        });
+        engine.set_llm(fb.clone());
+        engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
+        engine.record_assistant_turn("capital of france", "Paris.", ContinuationFlag::Continuation);
+
+        let (resp, _) = engine.process_input_traced("what is 27 times 3");
+        match resp { Response::Text(t) => assert_eq!(t, "81."), o => panic!("{o:?}") }
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 1, "[new] reseeds to a single turn");
+        assert_eq!(turns[0].user, "what is 27 times 3");
+        assert_eq!(turns[0].assistant, "81.");
     }
 }
