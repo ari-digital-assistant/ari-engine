@@ -93,12 +93,34 @@ pub fn fallback_response_for(locale: &str) -> &'static str {
 /// is treated as abandoned. Safety net only — the frontend cancels eagerly.
 const PENDING_TURN_TTL: Duration = Duration::from_secs(60);
 
+/// Inactivity window after which a conversation's context is dropped and
+/// the next assistant turn starts fresh.
+const CONVERSATION_TTL: Duration = Duration::from_secs(90);
+/// Most recent exchanges retained (10 role/content entries).
+const MAX_CONVERSATION_TURNS: usize = 5;
+
 /// A skill is awaiting the user's reply to a question it just asked.
 #[derive(Clone, Debug)]
 pub struct PendingTurn {
     pub skill_id: String,
     pub context: String,
     pub created_at: Instant,
+}
+
+/// One recorded assistant exchange: the user's query and the assistant's
+/// answer (continuation marker already stripped).
+#[derive(Clone, Debug)]
+pub(crate) struct ConversationTurn {
+    pub(crate) user: String,
+    pub(crate) assistant: String,
+}
+
+/// Recent assistant conversation, in chronological order, plus the last
+/// time any turn touched it (drives the inactivity TTL).
+#[derive(Debug)]
+struct ConversationBuffer {
+    turns: Vec<ConversationTurn>,
+    last_activity: Instant,
 }
 
 /// Localized acknowledgement spoken when the user cancels a pending question.
@@ -215,6 +237,10 @@ pub struct Engine {
     /// that skill's `execute_reply`. Guarded by a TTL so a missed cancel
     /// can't strand the slot. `&self` methods mutate it via the `Mutex`.
     pending_turn: Mutex<Option<PendingTurn>>,
+    /// Passive multi-turn context for assistant-routed queries (behaviour
+    /// B). Unlike `pending_turn`, this never hijacks routing — it only
+    /// enriches assistant answers and is read non-destructively.
+    conversation: Mutex<Option<ConversationBuffer>>,
 }
 
 impl Engine {
@@ -232,6 +258,7 @@ impl Engine {
             named_assistants: Vec::new(),
             config_store: None,
             pending_turn: Mutex::new(None),
+            conversation: Mutex::new(None),
         }
     }
 
@@ -270,6 +297,51 @@ impl Engine {
     /// timeout, and fresh wake word; a no-op when nothing is pending.
     pub fn clear_pending_turn(&self) {
         *self.pending_turn.lock().expect("pending_turn poisoned") = None;
+    }
+
+    /// Recent assistant turns if the buffer is within its inactivity TTL,
+    /// refreshing the timer so any turn (skill or assistant) keeps the
+    /// conversation alive. A stale buffer is dropped and an empty list
+    /// returned. Non-destructive for a fresh buffer — behaviour B is
+    /// passive (contrast `take_pending_turn_if_fresh`).
+    #[allow(dead_code)]
+    pub(crate) fn conversation_context(&self) -> Vec<ConversationTurn> {
+        let mut guard = self.conversation.lock().expect("conversation poisoned");
+        match guard.as_mut() {
+            Some(buf) if buf.last_activity.elapsed() < CONVERSATION_TTL => {
+                buf.last_activity = Instant::now();
+                buf.turns.clone()
+            }
+            Some(_) => {
+                *guard = None;
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Record an assistant answer (marker already stripped) as the latest
+    /// turn. `New` starts a fresh conversation seeded with just this turn;
+    /// `Continuation` appends and trims to the most recent
+    /// `MAX_CONVERSATION_TURNS`.
+    #[allow(dead_code)]
+    pub(crate) fn record_assistant_turn(&self, user: &str, assistant: &str, flag: ContinuationFlag) {
+        let turn = ConversationTurn { user: user.to_string(), assistant: assistant.to_string() };
+        let mut guard = self.conversation.lock().expect("conversation poisoned");
+        match (flag, guard.as_mut()) {
+            (ContinuationFlag::Continuation, Some(buf)) => {
+                buf.turns.push(turn);
+                let len = buf.turns.len();
+                if len > MAX_CONVERSATION_TURNS {
+                    buf.turns.drain(0..len - MAX_CONVERSATION_TURNS);
+                }
+                buf.last_activity = Instant::now();
+            }
+            // `New`, or first turn of a fresh buffer: seed with this turn.
+            _ => {
+                *guard = Some(ConversationBuffer { turns: vec![turn], last_activity: Instant::now() });
+            }
+        }
     }
 
     /// Install a log sink for engine-internal diagnostics. Currently only
@@ -3128,5 +3200,78 @@ mod tests {
         let (text, flag) = parse_continuation_flag("Paris.\n[new]");
         assert_eq!(text, "Paris.");
         assert_eq!(flag, ContinuationFlag::New);
+    }
+
+    #[test]
+    fn record_continuation_appends_turn() {
+        let engine = Engine::new();
+        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        engine.record_assistant_turn("q2", "a2", ContinuationFlag::Continuation);
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].user, "q1");
+        assert_eq!(turns[1].assistant, "a2");
+    }
+
+    #[test]
+    fn record_new_reseeds_buffer_with_single_turn() {
+        let engine = Engine::new();
+        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        engine.record_assistant_turn("q2", "a2", ContinuationFlag::Continuation);
+        engine.record_assistant_turn("27 times 3?", "81.", ContinuationFlag::New);
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user, "27 times 3?");
+        assert_eq!(turns[0].assistant, "81.");
+    }
+
+    #[test]
+    fn record_caps_to_five_most_recent_exchanges() {
+        let engine = Engine::new();
+        for i in 0..7 {
+            engine.record_assistant_turn(&format!("q{i}"), &format!("a{i}"), ContinuationFlag::Continuation);
+        }
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 5);
+        assert_eq!(turns[0].user, "q2"); // q0,q1 dropped
+        assert_eq!(turns[4].user, "q6");
+    }
+
+    #[test]
+    fn conversation_context_empty_when_no_buffer() {
+        let engine = Engine::new();
+        assert!(engine.conversation_context().is_empty());
+    }
+
+    #[test]
+    fn conversation_context_expires_stale_buffer() {
+        use std::time::{Duration, Instant};
+        let engine = Engine::new();
+        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        // Age the buffer past the TTL.
+        {
+            let mut g = engine.conversation.lock().unwrap();
+            g.as_mut().unwrap().last_activity =
+                Instant::now().checked_sub(Duration::from_secs(120)).unwrap();
+        }
+        assert!(engine.conversation_context().is_empty(), "stale buffer must read empty");
+        assert!(engine.conversation.lock().unwrap().is_none(), "stale buffer must be dropped");
+    }
+
+    #[test]
+    fn conversation_context_refreshes_activity_when_fresh() {
+        use std::time::{Duration, Instant};
+        let engine = Engine::new();
+        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        // Age it to 80s — still inside the 90s TTL.
+        {
+            let mut g = engine.conversation.lock().unwrap();
+            g.as_mut().unwrap().last_activity =
+                Instant::now().checked_sub(Duration::from_secs(80)).unwrap();
+        }
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 1, "fresh buffer returns its turns");
+        let elapsed = engine.conversation.lock().unwrap().as_ref().unwrap().last_activity.elapsed();
+        assert!(elapsed < Duration::from_secs(5), "activity timer must be refreshed");
     }
 }
