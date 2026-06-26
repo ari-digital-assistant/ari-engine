@@ -786,7 +786,7 @@ impl Engine {
             // call that either routes to a skill or answers directly, instead
             // of route-then-separate-answer. The combined prompt is English
             // only, so non-English keeps the translated two-step below.
-            match self.route_or_answer(&normalized) {
+            match self.route_or_answer(&normalized, &[]) {
                 Ok(RouteOrAnswer::Skill(id)) => {
                     if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
                         trace.winner = Some(format!("router:assistant:{id}"));
@@ -972,7 +972,7 @@ impl Engine {
                             normalized.len()
                         ),
                     );
-                    let result = llm.try_answer(&normalized, &catalog, &self.ctx.locale);
+                    let result = llm.try_answer(&normalized, &catalog, &self.ctx.locale, &[]);
                     match result {
                         Some(ari_llm::FallbackResult::DirectAnswer { text }) => {
                             let preview: String = text.chars().take(160).collect();
@@ -1017,6 +1017,7 @@ impl Engine {
                     config_store.as_ref(),
                     &normalized,
                     &self.ctx.locale,
+                    &[],
                 ) {
                     Ok(text) if !text.is_empty() => {
                         trace.winner = Some(format!("assistant:{skill_id}"));
@@ -1061,7 +1062,7 @@ impl Engine {
         skill_catalog: &[(String, String, String)],
     ) -> Option<String> {
         let prompt = build_assistant_routing_prompt(input, skill_catalog, &self.ctx.locale);
-        let response = self.call_active_assistant(&prompt).ok()?;
+        let response = self.call_active_assistant(&prompt, &[]).ok()?;
         let picked = parse_assistant_routing_response(&response, skill_catalog);
         if picked.is_none() {
             let preview: String = response.chars().take(120).collect();
@@ -1080,7 +1081,7 @@ impl Engine {
     /// is configured, the on-device LLM isn't loaded, or the call failed.
     /// Shared by the routing prompt, the one-shot route-or-answer, and the
     /// debug commands.
-    fn call_active_assistant(&self, prompt: &str) -> Result<String, String> {
+    fn call_active_assistant(&self, prompt: &str, history: &[(String, String)]) -> Result<String, String> {
         let fail = |reason: String| -> Result<String, String> {
             self.log(LogLevel::Warn, &format!("assistant: {reason}"));
             Err(reason)
@@ -1096,6 +1097,7 @@ impl Engine {
                 config_store.as_ref(),
                 prompt,
                 &self.ctx.locale,
+                history,
             ) {
                 Ok(text) => Ok(text),
                 Err(e) => fail(format!("cloud call failed: {e}")),
@@ -1124,10 +1126,10 @@ impl Engine {
     /// be normalised. `None` when no assistant is configured or the call
     /// failed. English-instruction prompt for now; non-English callers should
     /// keep the translated two-step until a localised combined prompt exists.
-    fn route_or_answer(&self, input: &str) -> Result<RouteOrAnswer, String> {
+    fn route_or_answer(&self, input: &str, history: &[(String, String)]) -> Result<RouteOrAnswer, String> {
         let catalog = self.router_catalog();
         let prompt = build_combined_route_or_answer_prompt(input, &catalog);
-        let response = self.call_active_assistant(&prompt)?;
+        let response = self.call_active_assistant(&prompt, history)?;
         Ok(parse_combined_response(&response, &catalog))
     }
 
@@ -1429,6 +1431,7 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
         binding.config_store.as_ref(),
         prompt,
         locale,
+        &[],
     ) {
         Ok(text) if !text.is_empty() => Response::Text(text),
         Ok(_) => {
@@ -1803,6 +1806,7 @@ fn call_assistant_for_consult(
                 config_store.as_ref(),
                 prompt,
                 locale,
+                &[],
             )
             .map_err(|e| e.to_string())?;
             if text.trim().is_empty() {
@@ -1865,6 +1869,7 @@ fn call_assistant_for_consult(
                 config_store.as_ref(),
                 prompt,
                 locale,
+                &[],
             )
             .map_err(|e| e.to_string())?;
             if text.trim().is_empty() {
