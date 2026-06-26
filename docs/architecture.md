@@ -17,25 +17,31 @@ User speaks
 3. Input normalisation
     │
     ▼
-4. Keyword/regex scoring (three ranking rounds)
+4. Keyword/regex scoring — runs FIRST, for everyone (fast, free)
     │ matched
     ├──────────► Skill executes → response to user. Done.
     │
-    │ no match
+    │ no match — how the leftover is routed depends on the active assistant:
     ▼
-5. FunctionGemma router (optional, on-device LLM)
-    │ matched skill
-    ├──────────► Skill executes → response to user. Done.
-    │ matched system action
-    ├──────────► Android intent dispatched. Done.
+5. Route the leftover
     │
-    │ declined
+    ├─ Cloud assistant configured → ONE-SHOT call to the cloud:
+    │      routes to a skill ─────► Skill executes. Done.
+    │      otherwise ─────────────► cloud answers directly. Done.
+    │
+    ├─ On-device assistant / no assistant, English → FunctionGemma:
+    │      picks a skill ─────────► Skill executes. Done.
+    │      abstains ──────────────► step 6
+    │
+    └─ Non-English → the assistant routes (FunctionGemma is English-only):
+           picks a skill ─────────► Skill executes. Done.
+           none ──────────────────► step 6
     ▼
-6. Active assistant (on-device LLM or cloud API)
-    │ answered
+6. Answer the leftover (a general question, not a skill request)
+    │ on-device LLM or cloud assistant answers
     ├──────────► Response to user. Done.
     │
-    │ NotUnderstood
+    │ no assistant → NotUnderstood
     ▼
 7. STT retry (two additional passes with different audio slicing)
     │ retries re-enter at step 3
@@ -103,38 +109,51 @@ and the response is returned to the user.
 This step is **fast, deterministic, and free** — no model inference, just
 string matching. It handles the majority of everyday utterances.
 
-### 5. FunctionGemma router (optional)
+### 5. Route the leftover
 
-If enabled and a model is loaded, FunctionGemma (270M parameters, ~253MB
-GGUF) gets a chance to route the query. It sees:
-- The user's input
-- A list of all registered skills with their descriptions
+Anything the keyword scorer didn't claim is routed here. **Which router runs
+depends on the active assistant** — there are three branches:
 
-It either picks a skill (returns `RouteResult::Skill`), suggests a system
-action like "set an alarm" (returns `RouteResult::Action`), or declines
-(returns `RouteResult::NoMatch`).
+**Cloud assistant configured (one-shot).** The query goes straight to the
+cloud assistant in a *single* call that either routes to a skill (the model
+replies `SKILL: <id>`) or answers the question directly. FunctionGemma is
+**not** consulted — a capable cloud model both routes and abstains reliably,
+and folding route+answer into one call avoids a second round-trip. (See
+`Engine::route_or_answer`.)
 
-This catches paraphrases the keyword matcher missed. For example, "launch
-my music player" doesn't match the Open skill's keywords ("open", "launch"
-+ target), but FunctionGemma understands the intent and routes it.
+**On-device assistant, or no assistant — English (FunctionGemma).**
+FunctionGemma (270M parameters, ~253MB GGUF) routes the query. It sees the
+input plus the catalogue of registered skills — declared by **short alias**
+(the final id segment, e.g. `weather`, not `dev.heyari.weather`), because a
+270M model can't reliably emit reverse-DNS ids; the engine resolves the alias
+back. It either picks a skill or abstains (`NoMatch`). FunctionGemma is
+trained on Ari's own skills + a balanced set of "answer nothing" negatives,
+so it abstains on general-knowledge questions (~95% on the held-out eval)
+rather than force-routing them. Lazy lifecycle: loads on first use, unloads
+after 60s idle; sub-second inference on phone. If FunctionGemma abstains (or
+isn't installed), the query falls to step 6.
 
-The model uses the same lazy lifecycle as the LLM fallback: loads on first
-use, unloads after 60 seconds of idle. Sub-500ms inference on phone.
+**Non-English (assistant routes).** FunctionGemma is English-only, so for
+other locales the engine asks the *active assistant* (cloud or on-device LLM)
+to pick a skill id from the catalogue, or answer. This needs no per-language
+router model to maintain — the trade is latency on the on-device path, since
+the LLM must process the whole catalogue.
 
-**If the router is disabled or no model is loaded, this step is skipped
-entirely.** The flow goes straight from step 4 to step 6.
+> The training pipeline (`ari-tools/functiongemma`) deliberately omits Google's
+> mobile-actions demo dataset and scales negatives to the skill count; a
+> **promotion gate** (`route-eval`) scores abstention on a held-out set and
+> blocks any retrained model that regresses before it can ship.
 
-### 6. Active assistant
+### 6. Answer the leftover
 
-If no skill matched (keyword or router), the engine checks for an active
-assistant provider. Three modes:
+If routing produced no skill (FunctionGemma abstained, or the assistant said
+"none"), the active assistant answers the question directly:
 
-- **Builtin** — on-device GGUF model (Gemma 3 1B default). Answers general
-  knowledge questions in one sentence. Lazy-loaded, 60s idle eviction.
-- **API** — cloud provider (ChatGPT, Claude, Ollama, etc.) configured via
-  a declarative `type: assistant` SKILL.md manifest. The engine builds an
-  HTTP request from the manifest's API config, sends it, extracts the
-  response.
+- **Builtin** — on-device GGUF model (Gemma 3 1B default). One-sentence
+  general-knowledge answer. Lazy-loaded, 60s idle eviction.
+- **API** — cloud provider (ChatGPT, Claude, Ollama, etc.) configured via a
+  declarative `type: assistant` SKILL.md manifest. (For a cloud assistant the
+  one-shot in step 5 already produced the answer in the same call.)
 - **None** — no assistant configured. Returns `NotUnderstood` immediately.
 
 Only one assistant can be active at a time. The user picks one in
@@ -181,8 +200,8 @@ understand that." and returns to listening for the wake word.
 
 | Layer | Catches | Example |
 |-------|---------|---------|
-| Keyword scorer | Exact keyword matches | "what time is it" → CurrentTime |
-| FunctionGemma | Paraphrases, indirect language | "is it morning yet" → CurrentTime |
-| FunctionGemma | System actions (future) | "set an alarm for 7am" → Android intent |
-| Assistant | General knowledge | "what's the capital of France" → "Valletta... wait, Paris." |
+| Keyword scorer (always first) | Exact keyword/regex matches | "what time is it" → CurrentTime |
+| Cloud one-shot | Routes *or* answers in a single call (cloud-assistant users) | "remind me at 5" → Reminder; "capital of France" → answered |
+| FunctionGemma (on-device, English) | Paraphrases the keywords missed; abstains on general knowledge | "is it morning yet" → CurrentTime; "capital of France" → abstain |
+| Assistant | Answers the general-knowledge questions routing left behind | "what's the capital of France" → "Paris." |
 | STT retry | Misheard transcripts | "wheat time" (misheard) → retried → "what time" → CurrentTime |
