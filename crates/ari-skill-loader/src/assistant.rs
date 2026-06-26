@@ -763,4 +763,45 @@ mod tests {
         let err = resolve_config(&config, "test.id", &store).unwrap_err();
         assert!(matches!(err, AssistantApiError::MissingConfig { key } if key == "api_key"));
     }
+
+    #[test]
+    fn build_request_body_inserts_history_before_current_turn_anthropic() {
+        let config = ApiConfig {
+            endpoint: Some("https://api.anthropic.com/v1/messages".into()),
+            endpoint_config_key: None,
+            default_endpoint: None,
+            auth: AuthScheme::Header,
+            auth_header: Some("x-api-key".into()),
+            auth_config_key: Some("api_key".into()),
+            model_config_key: None,
+            default_model: "claude-sonnet-4-6".into(),
+            system_prompt: "You are Ari.".into(),
+            request_format: RequestFormat::Anthropic,
+            response_path: "content[0].text".into(),
+            api_version: Some("2023-06-01".into()),
+            api_version_header: Some("anthropic-version".into()),
+            max_tokens: 256,
+            temperature: 0.7,
+        };
+        let resolved = ResolvedConfig {
+            endpoint: "https://api.anthropic.com/v1/messages".into(),
+            model: "claude-sonnet-4-6".into(),
+            api_key: Some("sk-ant-test".into()),
+        };
+        let history = vec![
+            ("user".to_string(), "what is the capital of uae?".to_string()),
+            ("assistant".to_string(), "Abu Dhabi.".to_string()),
+        ];
+        let body = build_request_body(&config, &resolved, "what is the population?", "en", &history);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3); // 2 history + current user
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "what is the capital of uae?");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"], "Abu Dhabi.");
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(msgs[2]["content"], "what is the population?");
+        assert!(v["system"].as_str().unwrap().contains("[continuation]"));
+    }
 }
