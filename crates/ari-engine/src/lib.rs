@@ -3366,4 +3366,64 @@ mod tests {
         assert_eq!(turns[0].user, "what is 27 times 3");
         assert_eq!(turns[0].assistant, "81.");
     }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn skill_win_refreshes_but_does_not_record() {
+        use std::time::{Duration, Instant};
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(MockSkill {
+            id: "weather", specificity: Specificity::High, fixed_score: 1.0,
+            response: "It is sunny.", requires_setting: None,
+        }));
+        // A live conversation from a prior assistant turn, aged to 80s.
+        engine.record_assistant_turn("capital of france", "Paris.", ContinuationFlag::Continuation);
+        {
+            let mut g = engine.conversation.lock().unwrap();
+            g.as_mut().unwrap().last_activity =
+                Instant::now().checked_sub(Duration::from_secs(80)).unwrap();
+        }
+        let _ = engine.process_input_traced("weather please"); // MockSkill wins
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 1, "skill turn must NOT record into the buffer");
+        let elapsed = engine.conversation.lock().unwrap().as_ref().unwrap().last_activity.elapsed();
+        assert!(elapsed < Duration::from_secs(5), "skill turn must refresh the timer");
+    }
+
+    #[test]
+    fn behaviour_a_reply_does_not_record() {
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(AskingSkill));
+        engine.record_assistant_turn("capital of france", "Paris.", ContinuationFlag::Continuation);
+
+        let _ = engine.process_input_traced("play music");   // AskingSkill asks → pending turn
+        let _ = engine.process_input_traced("spotify");       // reply via execute_reply
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 1, "behaviour-A reply must not enter the conversation buffer");
+        assert_eq!(turns[0].user, "capital of france");
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn expired_buffer_reseeds_on_next_assistant_turn() {
+        use std::time::{Duration, Instant};
+        let mut engine = Engine::new();
+        let fb = std::sync::Arc::new(RecordingFallback {
+            last_history: std::sync::Mutex::new(Vec::new()),
+            reply: "Fresh answer. [continuation]",
+        });
+        engine.set_llm(fb.clone());
+        engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
+        engine.record_assistant_turn("old question", "old answer", ContinuationFlag::Continuation);
+        {
+            let mut g = engine.conversation.lock().unwrap();
+            g.as_mut().unwrap().last_activity =
+                Instant::now().checked_sub(Duration::from_secs(120)).unwrap();
+        }
+        let _ = engine.process_input_traced("a brand new question");
+        assert!(fb.last_history.lock().unwrap().is_empty(), "expired buffer sends no history");
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user, "a brand new question", "buffer reseeds with the fresh turn only");
+    }
 }
