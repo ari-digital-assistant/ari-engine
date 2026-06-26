@@ -1911,9 +1911,7 @@ fn strip_nested_consult(
     action
 }
 
-/// Flatten conversation turns into chronological role/content message
-/// pairs (oldest first): each turn yields a `user` then an `assistant`
-/// message. The caller appends the current user turn last.
+/// Prior turns only — the current user turn is appended by the caller, last.
 fn history_messages(turns: &[ConversationTurn]) -> Vec<(String, String)> {
     let mut msgs = Vec::with_capacity(turns.len() * 2);
     for t in turns {
