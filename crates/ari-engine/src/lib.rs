@@ -169,6 +169,12 @@ fn enter_conversation_phrases(locale: &str) -> &'static [&'static str] {
             "let us have a conversation",
             "keep listening",
             "start a conversation",
+            // Clipped trigger: a mid-phrase pause in "let's [pause] talk" makes
+            // the streaming recogniser endpoint on the stable partial "let us"
+            // before "talk" arrives. Accept the bare truncation so entry still
+            // fires. Safe because matching is whole-utterance exact: "let us go
+            // to the shop" (≠ "let us") never enters.
+            "let us",
         ],
     }
 }
@@ -3616,6 +3622,13 @@ mod tests {
         assert!(is_enter_conversation_phrase("parliamo", "it"));
         assert!(!is_enter_conversation_phrase("what time is it", "en"));
         assert!(!is_enter_conversation_phrase("let us talk about the weather", "en"));
+
+        // Clipped "let's [pause] talk" finalises as bare "let us" -> still enters.
+        assert!(is_enter_conversation_phrase("let us", "en"));
+        // ...but only as a whole utterance: "let us" + more words is NOT a
+        // misheard trigger and must not enter.
+        assert!(!is_enter_conversation_phrase("let us go to the shop", "en"));
+        assert!(!is_enter_conversation_phrase("let us pray", "en"));
     }
 
     #[test]
