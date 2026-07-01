@@ -4,6 +4,7 @@ use ari_core::{
 use ari_skill_loader::assistant::{AssistantApiError, ConfigStore};
 use ari_skill_loader::manifest::ApiConfig;
 use ari_skill_loader::wasm::{LogLevel, LogSink};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -294,6 +295,14 @@ pub struct Engine {
     /// B). Unlike `pending_turn`, this never hijacks routing — it only
     /// enriches assistant answers and is read non-destructively.
     conversation: Mutex<Option<ConversationBuffer>>,
+    // "Let's talk" mode. `conversation_active` is owned by the frontend
+    // (set via set_conversation_active) and mirrored here so the engine
+    // can (a) interpret exit phrases only while in the mode and (b) record
+    // skill turns into the buffer. enter/exit_signal are transient: set
+    // during process_input_traced, read-and-cleared by the FFI layer.
+    conversation_active: AtomicBool,
+    enter_signal: AtomicBool,
+    exit_signal: AtomicBool,
 }
 
 impl Engine {
@@ -312,6 +321,9 @@ impl Engine {
             config_store: None,
             pending_turn: Mutex::new(None),
             conversation: Mutex::new(None),
+            conversation_active: AtomicBool::new(false),
+            enter_signal: AtomicBool::new(false),
+            exit_signal: AtomicBool::new(false),
         }
     }
 
@@ -350,6 +362,27 @@ impl Engine {
     /// timeout, and fresh wake word; a no-op when nothing is pending.
     pub fn clear_pending_turn(&self) {
         *self.pending_turn.lock().expect("pending_turn poisoned") = None;
+    }
+
+    pub fn set_conversation_active(&self, active: bool) {
+        self.conversation_active.store(active, Ordering::SeqCst);
+        // Leaving the mode (exit phrase, silence timeout, or error) must not
+        // strand a skill's pending question.
+        if !active {
+            self.clear_pending_turn();
+        }
+    }
+
+    fn is_conversation_active(&self) -> bool {
+        self.conversation_active.load(Ordering::SeqCst)
+    }
+
+    pub fn take_enter_signal(&self) -> bool {
+        self.enter_signal.swap(false, Ordering::SeqCst)
+    }
+
+    pub fn take_exit_signal(&self) -> bool {
+        self.exit_signal.swap(false, Ordering::SeqCst)
     }
 
     /// Recent assistant turns if the buffer is within its inactivity TTL,
@@ -3507,5 +3540,21 @@ mod tests {
         assert_eq!(exit_conversation_ack_for("it"), "Va bene.");
         // Unknown locale falls back to English (not machine-translated).
         assert_eq!(enter_conversation_ack_for("fr"), "Okay, I'm listening.");
+    }
+
+    #[test]
+    fn conversation_active_flag_toggles_and_clears_pending() {
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(AskingSkill)); // arms a pending turn
+        let _ = engine.process_input_traced("play music");
+        assert!(engine.has_pending_turn());
+
+        engine.set_conversation_active(true);
+        assert!(engine.is_conversation_active());
+
+        // Turning the mode off must also drop any half-finished pending turn.
+        engine.set_conversation_active(false);
+        assert!(!engine.is_conversation_active());
+        assert!(!engine.has_pending_turn(), "deactivation clears pending turn");
     }
 }
