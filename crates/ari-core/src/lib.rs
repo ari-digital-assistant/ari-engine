@@ -557,6 +557,7 @@ fn expand_english_contractions(lower: &str) -> String {
         .replace("here's", "here is")
         .replace("that's", "that is")
         .replace("let's", "let us")
+        .replace("we're", "we are")
 }
 
 /// Replace any apostrophe (or unicode right-single-quote) that's
@@ -651,6 +652,11 @@ mod tests {
         assert_eq!(normalize_input("here's", "en"), "here is");
         assert_eq!(normalize_input("that's", "en"), "that is");
         assert_eq!(normalize_input("let's", "en"), "let us");
+    }
+
+    #[test]
+    fn normalize_expands_were_contraction() {
+        assert_eq!(normalize_input("we're done", "en"), "we are done");
     }
 
     #[test]
