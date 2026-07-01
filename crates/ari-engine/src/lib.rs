@@ -148,6 +148,59 @@ fn is_cancel_phrase(normalized: &str, locale: &str) -> bool {
     cancel_phrases(locale).contains(&normalized)
 }
 
+// "Let's talk" mode entry/exit phrases. Matched against POST-normalised
+// input (see normalize_input): English expands contractions, so "let's"
+// arrives as "let us" and "that's" as "that is". Matched as WHOLE
+// utterances (exact eq) so "stop the timer" never triggers an exit.
+// it: DRAFT — needs native review (see plan Global Constraints).
+fn enter_conversation_phrases(locale: &str) -> &'static [&'static str] {
+    match locale {
+        "it" => &[
+            "parliamo",
+            "chiacchieriamo",
+            "conversiamo",
+            "continua ad ascoltare",
+            "inizia una conversazione",
+        ],
+        _ => &[
+            "let us talk",
+            "let us chat",
+            "let us have a conversation",
+            "keep listening",
+            "start a conversation",
+        ],
+    }
+}
+
+fn exit_conversation_phrases(locale: &str) -> &'static [&'static str] {
+    match locale {
+        "it" => &["basta", "arrivederci", "è tutto", "abbiamo finito", "fine conversazione"],
+        _ => &["stop", "goodbye", "that is all", "we are done", "end conversation"],
+    }
+}
+
+fn is_enter_conversation_phrase(normalized: &str, locale: &str) -> bool {
+    enter_conversation_phrases(locale).contains(&normalized)
+}
+
+fn is_exit_conversation_phrase(normalized: &str, locale: &str) -> bool {
+    exit_conversation_phrases(locale).contains(&normalized)
+}
+
+pub fn enter_conversation_ack_for(locale: &str) -> &'static str {
+    match locale {
+        "it" => "Va bene, ti ascolto.",
+        _ => "Okay, I'm listening.",
+    }
+}
+
+pub fn exit_conversation_ack_for(locale: &str) -> &'static str {
+    match locale {
+        "it" => "Va bene.",
+        _ => "Okay.",
+    }
+}
+
 /// Strip an `await_reply` field from an action envelope, returning its
 /// `context` string if present. Mirrors the `consult_assistant` strip pattern.
 fn extract_await_reply(action: &mut serde_json::Value) -> Option<String> {
@@ -3423,5 +3476,36 @@ mod tests {
         let turns = engine.conversation_context();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].user, "a brand new question", "buffer reseeds with the fresh turn only");
+    }
+
+    #[test]
+    fn enter_phrases_match_normalised_forms() {
+        // Post-normalise: "let's talk" -> "let us talk".
+        for p in ["let us talk", "let us chat", "let us have a conversation",
+                  "keep listening", "start a conversation"] {
+            assert!(is_enter_conversation_phrase(p, "en"), "should match: {p}");
+        }
+        assert!(is_enter_conversation_phrase("parliamo", "it"));
+        assert!(!is_enter_conversation_phrase("what time is it", "en"));
+        assert!(!is_enter_conversation_phrase("let us talk about the weather", "en"));
+    }
+
+    #[test]
+    fn exit_phrases_match_normalised_forms() {
+        for p in ["stop", "goodbye", "that is all", "we are done", "end conversation"] {
+            assert!(is_exit_conversation_phrase(p, "en"), "should match: {p}");
+        }
+        assert!(is_exit_conversation_phrase("basta", "it"));
+        assert!(!is_exit_conversation_phrase("stop the timer", "en"));
+    }
+
+    #[test]
+    fn conversation_acks_are_localised() {
+        assert_eq!(enter_conversation_ack_for("en"), "Okay, I'm listening.");
+        assert_eq!(exit_conversation_ack_for("en"), "Okay.");
+        assert_eq!(enter_conversation_ack_for("it"), "Va bene, ti ascolto.");
+        assert_eq!(exit_conversation_ack_for("it"), "Va bene.");
+        // Unknown locale falls back to English (not machine-translated).
+        assert_eq!(enter_conversation_ack_for("fr"), "Okay, I'm listening.");
     }
 }
