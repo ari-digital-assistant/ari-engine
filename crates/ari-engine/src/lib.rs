@@ -2222,7 +2222,7 @@ mod tests {
         let turns = engine.conversation_context();
         assert_eq!(turns.len(), 1, "active: skill turn recorded");
         assert_eq!(turns[0].user, "hello");
-        assert!(!turns[0].assistant.is_empty(), "records the spoken response");
+        assert_eq!(turns[0].assistant, "Hi there.", "records the spoken response");
     }
 
     // --- Router catalogue eligibility ---

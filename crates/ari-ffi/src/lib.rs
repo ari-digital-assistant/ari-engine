@@ -551,6 +551,9 @@ impl AuthorizeProvider for ForeignAuthorizeProviderAdapter {
 pub enum FfiResponse {
     /// `rearm` true means the engine is awaiting a spoken reply — the host
     /// should re-arm the mic without a wake word (see multi-turn design).
+    /// `enter_conversation` true means the engine entered "let's talk"
+    /// continuous-conversation mode this turn; `exit_conversation` true means
+    /// it left the mode this turn — the host mirrors that state.
     Text { body: String, rearm: bool, enter_conversation: bool, exit_conversation: bool },
     /// `skill_id` is the manifest id of the emitting skill (e.g.
     /// `dev.heyari.timer`), used by the frontend to resolve `asset:<path>`
@@ -560,6 +563,9 @@ pub enum FfiResponse {
     /// asset references will fail to resolve".
     /// `rearm` true means the engine is awaiting a spoken reply — the host
     /// should re-arm the mic without a wake word (see multi-turn design).
+    /// `enter_conversation` true means the engine entered "let's talk"
+    /// continuous-conversation mode this turn; `exit_conversation` true means
+    /// it left the mode this turn — the host mirrors that state.
     Action { json: String, skill_id: String, rearm: bool, enter_conversation: bool, exit_conversation: bool },
     Binary { mime: String, data: Vec<u8> },
     /// The engine couldn't match any skill to the input. The host can use
@@ -1025,9 +1031,12 @@ impl AriEngine {
         engine.clear_pending_turn();
     }
 
-    /// Tell the engine whether a conversation session is currently active.
-    /// The host calls this when the user opens or closes the conversation UI
-    /// so the engine can manage conversational state (e.g. enter/exit signals).
+    /// Tell the engine whether "let's talk" continuous-conversation mode is
+    /// currently active. The frontend `VoiceSession` loop calls this — `true`
+    /// on entry, `false` on every exit route (exit phrase, silence timeout, or
+    /// error). While active the engine interprets exit phrases (a bare "stop"
+    /// ends the mode instead of routing to a skill) and records skill turns
+    /// into the conversation buffer.
     pub fn set_conversation_active(&self, active: bool) {
         self.inner
             .lock()
