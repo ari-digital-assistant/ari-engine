@@ -428,6 +428,28 @@ impl Engine {
         }
     }
 
+    // Records a skill's outgoing turn into the conversation buffer so it's
+    // visible to the assistant on later turns. Only while "let's talk" mode
+    // is active — outside it, skill wins stay transparent (behaviour B).
+    fn record_skill_turn(&self, user: &str, response: &Response) {
+        if !self.is_conversation_active() {
+            return;
+        }
+        let spoken = match response {
+            Response::Text(s) => s.clone(),
+            Response::Action(v) => v
+                .get("speak")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            Response::Binary { .. } => String::new(),
+        };
+        if spoken.is_empty() {
+            return;
+        }
+        self.record_assistant_turn(user, &spoken, ContinuationFlag::Continuation);
+    }
+
     /// Install a log sink for engine-internal diagnostics. Currently only
     /// Layer C (assistant consultation on low-confidence envelopes) uses
     /// it. Pass `None` to silence. Separate from skill logging — the
@@ -783,7 +805,7 @@ impl Engine {
                 let resp = skill.execute_reply(&pending.context, &normalized, &self.ctx);
                 // Route through the same chokepoint so a chained await_reply
                 // (the skill asks again) re-arms.
-                let resp = self.maybe_intercept_consult(skill, resp);
+                let resp = self.maybe_intercept_consult(skill, &normalized, resp);
                 return (resp, None);
             }
             return (
@@ -862,7 +884,7 @@ impl Engine {
                     .clone();
 
                 let response = skill.execute(&normalized, &self.ctx);
-                let response = self.maybe_intercept_consult(skill, response);
+                let response = self.maybe_intercept_consult(skill, &normalized, response);
                 return (response, Some(trace));
             }
         }
@@ -912,7 +934,7 @@ impl Engine {
                             &format!("router:assistant: one-shot routed skill={id}"),
                         );
                         let response = skill.execute(&normalized, &self.ctx);
-                        let response = self.maybe_intercept_consult(skill, response);
+                        let response = self.maybe_intercept_consult(skill, &normalized, response);
                         return (response, Some(trace));
                     }
                 }
@@ -955,7 +977,7 @@ impl Engine {
                         ),
                     );
                     let response = skill.execute(&normalized, &self.ctx);
-                    let response = self.maybe_intercept_consult(skill, response);
+                    let response = self.maybe_intercept_consult(skill, &normalized, response);
                     return (response, Some(trace));
                 }
             }
@@ -994,7 +1016,7 @@ impl Engine {
                             &format!("router: dispatching skill={id} (confidence {confidence:.3})"),
                         );
                         let response = skill.execute(&normalized, &self.ctx);
-                        let response = self.maybe_intercept_consult(skill, response);
+                        let response = self.maybe_intercept_consult(skill, &normalized, response);
                         return (response, Some(trace));
                     }
                 }
@@ -1022,7 +1044,7 @@ impl Engine {
                             ),
                         );
                         let response = skill.execute_with_args(&normalized, args_json, &self.ctx);
-                        let response = self.maybe_intercept_consult(skill, response);
+                        let response = self.maybe_intercept_consult(skill, &normalized, response);
                         return (response, Some(trace));
                     }
                 }
@@ -1064,7 +1086,7 @@ impl Engine {
             );
             if !fell_through {
                 trace.winner = Some(format!("fallback:{}", skill.id()));
-                let response = self.maybe_intercept_consult(skill, response);
+                let response = self.maybe_intercept_consult(skill, &normalized, response);
                 return (response, Some(trace));
             }
         }
@@ -1259,11 +1281,16 @@ impl Engine {
     fn maybe_intercept_consult(
         &self,
         skill: Arc<dyn Skill>,
+        user: &str,
         response: Response,
     ) -> Response {
+        // Every return path funnels through this labelled block so the final
+        // (possibly await_reply-stripped) response is recorded exactly once
+        // below, just before we hand it back to the caller.
+        let response = 'intercept: {
         let mut action = match response {
             Response::Action(v) => v,
-            other => return other,
+            other => break 'intercept other,
         };
 
         // Enforce declared capabilities before anything downstream sees the
@@ -1292,7 +1319,7 @@ impl Engine {
             .and_then(|obj| obj.remove("consult_assistant"))
         {
             Some(v) => v,
-            None => return Response::Action(action),
+            None => break 'intercept Response::Action(action),
         };
 
         let directive = match parse_consult_directive(&directive_value) {
@@ -1302,7 +1329,7 @@ impl Engine {
                     LogLevel::Warn,
                     "layer-c: consult_assistant directive malformed — ignoring, returning phase-1 envelope unchanged",
                 );
-                return Response::Action(action);
+                break 'intercept Response::Action(action);
             }
         };
 
@@ -1313,7 +1340,7 @@ impl Engine {
                     LogLevel::Warn,
                     "layer-c: consult_assistant requested but no envelope sink installed — phase-2 suppressed",
                 );
-                return Response::Action(action);
+                break 'intercept Response::Action(action);
             }
         };
 
@@ -1348,6 +1375,11 @@ impl Engine {
         });
 
         Response::Action(action)
+        };
+
+        // Visible skill turns: record the final response while in the mode.
+        self.record_skill_turn(user, &response);
+        response
     }
 }
 
@@ -2156,6 +2188,41 @@ mod tests {
         let (resp, _) = engine.process_input_traced("play music");
         assert!(matches!(resp, Response::Action(_)));
         assert!(engine.has_pending_turn());
+    }
+
+    // --- Visible skill turns during let's-talk mode ---
+
+    /// Minimal keyword skill returning a spoken `Response::Text` on "hello".
+    /// Mirrors the `AskingSkill` double: fixed win, plain text out — so the
+    /// assertion can be on the conversation buffer, not the skill.
+    struct GreetSkill;
+    impl Skill for GreetSkill {
+        fn id(&self) -> &str { "greet" }
+        fn specificity(&self) -> Specificity { Specificity::High }
+        fn score(&self, input: &str, _: &SkillContext) -> f32 {
+            if input == "hello" { 1.0 } else { 0.0 }
+        }
+        fn execute(&self, _: &str, _: &SkillContext) -> Response {
+            Response::Text("Hi there.".to_string())
+        }
+    }
+
+    #[test]
+    fn skill_turn_recorded_only_when_conversation_active() {
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(GreetSkill)); // existing test skill, keyword "hello"
+
+        // Inactive: skill win is transparent (not recorded).
+        let _ = engine.process_input_traced("hello");
+        assert_eq!(engine.conversation_context().len(), 0, "inactive: no record");
+
+        // Active: skill win is recorded as (user, spoken).
+        engine.set_conversation_active(true);
+        let _ = engine.process_input_traced("hello");
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 1, "active: skill turn recorded");
+        assert_eq!(turns[0].user, "hello");
+        assert!(!turns[0].assistant.is_empty(), "records the spoken response");
     }
 
     // --- Router catalogue eligibility ---
