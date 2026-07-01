@@ -729,6 +729,32 @@ impl Engine {
             );
         }
 
+        // "Let's talk" mode intercepts. These run BEFORE the pending-turn
+        // reply path and all routing so entry/exit phrases are never
+        // answered or mistaken for commands. Exit is gated on the active
+        // flag so a bare "stop" stays a normal command outside the mode.
+        // Reset the transient signals first so a stale one can't leak.
+        self.enter_signal.store(false, Ordering::SeqCst);
+        self.exit_signal.store(false, Ordering::SeqCst);
+        if is_enter_conversation_phrase(&normalized, &self.ctx.locale) {
+            self.enter_signal.store(true, Ordering::SeqCst);
+            return (
+                Response::Text(enter_conversation_ack_for(&self.ctx.locale).to_string()),
+                None,
+            );
+        }
+        if self.is_conversation_active()
+            && is_exit_conversation_phrase(&normalized, &self.ctx.locale)
+        {
+            self.exit_signal.store(true, Ordering::SeqCst);
+            // Bailing out of the mode abandons any skill sub-question.
+            self.clear_pending_turn();
+            return (
+                Response::Text(exit_conversation_ack_for(&self.ctx.locale).to_string()),
+                None,
+            );
+        }
+
         // Behaviour B: read (and refresh) the conversation buffer for this
         // turn. Any turn refreshes the inactivity timer; only assistant
         // answers below extend the buffer. Pending-turn replies and skill
@@ -3556,5 +3582,29 @@ mod tests {
         engine.set_conversation_active(false);
         assert!(!engine.is_conversation_active());
         assert!(!engine.has_pending_turn(), "deactivation clears pending turn");
+    }
+
+    #[test]
+    fn enter_phrase_signals_and_acks_without_routing() {
+        let engine = Engine::new();
+        let (resp, _) = engine.process_input_traced("let's talk");
+        assert!(matches!(resp, Response::Text(ref s) if s == enter_conversation_ack_for("en")));
+        assert!(engine.take_enter_signal(), "enter signal must be set");
+        assert!(!engine.take_enter_signal(), "signal is one-shot (already consumed)");
+    }
+
+    #[test]
+    fn exit_phrase_only_fires_while_active() {
+        let engine = Engine::new();
+
+        // Not in the mode: "stop" is NOT hijacked — no exit signal, routes on.
+        let _ = engine.process_input_traced("stop");
+        assert!(!engine.take_exit_signal(), "bare stop must pass through when inactive");
+
+        // In the mode: "stop" exits.
+        engine.set_conversation_active(true);
+        let (resp, _) = engine.process_input_traced("stop");
+        assert!(matches!(resp, Response::Text(ref s) if s == exit_conversation_ack_for("en")));
+        assert!(engine.take_exit_signal(), "exit signal must be set while active");
     }
 }
