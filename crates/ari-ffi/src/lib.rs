@@ -551,7 +551,7 @@ impl AuthorizeProvider for ForeignAuthorizeProviderAdapter {
 pub enum FfiResponse {
     /// `rearm` true means the engine is awaiting a spoken reply — the host
     /// should re-arm the mic without a wake word (see multi-turn design).
-    Text { body: String, rearm: bool },
+    Text { body: String, rearm: bool, enter_conversation: bool, exit_conversation: bool },
     /// `skill_id` is the manifest id of the emitting skill (e.g.
     /// `dev.heyari.timer`), used by the frontend to resolve `asset:<path>`
     /// references back to the skill's bundle directory. Empty string if
@@ -560,7 +560,7 @@ pub enum FfiResponse {
     /// asset references will fail to resolve".
     /// `rearm` true means the engine is awaiting a spoken reply — the host
     /// should re-arm the mic without a wake word (see multi-turn design).
-    Action { json: String, skill_id: String, rearm: bool },
+    Action { json: String, skill_id: String, rearm: bool, enter_conversation: bool, exit_conversation: bool },
     Binary { mime: String, data: Vec<u8> },
     /// The engine couldn't match any skill to the input. The host can use
     /// this signal to retry the upstream STT (e.g. with a fresh sherpa
@@ -975,6 +975,8 @@ impl AriEngine {
         engine.set_locale(locale.clone());
         let (response, skill_id) = engine.process_input_with_skill(&input);
         let rearm = engine.has_pending_turn();
+        let enter_conversation = engine.take_enter_signal();
+        let exit_conversation = engine.take_exit_signal();
         match response {
             ari_core::Response::Text(s) => {
                 // The engine's fallback text is locale-specific
@@ -988,13 +990,15 @@ impl AriEngine {
                     // A fallback never re-arms.
                     FfiResponse::NotUnderstood { body: s }
                 } else {
-                    FfiResponse::Text { body: s, rearm }
+                    FfiResponse::Text { body: s, rearm, enter_conversation, exit_conversation }
                 }
             }
             ari_core::Response::Action(v) => FfiResponse::Action {
                 json: serde_json::to_string(&v).unwrap_or_default(),
                 skill_id: skill_id.unwrap_or_default(),
                 rearm,
+                enter_conversation,
+                exit_conversation,
             },
             ari_core::Response::Binary { mime, data } => FfiResponse::Binary { mime, data },
         }
@@ -1019,6 +1023,16 @@ impl AriEngine {
     pub fn cancel_pending_reply(&self) {
         let engine = self.inner.lock().expect("engine mutex poisoned");
         engine.clear_pending_turn();
+    }
+
+    /// Tell the engine whether a conversation session is currently active.
+    /// The host calls this when the user opens or closes the conversation UI
+    /// so the engine can manage conversational state (e.g. enter/exit signals).
+    pub fn set_conversation_active(&self, active: bool) {
+        self.inner
+            .lock()
+            .expect("engine mutex poisoned")
+            .set_conversation_active(active);
     }
 
     /// Set the GGUF model path for the LLM fallback. The model is NOT
@@ -1320,11 +1334,13 @@ mod tests {
 
     #[test]
     fn ffi_response_action_carries_rearm_field() {
-        // Compile-level guarantee the variant has a `rearm` field.
+        // Compile-level guarantee the variant has the expected fields.
         let r = FfiResponse::Action {
             json: "{}".to_string(),
             skill_id: "x".to_string(),
             rearm: true,
+            enter_conversation: false,
+            exit_conversation: false,
         };
         match r {
             FfiResponse::Action { rearm, .. } => assert!(rearm),
