@@ -176,7 +176,9 @@ fn enter_conversation_phrases(locale: &str) -> &'static [&'static str] {
 fn exit_conversation_phrases(locale: &str) -> &'static [&'static str] {
     match locale {
         "it" => &["basta", "arrivederci", "è tutto", "abbiamo finito", "fine conversazione"],
-        _ => &["stop", "goodbye", "that is all", "we are done", "end conversation"],
+        // "stopped"/"stops": the STT model often transcribes a spoken "stop"
+        // as one of these (verified on-device), so accept them as exits too.
+        _ => &["stop", "stopped", "stops", "goodbye", "that is all", "we are done", "end conversation"],
     }
 }
 
@@ -3619,6 +3621,11 @@ mod tests {
     #[test]
     fn exit_phrases_match_normalised_forms() {
         for p in ["stop", "goodbye", "that is all", "we are done", "end conversation"] {
+            assert!(is_exit_conversation_phrase(p, "en"), "should match: {p}");
+        }
+        // The STT model transcribes a spoken "stop" as "stopped"/"stops"
+        // (verified on-device), so those must exit too.
+        for p in ["stopped", "stops"] {
             assert!(is_exit_conversation_phrase(p, "en"), "should match: {p}");
         }
         assert!(is_exit_conversation_phrase("basta", "it"));
