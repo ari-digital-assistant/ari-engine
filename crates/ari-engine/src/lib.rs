@@ -1037,6 +1037,52 @@ impl Engine {
             );
         }
 
+        // Personal memory ("remember that ...") intercepts. Like the let's-talk
+        // phrases, these run BEFORE routing so a command is never answered by
+        // the assistant or mistaken for a skill query. Order: forget-all and
+        // the recall query (whole-utterance) before the forget/remember
+        // prefixes, so "forget everything about me" isn't parsed as
+        // forget-fact("everything about me").
+        if is_recall_query_phrase(&normalized, &self.ctx.locale) {
+            let facts = self.remembered_facts();
+            let spoken = if facts.is_empty() {
+                no_facts_remembered_for(&self.ctx.locale).to_string()
+            } else {
+                let mut s = recall_query_intro_for(&self.ctx.locale).to_string();
+                for f in &facts {
+                    s.push_str("\n- ");
+                    s.push_str(f);
+                }
+                s
+            };
+            return (Response::Text(spoken), None);
+        }
+        if is_forget_all_phrase(&normalized, &self.ctx.locale) {
+            let cleared = self.forget_all_facts();
+            let spoken = if cleared {
+                facts_cleared_ack_for(&self.ctx.locale)
+            } else {
+                no_facts_remembered_for(&self.ctx.locale)
+            };
+            return (Response::Text(spoken.to_string()), None);
+        }
+        if let Some(fact) = remembered_fact_forget(&normalized) {
+            let removed = self.forget_fact(fact);
+            let spoken = if removed {
+                fact_forgotten_ack_for(&self.ctx.locale)
+            } else {
+                fact_not_found_ack_for(&self.ctx.locale)
+            };
+            return (Response::Text(spoken.to_string()), None);
+        }
+        if let Some(fact) = remembered_fact_capture(&normalized) {
+            self.capture_fact(fact);
+            return (
+                Response::Text(fact_remembered_ack_for(&self.ctx.locale).to_string()),
+                None,
+            );
+        }
+
         // Behaviour B: read (and refresh) the conversation buffer for this
         // turn. Any turn refreshes the inactivity timer; only assistant
         // answers below extend the buffer. Pending-turn replies and skill
@@ -4131,5 +4177,94 @@ mod tests {
         assert_eq!(facts.first(), Some(&"x0".to_string()));
         // Hydration never raises the write-back signal.
         assert!(!engine.take_facts_changed_signal());
+    }
+
+    #[test]
+    fn remember_command_captures_and_acks() {
+        let engine = Engine::new();
+        let (resp, _) = engine.process_input_traced("Remember that I'm vegetarian");
+        match resp {
+            Response::Text(t) => assert_eq!(t, "Got it — I'll remember that."),
+            other => panic!("expected Text ack, got {other:?}"),
+        }
+        assert_eq!(engine.remembered_facts(), vec!["i am vegetarian".to_string()]);
+        assert!(engine.take_facts_changed_signal());
+    }
+
+    #[test]
+    fn forget_command_removes_and_acks() {
+        let engine = Engine::new();
+        engine.process_input_traced("remember that i am vegetarian");
+        let _ = engine.take_facts_changed_signal();
+        let (resp, _) = engine.process_input_traced("forget that I'm vegetarian");
+        match resp {
+            Response::Text(t) => assert_eq!(t, "Okay, I've forgotten that."),
+            other => panic!("expected Text ack, got {other:?}"),
+        }
+        assert!(engine.remembered_facts().is_empty());
+        assert!(engine.take_facts_changed_signal());
+    }
+
+    #[test]
+    fn forget_command_non_match_acks_not_found() {
+        let engine = Engine::new();
+        let (resp, _) = engine.process_input_traced("forget that i like tea");
+        match resp {
+            Response::Text(t) => assert_eq!(t, "I didn't have that one."),
+            other => panic!("expected Text ack, got {other:?}"),
+        }
+        assert!(!engine.take_facts_changed_signal());
+    }
+
+    #[test]
+    fn forget_everything_clears_all() {
+        let engine = Engine::new();
+        engine.process_input_traced("remember that i am vegetarian");
+        engine.process_input_traced("remember that i live in valletta");
+        let _ = engine.take_facts_changed_signal();
+        let (resp, _) = engine.process_input_traced("forget everything about me");
+        match resp {
+            Response::Text(t) => assert_eq!(t, "Okay, I've forgotten everything I knew about you."),
+            other => panic!("expected Text ack, got {other:?}"),
+        }
+        assert!(engine.remembered_facts().is_empty());
+    }
+
+    #[test]
+    fn recall_query_lists_facts() {
+        let engine = Engine::new();
+        engine.process_input_traced("remember that i am vegetarian");
+        engine.process_input_traced("remember that i live in valletta");
+        let (resp, _) = engine.process_input_traced("what do you remember about me");
+        match resp {
+            Response::Text(t) => assert_eq!(
+                t,
+                "Here's what I remember about you:\n- i am vegetarian\n- i live in valletta"
+            ),
+            other => panic!("expected Text list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recall_query_empty_says_nothing_yet() {
+        let engine = Engine::new();
+        let (resp, _) = engine.process_input_traced("what do you know about me");
+        match resp {
+            Response::Text(t) => assert_eq!(t, "I don't remember anything about you yet."),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_remember_is_not_captured() {
+        let engine = Engine::new();
+        // "remember" alone has no remainder → falls through to normal routing,
+        // which on a bare engine yields the fallback response (not an ack).
+        let (resp, _) = engine.process_input_traced("remember");
+        match resp {
+            Response::Text(t) => assert_eq!(t, fallback_response_for("en")),
+            other => panic!("expected fallback Text, got {other:?}"),
+        }
+        assert!(engine.remembered_facts().is_empty());
     }
 }
