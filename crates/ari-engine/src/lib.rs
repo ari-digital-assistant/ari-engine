@@ -387,6 +387,10 @@ impl Engine {
     }
 
     pub fn set_conversation_active(&self, active: bool) {
+        // "Let's talk" mode is meaningless without conversation memory; never
+        // activate while memory is off, even if a caller asks (defence in depth
+        // against a frontend/engine state mismatch).
+        let active = active && self.is_conversation_memory_enabled();
         self.conversation_active.store(active, Ordering::SeqCst);
         // Leaving the mode (exit phrase, silence timeout, or error) must not
         // strand a skill's pending question.
@@ -405,7 +409,10 @@ impl Engine {
     pub fn set_conversation_memory_enabled(&self, enabled: bool) {
         self.conversation_memory_enabled.store(enabled, Ordering::SeqCst);
         if !enabled {
+            // Nothing must linger in RAM, and any active "let's talk" session
+            // ends — talk mode can't run without memory.
             *self.conversation.lock().expect("conversation poisoned") = None;
+            self.set_conversation_active(false);
         }
     }
 
@@ -3751,6 +3758,29 @@ mod tests {
         engine.set_conversation_active(false);
         assert!(!engine.is_conversation_active());
         assert!(!engine.has_pending_turn(), "deactivation clears pending turn");
+    }
+
+    #[test]
+    fn set_conversation_active_refused_when_memory_disabled() {
+        let engine = Engine::new();
+        engine.set_conversation_memory_enabled(false);
+        engine.set_conversation_active(true);
+        assert!(
+            !engine.is_conversation_active(),
+            "talk mode must not activate while memory is off"
+        );
+    }
+
+    #[test]
+    fn disabling_memory_ends_active_conversation() {
+        let engine = Engine::new();
+        engine.set_conversation_active(true);
+        assert!(engine.is_conversation_active(), "sanity: active with memory on");
+        engine.set_conversation_memory_enabled(false);
+        assert!(
+            !engine.is_conversation_active(),
+            "disabling memory must end any active talk-mode session"
+        );
     }
 
     #[test]
