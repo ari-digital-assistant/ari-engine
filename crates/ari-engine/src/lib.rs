@@ -311,6 +311,10 @@ pub struct Engine {
     conversation_active: AtomicBool,
     enter_signal: AtomicBool,
     exit_signal: AtomicBool,
+    // Behaviour B/C master switch, owned by the frontend (set via
+    // set_conversation_memory_enabled). When false the engine keeps NO
+    // conversation buffer and refuses "let's talk" entry.
+    conversation_memory_enabled: AtomicBool,
 }
 
 impl Engine {
@@ -332,6 +336,7 @@ impl Engine {
             conversation_active: AtomicBool::new(false),
             enter_signal: AtomicBool::new(false),
             exit_signal: AtomicBool::new(false),
+            conversation_memory_enabled: AtomicBool::new(true),
         }
     }
 
@@ -385,6 +390,20 @@ impl Engine {
         self.conversation_active.load(Ordering::SeqCst)
     }
 
+    /// Master switch for conversation memory (behaviours B and C). When set
+    /// to `false` the current buffer is wiped immediately — flipping the
+    /// toggle off must leave nothing retained in RAM.
+    pub fn set_conversation_memory_enabled(&self, enabled: bool) {
+        self.conversation_memory_enabled.store(enabled, Ordering::SeqCst);
+        if !enabled {
+            *self.conversation.lock().expect("conversation poisoned") = None;
+        }
+    }
+
+    fn is_conversation_memory_enabled(&self) -> bool {
+        self.conversation_memory_enabled.load(Ordering::SeqCst)
+    }
+
     pub fn take_enter_signal(&self) -> bool {
         self.enter_signal.swap(false, Ordering::SeqCst)
     }
@@ -399,6 +418,9 @@ impl Engine {
     /// returned. Non-destructive for a fresh buffer — behaviour B is
     /// passive (contrast `take_pending_turn_if_fresh`).
     pub(crate) fn conversation_context(&self) -> Vec<ConversationTurn> {
+        if !self.is_conversation_memory_enabled() {
+            return Vec::new();
+        }
         let mut guard = self.conversation.lock().expect("conversation poisoned");
         match guard.as_mut() {
             Some(buf) if buf.last_activity.elapsed() < CONVERSATION_TTL => {
@@ -418,6 +440,9 @@ impl Engine {
     /// `Continuation` appends and trims to the most recent
     /// `MAX_CONVERSATION_TURNS`.
     pub(crate) fn record_assistant_turn(&self, user: &str, assistant: &str, flag: ContinuationFlag) {
+        if !self.is_conversation_memory_enabled() {
+            return;
+        }
         let turn = ConversationTurn { user: user.to_string(), assistant: assistant.to_string() };
         let mut guard = self.conversation.lock().expect("conversation poisoned");
         match (flag, guard.as_mut()) {
@@ -3486,6 +3511,43 @@ mod tests {
         assert_eq!(turns.len(), 1, "fresh buffer returns its turns");
         let elapsed = engine.conversation.lock().unwrap().as_ref().unwrap().last_activity.elapsed();
         assert!(elapsed < Duration::from_secs(5), "activity timer must be refreshed");
+    }
+
+    #[test]
+    fn memory_enabled_by_default() {
+        let engine = Engine::new();
+        engine.record_assistant_turn("hi", "hello", ContinuationFlag::New);
+        assert_eq!(engine.conversation_context().len(), 1, "memory on by default");
+    }
+
+    #[test]
+    fn record_is_noop_while_memory_disabled() {
+        let engine = Engine::new();
+        engine.set_conversation_memory_enabled(false);
+        engine.record_assistant_turn("hi", "hello", ContinuationFlag::New);
+        // Re-enable and read: nothing should have been recorded.
+        engine.set_conversation_memory_enabled(true);
+        assert!(
+            engine.conversation_context().is_empty(),
+            "nothing recorded while memory disabled"
+        );
+    }
+
+    #[test]
+    fn disabling_memory_returns_empty_context_and_wipes_buffer() {
+        let engine = Engine::new();
+        engine.record_assistant_turn("hi", "hello", ContinuationFlag::New);
+        assert_eq!(engine.conversation_context().len(), 1);
+
+        engine.set_conversation_memory_enabled(false);
+        assert!(engine.conversation_context().is_empty(), "no history while disabled");
+
+        // Re-enabling reveals nothing — disabling wiped the buffer, not just hid it.
+        engine.set_conversation_memory_enabled(true);
+        assert!(
+            engine.conversation_context().is_empty(),
+            "disabling memory wiped the buffer"
+        );
     }
 
     #[cfg(feature = "llm")]
