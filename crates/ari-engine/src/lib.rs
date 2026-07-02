@@ -100,6 +100,10 @@ const CONVERSATION_TTL: Duration = Duration::from_secs(90);
 /// Most recent exchanges retained (10 role/content entries).
 const MAX_CONVERSATION_TURNS: usize = 5;
 
+/// Upper bound on stored personal facts. Bounds the recall block injected
+/// into the assistant prompt; a capture at the cap evicts the oldest.
+const MAX_REMEMBERED_FACTS: usize = 50;
+
 /// A skill is awaiting the user's reply to a question it just asked.
 #[derive(Clone, Debug)]
 pub struct PendingTurn {
@@ -324,6 +328,13 @@ pub struct Engine {
     // set_conversation_memory_enabled). When false the engine keeps NO
     // conversation buffer and refuses "let's talk" entry.
     conversation_memory_enabled: AtomicBool,
+    // Durable personal facts (explicit "remember that ..." captures). Canonical
+    // runtime copy; the frontend owns disk persistence and hydrates this at
+    // build via set_remembered_facts. facts_changed is a transient per-turn
+    // signal (set on capture/forget, read-and-cleared by the FFI layer) telling
+    // the frontend to re-read and persist.
+    remembered_facts: Mutex<Vec<String>>,
+    facts_changed: AtomicBool,
 }
 
 impl Engine {
@@ -346,6 +357,8 @@ impl Engine {
             enter_signal: AtomicBool::new(false),
             exit_signal: AtomicBool::new(false),
             conversation_memory_enabled: AtomicBool::new(true),
+            remembered_facts: Mutex::new(Vec::new()),
+            facts_changed: AtomicBool::new(false),
         }
     }
 
@@ -418,6 +431,77 @@ impl Engine {
 
     fn is_conversation_memory_enabled(&self) -> bool {
         self.conversation_memory_enabled.load(Ordering::SeqCst)
+    }
+
+    /// Replace the stored facts wholesale (frontend hydration + settings-screen
+    /// edits). Applies dedup + cap; does NOT raise the changed signal, so
+    /// hydration can't trigger a write-back loop.
+    pub fn set_remembered_facts(&self, facts: Vec<String>) {
+        let mut deduped: Vec<String> = Vec::with_capacity(facts.len().min(MAX_REMEMBERED_FACTS));
+        for f in facts {
+            if !deduped.contains(&f) {
+                deduped.push(f);
+            }
+        }
+        if deduped.len() > MAX_REMEMBERED_FACTS {
+            let overflow = deduped.len() - MAX_REMEMBERED_FACTS;
+            deduped.drain(0..overflow);
+        }
+        *self.remembered_facts.lock().expect("remembered_facts poisoned") = deduped;
+    }
+
+    /// Snapshot of the stored facts in insertion order (oldest first).
+    pub fn remembered_facts(&self) -> Vec<String> {
+        self.remembered_facts.lock().expect("remembered_facts poisoned").clone()
+    }
+
+    /// Store a new fact. Exact duplicate is a no-op; at the cap the oldest is
+    /// evicted. Returns true iff the list changed (and then raises the signal).
+    pub(crate) fn capture_fact(&self, text: &str) -> bool {
+        let mut guard = self.remembered_facts.lock().expect("remembered_facts poisoned");
+        if guard.iter().any(|f| f == text) {
+            return false;
+        }
+        if guard.len() >= MAX_REMEMBERED_FACTS {
+            guard.remove(0);
+        }
+        guard.push(text.to_string());
+        drop(guard);
+        self.facts_changed.store(true, Ordering::SeqCst);
+        true
+    }
+
+    /// Remove the first fact exactly equal to `text`. Returns true iff a fact
+    /// was removed (and then raises the signal).
+    pub(crate) fn forget_fact(&self, text: &str) -> bool {
+        let mut guard = self.remembered_facts.lock().expect("remembered_facts poisoned");
+        if let Some(idx) = guard.iter().position(|f| f == text) {
+            guard.remove(idx);
+            drop(guard);
+            self.facts_changed.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear all facts. Returns true iff the list was non-empty (and then
+    /// raises the signal).
+    pub(crate) fn forget_all_facts(&self) -> bool {
+        let mut guard = self.remembered_facts.lock().expect("remembered_facts poisoned");
+        if guard.is_empty() {
+            return false;
+        }
+        guard.clear();
+        drop(guard);
+        self.facts_changed.store(true, Ordering::SeqCst);
+        true
+    }
+
+    /// Read-and-clear the per-turn "facts changed" signal. The FFI layer
+    /// surfaces this after each process_input so the frontend persists.
+    pub fn take_facts_changed_signal(&self) -> bool {
+        self.facts_changed.swap(false, Ordering::SeqCst)
     }
 
     pub fn take_enter_signal(&self) -> bool {
@@ -3820,5 +3904,88 @@ mod tests {
         let (resp, _) = engine.process_input_traced("stop");
         assert!(matches!(resp, Response::Text(ref s) if s == exit_conversation_ack_for("en")));
         assert!(engine.take_exit_signal(), "exit signal must be set while active");
+    }
+
+    #[test]
+    fn capture_fact_stores_and_signals() {
+        let engine = Engine::new();
+        assert!(engine.capture_fact("i am vegetarian"));
+        assert_eq!(engine.remembered_facts(), vec!["i am vegetarian".to_string()]);
+        assert!(engine.take_facts_changed_signal());
+        // Signal is one-shot.
+        assert!(!engine.take_facts_changed_signal());
+    }
+
+    #[test]
+    fn capture_fact_dedupes_exact_duplicate() {
+        let engine = Engine::new();
+        assert!(engine.capture_fact("i am vegetarian"));
+        let _ = engine.take_facts_changed_signal();
+        assert!(!engine.capture_fact("i am vegetarian"));
+        assert_eq!(engine.remembered_facts().len(), 1);
+        assert!(!engine.take_facts_changed_signal());
+    }
+
+    #[test]
+    fn capture_fact_caps_and_evicts_oldest() {
+        let engine = Engine::new();
+        for i in 0..MAX_REMEMBERED_FACTS {
+            assert!(engine.capture_fact(&format!("fact {i}")));
+        }
+        assert_eq!(engine.remembered_facts().len(), MAX_REMEMBERED_FACTS);
+        // The 51st capture evicts "fact 0".
+        assert!(engine.capture_fact("fact new"));
+        let facts = engine.remembered_facts();
+        assert_eq!(facts.len(), MAX_REMEMBERED_FACTS);
+        assert!(!facts.contains(&"fact 0".to_string()));
+        assert_eq!(facts.last(), Some(&"fact new".to_string()));
+    }
+
+    #[test]
+    fn forget_fact_removes_match_only() {
+        let engine = Engine::new();
+        engine.capture_fact("i am vegetarian");
+        engine.capture_fact("i live in valletta");
+        let _ = engine.take_facts_changed_signal();
+        assert!(engine.forget_fact("i am vegetarian"));
+        assert_eq!(engine.remembered_facts(), vec!["i live in valletta".to_string()]);
+        assert!(engine.take_facts_changed_signal());
+        // Non-match leaves the list intact and does not signal.
+        assert!(!engine.forget_fact("i am nothing"));
+        assert_eq!(engine.remembered_facts().len(), 1);
+        assert!(!engine.take_facts_changed_signal());
+    }
+
+    #[test]
+    fn forget_all_clears_and_signals_only_when_nonempty() {
+        let engine = Engine::new();
+        engine.capture_fact("i am vegetarian");
+        let _ = engine.take_facts_changed_signal();
+        assert!(engine.forget_all_facts());
+        assert!(engine.remembered_facts().is_empty());
+        assert!(engine.take_facts_changed_signal());
+        // Clearing an already-empty list is a no-op.
+        assert!(!engine.forget_all_facts());
+        assert!(!engine.take_facts_changed_signal());
+    }
+
+    #[test]
+    fn set_remembered_facts_replaces_dedups_caps_without_signal() {
+        let engine = Engine::new();
+        let mut input = vec!["a".to_string(), "a".to_string(), "b".to_string()];
+        for i in 0..MAX_REMEMBERED_FACTS {
+            input.push(format!("x{i}"));
+        }
+        engine.set_remembered_facts(input);
+        let facts = engine.remembered_facts();
+        assert_eq!(facts.len(), MAX_REMEMBERED_FACTS);
+        // Dedup collapsed the two "a" entries into one, but "a" and "b" are
+        // the oldest entries in insertion order; the cap evicts the oldest
+        // (same policy as capture_fact), so neither survives.
+        assert_eq!(facts.iter().filter(|f| f.as_str() == "a").count(), 0);
+        assert!(!facts.contains(&"b".to_string()));
+        assert_eq!(facts.first(), Some(&"x0".to_string()));
+        // Hydration never raises the write-back signal.
+        assert!(!engine.take_facts_changed_signal());
     }
 }
