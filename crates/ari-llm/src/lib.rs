@@ -48,6 +48,7 @@ pub trait Fallback: Send + Sync {
         skills: &[SkillInfo],
         locale: &str,
         history: &[(String, String)],
+        facts: &[String],
     ) -> Option<FallbackResult>;
 
     /// Run an arbitrary prompt and return the raw stripped output. Used
@@ -421,6 +422,7 @@ impl Fallback for LazyLlmFallback {
         skills: &[SkillInfo],
         locale: &str,
         history: &[(String, String)],
+        facts: &[String],
     ) -> Option<FallbackResult> {
         self.clear_error();
         let mut state = match self.inner.lock() {
@@ -456,7 +458,7 @@ impl Fallback for LazyLlmFallback {
         let now = Instant::now();
         state.last_used = Some(now);
 
-        let system_prompt = build_system_prompt(skills, locale, !history.is_empty());
+        let system_prompt = build_system_prompt(skills, locale, !history.is_empty(), facts);
         let user_prompt = build_user_prompt(input);
 
         let model = state.loaded.as_ref().unwrap();
@@ -570,10 +572,11 @@ impl Fallback for LlmFallback {
         skills: &[SkillInfo],
         locale: &str,
         _history: &[(String, String)],
+        _facts: &[String],
     ) -> Option<FallbackResult> {
         let _guard = self.inference_lock.lock().ok()?;
 
-        let system_prompt = build_system_prompt(skills, locale, false);
+        let system_prompt = build_system_prompt(skills, locale, false, &[]);
         let user_prompt = build_user_prompt(input);
 
         let prompt = match self.build_chat_prompt(&system_prompt, &[], &user_prompt) {
@@ -623,7 +626,7 @@ const PROMPT_IT_SYSTEM: &str = include_str!("../prompts/it/system.md");
 /// for small models (Gemma 4 E2B occasionally bleeds in non-target-
 /// language tokens like `不` for "no" when the prompt isn't language-
 /// scoped).
-fn build_system_prompt(_skills: &[SkillInfo], locale: &str, has_history: bool) -> String {
+fn build_system_prompt(_skills: &[SkillInfo], locale: &str, has_history: bool, facts: &[String]) -> String {
     let template = match locale {
         "en" => PROMPT_EN_SYSTEM,
         "it" => PROMPT_IT_SYSTEM,
@@ -639,6 +642,10 @@ fn build_system_prompt(_skills: &[SkillInfo], locale: &str, has_history: bool) -
     if has_history {
         prompt.push_str("\n\n");
         prompt.push_str(ari_core::CONTINUATION_INSTRUCTION);
+    }
+    if let Some(block) = ari_core::remembered_facts_block(facts) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&block);
     }
     prompt
 }
@@ -1347,7 +1354,7 @@ mod tests {
 
     #[test]
     fn system_prompt_english_is_concise_and_locale_fenced() {
-        let prompt = build_system_prompt(&test_skills(), "en", false);
+        let prompt = build_system_prompt(&test_skills(), "en", false, &[]);
         assert!(prompt.contains("Ari"));
         // Locale fence — the explicit "English" word matters for
         // small models that occasionally bleed in non-English tokens.
@@ -1358,8 +1365,21 @@ mod tests {
     }
 
     #[test]
+    fn build_system_prompt_injects_facts_block() {
+        let facts = vec!["i live in valletta".to_string()];
+        let prompt = build_system_prompt(&[], "en", false, &facts);
+        assert!(prompt.contains("Things you know about the user:\n- i live in valletta"));
+    }
+
+    #[test]
+    fn build_system_prompt_no_facts_block_when_empty() {
+        let prompt = build_system_prompt(&[], "en", false, &[]);
+        assert!(!prompt.contains("Things you know about the user"));
+    }
+
+    #[test]
     fn system_prompt_italian_is_localized() {
-        let prompt = build_system_prompt(&test_skills(), "it", false);
+        let prompt = build_system_prompt(&test_skills(), "it", false, &[]);
         assert!(prompt.contains("Ari"));
         assert!(prompt.contains("italiano"));
         assert!(prompt.contains("breve frase"));
@@ -1370,7 +1390,7 @@ mod tests {
 
     #[test]
     fn system_prompt_unknown_locale_falls_back_to_english() {
-        let prompt = build_system_prompt(&test_skills(), "ja", false);
+        let prompt = build_system_prompt(&test_skills(), "ja", false, &[]);
         // "Ja" isn't shipped — should silently get the en template.
         assert!(prompt.contains("Ari"));
         assert!(prompt.contains("English"));
@@ -1591,7 +1611,7 @@ mod tests {
         eprintln!("Model loaded.");
 
         let skills = test_skills();
-        let system = build_system_prompt(&skills, "en", false);
+        let system = build_system_prompt(&skills, "en", false, &[]);
         let user = build_user_prompt("what is the capital of australia");
 
         eprintln!("--- System prompt ---");
