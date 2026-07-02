@@ -1044,6 +1044,18 @@ impl AriEngine {
             .set_conversation_active(active);
     }
 
+    /// Master switch for conversation memory (cross-turn context + "Let's
+    /// Talk" mode). Mirrors the Android `conversationMemoryEnabled` setting;
+    /// hydrated at engine build and written through when the user toggles it.
+    /// When `false` the engine retains no conversation buffer and refuses
+    /// "let's talk" entry (guiding the user to the toggle instead).
+    pub fn set_conversation_memory_enabled(&self, enabled: bool) {
+        self.inner
+            .lock()
+            .expect("engine mutex poisoned")
+            .set_conversation_memory_enabled(enabled);
+    }
+
     /// Set the GGUF model path for the LLM fallback. The model is NOT
     /// loaded immediately — it loads on demand when the first unmatched
     /// query arrives, and unloads after 60 seconds of idle to free RAM.
