@@ -51,6 +51,22 @@ context to answer. At the very end of your reply, append a single space and then
 [continuation] if this message continues the earlier conversation, or [new] if it begins \
 a new, unrelated topic. Keep the marker on the same line as your answer.";
 
+/// A compact block of durable user facts for injection into an assistant
+/// system prompt. `None` when there are no facts so callers emit nothing.
+/// Format is fixed (see the plan Global Constraints): a header line then one
+/// `- <fact>` bullet per fact.
+pub fn remembered_facts_block(facts: &[String]) -> Option<String> {
+    if facts.is_empty() {
+        return None;
+    }
+    let mut block = String::from("Things you know about the user:");
+    for fact in facts {
+        block.push_str("\n- ");
+        block.push_str(fact);
+    }
+    Some(block)
+}
+
 /// Trait for an LLM-based skill router that runs after the keyword
 /// matcher fails. The router sees the user input and the list of
 /// available skills, and either picks one, suggests a system action,
@@ -587,6 +603,22 @@ fn strip_italian_elisions(lower: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- remembered_facts_block ---
+
+    #[test]
+    fn remembered_facts_block_formats_bullets() {
+        let facts = vec!["i am vegetarian".to_string(), "my wife is sara".to_string()];
+        assert_eq!(
+            crate::remembered_facts_block(&facts),
+            Some("Things you know about the user:\n- i am vegetarian\n- my wife is sara".to_string())
+        );
+    }
+
+    #[test]
+    fn remembered_facts_block_empty_is_none() {
+        assert_eq!(crate::remembered_facts_block(&[]), None);
+    }
 
     // --- settings_query ---
 
