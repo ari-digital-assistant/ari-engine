@@ -210,6 +210,15 @@ pub fn exit_conversation_ack_for(locale: &str) -> &'static str {
     }
 }
 
+/// Spoken when the user tries to enter "Let's Talk" mode while conversation
+/// memory is switched off — the mode is meaningless without it.
+pub fn conversation_memory_required_msg_for(locale: &str) -> &'static str {
+    match locale {
+        "it" => "Dovrai attivare la memoria delle conversazioni per la modalità “Parliamo”.",
+        _ => "You'll need to turn on conversation memory for Let's Talk mode.",
+    }
+}
+
 /// Strip an `await_reply` field from an action envelope, returning its
 /// `context` string if present. Mirrors the `consult_assistant` strip pattern.
 fn extract_await_reply(action: &mut serde_json::Value) -> Option<String> {
@@ -792,6 +801,17 @@ impl Engine {
         self.enter_signal.store(false, Ordering::SeqCst);
         self.exit_signal.store(false, Ordering::SeqCst);
         if is_enter_conversation_phrase(&normalized, &self.ctx.locale) {
+            // "Let's talk" is pointless without memory — guide the user to the
+            // toggle instead of entering the mode. Note: still intercepted here
+            // (before routing) so the phrase is never answered as a query.
+            if !self.is_conversation_memory_enabled() {
+                return (
+                    Response::Text(
+                        conversation_memory_required_msg_for(&self.ctx.locale).to_string(),
+                    ),
+                    None,
+                );
+            }
             self.enter_signal.store(true, Ordering::SeqCst);
             return (
                 Response::Text(enter_conversation_ack_for(&self.ctx.locale).to_string()),
@@ -3740,6 +3760,21 @@ mod tests {
         assert!(matches!(resp, Response::Text(ref s) if s == enter_conversation_ack_for("en")));
         assert!(engine.take_enter_signal(), "enter signal must be set");
         assert!(!engine.take_enter_signal(), "signal is one-shot (already consumed)");
+    }
+
+    #[test]
+    fn enter_phrase_blocked_when_memory_disabled() {
+        let engine = Engine::new();
+        engine.set_conversation_memory_enabled(false);
+        let (resp, _) = engine.process_input_traced("let's talk");
+        assert!(
+            matches!(resp, Response::Text(ref s) if s == conversation_memory_required_msg_for("en")),
+            "must speak the enable-memory guidance"
+        );
+        assert!(
+            !engine.take_enter_signal(),
+            "enter signal must NOT fire when memory is disabled"
+        );
     }
 
     #[test]
