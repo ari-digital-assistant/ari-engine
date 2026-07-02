@@ -554,7 +554,10 @@ pub enum FfiResponse {
     /// `enter_conversation` true means the engine entered "let's talk"
     /// continuous-conversation mode this turn; `exit_conversation` true means
     /// it left the mode this turn — the host mirrors that state.
-    Text { body: String, rearm: bool, enter_conversation: bool, exit_conversation: bool },
+    /// `facts_changed` true means this turn mutated the engine's durable
+    /// personal facts (a remember/forget) — the host should re-read
+    /// `remembered_facts()` and persist the snapshot.
+    Text { body: String, rearm: bool, enter_conversation: bool, exit_conversation: bool, facts_changed: bool },
     /// `skill_id` is the manifest id of the emitting skill (e.g.
     /// `dev.heyari.timer`), used by the frontend to resolve `asset:<path>`
     /// references back to the skill's bundle directory. Empty string if
@@ -566,7 +569,7 @@ pub enum FfiResponse {
     /// `enter_conversation` true means the engine entered "let's talk"
     /// continuous-conversation mode this turn; `exit_conversation` true means
     /// it left the mode this turn — the host mirrors that state.
-    Action { json: String, skill_id: String, rearm: bool, enter_conversation: bool, exit_conversation: bool },
+    Action { json: String, skill_id: String, rearm: bool, enter_conversation: bool, exit_conversation: bool, facts_changed: bool },
     Binary { mime: String, data: Vec<u8> },
     /// The engine couldn't match any skill to the input. The host can use
     /// this signal to retry the upstream STT (e.g. with a fresh sherpa
@@ -983,6 +986,7 @@ impl AriEngine {
         let rearm = engine.has_pending_turn();
         let enter_conversation = engine.take_enter_signal();
         let exit_conversation = engine.take_exit_signal();
+        let facts_changed = engine.take_facts_changed_signal();
         match response {
             ari_core::Response::Text(s) => {
                 // The engine's fallback text is locale-specific
@@ -996,7 +1000,7 @@ impl AriEngine {
                     // A fallback never re-arms.
                     FfiResponse::NotUnderstood { body: s }
                 } else {
-                    FfiResponse::Text { body: s, rearm, enter_conversation, exit_conversation }
+                    FfiResponse::Text { body: s, rearm, enter_conversation, exit_conversation, facts_changed }
                 }
             }
             ari_core::Response::Action(v) => FfiResponse::Action {
@@ -1005,6 +1009,7 @@ impl AriEngine {
                 rearm,
                 enter_conversation,
                 exit_conversation,
+                facts_changed,
             },
             ari_core::Response::Binary { mime, data } => FfiResponse::Binary { mime, data },
         }
@@ -1054,6 +1059,26 @@ impl AriEngine {
             .lock()
             .expect("engine mutex poisoned")
             .set_conversation_memory_enabled(enabled);
+    }
+
+    /// Replace the engine's durable personal facts. Mirrors the Android
+    /// persisted store; hydrated at engine build and written through after a
+    /// settings-screen edit.
+    pub fn set_remembered_facts(&self, facts: Vec<String>) {
+        self.inner
+            .lock()
+            .expect("engine mutex poisoned")
+            .set_remembered_facts(facts);
+    }
+
+    /// Snapshot of the engine's durable personal facts (oldest first). The
+    /// frontend reads this after a turn that signalled `facts_changed` and
+    /// persists the result.
+    pub fn remembered_facts(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .expect("engine mutex poisoned")
+            .remembered_facts()
     }
 
     /// Set the GGUF model path for the LLM fallback. The model is NOT
@@ -1362,10 +1387,18 @@ mod tests {
             rearm: true,
             enter_conversation: false,
             exit_conversation: false,
+            facts_changed: false,
         };
         match r {
             FfiResponse::Action { rearm, .. } => assert!(rearm),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn ffi_engine_set_and_get_remembered_facts() {
+        let engine = AriEngine::new();
+        engine.set_remembered_facts(vec!["i am vegetarian".to_string()]);
+        assert_eq!(engine.remembered_facts(), vec!["i am vegetarian".to_string()]);
     }
 }
