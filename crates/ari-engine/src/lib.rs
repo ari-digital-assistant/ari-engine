@@ -223,6 +223,122 @@ pub fn conversation_memory_required_msg_for(locale: &str) -> &'static str {
     }
 }
 
+// ---- Remembered Facts (personal memory) command recognition ----
+// All matching is against POST-normalize_input text (lowercase, contractions
+// expanded, punctuation collapsed to spaces). Capture/forget are prefix
+// commands; forget-all and the recall query are whole-utterance phrases.
+
+/// Strip a leading remember-command prefix and return the trimmed remainder,
+/// or None when the utterance isn't a capture (or the remainder is empty).
+fn remembered_fact_capture(normalized: &str) -> Option<&str> {
+    // Bare command with no remainder (e.g. "remember", "remember that") is
+    // not a capture. Without this guard, "remember that" would fall through
+    // to the "remember " strip below and wrongly yield "that" as content.
+    if normalized == "remember" || normalized == "remember that" {
+        return None;
+    }
+    let rest = normalized
+        .strip_prefix("remember that ")
+        .or_else(|| normalized.strip_prefix("remember "))?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest)
+    }
+}
+
+/// Strip a leading forget-command prefix and return the trimmed remainder,
+/// or None when the utterance isn't a forget-one (or the remainder is empty).
+fn remembered_fact_forget(normalized: &str) -> Option<&str> {
+    // Bare command with no remainder (e.g. "forget", "forget that") is not
+    // a forget-one; see remembered_fact_capture for why this guard exists.
+    if normalized == "forget" || normalized == "forget that" {
+        return None;
+    }
+    let rest = normalized
+        .strip_prefix("forget that ")
+        .or_else(|| normalized.strip_prefix("forget "))?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest)
+    }
+}
+
+fn forget_all_phrases(locale: &str) -> &'static [&'static str] {
+    match locale {
+        // it: DRAFT — needs native review (see plan Global Constraints).
+        "it" => &["dimentica tutto su di me", "dimentica tutto quello che sai su di me"],
+        _ => &["forget everything about me", "forget everything you know about me"],
+    }
+}
+
+fn is_forget_all_phrase(normalized: &str, locale: &str) -> bool {
+    forget_all_phrases(locale).contains(&normalized)
+}
+
+fn recall_query_phrases(locale: &str) -> &'static [&'static str] {
+    match locale {
+        // it: DRAFT — needs native review (see plan Global Constraints).
+        "it" => &["cosa ti ricordi di me", "cosa sai di me"],
+        _ => &["what do you remember about me", "what do you know about me"],
+    }
+}
+
+fn is_recall_query_phrase(normalized: &str, locale: &str) -> bool {
+    recall_query_phrases(locale).contains(&normalized)
+}
+
+/// Spoken when a fact is stored.
+pub fn fact_remembered_ack_for(locale: &str) -> &'static str {
+    match locale {
+        "it" => "Fatto, me ne ricorderò.", // DRAFT — needs native review.
+        _ => "Got it — I'll remember that.",
+    }
+}
+
+/// Spoken when a specific fact is forgotten.
+pub fn fact_forgotten_ack_for(locale: &str) -> &'static str {
+    match locale {
+        "it" => "Va bene, l'ho dimenticato.", // DRAFT — needs native review.
+        _ => "Okay, I've forgotten that.",
+    }
+}
+
+/// Spoken when a forget command matched nothing.
+pub fn fact_not_found_ack_for(locale: &str) -> &'static str {
+    match locale {
+        "it" => "Non me lo ricordavo comunque.", // DRAFT — needs native review.
+        _ => "I didn't have that one.",
+    }
+}
+
+/// Spoken when all facts are cleared.
+pub fn facts_cleared_ack_for(locale: &str) -> &'static str {
+    match locale {
+        "it" => "Va bene, ho dimenticato tutto quello che sapevo su di te.", // DRAFT.
+        _ => "Okay, I've forgotten everything I knew about you.",
+    }
+}
+
+/// Lead-in spoken before the recalled facts list.
+pub fn recall_query_intro_for(locale: &str) -> &'static str {
+    match locale {
+        "it" => "Ecco cosa ricordo di te:", // DRAFT — needs native review.
+        _ => "Here's what I remember about you:",
+    }
+}
+
+/// Spoken for the recall query when nothing is stored.
+pub fn no_facts_remembered_for(locale: &str) -> &'static str {
+    match locale {
+        "it" => "Non ricordo ancora nulla su di te.", // DRAFT — needs native review.
+        _ => "I don't remember anything about you yet.",
+    }
+}
+
 /// Strip an `await_reply` field from an action envelope, returning its
 /// `context` string if present. Mirrors the `consult_assistant` strip pattern.
 fn extract_await_reply(action: &mut serde_json::Value) -> Option<String> {
@@ -3826,6 +3942,34 @@ mod tests {
         assert_eq!(exit_conversation_ack_for("it"), "Va bene.");
         // Unknown locale falls back to English (not machine-translated).
         assert_eq!(enter_conversation_ack_for("fr"), "Okay, I'm listening.");
+    }
+
+    #[test]
+    fn capture_prefix_extracts_remainder() {
+        assert_eq!(remembered_fact_capture("remember that i am vegetarian"), Some("i am vegetarian"));
+        assert_eq!(remembered_fact_capture("remember i live in valletta"), Some("i live in valletta"));
+        // Bare command → not a capture.
+        assert_eq!(remembered_fact_capture("remember"), None);
+        assert_eq!(remembered_fact_capture("remember that"), None);
+        // Unrelated utterance → not a capture.
+        assert_eq!(remembered_fact_capture("what is the weather"), None);
+    }
+
+    #[test]
+    fn forget_prefix_extracts_remainder() {
+        assert_eq!(remembered_fact_forget("forget that i am vegetarian"), Some("i am vegetarian"));
+        assert_eq!(remembered_fact_forget("forget i live in valletta"), Some("i live in valletta"));
+        assert_eq!(remembered_fact_forget("forget"), None);
+    }
+
+    #[test]
+    fn forget_all_and_query_phrases_match() {
+        assert!(is_forget_all_phrase("forget everything about me", "en"));
+        assert!(is_forget_all_phrase("forget everything you know about me", "en"));
+        assert!(!is_forget_all_phrase("forget that i am vegetarian", "en"));
+        assert!(is_recall_query_phrase("what do you remember about me", "en"));
+        assert!(is_recall_query_phrase("what do you know about me", "en"));
+        assert!(!is_recall_query_phrase("what is the weather", "en"));
     }
 
     #[test]
