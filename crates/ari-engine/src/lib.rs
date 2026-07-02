@@ -1089,6 +1089,11 @@ impl Engine {
         // wins are transparent (refresh, never record).
         let conversation = self.conversation_context();
         let history = history_messages(&conversation);
+        // Personal memory: the durable facts snapshot handed to the assistant
+        // for THIS turn's free-text answer. Skill-serving assistant calls
+        // (routing, named-assistant, layer-C) pass &[] — facts are user-answer
+        // context only.
+        let facts = self.remembered_facts();
 
         // Multi-turn: if a skill is awaiting a reply, this utterance belongs
         // to it — bypass all routing (scoring, router, assistant).
@@ -1231,7 +1236,7 @@ impl Engine {
             // call that either routes to a skill or answers directly, instead
             // of route-then-separate-answer. The combined prompt is English
             // only, so non-English keeps the translated two-step below.
-            match self.route_or_answer(&normalized, &history) {
+            match self.route_or_answer(&normalized, &history, &facts) {
                 Ok(RouteOrAnswer::Skill(id)) => {
                     if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
                         trace.winner = Some(format!("router:assistant:{id}"));
@@ -1419,7 +1424,7 @@ impl Engine {
                             normalized.len()
                         ),
                     );
-                    let result = llm.try_answer(&normalized, &catalog, &self.ctx.locale, &history);
+                    let result = llm.try_answer(&normalized, &catalog, &self.ctx.locale, &history, &facts);
                     match result {
                         Some(ari_llm::FallbackResult::DirectAnswer { text }) => {
                             let (clean, flag) = parse_continuation_flag(&text);
@@ -1467,6 +1472,7 @@ impl Engine {
                     &normalized,
                     &self.ctx.locale,
                     &history,
+                    &facts,
                 ) {
                     Ok(text) if !text.is_empty() => {
                         let (clean, flag) = parse_continuation_flag(&text);
@@ -1513,7 +1519,7 @@ impl Engine {
         skill_catalog: &[(String, String, String)],
     ) -> Option<String> {
         let prompt = build_assistant_routing_prompt(input, skill_catalog, &self.ctx.locale);
-        let response = self.call_active_assistant(&prompt, &[]).ok()?;
+        let response = self.call_active_assistant(&prompt, &[], &[]).ok()?;
         let picked = parse_assistant_routing_response(&response, skill_catalog);
         if picked.is_none() {
             let preview: String = response.chars().take(120).collect();
@@ -1532,7 +1538,7 @@ impl Engine {
     /// is configured, the on-device LLM isn't loaded, or the call failed.
     /// Shared by the routing prompt, the one-shot route-or-answer, and the
     /// debug commands.
-    fn call_active_assistant(&self, prompt: &str, history: &[(String, String)]) -> Result<String, String> {
+    fn call_active_assistant(&self, prompt: &str, history: &[(String, String)], facts: &[String]) -> Result<String, String> {
         let fail = |reason: String| -> Result<String, String> {
             self.log(LogLevel::Warn, &format!("assistant: {reason}"));
             Err(reason)
@@ -1549,6 +1555,7 @@ impl Engine {
                 prompt,
                 &self.ctx.locale,
                 history,
+                facts,
             ) {
                 Ok(text) => Ok(text),
                 Err(e) => fail(format!("cloud call failed: {e}")),
@@ -1577,10 +1584,10 @@ impl Engine {
     /// be normalised. `None` when no assistant is configured or the call
     /// failed. English-instruction prompt for now; non-English callers should
     /// keep the translated two-step until a localised combined prompt exists.
-    fn route_or_answer(&self, input: &str, history: &[(String, String)]) -> Result<RouteOrAnswer, String> {
+    fn route_or_answer(&self, input: &str, history: &[(String, String)], facts: &[String]) -> Result<RouteOrAnswer, String> {
         let catalog = self.router_catalog();
         let prompt = build_combined_route_or_answer_prompt(input, &catalog);
-        let response = self.call_active_assistant(&prompt, history)?;
+        let response = self.call_active_assistant(&prompt, history, facts)?;
         Ok(parse_combined_response(&response, &catalog))
     }
 
@@ -1892,6 +1899,7 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
         binding.config_store.as_ref(),
         prompt,
         locale,
+        &[],
         &[],
     ) {
         Ok(text) if !text.is_empty() => Response::Text(text),
@@ -2268,6 +2276,7 @@ fn call_assistant_for_consult(
                 prompt,
                 locale,
                 &[],
+                &[],
             )
             .map_err(|e| e.to_string())?;
             if text.trim().is_empty() {
@@ -2330,6 +2339,7 @@ fn call_assistant_for_consult(
                 config_store.as_ref(),
                 prompt,
                 locale,
+                &[],
                 &[],
             )
             .map_err(|e| e.to_string())?;
@@ -3826,6 +3836,7 @@ mod tests {
     #[cfg(feature = "llm")]
     struct RecordingFallback {
         last_history: std::sync::Mutex<Vec<(String, String)>>,
+        last_facts: std::sync::Mutex<Vec<String>>,
         reply: &'static str,
     }
 
@@ -3837,8 +3848,10 @@ mod tests {
             _skills: &[ari_llm::SkillInfo],
             _locale: &str,
             history: &[(String, String)],
+            facts: &[String],
         ) -> Option<ari_llm::FallbackResult> {
             *self.last_history.lock().unwrap() = history.to_vec();
+            *self.last_facts.lock().unwrap() = facts.to_vec();
             Some(ari_llm::FallbackResult::DirectAnswer { text: self.reply.to_string() })
         }
     }
@@ -3849,6 +3862,7 @@ mod tests {
         let mut engine = Engine::new();
         let fb = std::sync::Arc::new(RecordingFallback {
             last_history: std::sync::Mutex::new(Vec::new()),
+            last_facts: std::sync::Mutex::new(Vec::new()),
             reply: "Paris. [continuation]",
         });
         engine.set_llm(fb.clone());
@@ -3869,10 +3883,34 @@ mod tests {
 
     #[cfg(feature = "llm")]
     #[test]
+    fn assistant_answer_receives_facts() {
+        // The remembered-facts snapshot must reach the builtin assistant's
+        // free-text answer site (try_answer) verbatim.
+        let mut engine = Engine::new();
+        let fb = std::sync::Arc::new(RecordingFallback {
+            last_history: std::sync::Mutex::new(Vec::new()),
+            last_facts: std::sync::Mutex::new(Vec::new()),
+            reply: "ok. [continuation]",
+        });
+        engine.set_llm(fb.clone());
+        engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
+        engine.set_remembered_facts(vec!["i am vegetarian".to_string()]);
+
+        let _ = engine.process_input_traced("tell me a joke");
+        assert_eq!(
+            *fb.last_facts.lock().unwrap(),
+            vec!["i am vegetarian".to_string()],
+            "try_answer must receive the stored facts snapshot"
+        );
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
     fn new_flag_reseeds_conversation() {
         let mut engine = Engine::new();
         let fb = std::sync::Arc::new(RecordingFallback {
             last_history: std::sync::Mutex::new(Vec::new()),
+            last_facts: std::sync::Mutex::new(Vec::new()),
             reply: "81. [new]",
         });
         engine.set_llm(fb.clone());
@@ -3930,6 +3968,7 @@ mod tests {
         let mut engine = Engine::new();
         let fb = std::sync::Arc::new(RecordingFallback {
             last_history: std::sync::Mutex::new(Vec::new()),
+            last_facts: std::sync::Mutex::new(Vec::new()),
             reply: "Fresh answer. [continuation]",
         });
         engine.set_llm(fb.clone());
