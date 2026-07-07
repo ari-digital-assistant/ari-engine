@@ -1043,44 +1043,52 @@ impl Engine {
         // the recall query (whole-utterance) before the forget/remember
         // prefixes, so "forget everything about me" isn't parsed as
         // forget-fact("everything about me").
-        if is_recall_query_phrase(&normalized, &self.ctx.locale) {
-            let facts = self.remembered_facts();
-            let spoken = if facts.is_empty() {
-                no_facts_remembered_for(&self.ctx.locale).to_string()
-            } else {
-                let mut s = recall_query_intro_for(&self.ctx.locale).to_string();
-                for f in &facts {
-                    s.push_str("\n- ");
-                    s.push_str(f);
-                }
-                s
-            };
-            return (Response::Text(spoken), None);
-        }
-        if is_forget_all_phrase(&normalized, &self.ctx.locale) {
-            let cleared = self.forget_all_facts();
-            let spoken = if cleared {
-                facts_cleared_ack_for(&self.ctx.locale)
-            } else {
-                no_facts_remembered_for(&self.ctx.locale)
-            };
-            return (Response::Text(spoken.to_string()), None);
-        }
-        if let Some(fact) = remembered_fact_forget(&normalized) {
-            let removed = self.forget_fact(fact);
-            let spoken = if removed {
-                fact_forgotten_ack_for(&self.ctx.locale)
-            } else {
-                fact_not_found_ack_for(&self.ctx.locale)
-            };
-            return (Response::Text(spoken.to_string()), None);
-        }
-        if let Some(fact) = remembered_fact_capture(&normalized) {
-            self.capture_fact(fact);
-            return (
-                Response::Text(fact_remembered_ack_for(&self.ctx.locale).to_string()),
-                None,
-            );
+        // Guard: a whole-utterance cancel phrase ("forget it", "cancel",
+        // "stop", "never mind"…) must fall through to the pending-turn cancel
+        // path below — never be captured here. Only "forget it" actually
+        // collides (it matches the `forget ` prefix → forget-fact("it")); the
+        // others don't match any personal-memory prefix, so guarding the whole
+        // block is behaviour-preserving for them and keeps the intent clear.
+        if !is_cancel_phrase(&normalized, &self.ctx.locale) {
+            if is_recall_query_phrase(&normalized, &self.ctx.locale) {
+                let facts = self.remembered_facts();
+                let spoken = if facts.is_empty() {
+                    no_facts_remembered_for(&self.ctx.locale).to_string()
+                } else {
+                    let mut s = recall_query_intro_for(&self.ctx.locale).to_string();
+                    for f in &facts {
+                        s.push_str("\n- ");
+                        s.push_str(f);
+                    }
+                    s
+                };
+                return (Response::Text(spoken), None);
+            }
+            if is_forget_all_phrase(&normalized, &self.ctx.locale) {
+                let cleared = self.forget_all_facts();
+                let spoken = if cleared {
+                    facts_cleared_ack_for(&self.ctx.locale)
+                } else {
+                    no_facts_remembered_for(&self.ctx.locale)
+                };
+                return (Response::Text(spoken.to_string()), None);
+            }
+            if let Some(fact) = remembered_fact_forget(&normalized) {
+                let removed = self.forget_fact(fact);
+                let spoken = if removed {
+                    fact_forgotten_ack_for(&self.ctx.locale)
+                } else {
+                    fact_not_found_ack_for(&self.ctx.locale)
+                };
+                return (Response::Text(spoken.to_string()), None);
+            }
+            if let Some(fact) = remembered_fact_capture(&normalized) {
+                self.capture_fact(fact);
+                return (
+                    Response::Text(fact_remembered_ack_for(&self.ctx.locale).to_string()),
+                    None,
+                );
+            }
         }
 
         // Behaviour B: read (and refresh) the conversation buffer for this
@@ -2484,6 +2492,24 @@ mod tests {
         let (resp, _) = engine.process_input_traced("never mind");
         assert!(matches!(resp, Response::Text(ref s) if s == cancel_ack_for("en")));
         assert!(!engine.has_pending_turn(), "cancel must clear the slot");
+    }
+
+    #[test]
+    fn forget_it_cancels_pending_turn_not_personal_memory() {
+        // Regression: "forget it" is a registered cancel phrase. It must reach
+        // the pending-turn cancel path, NOT be captured by the personal-memory
+        // forget intercept (which would strip "forget " → "it", find no match,
+        // ack "I didn't have that one." and leave the pending turn armed).
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(AskingSkill));
+        let _ = engine.process_input_traced("play music"); // arm
+        assert!(engine.has_pending_turn(), "pending turn must be armed");
+        let (resp, _) = engine.process_input_traced("forget it");
+        assert!(
+            matches!(resp, Response::Text(ref s) if s == cancel_ack_for("en")),
+            "\"forget it\" must speak the cancel ack, not the personal-memory not-found ack; got {resp:?}"
+        );
+        assert!(!engine.has_pending_turn(), "cancel must consume the pending turn");
     }
 
     #[test]

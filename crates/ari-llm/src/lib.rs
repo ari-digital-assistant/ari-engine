@@ -572,10 +572,15 @@ impl Fallback for LlmFallback {
         skills: &[SkillInfo],
         locale: &str,
         _history: &[(String, String)],
+        // Intentionally dropped here: this eager `LlmFallback` is only the
+        // ari-cli dev-harness path. Production uses `LazyLlmFallback`, which
+        // injects `_facts` into the system prompt. Passing `&[]` below is a
+        // deliberate no-op for facts recall in the harness, not a parity bug.
         _facts: &[String],
     ) -> Option<FallbackResult> {
         let _guard = self.inference_lock.lock().ok()?;
 
+        // `&[]`: facts recall is a no-op in this dev-harness impl (see `_facts`).
         let system_prompt = build_system_prompt(skills, locale, false, &[]);
         let user_prompt = build_user_prompt(input);
 
