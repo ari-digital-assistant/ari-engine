@@ -228,48 +228,61 @@ pub fn conversation_memory_required_msg_for(locale: &str) -> &'static str {
 // expanded, punctuation collapsed to spaces). Capture/forget are prefix
 // commands; forget-all and the recall query are whole-utterance phrases.
 
-/// Strip a leading remember-command prefix and return the trimmed remainder,
-/// or None when the utterance isn't a capture (or the remainder is empty).
-fn remembered_fact_capture(normalized: &str) -> Option<&str> {
-    // Bare command with no remainder (e.g. "remember", "remember that") is
-    // not a capture. Without this guard, "remember that" would fall through
-    // to the "remember " strip below and wrongly yield "that" as content.
-    if normalized == "remember" || normalized == "remember that" {
+/// Localized "remember …" capture prefixes. MUST be ordered longest-first
+/// within a shared stem so the stripper doesn't clip a longer prefix (e.g.
+/// "ricordati che " must precede "ricordati "). Each carries a trailing space
+/// so a bare command word can't match.
+fn capture_prefixes(locale: &str) -> &'static [&'static str] {
+    match locale {
+        // it: accepts both "ricorda che" and "ricordati che" (and the bare
+        // "ricorda"/"ricordati") — the settings copy tells users "ricorda che…".
+        "it" => &["ricordati che ", "ricorda che ", "ricordati ", "ricorda "],
+        _ => &["remember that ", "remember "],
+    }
+}
+
+/// Localized "forget …" (forget-one) prefixes, same ordering rule as
+/// [`capture_prefixes`].
+fn forget_prefixes(locale: &str) -> &'static [&'static str] {
+    match locale {
+        "it" => &["dimenticati che ", "dimentica che ", "dimenticati ", "dimentica "],
+        _ => &["forget that ", "forget "],
+    }
+}
+
+/// Strip the first matching command prefix and return the trimmed remainder,
+/// or None when the utterance isn't such a command. A bare command (the input
+/// is exactly a prefix with no remainder, e.g. "remember that" / "ricorda
+/// che") returns None so it isn't captured as the fact "that" / "che".
+fn strip_command_prefix<'a>(normalized: &'a str, prefixes: &[&str]) -> Option<&'a str> {
+    if prefixes.iter().any(|p| normalized == p.trim_end()) {
         return None;
     }
-    let rest = normalized
-        .strip_prefix("remember that ")
-        .or_else(|| normalized.strip_prefix("remember "))?;
-    let rest = rest.trim();
-    if rest.is_empty() {
-        None
-    } else {
-        Some(rest)
+    for p in prefixes {
+        if let Some(rest) = normalized.strip_prefix(p) {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                return Some(rest);
+            }
+        }
     }
+    None
+}
+
+/// Strip a leading remember-command prefix and return the trimmed remainder,
+/// or None when the utterance isn't a capture (or the remainder is empty).
+fn remembered_fact_capture<'a>(normalized: &'a str, locale: &str) -> Option<&'a str> {
+    strip_command_prefix(normalized, capture_prefixes(locale))
 }
 
 /// Strip a leading forget-command prefix and return the trimmed remainder,
 /// or None when the utterance isn't a forget-one (or the remainder is empty).
-fn remembered_fact_forget(normalized: &str) -> Option<&str> {
-    // Bare command with no remainder (e.g. "forget", "forget that") is not
-    // a forget-one; see remembered_fact_capture for why this guard exists.
-    if normalized == "forget" || normalized == "forget that" {
-        return None;
-    }
-    let rest = normalized
-        .strip_prefix("forget that ")
-        .or_else(|| normalized.strip_prefix("forget "))?;
-    let rest = rest.trim();
-    if rest.is_empty() {
-        None
-    } else {
-        Some(rest)
-    }
+fn remembered_fact_forget<'a>(normalized: &'a str, locale: &str) -> Option<&'a str> {
+    strip_command_prefix(normalized, forget_prefixes(locale))
 }
 
 fn forget_all_phrases(locale: &str) -> &'static [&'static str] {
     match locale {
-        // it: DRAFT — needs native review (see plan Global Constraints).
         "it" => &["dimentica tutto su di me", "dimentica tutto quello che sai su di me"],
         _ => &["forget everything about me", "forget everything you know about me"],
     }
@@ -281,7 +294,6 @@ fn is_forget_all_phrase(normalized: &str, locale: &str) -> bool {
 
 fn recall_query_phrases(locale: &str) -> &'static [&'static str] {
     match locale {
-        // it: DRAFT — needs native review (see plan Global Constraints).
         "it" => &["cosa ti ricordi di me", "cosa sai di me"],
         _ => &["what do you remember about me", "what do you know about me"],
     }
@@ -294,7 +306,7 @@ fn is_recall_query_phrase(normalized: &str, locale: &str) -> bool {
 /// Spoken when a fact is stored.
 pub fn fact_remembered_ack_for(locale: &str) -> &'static str {
     match locale {
-        "it" => "Fatto, me ne ricorderò.", // DRAFT — needs native review.
+        "it" => "Fatto, me ne ricorderò.",
         _ => "Got it — I'll remember that.",
     }
 }
@@ -302,7 +314,7 @@ pub fn fact_remembered_ack_for(locale: &str) -> &'static str {
 /// Spoken when a specific fact is forgotten.
 pub fn fact_forgotten_ack_for(locale: &str) -> &'static str {
     match locale {
-        "it" => "Va bene, l'ho dimenticato.", // DRAFT — needs native review.
+        "it" => "Va bene, l'ho dimenticato.",
         _ => "Okay, I've forgotten that.",
     }
 }
@@ -310,7 +322,7 @@ pub fn fact_forgotten_ack_for(locale: &str) -> &'static str {
 /// Spoken when a forget command matched nothing.
 pub fn fact_not_found_ack_for(locale: &str) -> &'static str {
     match locale {
-        "it" => "Non me lo ricordavo comunque.", // DRAFT — needs native review.
+        "it" => "Non me lo ricordavo comunque.",
         _ => "I didn't have that one.",
     }
 }
@@ -318,7 +330,7 @@ pub fn fact_not_found_ack_for(locale: &str) -> &'static str {
 /// Spoken when all facts are cleared.
 pub fn facts_cleared_ack_for(locale: &str) -> &'static str {
     match locale {
-        "it" => "Va bene, ho dimenticato tutto quello che sapevo su di te.", // DRAFT.
+        "it" => "Va bene, ho dimenticato tutto quello che sapevo su di te.",
         _ => "Okay, I've forgotten everything I knew about you.",
     }
 }
@@ -326,7 +338,7 @@ pub fn facts_cleared_ack_for(locale: &str) -> &'static str {
 /// Lead-in spoken before the recalled facts list.
 pub fn recall_query_intro_for(locale: &str) -> &'static str {
     match locale {
-        "it" => "Ecco cosa ricordo di te:", // DRAFT — needs native review.
+        "it" => "Ecco cosa ricordo di te:",
         _ => "Here's what I remember about you:",
     }
 }
@@ -334,7 +346,7 @@ pub fn recall_query_intro_for(locale: &str) -> &'static str {
 /// Spoken for the recall query when nothing is stored.
 pub fn no_facts_remembered_for(locale: &str) -> &'static str {
     match locale {
-        "it" => "Non ricordo ancora nulla su di te.", // DRAFT — needs native review.
+        "it" => "Non ricordo ancora nulla su di te.",
         _ => "I don't remember anything about you yet.",
     }
 }
@@ -1073,7 +1085,7 @@ impl Engine {
                 };
                 return (Response::Text(spoken.to_string()), None);
             }
-            if let Some(fact) = remembered_fact_forget(&normalized) {
+            if let Some(fact) = remembered_fact_forget(&normalized, &self.ctx.locale) {
                 let removed = self.forget_fact(fact);
                 let spoken = if removed {
                     fact_forgotten_ack_for(&self.ctx.locale)
@@ -1082,7 +1094,7 @@ impl Engine {
                 };
                 return (Response::Text(spoken.to_string()), None);
             }
-            if let Some(fact) = remembered_fact_capture(&normalized) {
+            if let Some(fact) = remembered_fact_capture(&normalized, &self.ctx.locale) {
                 self.capture_fact(fact);
                 return (
                     Response::Text(fact_remembered_ack_for(&self.ctx.locale).to_string()),
@@ -4057,20 +4069,62 @@ mod tests {
 
     #[test]
     fn capture_prefix_extracts_remainder() {
-        assert_eq!(remembered_fact_capture("remember that i am vegetarian"), Some("i am vegetarian"));
-        assert_eq!(remembered_fact_capture("remember i live in valletta"), Some("i live in valletta"));
+        assert_eq!(remembered_fact_capture("remember that i am vegetarian", "en"), Some("i am vegetarian"));
+        assert_eq!(remembered_fact_capture("remember i live in valletta", "en"), Some("i live in valletta"));
         // Bare command → not a capture.
-        assert_eq!(remembered_fact_capture("remember"), None);
-        assert_eq!(remembered_fact_capture("remember that"), None);
+        assert_eq!(remembered_fact_capture("remember", "en"), None);
+        assert_eq!(remembered_fact_capture("remember that", "en"), None);
         // Unrelated utterance → not a capture.
-        assert_eq!(remembered_fact_capture("what is the weather"), None);
+        assert_eq!(remembered_fact_capture("what is the weather", "en"), None);
     }
 
     #[test]
     fn forget_prefix_extracts_remainder() {
-        assert_eq!(remembered_fact_forget("forget that i am vegetarian"), Some("i am vegetarian"));
-        assert_eq!(remembered_fact_forget("forget i live in valletta"), Some("i live in valletta"));
-        assert_eq!(remembered_fact_forget("forget"), None);
+        assert_eq!(remembered_fact_forget("forget that i am vegetarian", "en"), Some("i am vegetarian"));
+        assert_eq!(remembered_fact_forget("forget i live in valletta", "en"), Some("i live in valletta"));
+        assert_eq!(remembered_fact_forget("forget", "en"), None);
+    }
+
+    #[test]
+    fn capture_prefix_italian() {
+        // Both "ricorda che" and "ricordati che" (and bare "ricorda"/"ricordati")
+        // are accepted; the longest matching prefix is stripped.
+        assert_eq!(remembered_fact_capture("ricordati che sono vegetariano", "it"), Some("sono vegetariano"));
+        assert_eq!(remembered_fact_capture("ricorda che vivo a carlisle", "it"), Some("vivo a carlisle"));
+        assert_eq!(remembered_fact_capture("ricorda vivo a carlisle", "it"), Some("vivo a carlisle"));
+        // Bare commands → not a capture (must not yield "che").
+        assert_eq!(remembered_fact_capture("ricorda", "it"), None);
+        assert_eq!(remembered_fact_capture("ricordati", "it"), None);
+        assert_eq!(remembered_fact_capture("ricorda che", "it"), None);
+        assert_eq!(remembered_fact_capture("ricordati che", "it"), None);
+        // English prefix must NOT match under the Italian locale.
+        assert_eq!(remembered_fact_capture("remember that i am vegetarian", "it"), None);
+    }
+
+    #[test]
+    fn forget_prefix_italian() {
+        assert_eq!(remembered_fact_forget("dimentica che sono vegetariano", "it"), Some("sono vegetariano"));
+        assert_eq!(remembered_fact_forget("dimentica sono vegetariano", "it"), Some("sono vegetariano"));
+        assert_eq!(remembered_fact_forget("dimentica", "it"), None);
+        assert_eq!(remembered_fact_forget("dimentica che", "it"), None);
+    }
+
+    #[test]
+    fn italian_remember_command_captures_and_acks_end_to_end() {
+        let mut engine = Engine::new();
+        engine.set_locale("it".to_string());
+        let (resp, _) = engine.process_input_traced("Ricordati che vivo a Carlisle");
+        match resp {
+            Response::Text(t) => assert_eq!(t, "Fatto, me ne ricorderò."),
+            other => panic!("expected Italian capture ack, got {other:?}"),
+        }
+        assert_eq!(engine.remembered_facts(), vec!["vivo a carlisle".to_string()]);
+        // Italian recall query lists it back with the Italian intro.
+        let (resp, _) = engine.process_input_traced("cosa ti ricordi di me");
+        match resp {
+            Response::Text(t) => assert_eq!(t, "Ecco cosa ricordo di te:\n- vivo a carlisle"),
+            other => panic!("expected Italian recall list, got {other:?}"),
+        }
     }
 
     #[test]
