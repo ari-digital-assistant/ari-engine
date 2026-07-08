@@ -582,6 +582,11 @@ pub enum Capability {
     /// skill declaring the capability is installed. (Apple calls the same
     /// concept "Critical Alerts".)
     CriticalAlert,
+    /// Permission to emit an `alarm` action — the frontend sets a device
+    /// alarm (Android: the `AlarmClock` intent family; the user's Clock app
+    /// owns scheduling, reboot persistence and ringing) or opens the alarm
+    /// list. Pure frontend: no WASM host import.
+    Alarm,
 }
 
 #[derive(Debug, Clone, PartialEq)]

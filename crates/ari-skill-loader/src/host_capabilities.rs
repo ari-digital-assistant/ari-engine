@@ -54,6 +54,7 @@ impl HostCapabilities {
             Capability::MediaControl,
             Capability::MediaServices,
             Capability::CriticalAlert,
+            Capability::Alarm,
         ] {
             s.granted.insert(cap);
         }
@@ -79,6 +80,7 @@ impl HostCapabilities {
         s.granted.insert(Capability::Tasks);
         s.granted.insert(Capability::MediaControl);
         s.granted.insert(Capability::CriticalAlert);
+        s.granted.insert(Capability::Alarm);
         s
     }
 
@@ -126,6 +128,7 @@ pub fn parse_capability(s: &str) -> Option<Capability> {
         "media_control" => Some(Capability::MediaControl),
         "media_services" => Some(Capability::MediaServices),
         "critical_alert" => Some(Capability::CriticalAlert),
+        "alarm" => Some(Capability::Alarm),
         _ => None,
     }
 }
@@ -146,6 +149,7 @@ pub fn capability_name(cap: Capability) -> &'static str {
         Capability::MediaControl => "media_control",
         Capability::MediaServices => "media_services",
         Capability::CriticalAlert => "critical_alert",
+        Capability::Alarm => "alarm",
     }
 }
 
@@ -282,6 +286,18 @@ mod tests {
         assert_eq!(capability_name(Capability::MediaServices), "media_services");
         assert!(HostCapabilities::all().provides(Capability::MediaServices));
         assert!(!HostCapabilities::pure_frontend().provides(Capability::MediaServices));
+    }
+
+    #[test]
+    fn alarm_capability_roundtrips() {
+        assert_eq!(parse_capability("alarm"), Some(Capability::Alarm));
+        assert_eq!(capability_name(Capability::Alarm), "alarm");
+    }
+
+    #[test]
+    fn pure_frontend_grants_alarm() {
+        assert!(HostCapabilities::pure_frontend().provides(Capability::Alarm));
+        assert!(HostCapabilities::all().provides(Capability::Alarm));
     }
 
 }
