@@ -299,5 +299,4 @@ mod tests {
         assert!(HostCapabilities::pure_frontend().provides(Capability::Alarm));
         assert!(HostCapabilities::all().provides(Capability::Alarm));
     }
-
 }
