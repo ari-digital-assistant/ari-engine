@@ -587,6 +587,12 @@ pub enum Capability {
     /// owns scheduling, reboot persistence and ringing) or opens the alarm
     /// list. Pure frontend: no WASM host import.
     Alarm,
+    /// Permission to emit a `navigate` action — the frontend starts navigation
+    /// to a destination (Android: an `ACTION_VIEW` `geo:` intent to the user's
+    /// default maps app, or `google.navigation:` for turn-by-turn). The maps
+    /// app owns routing, tiles and live traffic. Pure frontend: no WASM host
+    /// import.
+    Navigation,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -55,6 +55,7 @@ impl HostCapabilities {
             Capability::MediaServices,
             Capability::CriticalAlert,
             Capability::Alarm,
+            Capability::Navigation,
         ] {
             s.granted.insert(cap);
         }
@@ -81,6 +82,7 @@ impl HostCapabilities {
         s.granted.insert(Capability::MediaControl);
         s.granted.insert(Capability::CriticalAlert);
         s.granted.insert(Capability::Alarm);
+        s.granted.insert(Capability::Navigation);
         s
     }
 
@@ -129,6 +131,7 @@ pub fn parse_capability(s: &str) -> Option<Capability> {
         "media_services" => Some(Capability::MediaServices),
         "critical_alert" => Some(Capability::CriticalAlert),
         "alarm" => Some(Capability::Alarm),
+        "navigation" => Some(Capability::Navigation),
         _ => None,
     }
 }
@@ -150,6 +153,7 @@ pub fn capability_name(cap: Capability) -> &'static str {
         Capability::MediaServices => "media_services",
         Capability::CriticalAlert => "critical_alert",
         Capability::Alarm => "alarm",
+        Capability::Navigation => "navigation",
     }
 }
 
@@ -298,5 +302,17 @@ mod tests {
     fn pure_frontend_grants_alarm() {
         assert!(HostCapabilities::pure_frontend().provides(Capability::Alarm));
         assert!(HostCapabilities::all().provides(Capability::Alarm));
+    }
+
+    #[test]
+    fn navigation_capability_roundtrips() {
+        assert_eq!(parse_capability("navigation"), Some(Capability::Navigation));
+        assert_eq!(capability_name(Capability::Navigation), "navigation");
+    }
+
+    #[test]
+    fn pure_frontend_grants_navigation() {
+        assert!(HostCapabilities::pure_frontend().provides(Capability::Navigation));
+        assert!(HostCapabilities::all().provides(Capability::Navigation));
     }
 }
