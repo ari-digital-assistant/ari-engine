@@ -148,6 +148,11 @@ pub struct FfiSkillManifest {
     pub languages: Vec<String>,
     /// Full SKILL.md body after the frontmatter — markdown, verbatim.
     pub body: String,
+    /// Example utterances the skill declares in `metadata.ari.examples`
+    /// (the `text` of each entry, declaration order). Skills declare >=5.
+    /// Surfaced so the frontend can offer real, skill-agnostic suggestion
+    /// chips without inventing per-skill copy.
+    pub examples: Vec<String>,
 }
 
 #[derive(Debug, Error, uniffi::Error)]
@@ -500,6 +505,7 @@ impl SkillRegistry {
                 .collect(),
             languages: ext.languages,
             body: skillfile.body,
+            examples: ext.examples.iter().map(|e| e.text.clone()).collect(),
         })
     }
 
@@ -559,6 +565,7 @@ impl SkillRegistry {
                 .collect(),
             languages: ext.languages,
             body: skillfile.body,
+            examples: ext.examples.iter().map(|e| e.text.clone()).collect(),
         })
     }
 
@@ -860,6 +867,77 @@ mod tests {
                 .as_deref(),
             Some("Personal"),
         );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    /// A minimal but valid SKILL.md declaring exactly five example
+    /// utterances in a known order, so we can assert both the values and
+    /// the declaration order survive the FFI mapping intact.
+    const GREET_SKILL_MD: &str = r#"---
+name: greet
+description: A test skill
+metadata:
+  ari:
+    id: dev.heyari.test.greet
+    version: "1.0.0"
+    engine: ">=0.3,<0.4"
+    capabilities: []
+    languages: [en]
+    specificity: medium
+    matching:
+      patterns:
+        - keywords: [hello]
+          weight: 1.0
+    declarative:
+      response: "hi"
+    examples:
+      - text: hello
+      - text: hi there
+      - text: hey
+      - text: good morning
+      - text: greetings
+---
+
+# Greet
+Says hello.
+"#;
+
+    #[test]
+    fn read_installed_manifest_surfaces_examples_in_declaration_order() {
+        // End-to-end through the real FFI method: lay down an installed
+        // skill on disk, open the registry (which rescans it into the
+        // store), then read it back and assert every declared example
+        // utterance is surfaced verbatim, in order.
+        let root = unique_dir("examples-root");
+        let storage = unique_dir("examples-storage");
+        let skill_dir = root.join("greet");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), GREET_SKILL_MD).unwrap();
+
+        let reg = SkillRegistry::new(
+            root.to_string_lossy().into_owned(),
+            storage.to_string_lossy().into_owned(),
+            SkillSettingsStore::new(),
+        )
+        .unwrap();
+
+        let manifest = reg
+            .read_installed_manifest("dev.heyari.test.greet".into(), "en".into())
+            .expect("skill was just installed, manifest must read");
+
+        assert_eq!(
+            manifest.examples,
+            vec![
+                "hello".to_string(),
+                "hi there".to_string(),
+                "hey".to_string(),
+                "good morning".to_string(),
+                "greetings".to_string(),
+            ],
+            "declared example utterances must be surfaced verbatim, in declaration order",
+        );
+
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&storage);
     }
