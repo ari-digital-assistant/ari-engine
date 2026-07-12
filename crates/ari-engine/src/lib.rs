@@ -1200,6 +1200,13 @@ impl Engine {
                 return (Response::Text(spoken.to_string()), None);
             }
             if let Some(fact) = remembered_fact_capture(&normalized, &self.ctx.locale) {
+                if is_bare_name_request(fact, &self.ctx.locale) {
+                    self.set_pending_turn(NAME_CAPTURE_SENTINEL, String::new());
+                    return (
+                        Response::Text(name_prompt_for(&self.ctx.locale).to_string()),
+                        None,
+                    );
+                }
                 self.capture_fact(fact);
                 return (
                     Response::Text(fact_remembered_ack_for(&self.ctx.locale).to_string()),
@@ -1229,6 +1236,23 @@ impl Engine {
                     Response::Text(cancel_ack_for(&self.ctx.locale).to_string()),
                     None,
                 );
+            }
+            // Engine-internal name capture: the reply is the user's name. Use the
+            // raw `input` (not `normalized`) so the name's casing survives.
+            if pending.skill_id == NAME_CAPTURE_SENTINEL {
+                return match extract_name(input, &self.ctx.locale) {
+                    Some(name) => {
+                        self.capture_fact(&name_fact_for(&self.ctx.locale, &name));
+                        (
+                            Response::Text(name_captured_ack_for(&self.ctx.locale, &name)),
+                            None,
+                        )
+                    }
+                    None => (
+                        Response::Text(name_not_caught_for(&self.ctx.locale).to_string()),
+                        None,
+                    ),
+                };
             }
             // The reply goes ONLY to the asking skill. If the skill vanished
             // (e.g. a community-skill reload), fail cleanly.
@@ -2552,6 +2576,65 @@ mod tests {
         assert_eq!(name_prompt_for("fr"), "What's your name?");
         assert_eq!(name_captured_ack_for("en", "Keith"), "Nice to meet you, Keith!");
         assert_eq!(name_captured_ack_for("it", "Giovanni"), "Piacere di conoscerti, Giovanni!");
+    }
+
+    #[test]
+    fn remember_my_name_elicits_then_captures_en() {
+        let mut engine = Engine::new();
+        let (resp, _) = engine.process_input_traced("remember my name");
+        assert!(matches!(resp, Response::Text(ref s) if s == name_prompt_for("en")),
+            "bare request must ask for the name; got {resp:?}");
+        assert!(engine.has_pending_turn(), "name capture must arm a pending turn");
+        assert_eq!(engine.pending_turn.lock().unwrap().as_ref().unwrap().skill_id,
+            NAME_CAPTURE_SENTINEL);
+
+        let (resp, _) = engine.process_input_traced("i'm Keith");
+        assert!(matches!(resp, Response::Text(ref s) if s == "Nice to meet you, Keith!"),
+            "got {resp:?}");
+        assert_eq!(engine.remembered_facts(), vec!["my name is Keith".to_string()]);
+        assert!(!engine.has_pending_turn(), "slot must clear after capture");
+    }
+
+    #[test]
+    fn remember_my_name_elicits_then_captures_it() {
+        let mut engine = Engine::new();
+        engine.set_locale("it".to_string());
+        let (resp, _) = engine.process_input_traced("ricorda il mio nome");
+        assert!(matches!(resp, Response::Text(ref s) if s == name_prompt_for("it")));
+        let (resp, _) = engine.process_input_traced("sono Giovanni");
+        assert!(matches!(resp, Response::Text(ref s) if s == "Piacere di conoscerti, Giovanni!"),
+            "got {resp:?}");
+        assert_eq!(engine.remembered_facts(), vec!["mi chiamo Giovanni".to_string()]);
+    }
+
+    #[test]
+    fn name_reply_with_no_name_apologises_once() {
+        let mut engine = Engine::new();
+        let _ = engine.process_input_traced("remember my name");
+        let (resp, _) = engine.process_input_traced("nope");
+        assert!(matches!(resp, Response::Text(ref s) if s == name_not_caught_for("en")));
+        assert!(engine.remembered_facts().is_empty(), "no name fact on unusable reply");
+        assert!(!engine.has_pending_turn(), "single-shot: slot cleared, no retry");
+    }
+
+    #[test]
+    fn cancel_during_name_capture_escapes() {
+        let mut engine = Engine::new();
+        let _ = engine.process_input_traced("remember my name");
+        let (resp, _) = engine.process_input_traced("cancel");
+        assert!(matches!(resp, Response::Text(ref s) if s == cancel_ack_for("en")));
+        assert!(engine.remembered_facts().is_empty());
+        assert!(!engine.has_pending_turn());
+    }
+
+    #[test]
+    fn remember_my_name_with_name_stores_directly() {
+        // Regression: the non-bare form must NOT elicit — it stores as-is.
+        let mut engine = Engine::new();
+        let (resp, _) = engine.process_input_traced("remember my name is Dave");
+        assert!(matches!(resp, Response::Text(ref s) if s == fact_remembered_ack_for("en")));
+        assert!(!engine.has_pending_turn());
+        assert_eq!(engine.remembered_facts(), vec!["my name is dave".to_string()]);
     }
 
     struct MockSkill {
