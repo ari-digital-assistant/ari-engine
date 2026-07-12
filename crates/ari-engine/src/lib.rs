@@ -104,6 +104,9 @@ const MAX_CONVERSATION_TURNS: usize = 5;
 /// into the assistant prompt; a capture at the cap evicts the oldest.
 const MAX_REMEMBERED_FACTS: usize = 50;
 
+/// Reserved `pending_turn` id for the engine-internal name-capture round-trip.
+const NAME_CAPTURE_SENTINEL: &str = "__ari_name_capture";
+
 /// A skill is awaiting the user's reply to a question it just asked.
 #[derive(Clone, Debug)]
 pub struct PendingTurn {
@@ -308,6 +311,108 @@ pub fn fact_remembered_ack_for(locale: &str) -> &'static str {
     match locale {
         "it" => "Fatto, me ne ricorderò.",
         _ => "Got it — I'll remember that.",
+    }
+}
+
+/// True when a stripped capture payload is a bare "my name" request (no name
+/// given) — the trigger to elicit the name rather than store a fact.
+fn is_bare_name_request(payload: &str, locale: &str) -> bool {
+    match locale {
+        "it" => payload == "il mio nome",
+        _ => payload == "my name",
+    }
+}
+
+/// Lead-in filler words skipped before the name token.
+fn name_fillers(locale: &str) -> &'static [&'static str] {
+    match locale {
+        "it" => &["mi", "chiamo", "sono", "il", "mio", "nome", "è", "chiamami",
+                  "puoi", "chiamarmi", "ecco", "beh"],
+        _ => &["my", "name", "name's", "is", "the", "i", "i'm", "im", "am", "it",
+               "it's", "its", "call", "me", "you", "can", "just", "um", "uh", "er", "well"],
+    }
+}
+
+/// Obvious refusals — a reply of one of these yields no name.
+fn name_refusals(locale: &str) -> &'static [&'static str] {
+    match locale {
+        "it" => &["no", "niente", "nulla", "boh"],
+        _ => &["no", "nope", "nah", "nothing", "none", "nevermind"],
+    }
+}
+
+/// Capitalise the first letter iff the token is all-lowercase (leave names
+/// that already carry uppercase, e.g. "McDonald", intact).
+fn capitalize_first(s: &str) -> String {
+    if s.chars().any(|c| c.is_uppercase()) {
+        return s.to_string();
+    }
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Extract a display-ready first name from a raw reply, or None. Skips leading
+/// filler words, rejects obvious refusals, takes the first name-like token.
+fn extract_name(raw_input: &str, locale: &str) -> Option<String> {
+    let fillers = name_fillers(locale);
+    let refusals = name_refusals(locale);
+    for word in raw_input.split_whitespace() {
+        let token: String = word
+            .chars()
+            .filter(|c| c.is_alphabetic() || *c == '-' || *c == '\'')
+            .collect();
+        let token = token.trim_matches(|c| c == '-' || c == '\'').to_string();
+        if token.is_empty() {
+            continue;
+        }
+        let lower = token.to_lowercase();
+        if fillers.contains(&lower.as_str()) {
+            continue;
+        }
+        if refusals.contains(&lower.as_str()) {
+            return None;
+        }
+        if token.chars().count() > 30 {
+            return None;
+        }
+        return Some(capitalize_first(&token));
+    }
+    None
+}
+
+/// The locale-natural remembered fact for a captured name. Must stay readable
+/// by the frontend's `detectUserName`.
+fn name_fact_for(locale: &str, name: &str) -> String {
+    match locale {
+        "it" => format!("mi chiamo {name}"),
+        _ => format!("my name is {name}"),
+    }
+}
+
+/// Prompt asking the user for their name.
+fn name_prompt_for(locale: &str) -> &'static str {
+    match locale {
+        "it" => "Come ti chiami?",
+        _ => "What's your name?",
+    }
+}
+
+/// Warm ack once the name is captured.
+fn name_captured_ack_for(locale: &str, name: &str) -> String {
+    match locale {
+        "it" => format!("Piacere di conoscerti, {name}!"),
+        _ => format!("Nice to meet you, {name}!"),
+    }
+}
+
+/// Spoken when the reply held no usable name (single-shot; no retry).
+fn name_not_caught_for(locale: &str) -> &'static str {
+    match locale {
+        "it" => "Scusa, non ho capito il nome — puoi dirmelo quando vuoi con \"mi chiamo …\".",
+        _ => "Sorry, I didn't catch a name — you can tell me any time by saying \"my name is …\".",
     }
 }
 
@@ -2411,6 +2516,43 @@ impl Default for Engine {
 mod tests {
     use super::*;
     use ari_core::FallbackTier;
+
+    #[test]
+    fn bare_name_request_detected_per_locale() {
+        assert!(is_bare_name_request("my name", "en"));
+        assert!(!is_bare_name_request("my name is john", "en"));
+        assert!(!is_bare_name_request("i like pizza", "en"));
+        assert!(is_bare_name_request("il mio nome", "it"));
+        assert!(!is_bare_name_request("my name", "it"));
+    }
+
+    #[test]
+    fn extract_name_handles_phrasings_and_casing() {
+        assert_eq!(extract_name("John", "en").as_deref(), Some("John"));
+        assert_eq!(extract_name("i'm sarah", "en").as_deref(), Some("Sarah"));
+        assert_eq!(extract_name("my name is bob", "en").as_deref(), Some("Bob"));
+        assert_eq!(extract_name("John Smith", "en").as_deref(), Some("John"));
+        assert_eq!(extract_name("sono Giovanni", "it").as_deref(), Some("Giovanni"));
+        assert_eq!(extract_name("il mio nome è Anna", "it").as_deref(), Some("Anna"));
+        assert_eq!(extract_name("nope", "en"), None);
+        assert_eq!(extract_name("", "en"), None);
+    }
+
+    #[test]
+    fn name_fact_is_locale_natural() {
+        assert_eq!(name_fact_for("en", "Keith"), "my name is Keith");
+        assert_eq!(name_fact_for("it", "Giovanni"), "mi chiamo Giovanni");
+        assert_eq!(name_fact_for("fr", "Marie"), "my name is Marie");
+    }
+
+    #[test]
+    fn name_strings_are_localised() {
+        assert_eq!(name_prompt_for("en"), "What's your name?");
+        assert_eq!(name_prompt_for("it"), "Come ti chiami?");
+        assert_eq!(name_prompt_for("fr"), "What's your name?");
+        assert_eq!(name_captured_ack_for("en", "Keith"), "Nice to meet you, Keith!");
+        assert_eq!(name_captured_ack_for("it", "Giovanni"), "Piacere di conoscerti, Giovanni!");
+    }
 
     struct MockSkill {
         id: &'static str,
