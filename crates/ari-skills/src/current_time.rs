@@ -305,4 +305,14 @@ mod tests {
             _ => panic!("expected Text response"),
         }
     }
+
+    #[test]
+    fn example_utterances_for_defaults_to_base_examples() {
+        let skill = CurrentTimeSkill::new();
+        // Plan 1 adds no locale override, so every locale returns the base
+        // (English) set via the trait default. Plan 2 changes "it".
+        assert_eq!(skill.example_utterances_for("it"), skill.example_utterances());
+        assert_eq!(skill.example_utterances_for("en"), skill.example_utterances());
+        assert!(!skill.example_utterances_for("en").is_empty());
+    }
 }

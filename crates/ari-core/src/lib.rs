@@ -170,6 +170,7 @@ impl Default for SkillContext {
 /// `"{}"` for parameterless skills, or `r#"{"app_name": "Spotify"}"#` for
 /// parameterised ones. The args literal must be valid JSON; the export
 /// pipeline parses it directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExampleUtterance {
     pub text: &'static str,
     pub args: &'static str,
@@ -299,6 +300,16 @@ pub trait Skill: Send + Sync {
     /// should land on this skill, not just the rigid ones the keyword
     /// patterns catch.
     fn example_utterances(&self) -> &[ExampleUtterance] { &[] }
+
+    /// Locale-aware example utterances for the FunctionGemma router.
+    ///
+    /// Built-in skills override this to return per-locale examples (English,
+    /// Italian, …) via a `match locale`. The default returns the
+    /// locale-agnostic [`example_utterances`](Skill::example_utterances), so a
+    /// skill that has not localised its router examples keeps working (English).
+    fn example_utterances_for(&self, _locale: &str) -> &[ExampleUtterance] {
+        self.example_utterances()
+    }
 
     /// JSON schema describing this skill's parameters in OpenAI tool
     /// format. Used by the FunctionGemma router for both training data
