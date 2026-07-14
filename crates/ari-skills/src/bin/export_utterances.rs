@@ -72,8 +72,10 @@ fn run(locale: &str) -> String {
         Box::new(OpenSkill::new()),
         Box::new(SearchSkill::new()),
     ];
-    let dump: Vec<serde_json::Value> =
-        skills.iter().map(|s| dump_skill(s.as_ref(), locale)).collect();
+    let dump: Vec<serde_json::Value> = skills
+        .iter()
+        .map(|s| dump_skill(s.as_ref(), locale))
+        .collect();
     serde_json::to_string_pretty(&dump).unwrap()
 }
 
