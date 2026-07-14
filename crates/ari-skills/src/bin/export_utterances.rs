@@ -37,9 +37,9 @@ fn specificity_str(s: Specificity) -> &'static str {
     }
 }
 
-fn dump_skill(skill: &dyn Skill) -> serde_json::Value {
+fn dump_skill(skill: &dyn Skill, locale: &str) -> serde_json::Value {
     let examples: Vec<serde_json::Value> = skill
-        .example_utterances()
+        .example_utterances_for(locale)
         .iter()
         .map(|e| {
             let args: serde_json::Value = serde_json::from_str(e.args).unwrap_or(json!({}));
@@ -62,7 +62,8 @@ fn dump_skill(skill: &dyn Skill) -> serde_json::Value {
     })
 }
 
-fn main() {
+/// Build the export JSON for `locale`. Extracted from `main` so it is unit-testable.
+fn run(locale: &str) -> String {
     let skills: Vec<Box<dyn Skill>> = vec![
         Box::new(CurrentTimeSkill::new()),
         Box::new(DateSkill::new()),
@@ -71,8 +72,42 @@ fn main() {
         Box::new(OpenSkill::new()),
         Box::new(SearchSkill::new()),
     ];
+    let dump: Vec<serde_json::Value> =
+        skills.iter().map(|s| dump_skill(s.as_ref(), locale)).collect();
+    serde_json::to_string_pretty(&dump).unwrap()
+}
 
-    let dump: Vec<serde_json::Value> = skills.iter().map(|s| dump_skill(s.as_ref())).collect();
+fn main() {
+    // Optional `--locale <xx>` flag; defaults to English.
+    let mut locale = "en".to_string();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--locale" {
+            locale = args.next().unwrap_or_else(|| {
+                eprintln!("--locale requires a value");
+                std::process::exit(2);
+            });
+        }
+    }
+    println!("{}", run(&locale));
+}
 
-    println!("{}", serde_json::to_string_pretty(&dump).unwrap());
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn en_export_is_valid_json_with_all_builtins() {
+        let out = run("en");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 6, "six built-in skills");
+        assert!(out.contains("what time is it"), "english example present");
+    }
+
+    #[test]
+    fn unlocalised_locale_falls_back_to_english() {
+        // No built-in overrides example_utterances_for yet (Plan 2), so an
+        // unlocalised request returns the English export unchanged.
+        assert_eq!(run("it"), run("en"));
+    }
 }
