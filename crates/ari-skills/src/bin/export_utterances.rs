@@ -57,6 +57,7 @@ fn dump_skill(skill: &dyn Skill, locale: &str) -> serde_json::Value {
         "id": skill.id(),
         "description": skill.description(),
         "specificity": specificity_str(skill.specificity()),
+        "router_eligible": skill.router_eligible(),
         "parameters": parameters,
         "examples": examples,
     })
@@ -173,5 +174,20 @@ mod tests {
         // `search` is router_eligible=false and is deliberately never
         // localised — it stays English in every locale.
         assert_eq!(examples("search"), examples_en("search"));
+    }
+
+    #[test]
+    fn export_declares_router_eligibility() {
+        let out = run("en");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let pick = |id: &str| -> bool {
+            v.as_array().unwrap().iter()
+                .find(|s| s["id"] == id).expect("skill present in export")
+                ["router_eligible"].as_bool().expect("router_eligible is a bool")
+        };
+        // search is keyword-only — router_catalog() filters it out, so the
+        // trainer must be able to see that and exclude it from the corpus.
+        assert!(!pick("search"), "search must declare router_eligible=false");
+        assert!(pick("current_time"), "current_time must be router-eligible");
     }
 }
