@@ -126,7 +126,7 @@ mod tests {
                 .unwrap()
         };
 
-        // The three skills localised so far lead with their canonical
+        // The four skills localised so far lead with their canonical
         // Italian phrasing and keep count parity with English.
         assert_eq!(examples("current_time").len(), 29);
         assert_eq!(examples("current_time")[0]["text"], "che ora è");
@@ -135,6 +135,14 @@ mod tests {
         assert_eq!(examples("current_date")[0]["text"], "che giorno è oggi");
         assert_eq!(examples("greeting").len(), 30);
         assert_eq!(examples("greeting")[0]["text"], "ciao");
+        // `open` is the first localised skill carrying args: the Italian
+        // text is translated but the app_name value stays canonical
+        // English, because it feeds app resolution rather than display.
+        assert_eq!(examples("open").len(), 40);
+        assert_eq!(examples("open")[0]["text"], "apri spotify");
+        assert_eq!(examples("open")[0]["args"], json!({"app_name": "Spotify"}));
+        assert_eq!(examples("open")[1]["text"], "apri la fotocamera");
+        assert_eq!(examples("open")[1]["args"], json!({"app_name": "Camera"}));
 
         // Not yet localised — still English until their own tasks land.
         assert_eq!(examples("calculator")[0]["text"], "calculate 5 + 3");

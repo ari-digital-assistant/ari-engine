@@ -11,6 +11,108 @@ const TRIGGER_WORDS: &[&str] = &[
     "apri", "avvia", "lancia", "esegui",
 ];
 
+// Router training examples. Natural raw text as a user would actually
+// say it, paired with the canonical app name the router should emit.
+//
+// The canonical value stays English in every locale: `execute_with_args`
+// hands `app_name` straight to the frontend's `launch_app` slot, which
+// resolves it against installed apps' labels and package names. It feeds
+// resolution, not display — so it isn't translated.
+const OPEN_EXAMPLES_EN: &[ExampleUtterance] = &[
+    ExampleUtterance { text: "open spotify", args: r#"{"app_name": "Spotify"}"# },
+    ExampleUtterance { text: "launch the camera", args: r#"{"app_name": "Camera"}"# },
+    ExampleUtterance { text: "start the browser", args: r#"{"app_name": "Browser"}"# },
+    ExampleUtterance { text: "open youtube", args: r#"{"app_name": "YouTube"}"# },
+    ExampleUtterance { text: "can you open settings", args: r#"{"app_name": "Settings"}"# },
+    ExampleUtterance { text: "launch maps", args: r#"{"app_name": "Maps"}"# },
+    ExampleUtterance { text: "fire up the music player", args: r#"{"app_name": "Music Player"}"# },
+    ExampleUtterance { text: "run chrome", args: r#"{"app_name": "Chrome"}"# },
+    ExampleUtterance { text: "open my email", args: r#"{"app_name": "Email"}"# },
+    ExampleUtterance { text: "start whatsapp", args: r#"{"app_name": "WhatsApp"}"# },
+    ExampleUtterance { text: "open the calculator app", args: r#"{"app_name": "Calculator"}"# },
+    ExampleUtterance { text: "launch instagram", args: r#"{"app_name": "Instagram"}"# },
+    ExampleUtterance { text: "can you start the camera app", args: r#"{"app_name": "Camera"}"# },
+    ExampleUtterance { text: "open netflix", args: r#"{"app_name": "Netflix"}"# },
+    ExampleUtterance { text: "fire up spotify", args: r#"{"app_name": "Spotify"}"# },
+    ExampleUtterance { text: "launch my music player", args: r#"{"app_name": "Music Player"}"# },
+    ExampleUtterance { text: "run the gallery", args: r#"{"app_name": "Gallery"}"# },
+    ExampleUtterance { text: "open telegram", args: r#"{"app_name": "Telegram"}"# },
+    ExampleUtterance { text: "start firefox", args: r#"{"app_name": "Firefox"}"# },
+    ExampleUtterance { text: "open the clock app", args: r#"{"app_name": "Clock"}"# },
+    ExampleUtterance { text: "launch the phone app", args: r#"{"app_name": "Phone"}"# },
+    ExampleUtterance { text: "open messages", args: r#"{"app_name": "Messages"}"# },
+    ExampleUtterance { text: "can you open twitter", args: r#"{"app_name": "Twitter"}"# },
+    ExampleUtterance { text: "start the notes app", args: r#"{"app_name": "Notes"}"# },
+    ExampleUtterance { text: "open slack", args: r#"{"app_name": "Slack"}"# },
+    ExampleUtterance { text: "launch the calendar", args: r#"{"app_name": "Calendar"}"# },
+    ExampleUtterance { text: "fire up the weather app", args: r#"{"app_name": "Weather"}"# },
+    ExampleUtterance { text: "open reddit", args: r#"{"app_name": "Reddit"}"# },
+    ExampleUtterance { text: "run discord", args: r#"{"app_name": "Discord"}"# },
+    ExampleUtterance { text: "open the files app", args: r#"{"app_name": "Files"}"# },
+    // Paraphrases without explicit open/launch/start/run/fire-up triggers —
+    // teach the router that any "I want to use / get to / show me X" maps
+    // to opening that app.
+    ExampleUtterance { text: "I want to use spotify", args: r#"{"app_name": "Spotify"}"# },
+    ExampleUtterance { text: "show me the camera", args: r#"{"app_name": "Camera"}"# },
+    ExampleUtterance { text: "bring up the calculator", args: r#"{"app_name": "Calculator"}"# },
+    ExampleUtterance { text: "I need maps", args: r#"{"app_name": "Maps"}"# },
+    ExampleUtterance { text: "jump into telegram", args: r#"{"app_name": "Telegram"}"# },
+    ExampleUtterance { text: "get me to the weather app", args: r#"{"app_name": "Weather"}"# },
+    ExampleUtterance { text: "switch to chrome", args: r#"{"app_name": "Chrome"}"# },
+    ExampleUtterance { text: "I want to check whatsapp", args: r#"{"app_name": "WhatsApp"}"# },
+    ExampleUtterance { text: "boot up the music player", args: r#"{"app_name": "Music Player"}"# },
+    ExampleUtterance { text: "take me to settings", args: r#"{"app_name": "Settings"}"# },
+];
+
+// The same 40 intents in natural Italian — same app spread and the same
+// phrasing variety (apri / avvia / lancia / fai partire / esegui, article
+// and "l'app X" variants, plus the no-launch-verb paraphrases), rather
+// than a line-by-line translation of the English.
+const OPEN_EXAMPLES_IT: &[ExampleUtterance] = &[
+    ExampleUtterance { text: "apri spotify", args: r#"{"app_name": "Spotify"}"# },
+    ExampleUtterance { text: "apri la fotocamera", args: r#"{"app_name": "Camera"}"# },
+    ExampleUtterance { text: "avvia il browser", args: r#"{"app_name": "Browser"}"# },
+    ExampleUtterance { text: "apri youtube", args: r#"{"app_name": "YouTube"}"# },
+    ExampleUtterance { text: "puoi aprire le impostazioni", args: r#"{"app_name": "Settings"}"# },
+    ExampleUtterance { text: "avvia mappe", args: r#"{"app_name": "Maps"}"# },
+    ExampleUtterance { text: "fai partire il lettore musicale", args: r#"{"app_name": "Music Player"}"# },
+    ExampleUtterance { text: "esegui chrome", args: r#"{"app_name": "Chrome"}"# },
+    ExampleUtterance { text: "apri la mia email", args: r#"{"app_name": "Email"}"# },
+    ExampleUtterance { text: "avvia whatsapp", args: r#"{"app_name": "WhatsApp"}"# },
+    ExampleUtterance { text: "apri l'app calcolatrice", args: r#"{"app_name": "Calculator"}"# },
+    ExampleUtterance { text: "lancia instagram", args: r#"{"app_name": "Instagram"}"# },
+    ExampleUtterance { text: "puoi avviare l'app fotocamera", args: r#"{"app_name": "Camera"}"# },
+    ExampleUtterance { text: "apri netflix", args: r#"{"app_name": "Netflix"}"# },
+    ExampleUtterance { text: "fai partire spotify", args: r#"{"app_name": "Spotify"}"# },
+    ExampleUtterance { text: "lancia il mio lettore musicale", args: r#"{"app_name": "Music Player"}"# },
+    ExampleUtterance { text: "apri la galleria", args: r#"{"app_name": "Gallery"}"# },
+    ExampleUtterance { text: "apri telegram", args: r#"{"app_name": "Telegram"}"# },
+    ExampleUtterance { text: "avvia firefox", args: r#"{"app_name": "Firefox"}"# },
+    ExampleUtterance { text: "apri l'app orologio", args: r#"{"app_name": "Clock"}"# },
+    ExampleUtterance { text: "avvia l'app telefono", args: r#"{"app_name": "Phone"}"# },
+    ExampleUtterance { text: "apri messaggi", args: r#"{"app_name": "Messages"}"# },
+    ExampleUtterance { text: "puoi aprire twitter", args: r#"{"app_name": "Twitter"}"# },
+    ExampleUtterance { text: "avvia l'app note", args: r#"{"app_name": "Notes"}"# },
+    ExampleUtterance { text: "apri slack", args: r#"{"app_name": "Slack"}"# },
+    ExampleUtterance { text: "avvia il calendario", args: r#"{"app_name": "Calendar"}"# },
+    ExampleUtterance { text: "fai partire l'app meteo", args: r#"{"app_name": "Weather"}"# },
+    ExampleUtterance { text: "apri reddit", args: r#"{"app_name": "Reddit"}"# },
+    ExampleUtterance { text: "esegui discord", args: r#"{"app_name": "Discord"}"# },
+    ExampleUtterance { text: "apri l'app file", args: r#"{"app_name": "Files"}"# },
+    // Parafrasi senza verbo di avvio esplicito — insegnano al router che
+    // "voglio usare / portami a / mostrami X" significa aprire X.
+    ExampleUtterance { text: "voglio usare spotify", args: r#"{"app_name": "Spotify"}"# },
+    ExampleUtterance { text: "mostrami la fotocamera", args: r#"{"app_name": "Camera"}"# },
+    ExampleUtterance { text: "fammi vedere la calcolatrice", args: r#"{"app_name": "Calculator"}"# },
+    ExampleUtterance { text: "mi servono le mappe", args: r#"{"app_name": "Maps"}"# },
+    ExampleUtterance { text: "vai su telegram", args: r#"{"app_name": "Telegram"}"# },
+    ExampleUtterance { text: "portami all'app meteo", args: r#"{"app_name": "Weather"}"# },
+    ExampleUtterance { text: "passa a chrome", args: r#"{"app_name": "Chrome"}"# },
+    ExampleUtterance { text: "voglio controllare whatsapp", args: r#"{"app_name": "WhatsApp"}"# },
+    ExampleUtterance { text: "apri il lettore musicale", args: r#"{"app_name": "Music Player"}"# },
+    ExampleUtterance { text: "portami alle impostazioni", args: r#"{"app_name": "Settings"}"# },
+];
+
 pub struct OpenSkill;
 
 impl OpenSkill {
@@ -58,51 +160,14 @@ impl Skill for OpenSkill {
     }
 
     fn example_utterances(&self) -> &[ExampleUtterance] {
-        &[
-            ExampleUtterance { text: "open spotify", args: r#"{"app_name": "Spotify"}"# },
-            ExampleUtterance { text: "launch the camera", args: r#"{"app_name": "Camera"}"# },
-            ExampleUtterance { text: "start the browser", args: r#"{"app_name": "Browser"}"# },
-            ExampleUtterance { text: "open youtube", args: r#"{"app_name": "YouTube"}"# },
-            ExampleUtterance { text: "can you open settings", args: r#"{"app_name": "Settings"}"# },
-            ExampleUtterance { text: "launch maps", args: r#"{"app_name": "Maps"}"# },
-            ExampleUtterance { text: "fire up the music player", args: r#"{"app_name": "Music Player"}"# },
-            ExampleUtterance { text: "run chrome", args: r#"{"app_name": "Chrome"}"# },
-            ExampleUtterance { text: "open my email", args: r#"{"app_name": "Email"}"# },
-            ExampleUtterance { text: "start whatsapp", args: r#"{"app_name": "WhatsApp"}"# },
-            ExampleUtterance { text: "open the calculator app", args: r#"{"app_name": "Calculator"}"# },
-            ExampleUtterance { text: "launch instagram", args: r#"{"app_name": "Instagram"}"# },
-            ExampleUtterance { text: "can you start the camera app", args: r#"{"app_name": "Camera"}"# },
-            ExampleUtterance { text: "open netflix", args: r#"{"app_name": "Netflix"}"# },
-            ExampleUtterance { text: "fire up spotify", args: r#"{"app_name": "Spotify"}"# },
-            ExampleUtterance { text: "launch my music player", args: r#"{"app_name": "Music Player"}"# },
-            ExampleUtterance { text: "run the gallery", args: r#"{"app_name": "Gallery"}"# },
-            ExampleUtterance { text: "open telegram", args: r#"{"app_name": "Telegram"}"# },
-            ExampleUtterance { text: "start firefox", args: r#"{"app_name": "Firefox"}"# },
-            ExampleUtterance { text: "open the clock app", args: r#"{"app_name": "Clock"}"# },
-            ExampleUtterance { text: "launch the phone app", args: r#"{"app_name": "Phone"}"# },
-            ExampleUtterance { text: "open messages", args: r#"{"app_name": "Messages"}"# },
-            ExampleUtterance { text: "can you open twitter", args: r#"{"app_name": "Twitter"}"# },
-            ExampleUtterance { text: "start the notes app", args: r#"{"app_name": "Notes"}"# },
-            ExampleUtterance { text: "open slack", args: r#"{"app_name": "Slack"}"# },
-            ExampleUtterance { text: "launch the calendar", args: r#"{"app_name": "Calendar"}"# },
-            ExampleUtterance { text: "fire up the weather app", args: r#"{"app_name": "Weather"}"# },
-            ExampleUtterance { text: "open reddit", args: r#"{"app_name": "Reddit"}"# },
-            ExampleUtterance { text: "run discord", args: r#"{"app_name": "Discord"}"# },
-            ExampleUtterance { text: "open the files app", args: r#"{"app_name": "Files"}"# },
-            // Paraphrases without explicit open/launch/start/run/fire-up triggers —
-            // teach the router that any "I want to use / get to / show me X" maps
-            // to opening that app.
-            ExampleUtterance { text: "I want to use spotify", args: r#"{"app_name": "Spotify"}"# },
-            ExampleUtterance { text: "show me the camera", args: r#"{"app_name": "Camera"}"# },
-            ExampleUtterance { text: "bring up the calculator", args: r#"{"app_name": "Calculator"}"# },
-            ExampleUtterance { text: "I need maps", args: r#"{"app_name": "Maps"}"# },
-            ExampleUtterance { text: "jump into telegram", args: r#"{"app_name": "Telegram"}"# },
-            ExampleUtterance { text: "get me to the weather app", args: r#"{"app_name": "Weather"}"# },
-            ExampleUtterance { text: "switch to chrome", args: r#"{"app_name": "Chrome"}"# },
-            ExampleUtterance { text: "I want to check whatsapp", args: r#"{"app_name": "WhatsApp"}"# },
-            ExampleUtterance { text: "boot up the music player", args: r#"{"app_name": "Music Player"}"# },
-            ExampleUtterance { text: "take me to settings", args: r#"{"app_name": "Settings"}"# },
-        ]
+        OPEN_EXAMPLES_EN
+    }
+
+    fn example_utterances_for(&self, locale: &str) -> &[ExampleUtterance] {
+        match locale {
+            "it" => OPEN_EXAMPLES_IT,
+            _ => OPEN_EXAMPLES_EN,
+        }
     }
 
     fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {
@@ -305,6 +370,20 @@ mod tests {
             Response::Action(v) => assert_eq!(v["launch_app"], "firefox"),
             other => panic!("expected Action via fallback, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn italian_router_examples() {
+        let skill = OpenSkill::new();
+        let it = skill.example_utterances_for("it");
+        let en = skill.example_utterances_for("en");
+        assert_eq!(it.len(), en.len(), "Italian example count matches English");
+        assert_ne!(it, en, "Italian examples are distinct from English");
+        assert!(it.iter().any(|e| e.text == "apri spotify" && e.args == r#"{"app_name": "Spotify"}"#),
+            "Italian utterance carries the canonical English app_name");
+        assert!(it.iter().all(|e| e.args.contains("app_name")), "every open example supplies app_name");
+        assert!(en.iter().any(|e| e.text == "open spotify"), "English arm unchanged");
+        assert_eq!(skill.example_utterances_for("fr"), en, "unknown locale falls back to English");
     }
 
     #[test]
