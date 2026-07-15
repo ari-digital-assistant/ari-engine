@@ -99,8 +99,9 @@ const OPEN_EXAMPLES_IT: &[ExampleUtterance] = &[
     ExampleUtterance { text: "apri reddit", args: r#"{"app_name": "Reddit"}"# },
     ExampleUtterance { text: "esegui discord", args: r#"{"app_name": "Discord"}"# },
     ExampleUtterance { text: "apri l'app file", args: r#"{"app_name": "Files"}"# },
-    // Parafrasi senza verbo di avvio esplicito — insegnano al router che
-    // "voglio usare / portami a / mostrami X" significa aprire X.
+    // Paraphrases without an explicit launch verb — teach the router that
+    // "voglio usare / portami a / mostrami X" ("I want to use / take me
+    // to / show me X") means opening X.
     ExampleUtterance { text: "voglio usare spotify", args: r#"{"app_name": "Spotify"}"# },
     ExampleUtterance { text: "mostrami la fotocamera", args: r#"{"app_name": "Camera"}"# },
     ExampleUtterance { text: "fammi vedere la calcolatrice", args: r#"{"app_name": "Calculator"}"# },
@@ -382,6 +383,12 @@ mod tests {
         assert!(it.iter().any(|e| e.text == "apri spotify" && e.args == r#"{"app_name": "Spotify"}"#),
             "Italian utterance carries the canonical English app_name");
         assert!(it.iter().all(|e| e.args.contains("app_name")), "every open example supplies app_name");
+        // Every Italian example must reuse a canonical English app_name —
+        // the value feeds locale-agnostic app resolution, not display.
+        assert!(
+            it.iter().all(|e| en.iter().any(|x| x.args == e.args)),
+            "an Italian example carries an app_name English never uses"
+        );
         assert!(en.iter().any(|e| e.text == "open spotify"), "English arm unchanged");
         assert_eq!(skill.example_utterances_for("fr"), en, "unknown locale falls back to English");
     }

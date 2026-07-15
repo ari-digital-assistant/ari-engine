@@ -84,11 +84,17 @@ fn main() {
     let mut locale = "en".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--locale" {
-            locale = args.next().unwrap_or_else(|| {
-                eprintln!("--locale requires a value");
+        match arg.as_str() {
+            "--locale" => {
+                locale = args.next().unwrap_or_else(|| {
+                    eprintln!("--locale requires a value");
+                    std::process::exit(2);
+                });
+            }
+            other => {
+                eprintln!("unknown argument: {other}");
                 std::process::exit(2);
-            });
+            }
         }
     }
     println!("{}", run(&locale));
