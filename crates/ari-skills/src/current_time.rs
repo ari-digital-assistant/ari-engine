@@ -88,7 +88,7 @@ const CURRENT_TIME_EXAMPLES_IT: &[ExampleUtterance] = &[
     ExampleUtterance { text: "è presto o tardi", args: "{}" },
     ExampleUtterance { text: "dimmi l'ora attuale", args: "{}" },
     ExampleUtterance { text: "che ore segna l'orologio", args: "{}" },
-    ExampleUtterance { text: "ora attuale per favore", args: "{}" },
+    ExampleUtterance { text: "l'ora esatta per favore", args: "{}" },
 ];
 
 pub struct CurrentTimeSkill;

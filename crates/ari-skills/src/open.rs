@@ -77,7 +77,7 @@ const OPEN_EXAMPLES_IT: &[ExampleUtterance] = &[
     ExampleUtterance { text: "avvia mappe", args: r#"{"app_name": "Maps"}"# },
     ExampleUtterance { text: "fai partire il lettore musicale", args: r#"{"app_name": "Music Player"}"# },
     ExampleUtterance { text: "esegui chrome", args: r#"{"app_name": "Chrome"}"# },
-    ExampleUtterance { text: "apri la mia email", args: r#"{"app_name": "Email"}"# },
+    ExampleUtterance { text: "apri la posta", args: r#"{"app_name": "Email"}"# },
     ExampleUtterance { text: "avvia whatsapp", args: r#"{"app_name": "WhatsApp"}"# },
     ExampleUtterance { text: "apri l'app calcolatrice", args: r#"{"app_name": "Calculator"}"# },
     ExampleUtterance { text: "lancia instagram", args: r#"{"app_name": "Instagram"}"# },
@@ -98,7 +98,7 @@ const OPEN_EXAMPLES_IT: &[ExampleUtterance] = &[
     ExampleUtterance { text: "fai partire l'app meteo", args: r#"{"app_name": "Weather"}"# },
     ExampleUtterance { text: "apri reddit", args: r#"{"app_name": "Reddit"}"# },
     ExampleUtterance { text: "esegui discord", args: r#"{"app_name": "Discord"}"# },
-    ExampleUtterance { text: "apri l'app file", args: r#"{"app_name": "Files"}"# },
+    ExampleUtterance { text: "apri il gestore dei file", args: r#"{"app_name": "Files"}"# },
     // Paraphrases without an explicit launch verb — teach the router that
     // "voglio usare / portami a / mostrami X" ("I want to use / take me
     // to / show me X") means opening X.

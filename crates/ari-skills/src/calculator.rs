@@ -137,7 +137,7 @@ const CALCULATOR_EXAMPLES_IT: &[ExampleUtterance] = &[
     ExampleUtterance { text: "quanto fa il quindici percento di duecento", args: r#"{"expression": "15% of 200"}"# },
     ExampleUtterance { text: "calcola 12 per 8", args: r#"{"expression": "12 * 8"}"# },
     ExampleUtterance { text: "quanto fa 100 meno 37", args: r#"{"expression": "100 - 37"}"# },
-    ExampleUtterance { text: "calcola 2 elevato alla 10", args: r#"{"expression": "2^10"}"# },
+    ExampleUtterance { text: "calcola 2 elevato alla decima", args: r#"{"expression": "2^10"}"# },
     ExampleUtterance { text: "quanto fa 144 diviso 12", args: r#"{"expression": "144 / 12"}"# },
     ExampleUtterance { text: "25 più 75", args: r#"{"expression": "25 + 75"}"# },
     ExampleUtterance { text: "moltiplica 9 per 6", args: r#"{"expression": "9 * 6"}"# },
@@ -161,7 +161,7 @@ const CALCULATOR_EXAMPLES_IT: &[ExampleUtterance] = &[
     ExampleUtterance { text: "quanto fa 45 per 3", args: r#"{"expression": "45 * 3"}"# },
     ExampleUtterance { text: "18 diviso 3", args: r#"{"expression": "18 / 3"}"# },
     ExampleUtterance { text: "quanto fa 75 più 25", args: r#"{"expression": "75 + 25"}"# },
-    ExampleUtterance { text: "fammi il conto di 6 per 9", args: r#"{"expression": "6 * 9"}"# },
+    ExampleUtterance { text: "fammi 6 per 9", args: r#"{"expression": "6 * 9"}"# },
     // Parafrasi con intento matematico implicito — nessun verbo
     // calcola/risolvi, solo aritmetica come la direbbe una persona.
     ExampleUtterance { text: "ventitré più diciassette", args: r#"{"expression": "23 + 17"}"# },
@@ -171,7 +171,7 @@ const CALCULATOR_EXAMPLES_IT: &[ExampleUtterance] = &[
     ExampleUtterance { text: "quanto viene 42 diviso 6", args: r#"{"expression": "42 / 6"}"# },
     ExampleUtterance { text: "puoi calcolare 250 diviso 5", args: r#"{"expression": "250 / 5"}"# },
     ExampleUtterance { text: "qual è la radice quadrata di 144", args: r#"{"expression": "sqrt(144)"}"# },
-    ExampleUtterance { text: "quanto fa 3 elevato alla 4", args: r#"{"expression": "3^4"}"# },
+    ExampleUtterance { text: "quanto fa 3 elevato alla quarta", args: r#"{"expression": "3^4"}"# },
     ExampleUtterance { text: "aggiungi 40 a 60", args: r#"{"expression": "40 + 60"}"# },
     ExampleUtterance { text: "quanto fa cinquanta meno dodici", args: r#"{"expression": "50 - 12"}"# },
 ];
