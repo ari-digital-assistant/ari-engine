@@ -108,8 +108,35 @@ mod tests {
 
     #[test]
     fn unlocalised_locale_falls_back_to_english() {
-        // No built-in overrides example_utterances_for yet (Plan 2), so an
-        // unlocalised request returns the English export unchanged.
-        assert_eq!(run("it"), run("en"));
+        // No built-in localises "fr", so the export is the English one
+        // verbatim. ("it" is localised — see the Italian test below.)
+        assert_eq!(run("fr"), run("en"));
+    }
+
+    #[test]
+    fn it_export_uses_italian_examples_for_localised_builtins() {
+        let v: serde_json::Value = serde_json::from_str(&run("it")).unwrap();
+        let skills = v.as_array().unwrap();
+        let examples = |id: &str| -> &Vec<serde_json::Value> {
+            skills
+                .iter()
+                .find(|s| s["id"] == id)
+                .expect("skill present in export")["examples"]
+                .as_array()
+                .unwrap()
+        };
+
+        // The three skills localised so far lead with their canonical
+        // Italian phrasing and keep count parity with English.
+        assert_eq!(examples("current_time").len(), 29);
+        assert_eq!(examples("current_time")[0]["text"], "che ora è");
+        assert_eq!(examples("current_time")[0]["args"], json!({}));
+        assert_eq!(examples("current_date").len(), 30);
+        assert_eq!(examples("current_date")[0]["text"], "che giorno è oggi");
+        assert_eq!(examples("greeting").len(), 30);
+        assert_eq!(examples("greeting")[0]["text"], "ciao");
+
+        // Not yet localised — still English until their own tasks land.
+        assert_eq!(examples("calculator")[0]["text"], "calculate 5 + 3");
     }
 }

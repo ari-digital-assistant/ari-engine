@@ -53,6 +53,75 @@ fn how_are_you_response(locale: &str) -> &'static str {
     }
 }
 
+// Router training examples. Natural raw text as a user would actually say it.
+// (Whether the generator should normalise these to match inference is the
+// parity spike's question — not this file's.)
+const GREETING_EXAMPLES_EN: &[ExampleUtterance] = &[
+    ExampleUtterance { text: "hello", args: "{}" },
+    ExampleUtterance { text: "hi", args: "{}" },
+    ExampleUtterance { text: "hey", args: "{}" },
+    ExampleUtterance { text: "hey there", args: "{}" },
+    ExampleUtterance { text: "howdy", args: "{}" },
+    ExampleUtterance { text: "good morning", args: "{}" },
+    ExampleUtterance { text: "good afternoon", args: "{}" },
+    ExampleUtterance { text: "good evening", args: "{}" },
+    ExampleUtterance { text: "yo", args: "{}" },
+    ExampleUtterance { text: "sup", args: "{}" },
+    ExampleUtterance { text: "what's up", args: "{}" },
+    ExampleUtterance { text: "hiya", args: "{}" },
+    ExampleUtterance { text: "heya", args: "{}" },
+    ExampleUtterance { text: "hello ari", args: "{}" },
+    ExampleUtterance { text: "hi ari", args: "{}" },
+    ExampleUtterance { text: "hey ari", args: "{}" },
+    ExampleUtterance { text: "good morning ari", args: "{}" },
+    ExampleUtterance { text: "greetings", args: "{}" },
+    ExampleUtterance { text: "how are you", args: "{}" },
+    ExampleUtterance { text: "how are you doing", args: "{}" },
+    ExampleUtterance { text: "how's it going", args: "{}" },
+    ExampleUtterance { text: "what's going on", args: "{}" },
+    ExampleUtterance { text: "how do you do", args: "{}" },
+    ExampleUtterance { text: "nice to meet you", args: "{}" },
+    ExampleUtterance { text: "hey there ari", args: "{}" },
+    ExampleUtterance { text: "morning", args: "{}" },
+    ExampleUtterance { text: "evening", args: "{}" },
+    ExampleUtterance { text: "how are things", args: "{}" },
+    ExampleUtterance { text: "how you doing", args: "{}" },
+    ExampleUtterance { text: "what's happening", args: "{}" },
+];
+
+const GREETING_EXAMPLES_IT: &[ExampleUtterance] = &[
+    ExampleUtterance { text: "ciao", args: "{}" },
+    ExampleUtterance { text: "salve", args: "{}" },
+    ExampleUtterance { text: "buongiorno", args: "{}" },
+    ExampleUtterance { text: "buonasera", args: "{}" },
+    ExampleUtterance { text: "buon pomeriggio", args: "{}" },
+    ExampleUtterance { text: "ehi", args: "{}" },
+    ExampleUtterance { text: "ehilà", args: "{}" },
+    ExampleUtterance { text: "buondì", args: "{}" },
+    ExampleUtterance { text: "ciao ari", args: "{}" },
+    ExampleUtterance { text: "salve ari", args: "{}" },
+    ExampleUtterance { text: "buongiorno ari", args: "{}" },
+    ExampleUtterance { text: "buonasera ari", args: "{}" },
+    ExampleUtterance { text: "ehi ari", args: "{}" },
+    ExampleUtterance { text: "come stai", args: "{}" },
+    ExampleUtterance { text: "come va", args: "{}" },
+    ExampleUtterance { text: "come sta", args: "{}" },
+    ExampleUtterance { text: "tutto bene", args: "{}" },
+    ExampleUtterance { text: "tutto a posto", args: "{}" },
+    ExampleUtterance { text: "come butta", args: "{}" },
+    ExampleUtterance { text: "come te la passi", args: "{}" },
+    ExampleUtterance { text: "come vanno le cose", args: "{}" },
+    ExampleUtterance { text: "come procede", args: "{}" },
+    ExampleUtterance { text: "che si dice", args: "{}" },
+    ExampleUtterance { text: "che mi racconti", args: "{}" },
+    ExampleUtterance { text: "novità", args: "{}" },
+    ExampleUtterance { text: "piacere di conoscerti", args: "{}" },
+    ExampleUtterance { text: "come stai oggi", args: "{}" },
+    ExampleUtterance { text: "ciao come stai", args: "{}" },
+    ExampleUtterance { text: "salve come sta", args: "{}" },
+    ExampleUtterance { text: "come va la vita", args: "{}" },
+];
+
 pub struct GreetingSkill;
 
 impl GreetingSkill {
@@ -81,38 +150,14 @@ impl Skill for GreetingSkill {
     }
 
     fn example_utterances(&self) -> &[ExampleUtterance] {
-        &[
-            ExampleUtterance { text: "hello", args: "{}" },
-            ExampleUtterance { text: "hi", args: "{}" },
-            ExampleUtterance { text: "hey", args: "{}" },
-            ExampleUtterance { text: "hey there", args: "{}" },
-            ExampleUtterance { text: "howdy", args: "{}" },
-            ExampleUtterance { text: "good morning", args: "{}" },
-            ExampleUtterance { text: "good afternoon", args: "{}" },
-            ExampleUtterance { text: "good evening", args: "{}" },
-            ExampleUtterance { text: "yo", args: "{}" },
-            ExampleUtterance { text: "sup", args: "{}" },
-            ExampleUtterance { text: "what's up", args: "{}" },
-            ExampleUtterance { text: "hiya", args: "{}" },
-            ExampleUtterance { text: "heya", args: "{}" },
-            ExampleUtterance { text: "hello ari", args: "{}" },
-            ExampleUtterance { text: "hi ari", args: "{}" },
-            ExampleUtterance { text: "hey ari", args: "{}" },
-            ExampleUtterance { text: "good morning ari", args: "{}" },
-            ExampleUtterance { text: "greetings", args: "{}" },
-            ExampleUtterance { text: "how are you", args: "{}" },
-            ExampleUtterance { text: "how are you doing", args: "{}" },
-            ExampleUtterance { text: "how's it going", args: "{}" },
-            ExampleUtterance { text: "what's going on", args: "{}" },
-            ExampleUtterance { text: "how do you do", args: "{}" },
-            ExampleUtterance { text: "nice to meet you", args: "{}" },
-            ExampleUtterance { text: "hey there ari", args: "{}" },
-            ExampleUtterance { text: "morning", args: "{}" },
-            ExampleUtterance { text: "evening", args: "{}" },
-            ExampleUtterance { text: "how are things", args: "{}" },
-            ExampleUtterance { text: "how you doing", args: "{}" },
-            ExampleUtterance { text: "what's happening", args: "{}" },
-        ]
+        GREETING_EXAMPLES_EN
+    }
+
+    fn example_utterances_for(&self, locale: &str) -> &[ExampleUtterance] {
+        match locale {
+            "it" => GREETING_EXAMPLES_IT,
+            _ => GREETING_EXAMPLES_EN,
+        }
     }
 
     fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {
@@ -301,6 +346,19 @@ mod tests {
     #[test]
     fn specificity_is_low() {
         assert_eq!(GreetingSkill::new().specificity(), Specificity::Low);
+    }
+
+    #[test]
+    fn italian_router_examples() {
+        let skill = GreetingSkill::new();
+        let it = skill.example_utterances_for("it");
+        let en = skill.example_utterances_for("en");
+        assert_eq!(it.len(), en.len(), "Italian example count matches English");
+        assert_ne!(it, en, "Italian examples are distinct from English");
+        assert!(it.iter().any(|e| e.text == "ciao"), "canonical Italian greeting present");
+        assert!(it.iter().all(|e| e.args == "{}"), "greeting is parameterless");
+        assert!(en.iter().any(|e| e.text == "hello"), "English arm unchanged");
+        assert_eq!(skill.example_utterances_for("fr"), en, "unknown locale falls back to English");
     }
 
     #[test]

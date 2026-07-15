@@ -24,6 +24,73 @@ const TRIGGER_PHRASES: &[&[&str]] = &[
     &["ora", "attuale"],
 ];
 
+// Router training examples. Natural raw text as a user would actually say it.
+// (Whether the generator should normalise these to match inference is the
+// parity spike's question — not this file's.)
+const CURRENT_TIME_EXAMPLES_EN: &[ExampleUtterance] = &[
+    ExampleUtterance { text: "what time is it", args: "{}" },
+    ExampleUtterance { text: "what's the time", args: "{}" },
+    ExampleUtterance { text: "tell me the time", args: "{}" },
+    ExampleUtterance { text: "what time do you have", args: "{}" },
+    ExampleUtterance { text: "do you know what time it is", args: "{}" },
+    ExampleUtterance { text: "what hour is it", args: "{}" },
+    ExampleUtterance { text: "can you tell me the time", args: "{}" },
+    ExampleUtterance { text: "what's the current time", args: "{}" },
+    ExampleUtterance { text: "is it morning or afternoon", args: "{}" },
+    ExampleUtterance { text: "how late is it", args: "{}" },
+    ExampleUtterance { text: "what time is it right now", args: "{}" },
+    ExampleUtterance { text: "got the time", args: "{}" },
+    ExampleUtterance { text: "what's the time now", args: "{}" },
+    ExampleUtterance { text: "could you tell me the time please", args: "{}" },
+    ExampleUtterance { text: "I need to know what time it is", args: "{}" },
+    ExampleUtterance { text: "time please", args: "{}" },
+    ExampleUtterance { text: "what time have you got", args: "{}" },
+    ExampleUtterance { text: "is it late", args: "{}" },
+    ExampleUtterance { text: "am or pm right now", args: "{}" },
+    ExampleUtterance { text: "check the time for me", args: "{}" },
+    ExampleUtterance { text: "I wonder what time it is", args: "{}" },
+    ExampleUtterance { text: "any idea what time it is", args: "{}" },
+    ExampleUtterance { text: "do you have the time", args: "{}" },
+    ExampleUtterance { text: "quick, what time is it", args: "{}" },
+    ExampleUtterance { text: "is it still early", args: "{}" },
+    ExampleUtterance { text: "how early is it", args: "{}" },
+    ExampleUtterance { text: "tell me the current time", args: "{}" },
+    ExampleUtterance { text: "what's the clock say", args: "{}" },
+    ExampleUtterance { text: "current time please", args: "{}" },
+];
+
+const CURRENT_TIME_EXAMPLES_IT: &[ExampleUtterance] = &[
+    ExampleUtterance { text: "che ora è", args: "{}" },
+    ExampleUtterance { text: "che ore sono", args: "{}" },
+    ExampleUtterance { text: "dimmi l'ora", args: "{}" },
+    ExampleUtterance { text: "mi dici che ore sono", args: "{}" },
+    ExampleUtterance { text: "sai che ora è", args: "{}" },
+    ExampleUtterance { text: "che ora è adesso", args: "{}" },
+    ExampleUtterance { text: "mi puoi dire l'ora", args: "{}" },
+    ExampleUtterance { text: "qual è l'ora attuale", args: "{}" },
+    ExampleUtterance { text: "è mattina o pomeriggio", args: "{}" },
+    ExampleUtterance { text: "si è fatto tardi", args: "{}" },
+    ExampleUtterance { text: "che ore sono adesso", args: "{}" },
+    ExampleUtterance { text: "ce l'hai l'ora", args: "{}" },
+    ExampleUtterance { text: "che ore sono in questo momento", args: "{}" },
+    ExampleUtterance { text: "mi potrebbe dire l'ora per favore", args: "{}" },
+    ExampleUtterance { text: "ho bisogno di sapere che ore sono", args: "{}" },
+    ExampleUtterance { text: "l'ora per favore", args: "{}" },
+    ExampleUtterance { text: "hai l'ora", args: "{}" },
+    ExampleUtterance { text: "è tardi", args: "{}" },
+    ExampleUtterance { text: "scusa sai l'ora", args: "{}" },
+    ExampleUtterance { text: "guarda che ore sono", args: "{}" },
+    ExampleUtterance { text: "chissà che ore sono", args: "{}" },
+    ExampleUtterance { text: "per caso sai che ore sono", args: "{}" },
+    ExampleUtterance { text: "hai idea di che ore sono", args: "{}" },
+    ExampleUtterance { text: "presto, che ore sono", args: "{}" },
+    ExampleUtterance { text: "è ancora presto", args: "{}" },
+    ExampleUtterance { text: "è presto o tardi", args: "{}" },
+    ExampleUtterance { text: "dimmi l'ora attuale", args: "{}" },
+    ExampleUtterance { text: "che ore segna l'orologio", args: "{}" },
+    ExampleUtterance { text: "ora attuale per favore", args: "{}" },
+];
+
 pub struct CurrentTimeSkill;
 
 impl CurrentTimeSkill {
@@ -52,37 +119,14 @@ impl Skill for CurrentTimeSkill {
     }
 
     fn example_utterances(&self) -> &[ExampleUtterance] {
-        &[
-            ExampleUtterance { text: "what time is it", args: "{}" },
-            ExampleUtterance { text: "what's the time", args: "{}" },
-            ExampleUtterance { text: "tell me the time", args: "{}" },
-            ExampleUtterance { text: "what time do you have", args: "{}" },
-            ExampleUtterance { text: "do you know what time it is", args: "{}" },
-            ExampleUtterance { text: "what hour is it", args: "{}" },
-            ExampleUtterance { text: "can you tell me the time", args: "{}" },
-            ExampleUtterance { text: "what's the current time", args: "{}" },
-            ExampleUtterance { text: "is it morning or afternoon", args: "{}" },
-            ExampleUtterance { text: "how late is it", args: "{}" },
-            ExampleUtterance { text: "what time is it right now", args: "{}" },
-            ExampleUtterance { text: "got the time", args: "{}" },
-            ExampleUtterance { text: "what's the time now", args: "{}" },
-            ExampleUtterance { text: "could you tell me the time please", args: "{}" },
-            ExampleUtterance { text: "I need to know what time it is", args: "{}" },
-            ExampleUtterance { text: "time please", args: "{}" },
-            ExampleUtterance { text: "what time have you got", args: "{}" },
-            ExampleUtterance { text: "is it late", args: "{}" },
-            ExampleUtterance { text: "am or pm right now", args: "{}" },
-            ExampleUtterance { text: "check the time for me", args: "{}" },
-            ExampleUtterance { text: "I wonder what time it is", args: "{}" },
-            ExampleUtterance { text: "any idea what time it is", args: "{}" },
-            ExampleUtterance { text: "do you have the time", args: "{}" },
-            ExampleUtterance { text: "quick, what time is it", args: "{}" },
-            ExampleUtterance { text: "is it still early", args: "{}" },
-            ExampleUtterance { text: "how early is it", args: "{}" },
-            ExampleUtterance { text: "tell me the current time", args: "{}" },
-            ExampleUtterance { text: "what's the clock say", args: "{}" },
-            ExampleUtterance { text: "current time please", args: "{}" },
-        ]
+        CURRENT_TIME_EXAMPLES_EN
+    }
+
+    fn example_utterances_for(&self, locale: &str) -> &[ExampleUtterance] {
+        match locale {
+            "it" => CURRENT_TIME_EXAMPLES_IT,
+            _ => CURRENT_TIME_EXAMPLES_EN,
+        }
     }
 
     fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {
@@ -309,10 +353,23 @@ mod tests {
     #[test]
     fn example_utterances_for_defaults_to_base_examples() {
         let skill = CurrentTimeSkill::new();
-        // Plan 1 adds no locale override, so every locale returns the base
-        // (English) set via the trait default. Plan 2 changes "it".
-        assert_eq!(skill.example_utterances_for("it"), skill.example_utterances());
+        // Unlocalised locales return the base (English) set. "it" now has
+        // its own arm — see `italian_router_examples`.
         assert_eq!(skill.example_utterances_for("en"), skill.example_utterances());
+        assert_eq!(skill.example_utterances_for("fr"), skill.example_utterances());
         assert!(!skill.example_utterances_for("en").is_empty());
+    }
+
+    #[test]
+    fn italian_router_examples() {
+        let skill = CurrentTimeSkill::new();
+        let it = skill.example_utterances_for("it");
+        let en = skill.example_utterances_for("en");
+        assert_eq!(it.len(), en.len(), "Italian example count matches English");
+        assert_ne!(it, en, "Italian examples are distinct from English");
+        assert!(it.iter().any(|e| e.text == "che ora è"), "canonical Italian phrasing present");
+        assert!(it.iter().all(|e| e.args == "{}"), "current_time is parameterless");
+        assert!(en.iter().any(|e| e.text == "what time is it"), "English arm unchanged");
+        assert_eq!(skill.example_utterances_for("fr"), en, "unknown locale falls back to English");
     }
 }

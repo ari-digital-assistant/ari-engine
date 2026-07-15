@@ -22,6 +22,75 @@ const TRIGGER_PHRASES: &[&[&str]] = &[
     &["data", "attuale"],
 ];
 
+// Router training examples. Natural raw text as a user would actually say it.
+// (Whether the generator should normalise these to match inference is the
+// parity spike's question — not this file's.)
+const DATE_EXAMPLES_EN: &[ExampleUtterance] = &[
+    ExampleUtterance { text: "what's the date today", args: "{}" },
+    ExampleUtterance { text: "what day is it", args: "{}" },
+    ExampleUtterance { text: "what's today's date", args: "{}" },
+    ExampleUtterance { text: "which day of the week is it", args: "{}" },
+    ExampleUtterance { text: "what date is it", args: "{}" },
+    ExampleUtterance { text: "tell me today's date", args: "{}" },
+    ExampleUtterance { text: "what day are we on", args: "{}" },
+    ExampleUtterance { text: "is it Monday today", args: "{}" },
+    ExampleUtterance { text: "what's the date", args: "{}" },
+    ExampleUtterance { text: "do you know today's date", args: "{}" },
+    ExampleUtterance { text: "can you tell me the date", args: "{}" },
+    ExampleUtterance { text: "what day of the week is it today", args: "{}" },
+    ExampleUtterance { text: "I need to know the date", args: "{}" },
+    ExampleUtterance { text: "the date please", args: "{}" },
+    ExampleUtterance { text: "is today a weekday", args: "{}" },
+    ExampleUtterance { text: "what's today", args: "{}" },
+    ExampleUtterance { text: "which day is today", args: "{}" },
+    ExampleUtterance { text: "tell me what day it is", args: "{}" },
+    ExampleUtterance { text: "date please", args: "{}" },
+    ExampleUtterance { text: "current date", args: "{}" },
+    ExampleUtterance { text: "what is today's date", args: "{}" },
+    ExampleUtterance { text: "is it the weekend", args: "{}" },
+    ExampleUtterance { text: "what day is today", args: "{}" },
+    ExampleUtterance { text: "do you know what day it is", args: "{}" },
+    ExampleUtterance { text: "I forgot what day it is", args: "{}" },
+    ExampleUtterance { text: "is it still Tuesday", args: "{}" },
+    ExampleUtterance { text: "what's the day today", args: "{}" },
+    ExampleUtterance { text: "today's date please", args: "{}" },
+    ExampleUtterance { text: "check the date for me", args: "{}" },
+    ExampleUtterance { text: "could you tell me the date", args: "{}" },
+];
+
+const DATE_EXAMPLES_IT: &[ExampleUtterance] = &[
+    ExampleUtterance { text: "che giorno è oggi", args: "{}" },
+    ExampleUtterance { text: "che giorno è", args: "{}" },
+    ExampleUtterance { text: "che data è oggi", args: "{}" },
+    ExampleUtterance { text: "qual è la data di oggi", args: "{}" },
+    ExampleUtterance { text: "che data è", args: "{}" },
+    ExampleUtterance { text: "dimmi la data di oggi", args: "{}" },
+    ExampleUtterance { text: "in che giorno siamo", args: "{}" },
+    ExampleUtterance { text: "oggi è lunedì", args: "{}" },
+    ExampleUtterance { text: "qual è la data", args: "{}" },
+    ExampleUtterance { text: "sai che data è oggi", args: "{}" },
+    ExampleUtterance { text: "mi puoi dire la data", args: "{}" },
+    ExampleUtterance { text: "che giorno della settimana è oggi", args: "{}" },
+    ExampleUtterance { text: "ho bisogno di sapere la data", args: "{}" },
+    ExampleUtterance { text: "la data per favore", args: "{}" },
+    ExampleUtterance { text: "oggi è un giorno feriale", args: "{}" },
+    ExampleUtterance { text: "oggi che giorno è", args: "{}" },
+    ExampleUtterance { text: "che giorno della settimana è", args: "{}" },
+    ExampleUtterance { text: "dimmi che giorno è", args: "{}" },
+    ExampleUtterance { text: "data per favore", args: "{}" },
+    ExampleUtterance { text: "data di oggi", args: "{}" },
+    ExampleUtterance { text: "qual è la data odierna", args: "{}" },
+    ExampleUtterance { text: "è il weekend", args: "{}" },
+    ExampleUtterance { text: "oggi che data è", args: "{}" },
+    ExampleUtterance { text: "sai che giorno è oggi", args: "{}" },
+    ExampleUtterance { text: "non mi ricordo che giorno è", args: "{}" },
+    ExampleUtterance { text: "siamo ancora a martedì", args: "{}" },
+    ExampleUtterance { text: "dimmi la data", args: "{}" },
+    ExampleUtterance { text: "la data di oggi per favore", args: "{}" },
+    ExampleUtterance { text: "controlla la data", args: "{}" },
+    ExampleUtterance { text: "mi potrebbe dire la data", args: "{}" },
+];
+
 pub struct DateSkill;
 
 impl DateSkill {
@@ -50,38 +119,14 @@ impl Skill for DateSkill {
     }
 
     fn example_utterances(&self) -> &[ExampleUtterance] {
-        &[
-            ExampleUtterance { text: "what's the date today", args: "{}" },
-            ExampleUtterance { text: "what day is it", args: "{}" },
-            ExampleUtterance { text: "what's today's date", args: "{}" },
-            ExampleUtterance { text: "which day of the week is it", args: "{}" },
-            ExampleUtterance { text: "what date is it", args: "{}" },
-            ExampleUtterance { text: "tell me today's date", args: "{}" },
-            ExampleUtterance { text: "what day are we on", args: "{}" },
-            ExampleUtterance { text: "is it Monday today", args: "{}" },
-            ExampleUtterance { text: "what's the date", args: "{}" },
-            ExampleUtterance { text: "do you know today's date", args: "{}" },
-            ExampleUtterance { text: "can you tell me the date", args: "{}" },
-            ExampleUtterance { text: "what day of the week is it today", args: "{}" },
-            ExampleUtterance { text: "I need to know the date", args: "{}" },
-            ExampleUtterance { text: "the date please", args: "{}" },
-            ExampleUtterance { text: "is today a weekday", args: "{}" },
-            ExampleUtterance { text: "what's today", args: "{}" },
-            ExampleUtterance { text: "which day is today", args: "{}" },
-            ExampleUtterance { text: "tell me what day it is", args: "{}" },
-            ExampleUtterance { text: "date please", args: "{}" },
-            ExampleUtterance { text: "current date", args: "{}" },
-            ExampleUtterance { text: "what is today's date", args: "{}" },
-            ExampleUtterance { text: "is it the weekend", args: "{}" },
-            ExampleUtterance { text: "what day is today", args: "{}" },
-            ExampleUtterance { text: "do you know what day it is", args: "{}" },
-            ExampleUtterance { text: "I forgot what day it is", args: "{}" },
-            ExampleUtterance { text: "is it still Tuesday", args: "{}" },
-            ExampleUtterance { text: "what's the day today", args: "{}" },
-            ExampleUtterance { text: "today's date please", args: "{}" },
-            ExampleUtterance { text: "check the date for me", args: "{}" },
-            ExampleUtterance { text: "could you tell me the date", args: "{}" },
-        ]
+        DATE_EXAMPLES_EN
+    }
+
+    fn example_utterances_for(&self, locale: &str) -> &[ExampleUtterance] {
+        match locale {
+            "it" => DATE_EXAMPLES_IT,
+            _ => DATE_EXAMPLES_EN,
+        }
     }
 
     fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {
@@ -292,6 +337,19 @@ mod tests {
     #[test]
     fn specificity_is_high() {
         assert_eq!(DateSkill::new().specificity(), Specificity::High);
+    }
+
+    #[test]
+    fn italian_router_examples() {
+        let skill = DateSkill::new();
+        let it = skill.example_utterances_for("it");
+        let en = skill.example_utterances_for("en");
+        assert_eq!(it.len(), en.len(), "Italian example count matches English");
+        assert_ne!(it, en, "Italian examples are distinct from English");
+        assert!(it.iter().any(|e| e.text == "che giorno è oggi"), "canonical Italian phrasing present");
+        assert!(it.iter().all(|e| e.args == "{}"), "date is parameterless");
+        assert!(en.iter().any(|e| e.text == "what day is it"), "English arm unchanged");
+        assert_eq!(skill.example_utterances_for("fr"), en, "unknown locale falls back to English");
     }
 
     #[test]
