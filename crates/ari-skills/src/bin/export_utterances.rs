@@ -116,17 +116,20 @@ mod tests {
     #[test]
     fn it_export_uses_italian_examples_for_localised_builtins() {
         let v: serde_json::Value = serde_json::from_str(&run("it")).unwrap();
-        let skills = v.as_array().unwrap();
-        let examples = |id: &str| -> &Vec<serde_json::Value> {
-            skills
+        let en_v: serde_json::Value = serde_json::from_str(&run("en")).unwrap();
+        fn pick<'a>(doc: &'a serde_json::Value, id: &str) -> &'a Vec<serde_json::Value> {
+            doc.as_array()
+                .unwrap()
                 .iter()
                 .find(|s| s["id"] == id)
                 .expect("skill present in export")["examples"]
                 .as_array()
                 .unwrap()
-        };
+        }
+        let examples = |id: &str| pick(&v, id);
+        let examples_en = |id: &str| pick(&en_v, id);
 
-        // The four skills localised so far lead with their canonical
+        // All five router-eligible built-ins lead with their canonical
         // Italian phrasing and keep count parity with English.
         assert_eq!(examples("current_time").len(), 29);
         assert_eq!(examples("current_time")[0]["text"], "che ora è");
@@ -143,8 +146,26 @@ mod tests {
         assert_eq!(examples("open")[0]["args"], json!({"app_name": "Spotify"}));
         assert_eq!(examples("open")[1]["text"], "apri la fotocamera");
         assert_eq!(examples("open")[1]["args"], json!({"app_name": "Camera"}));
+        // `calculator` carries args whose value is canonical evaluator
+        // syntax: the utterance is Italian, the expression is not, because
+        // the evaluator has no locale.
+        assert_eq!(examples("calculator").len(), 40);
+        assert_eq!(examples("calculator")[0]["text"], "quanto fa 5 più 3");
+        assert_eq!(
+            examples("calculator")[0]["args"],
+            json!({"expression": "5 + 3"})
+        );
+        assert_eq!(
+            examples("calculator")[2]["text"],
+            "quanto fa il quindici percento di duecento"
+        );
+        assert_eq!(
+            examples("calculator")[2]["args"],
+            json!({"expression": "15% of 200"})
+        );
 
-        // Not yet localised — still English until their own tasks land.
-        assert_eq!(examples("calculator")[0]["text"], "calculate 5 + 3");
+        // `search` is router_eligible=false and is deliberately never
+        // localised — it stays English in every locale.
+        assert_eq!(examples("search"), examples_en("search"));
     }
 }

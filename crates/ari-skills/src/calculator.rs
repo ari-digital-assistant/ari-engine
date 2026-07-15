@@ -64,6 +64,118 @@ fn leadin_phrases(locale: &str) -> &'static [&'static str] {
     }
 }
 
+// Router training examples. Natural raw text as a user would actually
+// say it, paired with the canonical expression the router should emit.
+//
+// The canonical value is locale-agnostic in every locale: it is the
+// evaluator's own syntax (ASCII digits and operators), so word-form
+// numbers and operations collapse to it -- "fifteen percent of two
+// hundred" -> "15% of 200", "8 squared" -> "8^2". It feeds evaluation,
+// not display, so it is never translated.
+//
+// NOTE: the last five English entries are Italian utterances that
+// predate the per-locale split. They stay here verbatim so the `en`
+// export is unchanged; CALCULATOR_EXAMPLES_IT is the localised list.
+const CALCULATOR_EXAMPLES_EN: &[ExampleUtterance] = &[
+    ExampleUtterance { text: "calculate 5 + 3", args: r#"{"expression": "5 + 3"}"# },
+    ExampleUtterance { text: "what's 99 divided by 3", args: r#"{"expression": "99 / 3"}"# },
+    ExampleUtterance { text: "how much is fifteen percent of two hundred", args: r#"{"expression": "15% of 200"}"# },
+    ExampleUtterance { text: "compute 12 times 8", args: r#"{"expression": "12 * 8"}"# },
+    ExampleUtterance { text: "what's 100 minus 37", args: r#"{"expression": "100 - 37"}"# },
+    ExampleUtterance { text: "figure out 2 to the power of 10", args: r#"{"expression": "2^10"}"# },
+    ExampleUtterance { text: "what is 144 divided by 12", args: r#"{"expression": "144 / 12"}"# },
+    ExampleUtterance { text: "25 plus 75", args: r#"{"expression": "25 + 75"}"# },
+    ExampleUtterance { text: "multiply 9 by 6", args: r#"{"expression": "9 * 6"}"# },
+    ExampleUtterance { text: "what's the square root of 81", args: r#"{"expression": "sqrt(81)"}"# },
+    ExampleUtterance { text: "how much is 20 percent of 50", args: r#"{"expression": "20% of 50"}"# },
+    ExampleUtterance { text: "subtract 15 from 100", args: r#"{"expression": "100 - 15"}"# },
+    ExampleUtterance { text: "what does 7 times 7 equal", args: r#"{"expression": "7 * 7"}"# },
+    ExampleUtterance { text: "divide 200 by 8", args: r#"{"expression": "200 / 8"}"# },
+    ExampleUtterance { text: "add 33 and 67", args: r#"{"expression": "33 + 67"}"# },
+    ExampleUtterance { text: "what's 10 percent of 500", args: r#"{"expression": "10% of 500"}"# },
+    ExampleUtterance { text: "calculate the sum of 14 and 28", args: r#"{"expression": "14 + 28"}"# },
+    ExampleUtterance { text: "how much is 3.14 times 2", args: r#"{"expression": "3.14 * 2"}"# },
+    ExampleUtterance { text: "what is 1000 divided by 7", args: r#"{"expression": "1000 / 7"}"# },
+    ExampleUtterance { text: "compute 50 plus 50", args: r#"{"expression": "50 + 50"}"# },
+    ExampleUtterance { text: "figure out 8 squared", args: r#"{"expression": "8^2"}"# },
+    ExampleUtterance { text: "what's half of 246", args: r#"{"expression": "246 / 2"}"# },
+    ExampleUtterance { text: "9 plus 10", args: r#"{"expression": "9 + 10"}"# },
+    ExampleUtterance { text: "how much is a quarter of 80", args: r#"{"expression": "80 / 4"}"# },
+    ExampleUtterance { text: "what's 5 factorial", args: r#"{"expression": "5!"}"# },
+    ExampleUtterance { text: "calculate 999 minus 1", args: r#"{"expression": "999 - 1"}"# },
+    ExampleUtterance { text: "what is 45 times 3", args: r#"{"expression": "45 * 3"}"# },
+    ExampleUtterance { text: "18 divided by 3", args: r#"{"expression": "18 / 3"}"# },
+    ExampleUtterance { text: "what's 75 plus 25", args: r#"{"expression": "75 + 25"}"# },
+    ExampleUtterance { text: "do the math on 6 times 9", args: r#"{"expression": "6 * 9"}"# },
+    // Paraphrases with implicit math intent — no calculate/compute/figure
+    // trigger, just bare arithmetic phrasing the keyword scorer might miss.
+    ExampleUtterance { text: "twenty three plus seventeen", args: r#"{"expression": "23 + 17"}"# },
+    ExampleUtterance { text: "what would 12 multiplied by 7 give me", args: r#"{"expression": "12 * 7"}"# },
+    ExampleUtterance { text: "I need the result of 200 minus 47", args: r#"{"expression": "200 - 47"}"# },
+    ExampleUtterance { text: "give me 15 percent off 80", args: r#"{"expression": "80 - (80 * 15%)"}"# },
+    ExampleUtterance { text: "what does 42 over 6 come to", args: r#"{"expression": "42 / 6"}"# },
+    // Italian
+    ExampleUtterance { text: "calcola 5 + 3", args: r#"{"expression": "5 + 3"}"# },
+    ExampleUtterance { text: "quanto fa 99 diviso 3", args: r#"{"expression": "99 / 3"}"# },
+    ExampleUtterance { text: "quanto fa 12 per 8", args: r#"{"expression": "12 * 8"}"# },
+    ExampleUtterance { text: "calcola 100 meno 37", args: r#"{"expression": "100 - 37"}"# },
+    ExampleUtterance { text: "quanto fa 25 più 75", args: r#"{"expression": "25 + 75"}"# },
+];
+
+// The same 40 intents in natural Italian — same operation spread (+ - * /
+// powers, square root, factorial, percent, halves and quarters) and the
+// same phrasing variety (quanto fa / calcola / imperatives / bare
+// arithmetic), rather than a line-by-line translation of the English.
+//
+// The `expression` values are byte-for-byte the same canonical forms the
+// English list uses: the evaluator has no locale. That includes the
+// decimal point — "3,14" is how an Italian says and writes it, "3.14" is
+// what the evaluator parses, so the router is taught that mapping.
+const CALCULATOR_EXAMPLES_IT: &[ExampleUtterance] = &[
+    ExampleUtterance { text: "quanto fa 5 più 3", args: r#"{"expression": "5 + 3"}"# },
+    ExampleUtterance { text: "quanto fa 99 diviso 3", args: r#"{"expression": "99 / 3"}"# },
+    ExampleUtterance { text: "quanto fa il quindici percento di duecento", args: r#"{"expression": "15% of 200"}"# },
+    ExampleUtterance { text: "calcola 12 per 8", args: r#"{"expression": "12 * 8"}"# },
+    ExampleUtterance { text: "quanto fa 100 meno 37", args: r#"{"expression": "100 - 37"}"# },
+    ExampleUtterance { text: "calcola 2 elevato alla 10", args: r#"{"expression": "2^10"}"# },
+    ExampleUtterance { text: "quanto fa 144 diviso 12", args: r#"{"expression": "144 / 12"}"# },
+    ExampleUtterance { text: "25 più 75", args: r#"{"expression": "25 + 75"}"# },
+    ExampleUtterance { text: "moltiplica 9 per 6", args: r#"{"expression": "9 * 6"}"# },
+    ExampleUtterance { text: "quanto fa la radice quadrata di 81", args: r#"{"expression": "sqrt(81)"}"# },
+    ExampleUtterance { text: "quanto fa il 20 per cento di 50", args: r#"{"expression": "20% of 50"}"# },
+    ExampleUtterance { text: "sottrai 15 da 100", args: r#"{"expression": "100 - 15"}"# },
+    ExampleUtterance { text: "quanto fa 7 per 7", args: r#"{"expression": "7 * 7"}"# },
+    ExampleUtterance { text: "dividi 200 per 8", args: r#"{"expression": "200 / 8"}"# },
+    ExampleUtterance { text: "somma 33 e 67", args: r#"{"expression": "33 + 67"}"# },
+    ExampleUtterance { text: "quanto fa il 10 percento di 500", args: r#"{"expression": "10% of 500"}"# },
+    ExampleUtterance { text: "calcola la somma di 14 e 28", args: r#"{"expression": "14 + 28"}"# },
+    ExampleUtterance { text: "quanto fa 3,14 per 2", args: r#"{"expression": "3.14 * 2"}"# },
+    ExampleUtterance { text: "quanto fa 1000 diviso 7", args: r#"{"expression": "1000 / 7"}"# },
+    ExampleUtterance { text: "calcola 50 più 50", args: r#"{"expression": "50 + 50"}"# },
+    ExampleUtterance { text: "quanto fa 8 al quadrato", args: r#"{"expression": "8^2"}"# },
+    ExampleUtterance { text: "quanto fa la metà di 246", args: r#"{"expression": "246 / 2"}"# },
+    ExampleUtterance { text: "9 più 10", args: r#"{"expression": "9 + 10"}"# },
+    ExampleUtterance { text: "quanto fa un quarto di 80", args: r#"{"expression": "80 / 4"}"# },
+    ExampleUtterance { text: "quanto fa il fattoriale di 5", args: r#"{"expression": "5!"}"# },
+    ExampleUtterance { text: "calcola 999 meno 1", args: r#"{"expression": "999 - 1"}"# },
+    ExampleUtterance { text: "quanto fa 45 per 3", args: r#"{"expression": "45 * 3"}"# },
+    ExampleUtterance { text: "18 diviso 3", args: r#"{"expression": "18 / 3"}"# },
+    ExampleUtterance { text: "quanto fa 75 più 25", args: r#"{"expression": "75 + 25"}"# },
+    ExampleUtterance { text: "fammi il conto di 6 per 9", args: r#"{"expression": "6 * 9"}"# },
+    // Parafrasi con intento matematico implicito — nessun verbo
+    // calcola/risolvi, solo aritmetica come la direbbe una persona.
+    ExampleUtterance { text: "ventitré più diciassette", args: r#"{"expression": "23 + 17"}"# },
+    ExampleUtterance { text: "quanto verrebbe 12 moltiplicato per 7", args: r#"{"expression": "12 * 7"}"# },
+    ExampleUtterance { text: "mi serve il risultato di 200 meno 47", args: r#"{"expression": "200 - 47"}"# },
+    ExampleUtterance { text: "togli il 15 percento da 80", args: r#"{"expression": "80 - (80 * 15%)"}"# },
+    ExampleUtterance { text: "quanto viene 42 diviso 6", args: r#"{"expression": "42 / 6"}"# },
+    ExampleUtterance { text: "puoi calcolare 250 diviso 5", args: r#"{"expression": "250 / 5"}"# },
+    ExampleUtterance { text: "qual è la radice quadrata di 144", args: r#"{"expression": "sqrt(144)"}"# },
+    ExampleUtterance { text: "quanto fa 3 elevato alla 4", args: r#"{"expression": "3^4"}"# },
+    ExampleUtterance { text: "aggiungi 40 a 60", args: r#"{"expression": "40 + 60"}"# },
+    ExampleUtterance { text: "quanto fa cinquanta meno dodici", args: r#"{"expression": "50 - 12"}"# },
+];
+
 pub struct CalculatorSkill;
 
 impl CalculatorSkill {
@@ -129,51 +241,14 @@ impl Skill for CalculatorSkill {
     }
 
     fn example_utterances(&self) -> &[ExampleUtterance] {
-        &[
-            ExampleUtterance { text: "calculate 5 + 3", args: r#"{"expression": "5 + 3"}"# },
-            ExampleUtterance { text: "what's 99 divided by 3", args: r#"{"expression": "99 / 3"}"# },
-            ExampleUtterance { text: "how much is fifteen percent of two hundred", args: r#"{"expression": "15% of 200"}"# },
-            ExampleUtterance { text: "compute 12 times 8", args: r#"{"expression": "12 * 8"}"# },
-            ExampleUtterance { text: "what's 100 minus 37", args: r#"{"expression": "100 - 37"}"# },
-            ExampleUtterance { text: "figure out 2 to the power of 10", args: r#"{"expression": "2^10"}"# },
-            ExampleUtterance { text: "what is 144 divided by 12", args: r#"{"expression": "144 / 12"}"# },
-            ExampleUtterance { text: "25 plus 75", args: r#"{"expression": "25 + 75"}"# },
-            ExampleUtterance { text: "multiply 9 by 6", args: r#"{"expression": "9 * 6"}"# },
-            ExampleUtterance { text: "what's the square root of 81", args: r#"{"expression": "sqrt(81)"}"# },
-            ExampleUtterance { text: "how much is 20 percent of 50", args: r#"{"expression": "20% of 50"}"# },
-            ExampleUtterance { text: "subtract 15 from 100", args: r#"{"expression": "100 - 15"}"# },
-            ExampleUtterance { text: "what does 7 times 7 equal", args: r#"{"expression": "7 * 7"}"# },
-            ExampleUtterance { text: "divide 200 by 8", args: r#"{"expression": "200 / 8"}"# },
-            ExampleUtterance { text: "add 33 and 67", args: r#"{"expression": "33 + 67"}"# },
-            ExampleUtterance { text: "what's 10 percent of 500", args: r#"{"expression": "10% of 500"}"# },
-            ExampleUtterance { text: "calculate the sum of 14 and 28", args: r#"{"expression": "14 + 28"}"# },
-            ExampleUtterance { text: "how much is 3.14 times 2", args: r#"{"expression": "3.14 * 2"}"# },
-            ExampleUtterance { text: "what is 1000 divided by 7", args: r#"{"expression": "1000 / 7"}"# },
-            ExampleUtterance { text: "compute 50 plus 50", args: r#"{"expression": "50 + 50"}"# },
-            ExampleUtterance { text: "figure out 8 squared", args: r#"{"expression": "8^2"}"# },
-            ExampleUtterance { text: "what's half of 246", args: r#"{"expression": "246 / 2"}"# },
-            ExampleUtterance { text: "9 plus 10", args: r#"{"expression": "9 + 10"}"# },
-            ExampleUtterance { text: "how much is a quarter of 80", args: r#"{"expression": "80 / 4"}"# },
-            ExampleUtterance { text: "what's 5 factorial", args: r#"{"expression": "5!"}"# },
-            ExampleUtterance { text: "calculate 999 minus 1", args: r#"{"expression": "999 - 1"}"# },
-            ExampleUtterance { text: "what is 45 times 3", args: r#"{"expression": "45 * 3"}"# },
-            ExampleUtterance { text: "18 divided by 3", args: r#"{"expression": "18 / 3"}"# },
-            ExampleUtterance { text: "what's 75 plus 25", args: r#"{"expression": "75 + 25"}"# },
-            ExampleUtterance { text: "do the math on 6 times 9", args: r#"{"expression": "6 * 9"}"# },
-            // Paraphrases with implicit math intent — no calculate/compute/figure
-            // trigger, just bare arithmetic phrasing the keyword scorer might miss.
-            ExampleUtterance { text: "twenty three plus seventeen", args: r#"{"expression": "23 + 17"}"# },
-            ExampleUtterance { text: "what would 12 multiplied by 7 give me", args: r#"{"expression": "12 * 7"}"# },
-            ExampleUtterance { text: "I need the result of 200 minus 47", args: r#"{"expression": "200 - 47"}"# },
-            ExampleUtterance { text: "give me 15 percent off 80", args: r#"{"expression": "80 - (80 * 15%)"}"# },
-            ExampleUtterance { text: "what does 42 over 6 come to", args: r#"{"expression": "42 / 6"}"# },
-            // Italian
-            ExampleUtterance { text: "calcola 5 + 3", args: r#"{"expression": "5 + 3"}"# },
-            ExampleUtterance { text: "quanto fa 99 diviso 3", args: r#"{"expression": "99 / 3"}"# },
-            ExampleUtterance { text: "quanto fa 12 per 8", args: r#"{"expression": "12 * 8"}"# },
-            ExampleUtterance { text: "calcola 100 meno 37", args: r#"{"expression": "100 - 37"}"# },
-            ExampleUtterance { text: "quanto fa 25 più 75", args: r#"{"expression": "25 + 75"}"# },
-        ]
+        CALCULATOR_EXAMPLES_EN
+    }
+
+    fn example_utterances_for(&self, locale: &str) -> &[ExampleUtterance] {
+        match locale {
+            "it" => CALCULATOR_EXAMPLES_IT,
+            _ => CALCULATOR_EXAMPLES_EN,
+        }
     }
 
     fn score(&self, input: &str, ctx: &SkillContext) -> f32 {
@@ -440,6 +515,20 @@ mod tests {
         let mut it = SkillContext::default();
         it.locale = "it".to_string();
         assert_eq!(skill.score("calcola 2 + 2", &it), 0.95);
+    }
+
+    #[test]
+    fn italian_router_examples() {
+        let skill = CalculatorSkill::new();
+        let it = skill.example_utterances_for("it");
+        let en = skill.example_utterances_for("en");
+        assert_eq!(it.len(), en.len(), "Italian example count matches English");
+        assert_ne!(it, en, "Italian examples are distinct from English");
+        assert!(it.iter().any(|e| e.text == "quanto fa 5 più 3" && e.args == r#"{"expression": "5 + 3"}"#),
+            "Italian utterance maps to the canonical evaluator expression");
+        assert!(it.iter().all(|e| e.args.contains("expression")), "every calculator example supplies expression");
+        assert!(en.iter().any(|e| e.text == "calculate 5 + 3"), "English arm unchanged");
+        assert_eq!(skill.example_utterances_for("fr"), en, "unknown locale falls back to English");
     }
 
     #[test]
