@@ -34,6 +34,16 @@ fn run(locale: &str, texts: &[String]) -> Vec<bool> {
         .collect()
 }
 
+/// Split raw stdin text into one entry per input line.
+///
+/// Uses `str::lines()` so the line-exact contract holds at every edge:
+/// empty input yields zero lines (not a phantom empty one), a lone `"\n"`
+/// yields exactly one empty line, a trailing newline is not a phantom extra
+/// line, and CRLF endings don't leave a stray `\r` on the line.
+fn split_lines(input: &str) -> Vec<String> {
+    input.lines().map(|s| s.to_string()).collect()
+}
+
 fn main() {
     use std::io::Read;
 
@@ -50,19 +60,7 @@ fn main() {
         .read_to_string(&mut input)
         .expect("read stdin");
 
-    // Trailing newline from the caller must not become a phantom empty line,
-    // or the caller's zip() silently mis-pairs the whole corpus.
-    let texts: Vec<String> = input
-        .strip_suffix('\n')
-        .unwrap_or(&input)
-        .split('\n')
-        .map(|s| s.to_string())
-        .collect();
-    let texts = if texts.len() == 1 && texts[0].is_empty() {
-        Vec::new()
-    } else {
-        texts
-    };
+    let texts = split_lines(&input);
 
     for verdict in run(&locale, &texts) {
         println!("{verdict}");
@@ -122,5 +120,41 @@ mod tests {
     #[test]
     fn empty_input_yields_empty_output() {
         assert_eq!(run("en", &[]), Vec::<bool>::new());
+    }
+
+    #[test]
+    fn empty_stdin_splits_to_zero_lines() {
+        assert_eq!(split_lines(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn single_blank_line_splits_to_exactly_one_line() {
+        // Regression: the old strip_suffix + split logic collapsed a lone
+        // "\n" down to zero lines, silently mis-pairing the caller's zip().
+        assert_eq!(split_lines("\n"), vec!["".to_string()]);
+    }
+
+    #[test]
+    fn trailing_newline_does_not_add_a_phantom_line() {
+        assert_eq!(
+            split_lines("what time is it\nlong time no see\n"),
+            vec!["what time is it".to_string(), "long time no see".to_string()]
+        );
+    }
+
+    #[test]
+    fn embedded_blank_line_preserves_total_count() {
+        assert_eq!(
+            split_lines("first\n\nthird"),
+            vec!["first".to_string(), "".to_string(), "third".to_string()]
+        );
+    }
+
+    #[test]
+    fn crlf_input_does_not_leave_a_trailing_carriage_return() {
+        assert_eq!(
+            split_lines("what time is it\r\nlong time no see\r\n"),
+            vec!["what time is it".to_string(), "long time no see".to_string()]
+        );
     }
 }
