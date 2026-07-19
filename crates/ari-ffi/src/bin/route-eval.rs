@@ -53,6 +53,45 @@ fn main() {
     let router = ari_llm::FunctionGemmaRouter::new(std::path::Path::new(&gguf));
     engine.set_router(Some(Box::new(router)));
 
+    // Guardrail: the router is the FALLBACK tier — it only fires when the
+    // keyword scorer finds nothing. Any eval case the keyword scorer already
+    // wins never reaches the router in production, so scoring the router on it
+    // measures nothing and silently corrupts the number. Refuse to report.
+    {
+        let file = std::fs::File::open(&eval_path)
+            .unwrap_or_else(|e| panic!("cannot open eval set {eval_path}: {e}"));
+        let mut offenders: Vec<String> = Vec::new();
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line.expect("read eval line");
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            let case: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("bad eval line {line:?}: {e}"));
+            let utterance = case["utterance"].as_str().expect("utterance field");
+            let expect = case["expect"].as_str().expect("expect field");
+            if let Some(kw) = engine.keyword_decision(utterance) {
+                offenders.push(format!(
+                    "  {utterance:?}  expect={expect}  but the keyword scorer already routes it to {kw:?}"
+                ));
+            }
+        }
+        if !offenders.is_empty() {
+            eprintln!(
+                "EVAL POLLUTED — {} case(s) are handled by the keyword scorer and never reach the router:",
+                offenders.len()
+            );
+            for o in &offenders {
+                eprintln!("{o}");
+            }
+            eprintln!(
+                "A router promotion gate must contain only keyword-MISSES. Remove or replace these cases."
+            );
+            std::process::exit(3);
+        }
+    }
+
     // ROUTE_EVAL_VERBOSE=1 dumps a tab-separated line per case
     // (category, confidence, expect, raw-pick, utterance) for confidence
     // distribution analysis.
