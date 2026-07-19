@@ -17,20 +17,39 @@
 const ABSTAIN_MIN: f64 = 0.90;
 const POSITIVE_MIN: f64 = 0.80;
 
+/// Parse route-eval args: two positionals (gguf, eval-jsonl) plus an optional
+/// `--locale <xx>` that may appear anywhere. Locale defaults to "en".
+fn parse_args(args: impl Iterator<Item = String>) -> Result<(String, String, String), String> {
+    let mut positionals: Vec<String> = Vec::new();
+    let mut locale = "en".to_string();
+    let mut it = args;
+    while let Some(a) = it.next() {
+        if a == "--locale" {
+            locale = it.next().ok_or_else(|| "--locale requires a value".to_string())?;
+        } else {
+            positionals.push(a);
+        }
+    }
+    match positionals.as_slice() {
+        [gguf, eval] => Ok((gguf.clone(), eval.clone(), locale)),
+        _ => Err("usage: route-eval [--locale <xx>] <gguf-path> <eval-jsonl-path>".to_string()),
+    }
+}
+
 #[cfg(feature = "llm")]
 fn main() {
     use std::io::BufRead;
 
-    let mut args = std::env::args().skip(1);
-    let (gguf, eval_path) = match (args.next(), args.next()) {
-        (Some(g), Some(e)) => (g, e),
-        _ => {
-            eprintln!("usage: route-eval <gguf-path> <eval-jsonl-path>");
+    let (gguf, eval_path, locale) = match parse_args(std::env::args().skip(1)) {
+        Ok(t) => t,
+        Err(msg) => {
+            eprintln!("{msg}");
             std::process::exit(2);
         }
     };
 
     let mut engine = ari_ffi::build_engine_with_builtins();
+    engine.set_locale(locale);
     let router = ari_llm::FunctionGemmaRouter::new(std::path::Path::new(&gguf));
     engine.set_router(Some(Box::new(router)));
 
@@ -139,4 +158,36 @@ fn main() {
 fn main() {
     eprintln!("route-eval requires the 'llm' feature (FunctionGemma router)");
     std::process::exit(2);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(v: &[&str]) -> Result<(String, String, String), String> {
+        parse_args(v.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn positional_only_defaults_to_en() {
+        assert_eq!(parse(&["m.gguf", "e.jsonl"]).unwrap(),
+                   ("m.gguf".into(), "e.jsonl".into(), "en".into()));
+    }
+
+    #[test]
+    fn locale_flag_before_positionals() {
+        assert_eq!(parse(&["--locale", "it", "m.gguf", "e.jsonl"]).unwrap(),
+                   ("m.gguf".into(), "e.jsonl".into(), "it".into()));
+    }
+
+    #[test]
+    fn locale_flag_after_positionals() {
+        assert_eq!(parse(&["m.gguf", "e.jsonl", "--locale", "it"]).unwrap(),
+                   ("m.gguf".into(), "e.jsonl".into(), "it".into()));
+    }
+
+    #[test]
+    fn missing_positionals_is_an_error() {
+        assert!(parse(&["--locale", "it"]).is_err());
+    }
 }
