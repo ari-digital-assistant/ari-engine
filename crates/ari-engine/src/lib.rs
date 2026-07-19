@@ -4648,6 +4648,7 @@ mod tests {
     fn keyword_decision_reports_hits_and_misses() {
         let mut engine = crate::Engine::new();
         engine.register_skill(Box::new(ari_skills::OpenSkill::new()));
+        engine.register_skill(Box::new(ari_skills::CurrentTimeSkill::new()));
         engine.set_locale("it".to_string());
         // `apri spotify` is a plain open trigger — the keyword scorer wins it,
         // so production never consults the router.
@@ -4655,9 +4656,13 @@ mod tests {
         // Task 3 added the imperative-clitic triggers, so the keyword tier now
         // owns this and the router is no longer responsible for it.
         assert_eq!(engine.keyword_decision("aprimi duolingo").as_deref(), Some("open"));
-        // A polite conditional paraphrase the keyword scorer misses — this is
-        // exactly the shape the router exists to catch.
+        // CurrentTimeSkill IS registered, so these exercise its real scorer.
+        // Polite conditionals with no `che ora`/`che ore` pair are genuine
+        // keyword-misses — the shape the router exists to catch.
         assert_eq!(engine.keyword_decision("sapresti dirmi l'ora"), None);
+        assert_eq!(engine.keyword_decision("potresti dirmi l'ora"), None);
+        // ...but anything completing a trigger pair IS won by the keyword tier.
+        assert_eq!(engine.keyword_decision("che ore sono").as_deref(), Some("current_time"));
         // General knowledge: no skill should claim it.
         assert_eq!(engine.keyword_decision("chi ha scritto la Divina Commedia"), None);
     }

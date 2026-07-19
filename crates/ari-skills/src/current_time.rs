@@ -94,7 +94,7 @@ const CURRENT_TIME_EXAMPLES_IT: &[ExampleUtterance] = &[
     // the router had no training signal for them until now.
     ExampleUtterance { text: "sapresti dirmi l'ora", args: "{}" },
     ExampleUtterance { text: "mi sapresti dire l'ora", args: "{}" },
-    ExampleUtterance { text: "potresti dirmi che ore sono", args: "{}" },
+    ExampleUtterance { text: "potresti dirmi l'ora", args: "{}" },
     ExampleUtterance { text: "avrei bisogno di sapere l'ora", args: "{}" },
 ];
 
