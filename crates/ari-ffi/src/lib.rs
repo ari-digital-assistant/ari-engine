@@ -1081,55 +1081,6 @@ impl AriEngine {
             .remembered_facts()
     }
 
-    /// Set the GGUF model path for the LLM fallback. The model is NOT
-    /// loaded immediately — it loads on demand when the first unmatched
-    /// query arrives, and unloads after 60 seconds of idle to free RAM.
-    ///
-    /// Returns `true` if the path exists, `false` otherwise.
-    /// Call at app startup if a model file is available on disk.
-    #[cfg(feature = "llm")]
-    pub fn load_llm_model(&self, model_path: String) -> bool {
-        let path = std::path::Path::new(&model_path);
-        if !path.is_file() {
-            return false;
-        }
-        let lazy = ari_llm::LazyLlmFallback::new(path);
-        let mut engine = self.inner.lock().expect("engine mutex poisoned");
-        engine.set_llm(std::sync::Arc::new(lazy));
-        true
-    }
-
-    /// Remove the LLM fallback. If a model is currently loaded in RAM,
-    /// it is dropped and the memory is freed.
-    #[cfg(feature = "llm")]
-    pub fn unload_llm_model(&self) {
-        let mut engine = self.inner.lock().expect("engine mutex poisoned");
-        engine.set_llm_none();
-    }
-
-    /// Set the FunctionGemma router model path. Like the LLM fallback,
-    /// the model loads lazily on first use and unloads after 60s idle.
-    /// Returns `true` if the path exists, `false` otherwise.
-    #[cfg(feature = "llm")]
-    pub fn load_router_model(&self, model_path: String) -> bool {
-        let path = std::path::Path::new(&model_path);
-        if !path.is_file() {
-            return false;
-        }
-        let router = ari_llm::FunctionGemmaRouter::new(path);
-        let mut engine = self.inner.lock().expect("engine mutex poisoned");
-        engine.set_router(Some(Box::new(router)));
-        true
-    }
-
-    /// Remove the FunctionGemma router. Keyword scoring still works;
-    /// unmatched queries go straight to the assistant.
-    #[cfg(feature = "llm")]
-    pub fn unload_router_model(&self) {
-        let mut engine = self.inner.lock().expect("engine mutex poisoned");
-        engine.set_router(None);
-    }
-
     /// Rebuild the engine's skill set from scratch: the 6 built-in Rust
     /// skills plus every community skill on disk under `skill_store_dir`.
     ///
@@ -1197,6 +1148,96 @@ impl AriEngine {
         *self.inner.lock().expect("engine mutex poisoned") = fresh;
         loaded
     }
+}
+
+// ── On-device model loading ────────────────────────────────────────────
+//
+// These four methods live in their own `impl` blocks rather than in the
+// main one above because `#[uniffi::export]` is a proc macro: it sees the
+// method tokens *before* the compiler strips `#[cfg]`, so a per-method
+// `#[cfg(feature = "llm")]` still emits FFI scaffolding that calls a
+// method the cfg just deleted. A `#[cfg]` on the whole `impl` is honoured
+// (item-level cfg is evaluated before the attribute macro runs), so we
+// gate at that level and supply a `not(llm)` twin instead.
+//
+// The twin keeps the exported symbols present in every build, so the
+// Kotlin bindings are identical either way — dropping a UniFFI method
+// would break the frontend. Callers already treat `false` from the
+// `load_*` methods as "no model is active", which is exactly the truth in
+// a build with no LLM support compiled in.
+
+#[cfg(feature = "llm")]
+#[uniffi::export]
+impl AriEngine {
+    /// Set the GGUF model path for the LLM fallback. The model is NOT
+    /// loaded immediately — it loads on demand when the first unmatched
+    /// query arrives, and unloads after 60 seconds of idle to free RAM.
+    ///
+    /// Returns `true` if the path exists, `false` otherwise.
+    /// Call at app startup if a model file is available on disk.
+    pub fn load_llm_model(&self, model_path: String) -> bool {
+        let path = std::path::Path::new(&model_path);
+        if !path.is_file() {
+            return false;
+        }
+        let lazy = ari_llm::LazyLlmFallback::new(path);
+        let mut engine = self.inner.lock().expect("engine mutex poisoned");
+        engine.set_llm(std::sync::Arc::new(lazy));
+        true
+    }
+
+    /// Remove the LLM fallback. If a model is currently loaded in RAM,
+    /// it is dropped and the memory is freed.
+    pub fn unload_llm_model(&self) {
+        let mut engine = self.inner.lock().expect("engine mutex poisoned");
+        engine.set_llm_none();
+    }
+
+    /// Set the FunctionGemma router model path. Like the LLM fallback,
+    /// the model loads lazily on first use and unloads after 60s idle.
+    /// Returns `true` if the path exists, `false` otherwise.
+    pub fn load_router_model(&self, model_path: String) -> bool {
+        let path = std::path::Path::new(&model_path);
+        if !path.is_file() {
+            return false;
+        }
+        let router = ari_llm::FunctionGemmaRouter::new(path);
+        let mut engine = self.inner.lock().expect("engine mutex poisoned");
+        engine.set_router(Some(Box::new(router)));
+        true
+    }
+
+    /// Remove the FunctionGemma router. Keyword scoring still works;
+    /// unmatched queries go straight to the assistant.
+    pub fn unload_router_model(&self) {
+        let mut engine = self.inner.lock().expect("engine mutex poisoned");
+        engine.set_router(None);
+    }
+}
+
+/// Stubs for builds without the `llm` feature (e.g. the `keyword-hit`
+/// oracle, which must compile in containers with no libclang for
+/// `llama-cpp-sys`). Signatures match the real methods exactly; there is
+/// no model to load, so loading always reports failure and unloading is a
+/// no-op.
+#[cfg(not(feature = "llm"))]
+#[uniffi::export]
+impl AriEngine {
+    /// Always `false`: this build has no LLM support compiled in.
+    pub fn load_llm_model(&self, _model_path: String) -> bool {
+        false
+    }
+
+    /// No-op: this build has no LLM support compiled in.
+    pub fn unload_llm_model(&self) {}
+
+    /// Always `false`: this build has no LLM support compiled in.
+    pub fn load_router_model(&self, _model_path: String) -> bool {
+        false
+    }
+
+    /// No-op: this build has no LLM support compiled in.
+    pub fn unload_router_model(&self) {}
 }
 
 #[cfg(test)]

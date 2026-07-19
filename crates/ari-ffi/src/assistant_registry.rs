@@ -231,6 +231,12 @@ impl AssistantRegistry {
 
         let assistant = match active_id {
             None => None,
+            // Without the `llm` feature there is no on-device LLM to be
+            // built-in *to*, and `ActiveAssistant::Builtin` does not exist.
+            // Dropping the arm lets the built-in id fall through to the
+            // community lookup below, which won't find it and yields
+            // `None` — the same outcome as an unparseable tier.
+            #[cfg(feature = "llm")]
             Some(ref id) if id == &self.builtin.0 => {
                 let raw_tier = self.settings_store.inner.get_value(id, "model_tier");
                 match raw_tier.as_deref().and_then(ari_llm::BuiltinTier::parse) {
