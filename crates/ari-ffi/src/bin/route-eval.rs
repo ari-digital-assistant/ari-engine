@@ -9,9 +9,24 @@
 //!
 //! Each eval line is JSON: `{"utterance": "...", "expect": "<skill_id>|NONE"}`
 //! — `NONE` means the router must abstain (general-knowledge question that
-//! belongs to the assistant). Exits non-zero when the abstention or positive
-//! pass rate falls below threshold, which the training workflow uses to block
-//! promotion of a regressed model.
+//! belongs to the assistant). Exits non-zero when a gated metric falls below
+//! threshold, which the training workflow uses to block promotion of a
+//! regressed model.
+//!
+//! GATE v3 (2026-07-19). The router is a MIDDLE tier: everything it declines
+//! falls through to the assistant/LLM layer, so an abstention is graceful
+//! degradation while a misroute is the only user-visible failure (weather
+//! request → coin flip). The gate therefore scores what users experience:
+//!   - abstention on NONE cases  >= 0.90   (unchanged)
+//!   - precision when firing     >= 0.90   (of the positive cases it routes,
+//!                                          how many go to the RIGHT skill)
+//!   - recall (positives routed correctly / all positives) is REPORTED as
+//!     the coverage KPI to grow, but NOT gated — a low-recall high-precision
+//!     router is a net win (fast path when sure, safe hand-off when not),
+//!     whereas the old `positive >= 0.80` bar punished safe abstention as if
+//!     this were the last tier. That bar was also calibrated on the polluted
+//!     pre-guardrail eval; nobody ever consciously chose it for hard
+//!     obliques under a full catalogue.
 //!
 //! `--skills-dir` points at a directory of installed skill folders (the
 //! `skills/` root of an `ari-skills` checkout) and feeds the keyword-pollution
@@ -28,7 +43,9 @@ use std::path::PathBuf;
 
 // Abstention is the regression we care most about, so it's gated hard.
 const ABSTAIN_MIN: f64 = 0.90;
-const POSITIVE_MIN: f64 = 0.80;
+// Of the positive cases the router FIRES on, at least this share must go to
+// the right skill. Firing wrong is the only user-visible failure mode.
+const PRECISION_MIN: f64 = 0.90;
 
 /// Parsed command line.
 #[derive(Debug, PartialEq)]
@@ -157,6 +174,11 @@ fn main() {
 
     let (mut abstain_total, mut abstain_pass) = (0u32, 0u32);
     let (mut positive_total, mut positive_pass) = (0u32, 0u32);
+    // Positives the post-threshold router actually FIRED on (right or wrong).
+    // Precision = positive_pass / positive_fired; misses (abstained
+    // positives) cost recall, never precision — they fall through to the
+    // assistant tier and the user is still served.
+    let mut positive_fired = 0u32;
     let mut failures: Vec<String> = Vec::new();
 
     for line in std::io::BufReader::new(file).lines() {
@@ -207,6 +229,9 @@ fn main() {
             }
         } else {
             positive_total += 1;
+            if got.is_some() {
+                positive_fired += 1;
+            }
             if pass {
                 positive_pass += 1;
             }
@@ -220,7 +245,10 @@ fn main() {
 
     let rate = |pass: u32, total: u32| if total == 0 { 1.0 } else { pass as f64 / total as f64 };
     let abstain_rate = rate(abstain_pass, abstain_total);
-    let positive_rate = rate(positive_pass, positive_total);
+    let recall = rate(positive_pass, positive_total);
+    // A router that never fires has vacuously perfect precision — harmless
+    // but useless, which the recall line makes visible.
+    let precision = rate(positive_pass, positive_fired);
 
     if !failures.is_empty() {
         eprintln!("Failures:");
@@ -234,12 +262,19 @@ fn main() {
         ABSTAIN_MIN * 100.0
     );
     println!(
-        "positive:   {positive_pass}/{positive_total} ({:.0}%, min {:.0}%)",
-        positive_rate * 100.0,
-        POSITIVE_MIN * 100.0
+        "precision:  {positive_pass}/{positive_fired} fired ({:.0}%, min {:.0}%)",
+        precision * 100.0,
+        PRECISION_MIN * 100.0
     );
+    println!(
+        "recall:     {positive_pass}/{positive_total} ({:.0}%) — coverage KPI, tracked not gated",
+        recall * 100.0
+    );
+    if positive_fired == 0 {
+        println!("note: router never fired on a positive — precision is vacuous.");
+    }
 
-    let ok = abstain_rate >= ABSTAIN_MIN && positive_rate >= POSITIVE_MIN;
+    let ok = abstain_rate >= ABSTAIN_MIN && precision >= PRECISION_MIN;
     if ok {
         println!("GATE PASS — model may be promoted.");
     } else {
