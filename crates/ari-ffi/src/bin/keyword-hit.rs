@@ -16,8 +16,7 @@
 //! win them outright in production — and they stay in the corpus as waste.
 //! Omitting the flag preserves the builtin-only behaviour exactly.
 
-use ari_engine::Engine;
-use ari_skill_loader::{load_skill_directory_with, HostCapabilities, LoadOptions};
+use ari_ffi::register_community_skills;
 use std::path::{Path, PathBuf};
 
 /// Parsed command line.
@@ -48,48 +47,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
         }
     }
     Ok(Args { locale, skills_dir })
-}
-
-/// Load every skill under `root` and register it alongside the built-ins.
-///
-/// Grants [`HostCapabilities::all`] deliberately. The oracle only ever reads
-/// `matching.patterns` and `specificity` through `Skill::score` /
-/// `Skill::specificity` — it never executes a skill, so the runtime caveat on
-/// `all()` (unresolvable WASM imports) cannot bite here. Loading with the
-/// default `pure_frontend()` set instead would reject every skill declaring
-/// `http`, `location`, `storage_kv`, `authorize` or `media_services` —
-/// weather, home-assistant, music, counter and github-zen among them — and a
-/// rejected skill takes its patterns with it, which is precisely the silent
-/// under-count this flag exists to fix.
-///
-/// A per-skill load failure is fatal for the same reason: a missing skill
-/// means missing patterns, and missing patterns mean the filter quietly keeps
-/// examples the keyword scorer actually wins. Better to stop than to emit
-/// verdicts that are wrong in the direction nobody would notice.
-fn register_community_skills(engine: &mut Engine, root: &Path) -> Result<usize, String> {
-    let options = LoadOptions {
-        host_capabilities: HostCapabilities::all(),
-        ..LoadOptions::default()
-    };
-    let report = load_skill_directory_with(root, &options)
-        .map_err(|e| format!("--skills-dir {}: {e}", root.display()))?;
-
-    if !report.failures.is_empty() {
-        let details: Vec<String> = report.failures.iter().map(|f| f.to_string()).collect();
-        return Err(format!(
-            "{} skill(s) under {} failed to load, so their patterns are missing and \
-             every verdict below them would be silently wrong:\n  {}",
-            report.failures.len(),
-            root.display(),
-            details.join("\n  ")
-        ));
-    }
-
-    let loaded = report.skills.len();
-    for skill in report.skills {
-        engine.register_skill(skill);
-    }
-    Ok(loaded)
 }
 
 /// Answer the keyword question for each line, preserving order and count.

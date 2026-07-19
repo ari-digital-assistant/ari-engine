@@ -5,34 +5,74 @@
 //! `Engine`, builtin catalogue, prompt builder, parser and confidence gate
 //! production uses) and checks the pick against the expected outcome.
 //!
-//! Usage: `route-eval <gguf-path> <eval-jsonl-path>`
+//! Usage: `route-eval [--locale <xx>] [--skills-dir <path>] <gguf-path> <eval-jsonl-path>`
 //!
 //! Each eval line is JSON: `{"utterance": "...", "expect": "<skill_id>|NONE"}`
 //! — `NONE` means the router must abstain (general-knowledge question that
 //! belongs to the assistant). Exits non-zero when the abstention or positive
 //! pass rate falls below threshold, which the training workflow uses to block
 //! promotion of a regressed model.
+//!
+//! `--skills-dir` points at a directory of installed skill folders (the
+//! `skills/` root of an `ari-skills` checkout) and feeds the keyword-pollution
+//! guardrail below. It mirrors `keyword-hit`'s flag of the same name for a
+//! reason: `keyword-hit` decides what leaves the TRAINING corpus and this
+//! decides what may be MEASURED, and the two must agree on what a keyword-hit
+//! is. Without it the gate knows only the six built-ins, so the first eval
+//! case a community pattern claims — a weather, alarm, timer or navigation
+//! positive, or a `NONE` case some skill's patterns win — sails through the
+//! guardrail and inflates the score that promotes a model to real devices.
+//! Omitting the flag preserves the builtin-only behaviour exactly.
+
+use std::path::PathBuf;
 
 // Abstention is the regression we care most about, so it's gated hard.
 const ABSTAIN_MIN: f64 = 0.90;
 const POSITIVE_MIN: f64 = 0.80;
 
+/// Parsed command line.
+#[derive(Debug, PartialEq)]
+struct Args {
+    gguf: String,
+    eval_path: String,
+    locale: String,
+    skills_dir: Option<PathBuf>,
+}
+
 /// Parse route-eval args: two positionals (gguf, eval-jsonl) plus an optional
-/// `--locale <xx>` that may appear anywhere. Locale defaults to "en".
-fn parse_args(args: impl Iterator<Item = String>) -> Result<(String, String, String), String> {
+/// `--locale <xx>` and an optional `--skills-dir <path>`, either of which may
+/// appear anywhere. Locale defaults to "en"; `skills_dir` defaults to none,
+/// i.e. built-ins only.
+fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut positionals: Vec<String> = Vec::new();
     let mut locale = "en".to_string();
+    let mut skills_dir: Option<PathBuf> = None;
     let mut it = args;
     while let Some(a) = it.next() {
-        if a == "--locale" {
-            locale = it.next().ok_or_else(|| "--locale requires a value".to_string())?;
-        } else {
-            positionals.push(a);
+        match a.as_str() {
+            "--locale" => {
+                locale = it.next().ok_or_else(|| "--locale requires a value".to_string())?;
+            }
+            "--skills-dir" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| "--skills-dir requires a value".to_string())?;
+                skills_dir = Some(PathBuf::from(v));
+            }
+            _ => positionals.push(a),
         }
     }
     match positionals.as_slice() {
-        [gguf, eval] => Ok((gguf.clone(), eval.clone(), locale)),
-        _ => Err("usage: route-eval [--locale <xx>] <gguf-path> <eval-jsonl-path>".to_string()),
+        [gguf, eval] => Ok(Args {
+            gguf: gguf.clone(),
+            eval_path: eval.clone(),
+            locale,
+            skills_dir,
+        }),
+        _ => Err(
+            "usage: route-eval [--locale <xx>] [--skills-dir <path>] <gguf-path> <eval-jsonl-path>"
+                .to_string(),
+        ),
     }
 }
 
@@ -40,7 +80,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<(String, String, Str
 fn main() {
     use std::io::BufRead;
 
-    let (gguf, eval_path, locale) = match parse_args(std::env::args().skip(1)) {
+    let Args { gguf, eval_path, locale, skills_dir } = match parse_args(std::env::args().skip(1)) {
         Ok(t) => t,
         Err(msg) => {
             eprintln!("{msg}");
@@ -50,6 +90,21 @@ fn main() {
 
     let mut engine = ari_ffi::build_engine_with_builtins();
     engine.set_locale(locale);
+    // Registered BEFORE the guardrail runs so community `matching.patterns`
+    // participate in the keyword-hit question. A bad path is fatal: loading
+    // fewer skills than asked for would under-count keyword-hits, which is the
+    // exact silent inflation the guardrail exists to catch.
+    if let Some(root) = skills_dir.as_deref() {
+        match ari_ffi::register_community_skills(&mut engine, root) {
+            Ok(loaded) => {
+                eprintln!("route-eval: registered {loaded} skill(s) from {}", root.display())
+            }
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(2);
+            }
+        }
+    }
     let router = ari_llm::FunctionGemmaRouter::new(std::path::Path::new(&gguf));
     engine.set_router(Some(Box::new(router)));
 
@@ -203,30 +258,97 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn parse(v: &[&str]) -> Result<(String, String, String), String> {
+    fn parse(v: &[&str]) -> Result<Args, String> {
         parse_args(v.iter().map(|s| s.to_string()))
+    }
+
+    fn args(gguf: &str, eval: &str, locale: &str, skills: Option<&str>) -> Args {
+        Args {
+            gguf: gguf.to_string(),
+            eval_path: eval.to_string(),
+            locale: locale.to_string(),
+            skills_dir: skills.map(PathBuf::from),
+        }
     }
 
     #[test]
     fn positional_only_defaults_to_en() {
-        assert_eq!(parse(&["m.gguf", "e.jsonl"]).unwrap(),
-                   ("m.gguf".into(), "e.jsonl".into(), "en".into()));
+        assert_eq!(
+            parse(&["m.gguf", "e.jsonl"]).unwrap(),
+            args("m.gguf", "e.jsonl", "en", None)
+        );
     }
 
     #[test]
     fn locale_flag_before_positionals() {
-        assert_eq!(parse(&["--locale", "it", "m.gguf", "e.jsonl"]).unwrap(),
-                   ("m.gguf".into(), "e.jsonl".into(), "it".into()));
+        assert_eq!(
+            parse(&["--locale", "it", "m.gguf", "e.jsonl"]).unwrap(),
+            args("m.gguf", "e.jsonl", "it", None)
+        );
     }
 
     #[test]
     fn locale_flag_after_positionals() {
-        assert_eq!(parse(&["m.gguf", "e.jsonl", "--locale", "it"]).unwrap(),
-                   ("m.gguf".into(), "e.jsonl".into(), "it".into()));
+        assert_eq!(
+            parse(&["m.gguf", "e.jsonl", "--locale", "it"]).unwrap(),
+            args("m.gguf", "e.jsonl", "it", None)
+        );
     }
 
     #[test]
     fn missing_positionals_is_an_error() {
         assert!(parse(&["--locale", "it"]).is_err());
+    }
+
+    /// Absent `--skills-dir` must stay builtin-only, so every existing manual
+    /// invocation keeps its current meaning.
+    #[test]
+    fn no_skills_dir_flag_means_builtins_only() {
+        assert_eq!(parse(&["m.gguf", "e.jsonl"]).unwrap().skills_dir, None);
+    }
+
+    #[test]
+    fn skills_dir_flag_before_positionals() {
+        assert_eq!(
+            parse(&["--skills-dir", "/opt/ari/skills", "m.gguf", "e.jsonl"]).unwrap(),
+            args("m.gguf", "e.jsonl", "en", Some("/opt/ari/skills"))
+        );
+    }
+
+    #[test]
+    fn skills_dir_flag_after_positionals() {
+        assert_eq!(
+            parse(&["m.gguf", "e.jsonl", "--skills-dir", "/opt/ari/skills"]).unwrap(),
+            args("m.gguf", "e.jsonl", "en", Some("/opt/ari/skills"))
+        );
+    }
+
+    #[test]
+    fn skills_dir_flag_without_value_is_an_error() {
+        assert_eq!(
+            parse(&["m.gguf", "e.jsonl", "--skills-dir"]).unwrap_err(),
+            "--skills-dir requires a value"
+        );
+    }
+
+    /// The shape the training workflow actually invokes.
+    #[test]
+    fn both_flags_parse_together() {
+        assert_eq!(
+            parse(&["--locale", "it", "--skills-dir", "/tmp/skills/skills", "m.gguf", "e.jsonl"])
+                .unwrap(),
+            args("m.gguf", "e.jsonl", "it", Some("/tmp/skills/skills"))
+        );
+    }
+
+    /// `--skills-dir`'s value must never be mistaken for a positional — a
+    /// path swallowed as the gguf would fail confusingly, or worse, shift the
+    /// eval path.
+    #[test]
+    fn skills_dir_value_is_not_treated_as_a_positional() {
+        assert_eq!(
+            parse(&["--skills-dir", "m.gguf", "e.jsonl"]).unwrap_err(),
+            "usage: route-eval [--locale <xx>] [--skills-dir <path>] <gguf-path> <eval-jsonl-path>"
+        );
     }
 }

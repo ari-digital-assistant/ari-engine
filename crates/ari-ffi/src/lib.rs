@@ -14,7 +14,7 @@ use ari_skill_loader::{
 use ari_skills::{
     CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 mod assistant_registry;
@@ -769,6 +769,56 @@ pub fn build_engine_with_builtins() -> Engine {
     engine
 }
 
+/// Load every skill under `root` and register it alongside the built-ins,
+/// returning the number registered.
+///
+/// Shared by the `keyword-hit` oracle (which decides what leaves the training
+/// corpus) and the `route-eval` promotion gate (which decides what may be
+/// measured). Both answer the same question — "does the keyword scorer already
+/// claim this utterance?" — so they must answer it against the same skill
+/// catalogue. Two copies of this logic could drift, and a drifted gate reports
+/// a silently inflated score.
+///
+/// Grants [`HostCapabilities::all`] deliberately. Both callers only ever read
+/// `matching.patterns` and `specificity` through `Skill::score` /
+/// `Skill::specificity` — they never execute a skill, so the runtime caveat on
+/// `all()` (unresolvable WASM imports) cannot bite here. Loading with the
+/// default `pure_frontend()` set instead would reject every skill declaring
+/// `http`, `location`, `storage_kv`, `authorize` or `media_services` —
+/// weather, home-assistant, music, counter and github-zen among them — and a
+/// rejected skill takes its patterns with it, which is precisely the silent
+/// under-count this exists to fix.
+///
+/// A per-skill load failure is fatal for the same reason: a missing skill
+/// means missing patterns, and missing patterns mean the caller quietly treats
+/// keyword-hits as keyword-misses. Better to stop than to emit verdicts that
+/// are wrong in the direction nobody would notice.
+pub fn register_community_skills(engine: &mut Engine, root: &Path) -> Result<usize, String> {
+    let options = LoadOptions {
+        host_capabilities: HostCapabilities::all(),
+        ..LoadOptions::default()
+    };
+    let report = load_skill_directory_with(root, &options)
+        .map_err(|e| format!("--skills-dir {}: {e}", root.display()))?;
+
+    if !report.failures.is_empty() {
+        let details: Vec<String> = report.failures.iter().map(|f| f.to_string()).collect();
+        return Err(format!(
+            "{} skill(s) under {} failed to load, so their patterns are missing and \
+             every verdict below them would be silently wrong:\n  {}",
+            report.failures.len(),
+            root.display(),
+            details.join("\n  ")
+        ));
+    }
+
+    let loaded = report.skills.len();
+    for skill in report.skills {
+        engine.register_skill(skill);
+    }
+    Ok(loaded)
+}
+
 /// Internal assembler shared by [`AriEngineBuilder::build`]. NOT a UniFFI
 /// entry point: exposing all 11 providers as one FFI call passes 11 by-value
 /// `RustBuffer` structs, which JNA mis-marshals on arm64 (args spill to the
@@ -1254,6 +1304,143 @@ impl AriEngine {
     /// Remove the FunctionGemma router. Keyword scoring still works;
     /// unmatched queries go straight to the assistant.
     pub fn unload_router_model(&self) {}
+}
+
+/// Mechanical guard for the `llm` / `not(llm)` twin `impl` blocks above.
+///
+/// UniFFI folds each method's signature, argument names AND docstring into a
+/// per-method checksum that the generated Kotlin asserts at load time. If the
+/// twins drift on any of those, a build with the other feature setting fails
+/// at RUNTIME on device with a checksum mismatch — long after CI, and nowhere
+/// near the edit that caused it. The prose comment above the blocks asked
+/// nicely; this enforces it.
+///
+/// Necessarily a source-text test: the two blocks are never compiled together,
+/// so no amount of type-level cleverness can compare them. It reads this very
+/// file and compares what UniFFI hashes.
+#[cfg(test)]
+mod uniffi_twin_guard {
+    /// This file's own source. The blocks under test are the ones directly
+    /// above, so reading `lib.rs` is reading the thing being guarded.
+    const SRC: &str = include_str!("lib.rs");
+
+    const LLM_MARKER: &str = "#[cfg(feature = \"llm\")]\n#[uniffi::export]\nimpl AriEngine {";
+    const NO_LLM_MARKER: &str =
+        "#[cfg(not(feature = \"llm\"))]\n#[uniffi::export]\nimpl AriEngine {";
+
+    /// The four methods that must exist in both twins. Hardcoded so deleting a
+    /// method from BOTH blocks — which would keep them trivially equal while
+    /// dropping an exported FFI symbol the frontend calls — still fails here.
+    const EXPECTED: [&str; 4] = [
+        "load_llm_model",
+        "unload_llm_model",
+        "load_router_model",
+        "unload_router_model",
+    ];
+
+    /// Body of the `impl AriEngine` block introduced by `marker`, ending at
+    /// the first column-0 `}`.
+    fn block(marker: &str) -> &'static str {
+        let start = SRC
+            .find(marker)
+            .unwrap_or_else(|| panic!("lib.rs no longer contains the block introduced by:\n{marker}"))
+            + marker.len();
+        let len = SRC[start..]
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("unterminated impl block after:\n{marker}"));
+        &SRC[start..start + len]
+    }
+
+    /// Every `pub fn` in `block` as `(name, signature, docstring)`, where the
+    /// docstring is the run of `///` lines immediately preceding it.
+    ///
+    /// Per-line trimming makes this indifferent to indentation, but nothing
+    /// else: reword a docstring, rename an argument, change a type or reorder
+    /// the methods in one twin and the comparison fails.
+    fn methods(block: &str) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        let mut doc: Vec<String> = Vec::new();
+        for line in block.lines() {
+            let t = line.trim();
+            if let Some(d) = t.strip_prefix("///") {
+                doc.push(d.trim().to_string());
+            } else if let Some(sig) = t.strip_prefix("pub fn ") {
+                let sig = sig.split('{').next().unwrap().trim();
+                let name = sig.split('(').next().unwrap().trim().to_string();
+                out.push((name, sig.to_string(), doc.join("\n")));
+                doc.clear();
+            } else if !t.is_empty() {
+                // Any other code line breaks the doc-comment run.
+                doc.clear();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn llm_twins_match_in_everything_uniffi_hashes() {
+        let with = methods(block(LLM_MARKER));
+        let without = methods(block(NO_LLM_MARKER));
+
+        let names: Vec<&str> = with.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(
+            names, EXPECTED,
+            "the #[cfg(feature = \"llm\")] impl block no longer exports exactly the four \
+             expected methods in order — update EXPECTED here only if you also updated \
+             both twins and regenerated the Kotlin bindings"
+        );
+
+        assert_eq!(
+            with.len(),
+            without.len(),
+            "the twin impl blocks export {} and {} methods — every UniFFI method must \
+             exist in both, or the bindings break in whichever build lacks it",
+            with.len(),
+            without.len()
+        );
+
+        for (a, b) in with.iter().zip(without.iter()) {
+            assert_eq!(
+                a.0, b.0,
+                "twin methods are out of order: llm has `{}` where not(llm) has `{}`",
+                a.0, b.0
+            );
+            assert_eq!(
+                a.1, b.1,
+                "signature drift in `{}` — UniFFI folds signatures and argument names into \
+                 its per-method checksum, so this breaks the Kotlin bindings at runtime.\n\
+                 \x20 llm:      {}\n\x20 not(llm): {}",
+                a.0, a.1, b.1
+            );
+            assert_eq!(
+                a.2, b.2,
+                "docstring drift in `{}` — UniFFI folds docstrings into its per-method \
+                 checksum too, so this breaks the Kotlin bindings at runtime.\n\
+                 \x20 llm:\n{}\n\x20 not(llm):\n{}",
+                a.0, a.2, b.2
+            );
+        }
+    }
+
+    /// The guard is only worth anything if the extractor actually sees the
+    /// docstrings and signatures. Pin that against a known method rather than
+    /// letting a parser that silently returns nothing pass the test above.
+    #[test]
+    fn extractor_reads_real_signatures_and_docstrings() {
+        let with = methods(block(LLM_MARKER));
+        let (name, sig, doc) = &with[0];
+        assert_eq!(name, "load_llm_model");
+        assert_eq!(sig, "load_llm_model(&self, model_path: String) -> bool");
+        assert_eq!(
+            doc,
+            "Set the GGUF model path for the LLM fallback. The model is NOT\n\
+             loaded immediately — it loads on demand when the first unmatched\n\
+             query arrives, and unloads after 60 seconds of idle to free RAM.\n\
+             \n\
+             Returns `true` if the path exists, `false` otherwise.\n\
+             Call at app startup if a model file is available on disk."
+        );
+    }
 }
 
 #[cfg(test)]
