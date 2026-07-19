@@ -1137,12 +1137,18 @@ fn extract_call_block(output: &str) -> Option<(String, String)> {
         // FunctionGemma's string delimiter is the literal token
         // "<escape>" — toggle in/out on each occurrence so braces
         // inside strings don't perturb the depth counter.
-        if !in_escape && output[i..].starts_with("<escape>") {
+        //
+        // Compare BYTES, not the &str: `i` walks one byte at a time, so a
+        // string slice `output[i..]` panics whenever `i` lands inside a
+        // multi-byte char (è, à — routine in Italian args). The needle is
+        // pure ASCII, so byte comparison is semantically identical and
+        // cannot panic.
+        if !in_escape && bytes[i..].starts_with(b"<escape>") {
             in_escape = true;
             i += "<escape>".len();
             continue;
         }
-        if in_escape && output[i..].starts_with("<escape>") {
+        if in_escape && bytes[i..].starts_with(b"<escape>") {
             in_escape = false;
             i += "<escape>".len();
             continue;
@@ -1348,6 +1354,27 @@ fn escape_json_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_call_block_survives_multibyte_chars_in_args() {
+        // Regression: the brace-walk stepped BYTES but sliced the STR at
+        // every position, so any multi-byte char in the args (routine in
+        // Italian — è, à, ò) panicked at the char-boundary check the
+        // moment `i` landed inside one. Found live 2026-07-19: the first
+        // Italian reference-scale model crashed route-eval on case 13.
+        let out = "<start_function_call>call:reminder{title:<escape>portare fuori la spazzatura perché è tardi<escape>,when:<escape>già domani<escape>}";
+        let (name, block) = extract_call_block(out).expect("call parsed");
+        assert_eq!(name, "reminder");
+        assert_eq!(
+            block,
+            "title:<escape>portare fuori la spazzatura perché è tardi<escape>,when:<escape>già domani<escape>"
+        );
+        // And the full pipeline downstream of it renders clean JSON.
+        assert_eq!(
+            funcgemma_to_json(&block).unwrap(),
+            r#"{"title":"portare fuori la spazzatura perché è tardi","when":"già domani"}"#
+        );
+    }
 
     fn test_skills() -> Vec<SkillInfo> {
         vec![
