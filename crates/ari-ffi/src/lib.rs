@@ -1160,11 +1160,16 @@ impl AriEngine {
 // (item-level cfg is evaluated before the attribute macro runs), so we
 // gate at that level and supply a `not(llm)` twin instead.
 //
-// The twin keeps the exported symbols present in every build, so the
-// Kotlin bindings are identical either way — dropping a UniFFI method
-// would break the frontend. Callers already treat `false` from the
-// `load_*` methods as "no model is active", which is exactly the truth in
-// a build with no LLM support compiled in.
+// The twin keeps both the exported symbols AND the UniFFI checksums
+// identical across builds (docstrings and argument names are folded into
+// the per-method checksum UniFFI generates, so the stubs must match the
+// real methods word-for-word in those respects, not just in signature) —
+// which is why no Kotlin regeneration is needed when the `llm` feature is
+// toggled. Dropping a UniFFI method, or letting a stub's docstring or
+// argument names drift from its counterpart, would break the frontend.
+// Callers already treat `false` from the `load_*` methods as "no model is
+// active", which is exactly the truth in a build with no LLM support
+// compiled in.
 
 #[cfg(feature = "llm")]
 #[uniffi::export]
@@ -1223,20 +1228,31 @@ impl AriEngine {
 #[cfg(not(feature = "llm"))]
 #[uniffi::export]
 impl AriEngine {
-    /// Always `false`: this build has no LLM support compiled in.
-    pub fn load_llm_model(&self, _model_path: String) -> bool {
+    /// Set the GGUF model path for the LLM fallback. The model is NOT
+    /// loaded immediately — it loads on demand when the first unmatched
+    /// query arrives, and unloads after 60 seconds of idle to free RAM.
+    ///
+    /// Returns `true` if the path exists, `false` otherwise.
+    /// Call at app startup if a model file is available on disk.
+    pub fn load_llm_model(&self, model_path: String) -> bool {
+        let _ = model_path;
         false
     }
 
-    /// No-op: this build has no LLM support compiled in.
+    /// Remove the LLM fallback. If a model is currently loaded in RAM,
+    /// it is dropped and the memory is freed.
     pub fn unload_llm_model(&self) {}
 
-    /// Always `false`: this build has no LLM support compiled in.
-    pub fn load_router_model(&self, _model_path: String) -> bool {
+    /// Set the FunctionGemma router model path. Like the LLM fallback,
+    /// the model loads lazily on first use and unloads after 60s idle.
+    /// Returns `true` if the path exists, `false` otherwise.
+    pub fn load_router_model(&self, model_path: String) -> bool {
+        let _ = model_path;
         false
     }
 
-    /// No-op: this build has no LLM support compiled in.
+    /// Remove the FunctionGemma router. Keyword scoring still works;
+    /// unmatched queries go straight to the assistant.
     pub fn unload_router_model(&self) {}
 }
 
