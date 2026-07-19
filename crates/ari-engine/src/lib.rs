@@ -1090,6 +1090,62 @@ impl Engine {
         }
     }
 
+    /// The keyword scorer's verdict for `input`: the skill the ranking rounds
+    /// would execute, or `None` when no skill clears its threshold (in which
+    /// case production consults the router). Shares the exact ranking logic
+    /// `process_input_traced` uses — deliberately not a replica, because a
+    /// second copy would drift from the path it is supposed to describe.
+    pub fn keyword_decision(&self, input: &str) -> Option<String> {
+        let normalized = normalize_input(input.trim(), &self.ctx.locale);
+        if normalized.is_empty() {
+            return None;
+        }
+        self.keyword_winner(&normalized).map(|(s, _round)| s.skill_id)
+    }
+
+    /// Score every ready skill and run the ranking rounds. Returns the winning
+    /// score and the round index it won in, or `None` if no round produced a
+    /// winner. Single source of truth for keyword ranking.
+    fn keyword_winner(&self, normalized: &str) -> Option<(SkillScore, usize)> {
+        let scores = self.keyword_scores(normalized);
+        Self::rank(&scores).map(|(s, r)| (s.clone(), r))
+    }
+
+    /// Per-skill keyword scores for an already-normalised input.
+    fn keyword_scores(&self, normalized: &str) -> Vec<SkillScore> {
+        self.skills
+            .iter()
+            .filter(|s| self.skill_is_ready(s.as_ref()))
+            .map(|s| SkillScore {
+                skill_id: s.id().to_string(),
+                specificity: s.specificity(),
+                score: s.score(normalized, &self.ctx),
+            })
+            .collect()
+    }
+
+    /// Run the ranking rounds over pre-computed scores. Returns the winner and
+    /// its round index.
+    fn rank(scores: &[SkillScore]) -> Option<(&SkillScore, usize)> {
+        for (round_idx, round) in RANKING_ROUNDS.iter().enumerate() {
+            let threshold_for = |spec: Specificity| -> f32 {
+                match spec {
+                    Specificity::High => round.high_threshold,
+                    Specificity::Medium => round.medium_threshold,
+                    Specificity::Low => round.low_threshold,
+                }
+            };
+            let best = scores
+                .iter()
+                .filter(|s| s.score >= threshold_for(s.specificity))
+                .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some(winner) = best {
+                return Some((winner, round_idx));
+            }
+        }
+        None
+    }
+
     /// Raw router emission for analysis: the function the router picked and its
     /// confidence (mean per-token log-prob), BEFORE the confidence gate.
     /// `None` when the router abstained (emitted no function call). Used by
@@ -1300,16 +1356,7 @@ impl Engine {
             return (response, Some(trace));
         }
 
-        let scores: Vec<SkillScore> = self
-            .skills
-            .iter()
-            .filter(|s| self.skill_is_ready(s.as_ref()))
-            .map(|s| SkillScore {
-                skill_id: s.id().to_string(),
-                specificity: s.specificity(),
-                score: s.score(&normalized, &self.ctx),
-            })
-            .collect();
+        let scores: Vec<SkillScore> = self.keyword_scores(&normalized);
 
         let mut trace = DebugTrace {
             normalized_input: normalized.clone(),
@@ -1318,35 +1365,20 @@ impl Engine {
             round: None,
         };
 
-        for (round_idx, round) in RANKING_ROUNDS.iter().enumerate() {
-            let threshold_for = |spec: Specificity| -> f32 {
-                match spec {
-                    Specificity::High => round.high_threshold,
-                    Specificity::Medium => round.medium_threshold,
-                    Specificity::Low => round.low_threshold,
-                }
-            };
+        if let Some((winner, round_idx)) = Self::rank(&scores) {
+            trace.winner = Some(winner.skill_id.clone());
+            trace.round = Some(round_idx);
 
-            let best = scores
+            let skill = self
+                .skills
                 .iter()
-                .filter(|s| s.score >= threshold_for(s.specificity))
-                .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+                .find(|s| s.id() == winner.skill_id)
+                .unwrap()
+                .clone();
 
-            if let Some(winner) = best {
-                trace.winner = Some(winner.skill_id.clone());
-                trace.round = Some(round_idx);
-
-                let skill = self
-                    .skills
-                    .iter()
-                    .find(|s| s.id() == winner.skill_id)
-                    .unwrap()
-                    .clone();
-
-                let response = skill.execute(&normalized, &self.ctx);
-                let response = self.maybe_intercept_consult(skill, &normalized, response);
-                return (response, Some(trace));
-            }
+            let response = skill.execute(&normalized, &self.ctx);
+            let response = self.maybe_intercept_consult(skill, &normalized, response);
+            return (response, Some(trace));
         }
 
         // No keyword match. Try the skill router. The Phase-5 routing
@@ -4610,5 +4642,29 @@ mod tests {
             other => panic!("expected fallback Text, got {other:?}"),
         }
         assert!(engine.remembered_facts().is_empty());
+    }
+
+    #[test]
+    fn keyword_decision_reports_hits_and_misses() {
+        let mut engine = crate::Engine::new();
+        engine.register_skill(Box::new(ari_skills::OpenSkill::new()));
+        engine.set_locale("it".to_string());
+        // `apri spotify` is a plain open trigger — the keyword scorer wins it,
+        // so production never consults the router.
+        assert_eq!(engine.keyword_decision("apri spotify").as_deref(), Some("open"));
+        // A polite conditional paraphrase the keyword scorer misses — this is
+        // exactly the shape the router exists to catch.
+        assert_eq!(engine.keyword_decision("sapresti dirmi l'ora"), None);
+        // General knowledge: no skill should claim it.
+        assert_eq!(engine.keyword_decision("chi ha scritto la Divina Commedia"), None);
+    }
+
+    #[test]
+    fn keyword_decision_is_locale_aware() {
+        let mut engine = crate::Engine::new();
+        engine.register_skill(Box::new(ari_skills::OpenSkill::new()));
+        engine.set_locale("en".to_string());
+        assert_eq!(engine.keyword_decision("open spotify").as_deref(), Some("open"));
+        assert_eq!(engine.keyword_decision("who wrote Romeo and Juliet"), None);
     }
 }
