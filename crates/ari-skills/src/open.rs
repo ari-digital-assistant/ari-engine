@@ -9,6 +9,10 @@ const TRIGGER_WORDS: &[&str] = &[
     // Italian: apri (open), avvia (start/launch), lancia (launch),
     // esegui (run)
     "apri", "avvia", "lancia", "esegui",
+    // Italian imperative + clitic: "aprimi spotify" (open-me spotify),
+    // "aprila"/"aprilo" (open-it). Natural spoken Italian that the bare
+    // `apri` trigger misses because the clitic fuses onto the verb.
+    "aprimi", "aprila", "aprilo", "avviami", "avviala", "avvialo",
 ];
 
 // Router training examples. Natural raw text as a user would actually
@@ -402,5 +406,16 @@ mod tests {
             Response::Text(s) => assert_eq!(s, "What would you like me to open?"),
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn italian_imperative_clitic_forms_trigger_open() {
+        let skill = OpenSkill::new();
+        let mut ctx = SkillContext::default();
+        ctx.locale = "it".to_string();
+        // `aprimi X` = imperative `apri` + clitic `mi`. Natural Italian that
+        // the plain `apri` trigger misses entirely.
+        assert!(skill.score("aprimi duolingo", &ctx) >= 0.8, "aprimi must trigger open");
+        assert!(skill.score("avviami spotify", &ctx) >= 0.8, "avviami must trigger open");
     }
 }

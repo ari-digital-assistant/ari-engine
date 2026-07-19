@@ -89,6 +89,13 @@ const CURRENT_TIME_EXAMPLES_IT: &[ExampleUtterance] = &[
     ExampleUtterance { text: "dimmi l'ora attuale", args: "{}" },
     ExampleUtterance { text: "che ore segna l'orologio", args: "{}" },
     ExampleUtterance { text: "l'ora esatta per favore", args: "{}" },
+    // Polite conditional paraphrases — the keyword scorer misses these
+    // (no "che ora"/"che ore"/"dimmi ora"/"ora attuale" phrase match) and
+    // the router had no training signal for them until now.
+    ExampleUtterance { text: "sapresti dirmi l'ora", args: "{}" },
+    ExampleUtterance { text: "mi sapresti dire l'ora", args: "{}" },
+    ExampleUtterance { text: "potresti dirmi che ore sono", args: "{}" },
+    ExampleUtterance { text: "avrei bisogno di sapere l'ora", args: "{}" },
 ];
 
 pub struct CurrentTimeSkill;
@@ -365,11 +372,27 @@ mod tests {
         let skill = CurrentTimeSkill::new();
         let it = skill.example_utterances_for("it");
         let en = skill.example_utterances_for("en");
-        assert_eq!(it.len(), en.len(), "Italian example count matches English");
+        // Count parity between IT and EN was a Plan-2 authoring convention,
+        // not an invariant — Task 3 added Italian-only polite-conditional
+        // examples the English arm has no equivalent gap for, so IT now
+        // legitimately outnumbers EN.
+        assert_eq!(it.len(), 33, "Italian example count reflects Task 3 additions");
         assert_ne!(it, en, "Italian examples are distinct from English");
         assert!(it.iter().any(|e| e.text == "che ora è"), "canonical Italian phrasing present");
         assert!(it.iter().all(|e| e.args == "{}"), "current_time is parameterless");
         assert!(en.iter().any(|e| e.text == "what time is it"), "English arm unchanged");
         assert_eq!(skill.example_utterances_for("fr"), en, "unknown locale falls back to English");
+    }
+
+    #[test]
+    fn italian_polite_conditional_paraphrases_are_router_examples() {
+        let skill = CurrentTimeSkill::new();
+        let it = skill.example_utterances_for("it");
+        // These are the polite forms the keyword scorer misses — exactly what
+        // router examples are for. Without them the router has no signal.
+        assert!(it.iter().any(|e| e.text == "sapresti dirmi l'ora"),
+            "polite conditional paraphrase must be a router example");
+        assert!(it.iter().any(|e| e.text.contains("sapresti") || e.text.contains("potresti")),
+            "at least one conditional-politeness form present");
     }
 }

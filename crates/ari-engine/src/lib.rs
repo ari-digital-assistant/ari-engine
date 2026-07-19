@@ -4652,6 +4652,9 @@ mod tests {
         // `apri spotify` is a plain open trigger — the keyword scorer wins it,
         // so production never consults the router.
         assert_eq!(engine.keyword_decision("apri spotify").as_deref(), Some("open"));
+        // Task 3 added the imperative-clitic triggers, so the keyword tier now
+        // owns this and the router is no longer responsible for it.
+        assert_eq!(engine.keyword_decision("aprimi duolingo").as_deref(), Some("open"));
         // A polite conditional paraphrase the keyword scorer misses — this is
         // exactly the shape the router exists to catch.
         assert_eq!(engine.keyword_decision("sapresti dirmi l'ora"), None);

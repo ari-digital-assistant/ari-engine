@@ -137,8 +137,11 @@ mod tests {
         let examples_en = |id: &str| pick(&en_v, id);
 
         // All five router-eligible built-ins lead with their canonical
-        // Italian phrasing and keep count parity with English.
-        assert_eq!(examples("current_time").len(), 29);
+        // Italian phrasing. Count parity with English was a Plan-2
+        // authoring convention, not an invariant: Task 3 added four
+        // Italian-only polite-conditional `current_time` examples, so
+        // that one no longer matches English's count (29).
+        assert_eq!(examples("current_time").len(), 33);
         assert_eq!(examples("current_time")[0]["text"], "che ora è");
         assert_eq!(examples("current_time")[0]["args"], json!({}));
         assert_eq!(examples("current_date").len(), 30);
