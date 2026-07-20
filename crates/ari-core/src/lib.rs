@@ -38,15 +38,17 @@ pub enum RouteResult {
 ///
 /// Retuned 2026-07-19 from the launch value of -3.0 (mean per-token
 /// probability ≈ 0.05 — effectively a do-nothing gate) using the first
-/// empirical sweep on the reference-scale models: correct routes cluster
-/// near 0 (en median -0.075, it -0.039) while wrong routes sit lower
-/// (medians ≈ -0.12..-0.14). At -0.10, en precision-when-firing rose
-/// 73%→84% and Italian NONE-misroutes fell 13→3 (abstention healed to
-/// 90%) at modest recall cost. Every route this gate declines falls
-/// through to the assistant tier — the user is still served, slower —
-/// so the threshold trades silent latency for not sending anyone to the
-/// wrong skill. Full sweep: .superpowers/sdd/progress.md (2026-07-19).
-pub const MIN_ROUTER_CONFIDENCE: f32 = -0.10;
+/// empirical sweep on the reference-scale models, then tightened to
+/// -0.06 (≈ 94% mean per-token certainty) on the post-surgery v3 models
+/// (2026-07-20): right and wrong answers sort themselves around that
+/// line — en's last wrong firing sat at -0.075 while its top correct
+/// routes all sat above -0.059, and at -0.06 BOTH locales cleared
+/// Gate v3 locally (en 100%/28%/100%, it 94%/38%/97%). Every route this
+/// gate declines falls through to the assistant tier — the user is
+/// still served, slower — so the threshold trades silent latency for
+/// not sending anyone to the wrong skill. Full sweep:
+/// .superpowers/sdd/morning-report-2026-07-20.md.
+pub const MIN_ROUTER_CONFIDENCE: f32 = -0.06;
 
 /// Appended to the assistant system prompt when prior conversation turns
 /// are supplied, instructing the model to self-classify the turn. The
