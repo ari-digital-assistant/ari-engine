@@ -256,6 +256,15 @@ fn main() {
             eprintln!("{f}");
         }
     }
+    // Every number below is a function of this threshold, and the harness is
+    // built from whatever ari-engine the caller checked out. A gate result
+    // that doesn't say what it was graded against is unreproducible: a
+    // nightly once failed at -0.10 and passed hours later at -0.06 on the
+    // same corpus, and nothing in the output showed why.
+    println!(
+        "threshold:  MIN_ROUTER_CONFIDENCE = {}",
+        ari_core::MIN_ROUTER_CONFIDENCE
+    );
     println!(
         "abstention: {abstain_pass}/{abstain_total} ({:.0}%, min {:.0}%)",
         abstain_rate * 100.0,
