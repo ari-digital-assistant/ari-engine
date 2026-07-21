@@ -60,6 +60,12 @@ struct Args {
     /// is judged at the threshold it would actually ship with, not at a
     /// constant chosen for some other model's calibration.
     threshold: Option<f32>,
+    /// Gate bars, overriding the compiled `PRECISION_MIN` / `ABSTAIN_MIN`.
+    /// Gate v4 (2026-07-21) judges precision on the ~370-case GENERATED set
+    /// at 0.85 — the 40-case spine's 0.90 moved one whole case per 6-12
+    /// points of precision, so single-boundary flips decided promotions.
+    precision_min: Option<f64>,
+    abstain_min: Option<f64>,
 }
 
 /// Parse route-eval args: two positionals (gguf, eval-jsonl) plus optional
@@ -71,6 +77,19 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut locale = "en".to_string();
     let mut skills_dir: Option<PathBuf> = None;
     let mut threshold: Option<f32> = None;
+    let mut precision_min: Option<f64> = None;
+    let mut abstain_min: Option<f64> = None;
+    // Shared by --precision-min / --abstain-min: a rate in [0, 1].
+    fn parse_rate(flag: &str, v: Option<String>) -> Result<f64, String> {
+        let v = v.ok_or_else(|| format!("{flag} requires a value"))?;
+        let parsed: f64 = v
+            .parse()
+            .map_err(|_| format!("{flag}: not a number: {v:?}"))?;
+        if !(0.0..=1.0).contains(&parsed) {
+            return Err(format!("{flag} must be a rate in [0, 1], got {v}"));
+        }
+        Ok(parsed)
+    }
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -99,6 +118,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
                 }
                 threshold = Some(parsed);
             }
+            "--precision-min" => {
+                precision_min = Some(parse_rate("--precision-min", it.next())?);
+            }
+            "--abstain-min" => {
+                abstain_min = Some(parse_rate("--abstain-min", it.next())?);
+            }
             _ => positionals.push(a),
         }
     }
@@ -109,9 +134,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
             locale,
             skills_dir,
             threshold,
+            precision_min,
+            abstain_min,
         }),
         _ => Err(
-            "usage: route-eval [--locale <xx>] [--skills-dir <path>] [--threshold <f>] <gguf-path> <eval-jsonl-path>"
+            "usage: route-eval [--locale <xx>] [--skills-dir <path>] [--threshold <f>] [--precision-min <r>] [--abstain-min <r>] <gguf-path> <eval-jsonl-path>"
                 .to_string(),
         ),
     }
@@ -121,7 +148,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
 fn main() {
     use std::io::BufRead;
 
-    let Args { gguf, eval_path, locale, skills_dir, threshold } = match parse_args(std::env::args().skip(1)) {
+    let Args { gguf, eval_path, locale, skills_dir, threshold, precision_min, abstain_min } = match parse_args(std::env::args().skip(1)) {
         Ok(t) => t,
         Err(msg) => {
             eprintln!("{msg}");
@@ -194,6 +221,8 @@ fn main() {
     let verbose = std::env::var("ROUTE_EVAL_VERBOSE").is_ok();
 
     let effective_threshold = threshold.unwrap_or(ari_core::MIN_ROUTER_CONFIDENCE);
+    let effective_precision_min = precision_min.unwrap_or(PRECISION_MIN);
+    let effective_abstain_min = abstain_min.unwrap_or(ABSTAIN_MIN);
 
     let file = std::fs::File::open(&eval_path)
         .unwrap_or_else(|e| panic!("cannot open eval set {eval_path}: {e}"));
@@ -302,12 +331,12 @@ fn main() {
     println!(
         "abstention: {abstain_pass}/{abstain_total} ({:.0}%, min {:.0}%)",
         abstain_rate * 100.0,
-        ABSTAIN_MIN * 100.0
+        effective_abstain_min * 100.0
     );
     println!(
         "precision:  {positive_pass}/{positive_fired} fired ({:.0}%, min {:.0}%)",
         precision * 100.0,
-        PRECISION_MIN * 100.0
+        effective_precision_min * 100.0
     );
     println!(
         "recall:     {positive_pass}/{positive_total} ({:.0}%) — coverage KPI, tracked not gated",
@@ -317,7 +346,7 @@ fn main() {
         println!("note: router never fired on a positive — precision is vacuous.");
     }
 
-    let ok = abstain_rate >= ABSTAIN_MIN && precision >= PRECISION_MIN;
+    let ok = abstain_rate >= effective_abstain_min && precision >= effective_precision_min;
     if ok {
         println!("GATE PASS — model may be promoted.");
     } else {
@@ -347,6 +376,8 @@ mod tests {
             locale: locale.to_string(),
             skills_dir: skills.map(PathBuf::from),
             threshold: None,
+            precision_min: None,
+            abstain_min: None,
         }
     }
 
@@ -409,6 +440,45 @@ mod tests {
         assert_eq!(got.locale, "it");
         assert_eq!(got.skills_dir, Some(PathBuf::from("/tmp/skills/skills")));
         assert_eq!(got.threshold, Some(-0.0925));
+    }
+
+    /// The Gate v4 shape: gen-set gate at 0.85 precision.
+    #[test]
+    fn gate_bar_flags_parse() {
+        let got = parse(&[
+            "--precision-min", "0.85", "--abstain-min", "0.9", "m.gguf", "e.jsonl",
+        ])
+        .unwrap();
+        assert_eq!(got.precision_min, Some(0.85));
+        assert_eq!(got.abstain_min, Some(0.9));
+    }
+
+    #[test]
+    fn gate_bar_flags_default_to_none() {
+        let got = parse(&["m.gguf", "e.jsonl"]).unwrap();
+        assert_eq!(got.precision_min, None);
+        assert_eq!(got.abstain_min, None);
+    }
+
+    #[test]
+    fn precision_min_above_one_is_an_error() {
+        assert_eq!(
+            parse(&["--precision-min", "85", "m.gguf", "e.jsonl"]).unwrap_err(),
+            "--precision-min must be a rate in [0, 1], got 85"
+        );
+    }
+
+    #[test]
+    fn abstain_min_negative_is_an_error() {
+        assert!(parse(&["--abstain-min", "-0.1", "m.gguf", "e.jsonl"]).is_err());
+    }
+
+    #[test]
+    fn precision_min_without_value_is_an_error() {
+        assert_eq!(
+            parse(&["m.gguf", "e.jsonl", "--precision-min"]).unwrap_err(),
+            "--precision-min requires a value"
+        );
     }
 
     #[test]
@@ -488,7 +558,7 @@ mod tests {
     fn skills_dir_value_is_not_treated_as_a_positional() {
         assert_eq!(
             parse(&["--skills-dir", "m.gguf", "e.jsonl"]).unwrap_err(),
-            "usage: route-eval [--locale <xx>] [--skills-dir <path>] [--threshold <f>] <gguf-path> <eval-jsonl-path>"
+            "usage: route-eval [--locale <xx>] [--skills-dir <path>] [--threshold <f>] [--precision-min <r>] [--abstain-min <r>] <gguf-path> <eval-jsonl-path>"
         );
     }
 }
