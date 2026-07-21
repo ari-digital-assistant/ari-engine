@@ -54,16 +54,23 @@ struct Args {
     eval_path: String,
     locale: String,
     skills_dir: Option<PathBuf>,
+    /// Grade at this confidence floor instead of the compiled
+    /// `MIN_ROUTER_CONFIDENCE`. The training workflow derives a per-model
+    /// floor (derive_floor.py) and gates the spine AT that floor — a model
+    /// is judged at the threshold it would actually ship with, not at a
+    /// constant chosen for some other model's calibration.
+    threshold: Option<f32>,
 }
 
-/// Parse route-eval args: two positionals (gguf, eval-jsonl) plus an optional
-/// `--locale <xx>` and an optional `--skills-dir <path>`, either of which may
-/// appear anywhere. Locale defaults to "en"; `skills_dir` defaults to none,
-/// i.e. built-ins only.
+/// Parse route-eval args: two positionals (gguf, eval-jsonl) plus optional
+/// `--locale <xx>`, `--skills-dir <path>` and `--threshold <f32>`, any of
+/// which may appear anywhere. Locale defaults to "en"; `skills_dir` defaults
+/// to none (built-ins only); `threshold` defaults to the compiled constant.
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut positionals: Vec<String> = Vec::new();
     let mut locale = "en".to_string();
     let mut skills_dir: Option<PathBuf> = None;
+    let mut threshold: Option<f32> = None;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -76,6 +83,22 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
                     .ok_or_else(|| "--skills-dir requires a value".to_string())?;
                 skills_dir = Some(PathBuf::from(v));
             }
+            "--threshold" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| "--threshold requires a value".to_string())?;
+                let parsed: f32 = v
+                    .parse()
+                    .map_err(|_| format!("--threshold: not a number: {v:?}"))?;
+                if !parsed.is_finite() || parsed > 0.0 {
+                    // Confidence is a mean log-prob: finite and <= 0. A
+                    // positive or NaN floor silently gates everything out.
+                    return Err(format!(
+                        "--threshold must be a finite log-prob <= 0, got {v}"
+                    ));
+                }
+                threshold = Some(parsed);
+            }
             _ => positionals.push(a),
         }
     }
@@ -85,9 +108,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
             eval_path: eval.clone(),
             locale,
             skills_dir,
+            threshold,
         }),
         _ => Err(
-            "usage: route-eval [--locale <xx>] [--skills-dir <path>] <gguf-path> <eval-jsonl-path>"
+            "usage: route-eval [--locale <xx>] [--skills-dir <path>] [--threshold <f>] <gguf-path> <eval-jsonl-path>"
                 .to_string(),
         ),
     }
@@ -97,7 +121,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
 fn main() {
     use std::io::BufRead;
 
-    let Args { gguf, eval_path, locale, skills_dir } = match parse_args(std::env::args().skip(1)) {
+    let Args { gguf, eval_path, locale, skills_dir, threshold } = match parse_args(std::env::args().skip(1)) {
         Ok(t) => t,
         Err(msg) => {
             eprintln!("{msg}");
@@ -169,6 +193,8 @@ fn main() {
     // distribution analysis.
     let verbose = std::env::var("ROUTE_EVAL_VERBOSE").is_ok();
 
+    let effective_threshold = threshold.unwrap_or(ari_core::MIN_ROUTER_CONFIDENCE);
+
     let file = std::fs::File::open(&eval_path)
         .unwrap_or_else(|e| panic!("cannot open eval set {eval_path}: {e}"));
 
@@ -193,10 +219,11 @@ fn main() {
         let expect = case["expect"].as_str().expect("expect field");
 
         let raw = engine.route_raw(utterance);
-        // Post-threshold decision — identical to Engine::route_decision.
+        // Post-threshold decision — identical in shape to
+        // Engine::route_decision, graded at the effective floor.
         let got = raw
             .as_ref()
-            .filter(|(_, c)| *c >= ari_core::MIN_ROUTER_CONFIDENCE)
+            .filter(|(_, c)| *c >= effective_threshold)
             .map(|(id, _)| id.clone());
         let abstaining = expect.eq_ignore_ascii_case("NONE");
         let pass = if abstaining {
@@ -261,10 +288,17 @@ fn main() {
     // that doesn't say what it was graded against is unreproducible: a
     // nightly once failed at -0.10 and passed hours later at -0.06 on the
     // same corpus, and nothing in the output showed why.
+    // The first line always reports the compiled constant — derive_floor.py
+    // parses it out of measurement dumps as the fallback floor, so its shape
+    // must not change. The second line appears only when an override graded
+    // this run.
     println!(
         "threshold:  MIN_ROUTER_CONFIDENCE = {}",
         ari_core::MIN_ROUTER_CONFIDENCE
     );
+    if let Some(t) = threshold {
+        println!("threshold:  graded at --threshold = {t} (derived per-model floor)");
+    }
     println!(
         "abstention: {abstain_pass}/{abstain_total} ({:.0}%, min {:.0}%)",
         abstain_rate * 100.0,
@@ -312,7 +346,69 @@ mod tests {
             eval_path: eval.to_string(),
             locale: locale.to_string(),
             skills_dir: skills.map(PathBuf::from),
+            threshold: None,
         }
+    }
+
+    #[test]
+    fn threshold_flag_parses_a_negative_float() {
+        assert_eq!(
+            parse(&["--threshold", "-0.085", "m.gguf", "e.jsonl"]).unwrap().threshold,
+            Some(-0.085)
+        );
+    }
+
+    /// Zero is a legal floor (fire on everything the router emits).
+    #[test]
+    fn threshold_zero_is_accepted() {
+        assert_eq!(
+            parse(&["m.gguf", "e.jsonl", "--threshold", "0"]).unwrap().threshold,
+            Some(0.0)
+        );
+    }
+
+    /// A positive floor would gate out every prediction silently — reject it
+    /// loudly instead.
+    #[test]
+    fn threshold_positive_is_an_error() {
+        assert_eq!(
+            parse(&["--threshold", "0.5", "m.gguf", "e.jsonl"]).unwrap_err(),
+            "--threshold must be a finite log-prob <= 0, got 0.5"
+        );
+    }
+
+    #[test]
+    fn threshold_nan_is_an_error() {
+        assert!(parse(&["--threshold", "NaN", "m.gguf", "e.jsonl"]).is_err());
+    }
+
+    #[test]
+    fn threshold_non_numeric_is_an_error() {
+        assert_eq!(
+            parse(&["--threshold", "abc", "m.gguf", "e.jsonl"]).unwrap_err(),
+            "--threshold: not a number: \"abc\""
+        );
+    }
+
+    #[test]
+    fn threshold_without_value_is_an_error() {
+        assert_eq!(
+            parse(&["m.gguf", "e.jsonl", "--threshold"]).unwrap_err(),
+            "--threshold requires a value"
+        );
+    }
+
+    /// The exact shape the reordered training workflow invokes.
+    #[test]
+    fn all_three_flags_parse_together() {
+        let got = parse(&[
+            "--locale", "it", "--skills-dir", "/tmp/skills/skills",
+            "--threshold", "-0.0925", "m.gguf", "e.jsonl",
+        ])
+        .unwrap();
+        assert_eq!(got.locale, "it");
+        assert_eq!(got.skills_dir, Some(PathBuf::from("/tmp/skills/skills")));
+        assert_eq!(got.threshold, Some(-0.0925));
     }
 
     #[test]
@@ -392,7 +488,7 @@ mod tests {
     fn skills_dir_value_is_not_treated_as_a_positional() {
         assert_eq!(
             parse(&["--skills-dir", "m.gguf", "e.jsonl"]).unwrap_err(),
-            "usage: route-eval [--locale <xx>] [--skills-dir <path>] <gguf-path> <eval-jsonl-path>"
+            "usage: route-eval [--locale <xx>] [--skills-dir <path>] [--threshold <f>] <gguf-path> <eval-jsonl-path>"
         );
     }
 }
