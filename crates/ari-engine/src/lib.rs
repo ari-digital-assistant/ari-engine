@@ -521,6 +521,14 @@ pub struct Engine {
     llm: Option<Arc<dyn ari_llm::Fallback>>,
     active_assistant: Option<ActiveAssistant>,
     router: Option<Box<dyn SkillRouter>>,
+    /// Per-model confidence floor, from the model's own manifest
+    /// (`min_confidence`, derived per-model by CI's floor sweep). `None`
+    /// falls back to the compiled [`ari_core::MIN_ROUTER_CONFIDENCE`] —
+    /// the pre-T5 behaviour, and the behaviour for manifests without the
+    /// field. Calibration is per-MODEL: two same-corpus retrains have
+    /// measured viable floors of -0.0233 and none-at-all, so a constant
+    /// tuned on one roll silently mis-gates the next.
+    router_confidence_floor: Option<f32>,
     /// Optional sink so engine-internal paths (currently Layer C) can
     /// surface diagnostics in the same channel skills use. `None` means
     /// those log calls are no-ops — no formatting cost either.
@@ -580,6 +588,7 @@ impl Engine {
             llm: None,
             active_assistant: None,
             router: None,
+            router_confidence_floor: None,
             log_sink: None,
             envelope_sink: None,
             named_assistants: Vec::new(),
@@ -899,6 +908,23 @@ impl Engine {
         self.router = router;
     }
 
+    /// Set the confidence floor the router's picks must clear, from the
+    /// installed model's manifest (`min_confidence`). `None` reverts to
+    /// the compiled [`ari_core::MIN_ROUTER_CONFIDENCE`] — correct for
+    /// models whose manifest predates per-model floors. Call alongside
+    /// [`Self::set_router`]: the floor belongs to the MODEL, not the
+    /// device, so it must change when the loaded model does.
+    pub fn set_router_confidence_floor(&mut self, floor: Option<f32>) {
+        self.router_confidence_floor = floor;
+    }
+
+    /// The effective floor: the loaded model's own, else the compiled
+    /// constant.
+    fn router_floor(&self) -> f32 {
+        self.router_confidence_floor
+            .unwrap_or(ari_core::MIN_ROUTER_CONFIDENCE)
+    }
+
     /// Install the config store used to read skill settings from
     /// engine-internal paths (the fallback tier(s)).
     pub fn set_config_store(&mut self, store: Option<Arc<dyn ConfigStore>>) {
@@ -1048,8 +1074,9 @@ impl Engine {
         let catalog = self.router_catalog();
         let result = router.route(&normalized, &catalog);
         let raw = router.last_raw_output().unwrap_or_default();
+        let floor = self.router_floor();
         let gate = |c: f32| {
-            if c < ari_core::MIN_ROUTER_CONFIDENCE {
+            if c < floor {
                 "below threshold → would fall through"
             } else {
                 "above threshold → would dispatch"
@@ -1084,7 +1111,7 @@ impl Engine {
         match router.route(&normalized, &self.router_catalog()) {
             RouteResult::Skill { id, confidence }
             | RouteResult::SkillWithArgs { id, confidence, .. } => {
-                (confidence >= ari_core::MIN_ROUTER_CONFIDENCE).then_some(id)
+                (confidence >= self.router_floor()).then_some(id)
             }
             RouteResult::Action(_) | RouteResult::NoMatch => None,
         }
@@ -1492,13 +1519,13 @@ impl Engine {
 
             match route_result {
                 RouteResult::Skill { ref id, confidence } => {
-                    if confidence < ari_core::MIN_ROUTER_CONFIDENCE {
+                    if confidence < self.router_floor() {
                         self.log(
                             LogLevel::Info,
                             &format!(
                                 "router: skipping skill={id} — confidence {confidence:.3} \
                                  below threshold {threshold:.3}; falling through to assistant",
-                                threshold = ari_core::MIN_ROUTER_CONFIDENCE,
+                                threshold = self.router_floor(),
                             ),
                         );
                     } else if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
@@ -1517,13 +1544,13 @@ impl Engine {
                     ref args_json,
                     confidence,
                 } => {
-                    if confidence < ari_core::MIN_ROUTER_CONFIDENCE {
+                    if confidence < self.router_floor() {
                         self.log(
                             LogLevel::Info,
                             &format!(
                                 "router: skipping skill={id} — confidence {confidence:.3} \
                                  below threshold {threshold:.3}; falling through to assistant",
-                                threshold = ari_core::MIN_ROUTER_CONFIDENCE,
+                                threshold = self.router_floor(),
                             ),
                         );
                     } else if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {

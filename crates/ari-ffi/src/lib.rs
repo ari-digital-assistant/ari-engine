@@ -1099,6 +1099,21 @@ impl AriEngine {
             .set_conversation_active(active);
     }
 
+    /// Set the confidence floor router picks must clear, from the INSTALLED
+    /// MODEL's manifest (`min_confidence` — derived per-model by CI's floor
+    /// sweep). `None` reverts to the compiled default, which is also the
+    /// right call for models whose manifest lacks the field. The floor
+    /// belongs to the model, not the device: call it whenever
+    /// `load_router_model` is called, with whatever the sidecar recorded.
+    /// Not `llm`-gated on purpose — the gate lives in engine core, and a
+    /// floor set with no router loaded is simply inert.
+    pub fn set_router_confidence_floor(&self, floor: Option<f32>) {
+        self.inner
+            .lock()
+            .expect("engine mutex poisoned")
+            .set_router_confidence_floor(floor);
+    }
+
     /// Master switch for conversation memory (cross-turn context + "Let's
     /// Talk" mode). Mirrors the Android `conversationMemoryEnabled` setting;
     /// hydrated at engine build and written through when the user toggles it.
