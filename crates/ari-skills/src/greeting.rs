@@ -8,8 +8,11 @@ const GREETINGS: &[&str] = &[
     "hello", "hi", "hey", "heya", "howdy", "greetings", "good morning",
     "good afternoon", "good evening", "yo", "sup", "hiya", "ello",
     "hey ari", "hi ari", "hello ari",
-    // Italian
-    "ciao", "salve", "buongiorno", "buonasera", "buonanotte",
+    // Italian. No "buonanotte" — it's a farewell, and English doesn't
+    // list "good night" either. Answering it with "Ciao! Cosa posso fare
+    // per te?" is the wrong end of the conversation; let it fall through
+    // to the assistant, which is what the Italian router examples assume.
+    "ciao", "salve", "buongiorno", "buonasera",
     "ciao ari", "salve ari",
 ];
 
@@ -328,8 +331,19 @@ mod tests {
         let skill = GreetingSkill::new();
         // Italian greeting "ciao" must score above 0 — the union
         // dictionary lets the same scorer recognise both languages.
-        assert!(skill.score("ciao", &ctx()) > 0.0);
-        assert!(skill.score("buongiorno", &ctx()) > 0.0);
+        assert_eq!(skill.score("ciao", &ctx()), 1.0);
+        assert_eq!(skill.score("buongiorno", &ctx()), 1.0);
+    }
+
+    #[test]
+    fn farewells_are_not_greetings() {
+        let skill = GreetingSkill::new();
+        // Both languages agree: saying good night is leaving, not arriving.
+        assert_eq!(skill.score("buonanotte", &ctx()), 0.0);
+        assert_eq!(skill.score("good night", &ctx()), 0.0);
+        // The evening greeting it rhymes with is still a greeting.
+        assert_eq!(skill.score("buonasera", &ctx()), 1.0);
+        assert_eq!(skill.score("good evening", &ctx()), 1.0);
     }
 
     #[test]
