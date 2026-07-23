@@ -47,6 +47,16 @@ jobs:
           echo "Found libclang in: $LIBCLANG_DIR"
           echo "LIBCLANG_PATH=$LIBCLANG_DIR" >> "$GITHUB_ENV"
 
+      # keyword-hit's tests read the REAL community manifests rather than
+      # fixtures — the oracle's correctness is a property of those manifests,
+      # so a fixture would let the two drift apart — and resolve them as a
+      # sibling of this checkout. That path is outside GITHUB_WORKSPACE, so
+      # actions/checkout can't place it; clone it by hand exactly where the
+      # tests look. Yes, this means an ari-skills manifest change can turn this
+      # red with no engine commit. That is the point of the oracle.
+      - name: Check out ari-skills (the keyword oracle's manifests)
+        run: git clone --depth 1 https://github.com/ari-digital-assistant/ari-skills.git "$(dirname "$GITHUB_WORKSPACE")/ari-skills"
+
       - name: Run tests
         run: cargo test --workspace
 
