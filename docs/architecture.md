@@ -21,21 +21,27 @@ User speaks
     │ matched
     ├──────────► Skill executes → response to user. Done.
     │
-    │ no match — how the leftover is routed depends on the active assistant:
+    │ no match
     ▼
-5. Route the leftover
+5a. FunctionGemma — the on-device router. Runs whenever a model for the
+    │ language being spoken is loaded. Offline, sub-second, free.
     │
-    ├─ Cloud assistant configured → ONE-SHOT call to the cloud:
+    ├─ confident pick ───────────► Skill executes. Done.
+    └─ abstains / below its floor ► step 5b
+    ▼
+5b. The assistant routes what's left
+    │
+    ├─ Cloud assistant, English → ONE-SHOT call to the cloud:
     │      routes to a skill ─────► Skill executes. Done.
     │      otherwise ─────────────► cloud answers directly. Done.
     │
-    ├─ On-device assistant / no assistant, English → FunctionGemma:
+    ├─ Non-English → the assistant (cloud or on-device) picks from the
+    │  catalogue:
     │      picks a skill ─────────► Skill executes. Done.
-    │      abstains ──────────────► step 6
+    │      none ──────────────────► step 6
     │
-    └─ Non-English → the assistant routes (FunctionGemma is English-only):
-           picks a skill ─────────► Skill executes. Done.
-           none ──────────────────► step 6
+    └─ English, no cloud assistant → nobody else routes; the on-device LLM
+       is far too slow at it. Straight to step 6.
     ▼
 6. Answer the leftover (a general question, not a skill request)
     │ on-device LLM or cloud assistant answers
@@ -109,40 +115,58 @@ and the response is returned to the user.
 This step is **fast, deterministic, and free** — no model inference, just
 string matching. It handles the majority of everyday utterances.
 
-### 5. Route the leftover
+### 5a. FunctionGemma — the on-device router
 
-Anything the keyword scorer didn't claim is routed here. **Which router runs
-depends on the active assistant** — there are three branches:
+Anything the keyword scorer didn't claim goes to the on-device router first,
+**whenever a model exists for the language being spoken**. There is one
+trained model per locale (`functiongemma-en-latest`, `functiongemma-it-latest`,
+…), not one multilingual model; the host downloads the one matching the active
+language and swaps it when the user switches.
 
-**Cloud assistant configured (one-shot).** The query goes straight to the
-cloud assistant in a *single* call that either routes to a skill (the model
-replies `SKILL: <id>`) or answers the question directly. FunctionGemma is
-**not** consulted — a capable cloud model both routes and abstains reliably,
-and folding route+answer into one call avoids a second round-trip. (See
-`Engine::route_or_answer`.)
-
-**On-device assistant, or no assistant — English (FunctionGemma).**
-FunctionGemma (270M parameters, ~253MB GGUF) routes the query. It sees the
-input plus the catalogue of registered skills — declared by **short alias**
-(the final id segment, e.g. `weather`, not `dev.heyari.weather`), because a
-270M model can't reliably emit reverse-DNS ids; the engine resolves the alias
-back. It either picks a skill or abstains (`NoMatch`). FunctionGemma is
-trained on Ari's own skills + a balanced set of "answer nothing" negatives,
-so it abstains on general-knowledge questions (~95% on the held-out eval)
+FunctionGemma (270M parameters, ~253MB GGUF) sees the input plus the catalogue
+of registered skills — declared by **short alias** (the final id segment, e.g.
+`weather`, not `dev.heyari.weather`), because a 270M model can't reliably emit
+reverse-DNS ids; the engine resolves the alias back. It either picks a skill or
+abstains (`NoMatch`). It is trained on Ari's own skills plus a balanced set of
+"answer nothing" negatives, so it abstains on general-knowledge questions
 rather than force-routing them. Lazy lifecycle: loads on first use, unloads
-after 60s idle; sub-second inference on phone. If FunctionGemma abstains (or
-isn't installed), the query falls to step 6.
+after 60s idle; sub-second inference on phone.
 
-**Non-English (assistant routes).** FunctionGemma is English-only, so for
-other locales the engine asks the *active assistant* (cloud or on-device LLM)
-to pick a skill id from the catalogue, or answer. This needs no per-language
-router model to maintain — the trade is latency on the on-device path, since
-the LLM must process the whole catalogue.
+**The confidence floor is what makes going first safe.** Every published model
+ships a `min_confidence` in its manifest, derived from that specific model's
+measured precision/abstention curve, and the device enforces it. A pick below
+the floor is discarded and the query carries on to 5b. So the router only
+speaks up when it is sure, and being wrong costs a fall-through rather than a
+wrong answer.
+
+**The locale must match.** The engine tracks which language the loaded model
+was trained for (`Engine::set_router` takes both) and refuses to route with a
+mismatched one. The host swaps models asynchronously on a language change, so
+without this check there is a window where an English model would confidently
+route Italian.
+
+If no model is installed for the active language, this step is skipped
+entirely.
 
 > The training pipeline (`ari-tools/functiongemma`) deliberately omits Google's
 > mobile-actions demo dataset and scales negatives to the skill count; a
-> **promotion gate** (`route-eval`) scores abstention on a held-out set and
-> blocks any retrained model that regresses before it can ship.
+> **promotion gate** (`route-eval`) scores precision and abstention on a
+> generated eval bank at the model's own derived floor, and blocks any
+> retrained model that regresses before it can ship.
+
+### 5b. The assistant routes what's left
+
+**Cloud assistant, English (one-shot).** A *single* call that either routes to
+a skill (the model replies `SKILL: <id>`) or answers the question directly —
+folding route+answer into one call avoids a second round-trip. (See
+`Engine::route_or_answer`.)
+
+**Non-English.** The engine asks the *active assistant* (cloud or on-device
+LLM) to pick a skill id from the catalogue, or answer.
+
+**English with no cloud assistant.** Nothing else routes. The on-device LLM
+takes ~22s to route because the catalogue prefill dominates, so the router's
+verdict stands and the query goes straight to step 6 to be answered.
 
 ### 6. Answer the leftover
 
@@ -201,7 +225,7 @@ understand that." and returns to listening for the wake word.
 | Layer | Catches | Example |
 |-------|---------|---------|
 | Keyword scorer (always first) | Exact keyword/regex matches | "what time is it" → CurrentTime |
-| Cloud one-shot | Routes *or* answers in a single call (cloud-assistant users) | "remind me at 5" → Reminder; "capital of France" → answered |
-| FunctionGemma (on-device, English) | Paraphrases the keywords missed; abstains on general knowledge | "is it morning yet" → CurrentTime; "capital of France" → abstain |
+| FunctionGemma (on-device, per-locale, second) | Paraphrases the keywords missed, in whatever language has a model; abstains on general knowledge and on anything below its floor | "is it morning yet" → CurrentTime; "che ore sono ormai" → CurrentTime; "capital of France" → abstain |
+| Cloud one-shot | Routes *or* answers in a single call, for what the router declined | "remind me at 5" → Reminder; "capital of France" → answered |
 | Assistant | Answers the general-knowledge questions routing left behind | "what's the capital of France" → "Paris." |
 | STT retry | Misheard transcripts | "wheat time" (misheard) → retried → "what time" → CurrentTime |

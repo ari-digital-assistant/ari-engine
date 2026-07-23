@@ -1265,15 +1265,18 @@ impl AriEngine {
 
     /// Set the FunctionGemma router model path. Like the LLM fallback,
     /// the model loads lazily on first use and unloads after 60s idle.
-    /// Returns `true` if the path exists, `false` otherwise.
-    pub fn load_router_model(&self, model_path: String) -> bool {
+    /// `locale` is the language this model was trained for — the engine
+    /// only routes with it while that matches the active locale, so a
+    /// model left over from a language switch can't route the wrong
+    /// language. Returns `true` if the path exists, `false` otherwise.
+    pub fn load_router_model(&self, model_path: String, locale: String) -> bool {
         let path = std::path::Path::new(&model_path);
         if !path.is_file() {
             return false;
         }
         let router = ari_llm::FunctionGemmaRouter::new(path);
         let mut engine = self.inner.lock().expect("engine mutex poisoned");
-        engine.set_router(Some(Box::new(router)));
+        engine.set_router(Some((Box::new(router), locale)));
         true
     }
 
@@ -1310,9 +1313,13 @@ impl AriEngine {
 
     /// Set the FunctionGemma router model path. Like the LLM fallback,
     /// the model loads lazily on first use and unloads after 60s idle.
-    /// Returns `true` if the path exists, `false` otherwise.
-    pub fn load_router_model(&self, model_path: String) -> bool {
+    /// `locale` is the language this model was trained for — the engine
+    /// only routes with it while that matches the active locale, so a
+    /// model left over from a language switch can't route the wrong
+    /// language. Returns `true` if the path exists, `false` otherwise.
+    pub fn load_router_model(&self, model_path: String, locale: String) -> bool {
         let _ = model_path;
+        let _ = locale;
         false
     }
 

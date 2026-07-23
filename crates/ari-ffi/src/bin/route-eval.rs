@@ -157,7 +157,7 @@ fn main() {
     };
 
     let mut engine = ari_ffi::build_engine_with_builtins();
-    engine.set_locale(locale);
+    engine.set_locale(locale.clone());
     // Registered BEFORE the guardrail runs so community `matching.patterns`
     // participate in the keyword-hit question. A bad path is fatal: loading
     // fewer skills than asked for would under-count keyword-hits, which is the
@@ -174,7 +174,7 @@ fn main() {
         }
     }
     let router = ari_llm::FunctionGemmaRouter::new(std::path::Path::new(&gguf));
-    engine.set_router(Some(Box::new(router)));
+    engine.set_router(Some((Box::new(router), locale.clone())));
 
     // Guardrail: the router is the FALLBACK tier — it only fires when the
     // keyword scorer finds nothing. Any eval case the keyword scorer already
