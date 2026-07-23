@@ -121,23 +121,33 @@ mod tests {
     /// clone — the layout `generate-dataset.py::find_skills_dir` assumes and
     /// the one the training pipeline actually runs against.
     ///
+    /// `ARI_SKILLS_DIR` overrides that, naming the checkout ROOT (the
+    /// directory holding `skills/`) — the same variable and meaning
+    /// `generate-dataset.py` already uses. ari-skills' own `validate`
+    /// workflow sets it so the poaching test grades the manifests in the PR
+    /// rather than whatever is on main. Without it that gate would only ever
+    /// see main, which means a PR could introduce poaching, go green, and
+    /// break ari-engine's CI on somebody else's commit.
+    ///
     /// The oracle's correctness is a property of the REAL manifests, not of
     /// any fixture we could write here, so these tests read them directly. If
     /// the sibling clone is missing we fail loudly with instructions rather
     /// than skipping: a silently-skipped test would let the oracle drift out
     /// of agreement with the manifests it exists to model.
     fn real_skills_root() -> PathBuf {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../ari-skills/skills")
-            .canonicalize()
-            .unwrap_or_else(|e| {
-                panic!(
-                    "cannot resolve the ari-skills checkout ({e}). Clone \
-                     https://github.com/ari-digital-assistant/ari-skills as a sibling of \
-                     this ari-engine checkout — the keyword oracle is defined against \
-                     the real community manifests."
-                )
-            });
+        let candidate = match std::env::var("ARI_SKILLS_DIR") {
+            Ok(dir) => PathBuf::from(dir).join("skills"),
+            Err(_) => Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../ari-skills/skills"),
+        };
+        let root = candidate.canonicalize().unwrap_or_else(|e| {
+            panic!(
+                "cannot resolve the ari-skills checkout at {} ({e}). Clone \
+                 https://github.com/ari-digital-assistant/ari-skills as a sibling of \
+                 this ari-engine checkout, or set ARI_SKILLS_DIR to its root — the \
+                 keyword oracle is defined against the real community manifests.",
+                candidate.display()
+            )
+        });
         assert!(
             root.join("timer/SKILL.en.md").is_file(),
             "{} is not an ari-skills skills/ root",
