@@ -107,6 +107,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ari_core::Skill;
+    use ari_skill_loader::{parse_skill_directory, SkillType};
+    use ari_skills::{
+        CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill,
+    };
 
     fn parse(v: &[&str]) -> Result<Args, String> {
         parse_args(v.iter().map(|s| s.to_string()))
@@ -290,6 +295,108 @@ mod tests {
         assert_eq!(
             verdicts("en", Some(&real_skills_root()), &owned),
             vec![true, false]
+        );
+    }
+
+    /// Every router example paired with the skill that declares it: the
+    /// built-ins from their own consts, the community skills from their real
+    /// manifests.
+    ///
+    /// Router-ineligible skills are excluded because they are not in the
+    /// router's catalogue at inference and their examples never enter the
+    /// corpus — `search`'s do collide with weather/navigation/music, and that
+    /// collision is inert by construction.
+    ///
+    /// The built-in list mirrors `build_engine_with_builtins`; a new built-in
+    /// has to be added in both places (see the checklist in ari-skills'
+    /// module docs). Missing one under-covers this test, it can't corrupt it.
+    fn router_examples(locale: &str, skills_root: &Path) -> Vec<(String, String)> {
+        let builtins: Vec<Box<dyn Skill>> = vec![
+            Box::new(CurrentTimeSkill::new()),
+            Box::new(DateSkill::new()),
+            Box::new(CalculatorSkill::new()),
+            Box::new(GreetingSkill::new()),
+            Box::new(OpenSkill::new()),
+            Box::new(SearchSkill::new()),
+        ];
+
+        let mut pairs: Vec<(String, String)> = builtins
+            .iter()
+            .filter(|s| s.router_eligible())
+            .flat_map(|s| {
+                s.example_utterances_for(locale)
+                    .iter()
+                    .map(|e| (s.id().to_string(), e.text.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(skills_root)
+            .expect("read skills root")
+            .map(|e| e.expect("read skill dir entry").path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+
+        for dir in dirs {
+            let set = parse_skill_directory(&dir)
+                .unwrap_or_else(|e| panic!("parse {}: {e}", dir.display()));
+            let manifest = set.for_locale(locale);
+            let Some(ari) = manifest.ari_extension.as_ref() else {
+                continue;
+            };
+            // Assistant skills never enter routing, so they declare no
+            // patterns and can neither poach nor be poached.
+            if ari.skill_type != SkillType::Skill {
+                continue;
+            }
+            pairs.extend(
+                ari.examples
+                    .iter()
+                    .map(|e| (ari.id.clone(), e.text.clone())),
+            );
+        }
+        pairs
+    }
+
+    /// A router example must reach its OWN skill at the keyword tier, or
+    /// nobody at all. One that another skill's patterns win is an example the
+    /// router never sees in production: it teaches the model the opposite of
+    /// what the scorer does, and it sits in the manifest as an utterance its
+    /// own skill can never serve.
+    ///
+    /// Note the asymmetry with the oracle above — a keyword HIT on the
+    /// example's own skill is fine and expected (the router is the fallback
+    /// tier; those examples are still the model's evidence for what the skill
+    /// MEANS). Only a hit on a DIFFERENT skill is a defect.
+    ///
+    /// Scoped to the real manifests and both shipped locales, because the
+    /// property is only meaningful against the catalogue that actually ships.
+    #[test]
+    fn no_router_example_is_poached_by_another_skill() {
+        let root = real_skills_root();
+        let mut poached = Vec::new();
+
+        for locale in ["en", "it"] {
+            let mut engine = ari_ffi::build_engine_with_builtins();
+            engine.set_locale(locale.to_string());
+            register_community_skills(&mut engine, &root).unwrap();
+
+            for (owner, text) in router_examples(locale, &root) {
+                match engine.keyword_decision(&text) {
+                    Some(winner) if winner != owner => {
+                        poached.push(format!("[{locale}] {owner}: {text:?} is won by {winner}"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        assert!(
+            poached.is_empty(),
+            "router example(s) claimed by a different skill — re-word the example \
+             or tighten the poaching skill's patterns:\n  {}",
+            poached.join("\n  ")
         );
     }
 

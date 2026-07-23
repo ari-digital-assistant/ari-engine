@@ -49,23 +49,28 @@ const OPEN_EXAMPLES_EN: &[ExampleUtterance] = &[
     ExampleUtterance { text: "start the notes app", args: r#"{"app_name": "Notes"}"# },
     ExampleUtterance { text: "open slack", args: r#"{"app_name": "Slack"}"# },
     ExampleUtterance { text: "launch the calendar", args: r#"{"app_name": "Calendar"}"# },
-    ExampleUtterance { text: "fire up the weather app", args: r#"{"app_name": "Weather"}"# },
+    ExampleUtterance { text: "fire up the fitness app", args: r#"{"app_name": "Fitness"}"# },
     ExampleUtterance { text: "open reddit", args: r#"{"app_name": "Reddit"}"# },
     ExampleUtterance { text: "run discord", args: r#"{"app_name": "Discord"}"# },
     ExampleUtterance { text: "open the files app", args: r#"{"app_name": "Files"}"# },
     // Paraphrases without explicit open/launch/start/run/fire-up triggers —
-    // teach the router that any "I want to use / get to / show me X" maps
+    // teach the router that any "I want to use / show me / bring up X" maps
     // to opening that app.
+    //
+    // Nothing here may name an app another skill's keywords own, and nothing
+    // may use the "take/bring/get me to X" shape: navigation's patterns win
+    // both outright, so those utterances never reach the router and the
+    // example is dead weight that teaches a contradiction.
     ExampleUtterance { text: "I want to use spotify", args: r#"{"app_name": "Spotify"}"# },
     ExampleUtterance { text: "show me the camera", args: r#"{"app_name": "Camera"}"# },
     ExampleUtterance { text: "bring up the calculator", args: r#"{"app_name": "Calculator"}"# },
     ExampleUtterance { text: "I need maps", args: r#"{"app_name": "Maps"}"# },
     ExampleUtterance { text: "jump into telegram", args: r#"{"app_name": "Telegram"}"# },
-    ExampleUtterance { text: "get me to the weather app", args: r#"{"app_name": "Weather"}"# },
+    ExampleUtterance { text: "where is my banking app", args: r#"{"app_name": "Banking"}"# },
     ExampleUtterance { text: "switch to chrome", args: r#"{"app_name": "Chrome"}"# },
     ExampleUtterance { text: "I want to check whatsapp", args: r#"{"app_name": "WhatsApp"}"# },
     ExampleUtterance { text: "boot up the music player", args: r#"{"app_name": "Music Player"}"# },
-    ExampleUtterance { text: "take me to settings", args: r#"{"app_name": "Settings"}"# },
+    ExampleUtterance { text: "pull up settings", args: r#"{"app_name": "Settings"}"# },
 ];
 
 // The same 40 intents in natural Italian — same app spread and the same
@@ -99,23 +104,27 @@ const OPEN_EXAMPLES_IT: &[ExampleUtterance] = &[
     ExampleUtterance { text: "avvia l'app note", args: r#"{"app_name": "Notes"}"# },
     ExampleUtterance { text: "apri slack", args: r#"{"app_name": "Slack"}"# },
     ExampleUtterance { text: "avvia il calendario", args: r#"{"app_name": "Calendar"}"# },
-    ExampleUtterance { text: "fai partire l'app meteo", args: r#"{"app_name": "Weather"}"# },
+    ExampleUtterance { text: "fai partire l'app della palestra", args: r#"{"app_name": "Fitness"}"# },
     ExampleUtterance { text: "apri reddit", args: r#"{"app_name": "Reddit"}"# },
     ExampleUtterance { text: "esegui discord", args: r#"{"app_name": "Discord"}"# },
     ExampleUtterance { text: "apri il gestore dei file", args: r#"{"app_name": "Files"}"# },
     // Paraphrases without an explicit launch verb — teach the router that
-    // "voglio usare / portami a / mostrami X" ("I want to use / take me
-    // to / show me X") means opening X.
+    // "voglio usare / mostrami / mi serve X" ("I want to use / show me /
+    // I need X") means opening X.
+    //
+    // Niente "portami a X": è un pattern di `navigation`, che vince prima
+    // che il router entri in gioco — l'esempio non verrebbe mai visto e
+    // insegnerebbe il contrario di quello che succede in produzione.
     ExampleUtterance { text: "voglio usare spotify", args: r#"{"app_name": "Spotify"}"# },
     ExampleUtterance { text: "mostrami la fotocamera", args: r#"{"app_name": "Camera"}"# },
     ExampleUtterance { text: "fammi vedere la calcolatrice", args: r#"{"app_name": "Calculator"}"# },
     ExampleUtterance { text: "mi servono le mappe", args: r#"{"app_name": "Maps"}"# },
     ExampleUtterance { text: "vai su telegram", args: r#"{"app_name": "Telegram"}"# },
-    ExampleUtterance { text: "portami all'app meteo", args: r#"{"app_name": "Weather"}"# },
+    ExampleUtterance { text: "ho bisogno dell'app della banca", args: r#"{"app_name": "Banking"}"# },
     ExampleUtterance { text: "passa a chrome", args: r#"{"app_name": "Chrome"}"# },
     ExampleUtterance { text: "voglio controllare whatsapp", args: r#"{"app_name": "WhatsApp"}"# },
     ExampleUtterance { text: "apri il lettore musicale", args: r#"{"app_name": "Music Player"}"# },
-    ExampleUtterance { text: "portami alle impostazioni", args: r#"{"app_name": "Settings"}"# },
+    ExampleUtterance { text: "fammi entrare nelle impostazioni", args: r#"{"app_name": "Settings"}"# },
 ];
 
 pub struct OpenSkill;
@@ -153,7 +162,7 @@ impl Skill for OpenSkill {
     }
 
     fn description(&self) -> &str {
-        "Opens or launches apps by name. Use when the user asks to open, launch, start, run, fire up, or boot up an application — but ALSO when they want to use, get to, bring up, or jump into an app without naming a launch verb. Phrases like 'I want to use spotify', 'show me the camera', 'bring up the calculator', 'I need maps', 'jump into telegram', 'get me to the weather app', 'switch to chrome' all belong here. The app_name parameter is the app the user wants to interact with."
+        "Opens or launches apps by name. Use when the user asks to open, launch, start, run, fire up, or boot up an application — but ALSO when they want to use, pull up, bring up, or jump into an app without naming a launch verb. Phrases like 'I want to use spotify', 'show me the camera', 'bring up the calculator', 'I need maps', 'jump into telegram', 'where is my banking app', 'switch to chrome' all belong here. The app_name parameter is the app the user wants to interact with."
     }
 
     fn specificity(&self) -> Specificity {
