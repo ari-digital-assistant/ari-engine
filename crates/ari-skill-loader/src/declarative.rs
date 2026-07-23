@@ -279,7 +279,7 @@ fn build_response(
         None => Response::Text(text),
         Some(action) => {
             // The manifest's `action:` block is a presentation-envelope
-            // fragment (see docs/action-responses.md). Resolve any
+            // fragment (see docs/reference-actions.md). Resolve any
             // string leaves through the strings table first (card
             // titles, labels, etc.), then overlay `v` and `speak` —
             // those are protocol-level concerns the manifest author

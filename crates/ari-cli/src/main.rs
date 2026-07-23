@@ -299,8 +299,14 @@ fn parse_caps_csv(value: &str) -> Result<(HostCapabilities, Vec<String>), String
     Ok((caps, names))
 }
 
+/// Does `path` look like a single skill directory rather than a registry root?
+///
+/// Accepts both manifest names the loader accepts: the canonical per-locale
+/// `SKILL.en.md` and the legacy bare `SKILL.md`. Checking only the legacy name
+/// silently mis-classified every modern skill as a registry root, which then
+/// walked into `target/` and loaded nothing.
 fn has_skill_md(path: &std::path::Path) -> bool {
-    path.join("SKILL.md").is_file()
+    path.join("SKILL.md").is_file() || path.join("SKILL.en.md").is_file()
 }
 
 fn print_usage() {
@@ -311,9 +317,9 @@ fn print_usage() {
     eprintln!();
     eprintln!("  --debug                          print scoring trace to stderr");
     eprintln!("  --extra-skill-dir <path>         sideload skills from a directory.");
-    eprintln!("                                   if <path>/SKILL.md exists, loads that one skill;");
-    eprintln!("                                   otherwise treats <path> as a registry root and");
-    eprintln!("                                   loads every <path>/<slug>/SKILL.md it finds.");
+    eprintln!("                                   if <path>/SKILL.en.md (or the legacy <path>/SKILL.md)");
+    eprintln!("                                   exists, loads that one skill; otherwise treats <path>");
+    eprintln!("                                   as a registry root and loads every skill under it.");
     eprintln!("                                   may be passed multiple times.");
     eprintln!("  --host-capabilities <list>       override the host capability set with a");
     eprintln!("                                   comma-separated list. Valid names: http,");
