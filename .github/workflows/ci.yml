@@ -1,0 +1,57 @@
+name: ci
+
+# Nothing else in this repo runs Rust. Both the skills registry and the
+# nightly training pipeline BUILD from ari-engine, so a break here surfaces as
+# a mystery failure in another repo hours later — which is exactly how the two
+# incidents this workflow exists to prevent were found:
+#
+#   * `ari-ffi` had been unbuildable without its `llm` feature for an unknown
+#     length of time (six unconditional `ari_llm` references), discovered only
+#     when the training pipeline finally needed the light build.
+#   * the `llm` / `not(llm)` twin `impl` blocks in ari-ffi must stay identical
+#     down to argument names and docstrings — UniFFI folds all three into
+#     per-method checksums, and drift breaks the Kotlin bindings at RUNTIME on
+#     device. There is a test for it; without CI it only ran when someone
+#     remembered.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  # Force JS actions onto Node 24 ahead of the 2026-06-02 default flip.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out ari-engine
+        uses: actions/checkout@v5
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install llama.cpp build deps
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+          LIBCLANG_DIR="$(dirname "$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)")"
+          echo "Found libclang in: $LIBCLANG_DIR"
+          echo "LIBCLANG_PATH=$LIBCLANG_DIR" >> "$GITHUB_ENV"
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Build without the llm feature
+        # What the training pipeline compiles keyword-hit with. The full test
+        # run above cannot catch a break here — it builds with default
+        # features, where every `ari_llm` reference resolves.
+        run: cargo build -p ari-ffi --no-default-features --bin keyword-hit
