@@ -28,14 +28,6 @@ const MATH_WORDS_EN: &[(&str, &str)] = &[
 ];
 
 const MATH_WORDS_IT: &[(&str, &str)] = &[
-    // Percent family guards — "per" is a substring of these, and
-    // percentage phrases aren't supported yet, so neutralise them to an
-    // all-letters placeholder (stripped by the char filter → a non-
-    // evaluating expression → graceful error) instead of letting the
-    // "per" -> "*" rule below produce a wrong numeric answer.
-    ("percentuale", "PCT"),
-    ("per cento", "PCT"),
-    ("percento", "PCT"),
     ("diviso per", "/"),
     ("elevato alla", "^"),
     ("più", "+"),
@@ -50,6 +42,24 @@ fn math_words(locale: &str) -> &'static [(&'static str, &'static str)] {
     match locale {
         "it" => MATH_WORDS_IT,
         _ => MATH_WORDS_EN,
+    }
+}
+
+// Percent-family phrases, neutralised to an all-letters placeholder before
+// the operator table runs: "per" is a substring of "per cento", and
+// percentage phrases aren't supported yet, so the placeholder (stripped by
+// the char filter → a non-evaluating expression → graceful error) beats
+// letting the "per" -> "*" rule produce a wrong numeric answer.
+//
+// Deliberately NOT in MATH_WORDS_IT: `has_math_content` reads every entry
+// there as evidence of arithmetic, and "abbassa le luci al 30 percento" is
+// a lights command, not a sum.
+const PERCENT_PHRASES_IT: &[&str] = &["percentuale", "per cento", "percento"];
+
+fn percent_phrases(locale: &str) -> &'static [&'static str] {
+    match locale {
+        "it" => PERCENT_PHRASES_IT,
+        _ => &[],
     }
 }
 
@@ -190,19 +200,87 @@ impl Default for CalculatorSkill {
     }
 }
 
+// fasteval has no `sqrt`, and the router's canonical expressions use it
+// ("what's the square root of 81" -> `sqrt(81)`). Supplying it as a
+// namespace lookup is cheaper than rewriting the expression, and every
+// other name still resolves to `None`, so a bogus expression fails
+// instead of silently evaluating.
 fn eval_expr(expr: &str) -> Option<f64> {
-    let mut ns = fasteval::EmptyNamespace;
+    let mut ns = |name: &str, args: Vec<f64>| -> Option<f64> {
+        match (name, args.as_slice()) {
+            ("sqrt", [x]) => Some(x.sqrt()),
+            _ => None,
+        }
+    };
     fasteval::ez_eval(expr, &mut ns).ok()
+}
+
+fn format_result(result: f64) -> String {
+    if result.fract() == 0.0 && result.abs() < 1e15 {
+        format!("{}", result as i64)
+    } else {
+        format!("{:.6}", result)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    }
+}
+
+// Italian writes decimals with a comma. The char filter below drops it, so
+// "3,14 per 2" would evaluate as "3 14 * 2" — convert to the evaluator's
+// point first. Only a digit-flanked comma qualifies; anything else is
+// sentence punctuation and stays dropped.
+fn italian_decimal_point(expr: &str) -> String {
+    let chars: Vec<char> = expr.chars().collect();
+    chars
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let decimal = c == ','
+                && i > 0
+                && chars[i - 1].is_ascii_digit()
+                && chars.get(i + 1).is_some_and(|n| n.is_ascii_digit());
+            if decimal { '.' } else { c }
+        })
+        .collect()
+}
+
+// Italian "per" is "times" in "12 per 8" but "by" in "dividi 200 per 8".
+// The imperative is the case the word table can't see — "diviso per" is
+// already a single entry — so rewrite that "per" to the division operator
+// before the "per" -> "*" rule reaches it.
+fn italian_division_by(expr: &str) -> String {
+    const VERB: &str = "dividi";
+    const BY: &str = " per ";
+
+    let Some(after_verb) = expr.find(VERB).map(|i| i + VERB.len()) else {
+        return expr.to_string();
+    };
+    match expr[after_verb..].find(BY) {
+        Some(offset) => {
+            let at = after_verb + offset;
+            format!("{} / {}", &expr[..at], &expr[at + BY.len()..])
+        }
+        None => expr.to_string(),
+    }
 }
 
 fn to_math_expr(input: &str, locale: &str) -> String {
     let mut expr = input.to_string();
+
+    if locale == "it" {
+        expr = italian_decimal_point(&expr);
+        expr = italian_division_by(&expr);
+    }
 
     for trigger in TRIGGER_WORDS {
         expr = expr.replace(trigger, "");
     }
     for phrase in leadin_phrases(locale) {
         expr = expr.replace(phrase, "");
+    }
+    for phrase in percent_phrases(locale) {
+        expr = expr.replace(phrase, "PCT");
     }
 
     for (word, op) in math_words(locale) {
@@ -216,10 +294,29 @@ fn to_math_expr(input: &str, locale: &str) -> String {
         .to_string()
 }
 
+// Whole-word containment. A bare substring check reads the Italian
+// operator "per" inside "percento", "aperto", "persona" and friends —
+// which is how "abbassa le luci al 30 percento" became a sum.
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(i, m)| {
+        let before = haystack[..i].chars().next_back();
+        let after = haystack[i + m.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
 fn has_math_content(input: &str, locale: &str) -> bool {
+    // Percentages are not an operation this skill performs, and the
+    // Italian ones spell "per cento" with the multiplication word in it.
+    // Drop them before looking for operators, or every "al 30 percento"
+    // command in the house reads as arithmetic.
+    let input = percent_phrases(locale)
+        .iter()
+        .fold(input.to_string(), |acc, phrase| acc.replace(phrase, " "));
+
     let has_digits = input.chars().any(|c| c.is_ascii_digit());
     let has_operators = input.chars().any(|c| "+-*/%^".contains(c))
-        || math_words(locale).iter().any(|(word, _)| input.contains(word));
+        || math_words(locale).iter().any(|(word, _)| contains_word(&input, word));
     has_digits && has_operators
 }
 
@@ -276,13 +373,7 @@ impl Skill for CalculatorSkill {
         let expr = to_math_expr(input, ctx.locale.as_str());
 
         match eval_expr(&expr) {
-            Some(result) => {
-                if result.fract() == 0.0 && result.abs() < 1e15 {
-                    Response::Text(format!("{}", result as i64))
-                } else {
-                    Response::Text(format!("{:.6}", result).trim_end_matches('0').trim_end_matches('.').to_string())
-                }
-            }
+            Some(result) => Response::Text(format_result(result)),
             None => Response::Text(
                 match ctx.locale.as_str() {
                     "it" => "Mi spiace, non sono riuscito a calcolare quell'espressione.",
@@ -290,6 +381,30 @@ impl Skill for CalculatorSkill {
                 }
                 .to_string(),
             ),
+        }
+    }
+
+    /// Typed-args path. The router extracts a canonical `expression` in
+    /// the evaluator's own syntax, which carries operations the word
+    /// tables can't express — "what's the square root of 81" arrives as
+    /// `sqrt(81)`, where re-parsing the utterance leaves only `81`.
+    /// Falls back to `execute` when the slot is missing or doesn't
+    /// evaluate, so an unsupported canonical form (`15% of 200`) is no
+    /// worse off than before.
+    fn execute_with_args(
+        &self,
+        input: &str,
+        args_json: &str,
+        ctx: &SkillContext,
+    ) -> Response {
+        let result = serde_json::from_str::<serde_json::Value>(args_json)
+            .ok()
+            .and_then(|v| v.get("expression").and_then(|e| e.as_str()).map(String::from))
+            .and_then(|e| eval_expr(e.trim()));
+
+        match result {
+            Some(value) => Response::Text(format_result(value)),
+            None => self.execute(input, ctx),
         }
     }
 }
@@ -491,6 +606,17 @@ mod tests {
         assert!(!has_math_content("plus minus", "en"));
     }
 
+    #[test]
+    fn has_math_content_needs_a_whole_operator_word() {
+        // Operator words embedded in longer words are not operators.
+        assert!(!has_math_content("3 sometimes", "en"));
+        assert!(!has_math_content("discover 4 things", "en"));
+        assert!(!has_math_content("2 modern chairs", "en"));
+        assert!(!has_math_content("4 persone aperte", "it"));
+        assert!(has_math_content("3 times 4", "en"));
+        assert!(has_math_content("3 per 4", "it"));
+    }
+
     // --- Italian ---
 
     #[test]
@@ -542,5 +668,90 @@ mod tests {
         assert_eq!(exec_it("calcola il 20 percentuale di 50"), err);
     }
 
+    #[test]
+    fn italian_percent_phrase_is_not_math_content() {
+        // "abbassa le luci del corridoio al 30 percento" is a lights
+        // command. When the percent guards lived in MATH_WORDS_IT the
+        // calculator scored it 0.85 at High specificity and won round 0,
+        // answering "30" to someone dimming their hallway.
+        let skill = CalculatorSkill::new();
+        let mut it = SkillContext::default();
+        it.locale = "it".to_string();
+
+        assert!(!has_math_content("abbassa le luci del corridoio al 30 percento", "it"));
+        assert_eq!(skill.score("abbassa le luci del corridoio al 30 percento", &it), 0.0);
+        assert_eq!(skill.score("metti il volume al 50 per cento", &it), 0.0);
+        // A trigger word still scores, but only the bare trigger score —
+        // a percentage is not the math content that earns 0.95.
+        assert_eq!(skill.score("calcola il 20 percentuale di 50", &it), 0.5);
+        // Real arithmetic in the same locale is untouched.
+        assert_eq!(skill.score("quanto fa 12 per 8", &it), 0.85);
+    }
+
+    #[test]
+    fn italian_per_after_a_division_verb_divides() {
+        // "dividi 200 per 8" is 25. The "per" -> "*" rule answered 1600.
+        assert_eq!(exec_it("dividi 200 per 8"), "25");
+        assert_eq!(exec_it("dividi 90 per 3"), "30");
+        // "per" as multiplication is unaffected when no division verb leads.
+        assert_eq!(exec_it("moltiplica 9 per 6"), "54");
+        assert_eq!(exec_it("quanto fa 12 per 8"), "96");
+        // The pre-existing "diviso per" table entry still resolves.
+        assert_eq!(exec_it("quanto fa 99 diviso per 3"), "33");
+    }
+
+    #[test]
+    fn italian_decimal_comma_is_a_decimal_point() {
+        // Italian writes 3,14. Stripping the comma made it "3 14".
+        assert_eq!(exec_it("quanto fa 3,14 per 2"), "6.28");
+        assert_eq!(exec_it("quanto fa 1,5 più 2,5"), "4");
+        assert_eq!(italian_decimal_point("3,14 per 2"), "3.14 per 2");
+        // A comma that isn't between digits is not a decimal point.
+        assert_eq!(italian_decimal_point("ciao, quanto fa 2 più 2"), "ciao, quanto fa 2 più 2");
+    }
+
+    #[test]
+    fn execute_with_args_uses_the_routers_expression() {
+        // The word tables can't express a square root, so re-parsing the
+        // utterance yielded "81". The router's canonical form can.
+        let skill = CalculatorSkill::new();
+        match skill.execute_with_args(
+            "what is the square root of 81",
+            r#"{"expression": "sqrt(81)"}"#,
+            &ctx(),
+        ) {
+            Response::Text(s) => assert_eq!(s, "9"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        // Without args the same utterance still answers wrongly — proof
+        // the fix is the args path, not a change to the parser.
+        assert_eq!(exec("what is the square root of 81"), "81");
+    }
+
+    #[test]
+    fn execute_with_args_falls_back_when_the_expression_is_unusable() {
+        let skill = CalculatorSkill::new();
+        let fallback = |args: &str| match skill.execute_with_args("what is 2 plus 2", args, &ctx()) {
+            Response::Text(s) => s,
+            other => panic!("expected Text, got {other:?}"),
+        };
+        assert_eq!(fallback("{}"), "4", "missing slot falls back to the utterance");
+        assert_eq!(fallback("not json"), "4", "unparseable args fall back");
+        assert_eq!(fallback(r#"{"expression": "15% of 200"}"#), "4",
+            "a canonical form fasteval cannot evaluate falls back");
+    }
+
+    #[test]
+    fn execute_with_args_is_locale_agnostic() {
+        // `expression` is the evaluator's syntax in every locale, so the
+        // Italian path must not re-interpret it.
+        let skill = CalculatorSkill::new();
+        let mut it = SkillContext::default();
+        it.locale = "it".to_string();
+        match skill.execute_with_args("quanto fa 3,14 per 2", r#"{"expression": "3.14 * 2"}"#, &it) {
+            Response::Text(s) => assert_eq!(s, "6.28"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
 }
 

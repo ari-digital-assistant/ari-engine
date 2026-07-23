@@ -543,6 +543,11 @@ pub fn replace_number_words(input: &str) -> String {
 /// Lowercase, locale-specific contraction/elision handling, punctuation
 /// strip, locale-specific number-word replacement.
 ///
+/// A comma flanked by digits survives the punctuation strip: it is a
+/// number's own punctuation, not a sentence's. Italian writes decimals
+/// that way ("3,14") and English writes thousands that way ("1,000"), so
+/// blanking it turned both into two separate numbers.
+///
 /// Per-locale dispatch:
 /// - `"en"` — expand English contractions (`"don't"` → `"do not"`,
 ///   `"what's"` → `"what is"`) and replace English number words
@@ -564,9 +569,19 @@ pub fn normalize_input(input: &str, locale: &str) -> String {
         _ => lower,
     };
 
-    let cleaned: String = pre_clean
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c.is_whitespace() || "+-*/.%^".contains(c) { c } else { ' ' })
+    let chars: Vec<char> = pre_clean.chars().collect();
+    let cleaned: String = chars
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            if c.is_alphanumeric() || c.is_whitespace() || "+-*/.%^".contains(c) {
+                c
+            } else if c == ',' && is_between_digits(&chars, i) {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<&str>>()
@@ -576,6 +591,12 @@ pub fn normalize_input(input: &str, locale: &str) -> String {
         "en" => replace_number_words(&cleaned),
         _ => cleaned,
     }
+}
+
+fn is_between_digits(chars: &[char], i: usize) -> bool {
+    i > 0
+        && chars[i - 1].is_ascii_digit()
+        && chars.get(i + 1).is_some_and(|c| c.is_ascii_digit())
 }
 
 fn expand_english_contractions(lower: &str) -> String {
@@ -722,6 +743,20 @@ mod tests {
         assert_eq!(normalize_input("5 % 3", "en"), "5 % 3");
         assert_eq!(normalize_input("2^8", "en"), "2^8");
         assert_eq!(normalize_input("(1 + 2)", "en"), "1 + 2");
+    }
+
+    #[test]
+    fn normalize_keeps_a_comma_between_digits() {
+        // Italian decimals and English thousands both survive; the comma
+        // strip used to split them into two numbers ("3 14", "1 000").
+        assert_eq!(normalize_input("quanto fa 3,14 per 2", "it"), "quanto fa 3,14 per 2");
+        assert_eq!(normalize_input("what is 1,000 plus 5", "en"), "what is 1,000 plus 5");
+        // Sentence punctuation is still punctuation.
+        assert_eq!(normalize_input("hello, world", "en"), "hello world");
+        assert_eq!(normalize_input("ciao, 5 more", "en"), "ciao 5 more");
+        assert_eq!(normalize_input("5, 6 and 7", "en"), "5 6 and 7");
+        assert_eq!(normalize_input(",5", "en"), "5");
+        assert_eq!(normalize_input("5,", "en"), "5");
     }
 
     #[test]
