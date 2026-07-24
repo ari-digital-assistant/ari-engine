@@ -1456,19 +1456,15 @@ impl Engine {
 
         // No keyword match. Two routing tiers, in this order:
         //
-        // 1. The on-device router (FunctionGemma), whenever a model exists
-        //    for the language being spoken. Sub-second, offline, free. It
-        //    only speaks up when its confidence clears the floor its own
-        //    manifest shipped, so the phrasings it isn't sure about cost
+        // 1. The on-device router (FunctionGemma), but only for English — at
+        //    270M it routes other languages confidently but wrongly, so
+        //    `router_for_active_locale` gates it to `en`. Sub-second, offline,
+        //    free. It only speaks up when its confidence clears the floor its
+        //    own manifest shipped, so the phrasings it isn't sure about cost
         //    nothing and fall to tier 2.
         // 2. The assistant — cloud (one call that routes OR answers) or the
         //    on-device LLM. Slower and, for cloud, a network round-trip, but
         //    it handles what tier 1 declined and answers general questions.
-        //
-        // Tier 1 used to be English-only and sat BELOW the cloud assistant.
-        // Both of those were true when English was the only trained model
-        // and there was no per-model confidence floor to make "stay quiet
-        // when unsure" reliable. Neither is true any more.
 
         let skill_catalog = self.router_catalog();
 
