@@ -937,15 +937,21 @@ impl Engine {
         self.router_confidence_floor = floor;
     }
 
-    /// The on-device router, but only when the model that is loaded was
-    /// trained for the language the user is actually speaking.
+    /// The on-device router, but only when the active language is English.
     ///
-    /// The host loads one model at a time and swaps it when the user
-    /// changes language, but that swap is asynchronous — for a moment the
-    /// previous language's model is still resident. Routing Italian
-    /// through an English model would produce confident nonsense, so the
-    /// engine checks rather than trusting the host to be quick.
+    /// FunctionGemma is English-only: at 270M it routes other languages
+    /// confidently but wrongly, so the engine never consults it outside `en`.
+    /// Non-English routing is the cloud LLM's job (see `uses_assistant_routing`).
+    /// The debug/eval entry points read `self.router` directly and are
+    /// deliberately exempt, so the eval harness can still score any model.
+    ///
+    /// The `router_locale == ctx.locale` check stays as a second guard: the
+    /// host swaps models asynchronously on a language switch, and routing one
+    /// language through another's model would be confident nonsense.
     fn router_for_active_locale(&self) -> Option<&dyn SkillRouter> {
+        if self.ctx.locale != "en" {
+            return None;
+        }
         let router = self.router.as_ref()?;
         if self.router_locale.as_deref() != Some(self.ctx.locale.as_str()) {
             return None;
@@ -3034,22 +3040,31 @@ mod tests {
     }
 
     #[test]
-    fn router_dispatches_for_a_non_english_locale_when_its_model_is_loaded() {
+    fn router_is_english_only_even_with_a_matching_locale_model() {
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
         let mut engine = Engine::new();
         engine.set_locale("it".to_string());
         engine.register_skill(Box::new(unreachable_by_keyword("meteo", "Sole.")));
+        // An Italian-locale model is loaded and matches the active locale...
         engine.set_router(Some((
-            Box::new(AlwaysRoutesTo { target: "meteo" }),
+            Box::new(CatalogCapturingRouter { seen: seen.clone() }),
             "it".to_string(),
         )));
 
-        let (response, trace) = engine.process_input_traced("che tempo fa");
+        let (response, _) = engine.process_input_traced("che tempo fa");
 
+        // ...but FunctionGemma is English-only, so it is never consulted.
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "FunctionGemma must not be consulted for a non-English locale, got {:?}",
+            seen.lock().unwrap()
+        );
         match response {
-            Response::Text(t) => assert_eq!(t, "Sole."),
-            other => panic!("expected the routed skill's text, got {other:?}"),
+            Response::Text(t) => assert_eq!(t, fallback_response_for("it")),
+            other => panic!("expected the Italian fallback, got {other:?}"),
         }
-        assert_eq!(trace.unwrap().winner, Some("router:meteo".to_string()));
     }
 
     #[test]
