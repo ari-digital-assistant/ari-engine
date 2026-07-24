@@ -1557,8 +1557,7 @@ impl Engine {
         //   tier 1's verdict stands and anything left goes to the answer path.
         let has_cloud_assistant =
             matches!(&self.active_assistant, Some(ActiveAssistant::Api { .. }));
-        let use_assistant_routing =
-            uses_assistant_routing(&self.ctx.locale, has_cloud_assistant);
+        let use_assistant_routing = uses_assistant_routing(has_cloud_assistant);
 
         if use_assistant_routing && self.ctx.locale == "en" {
             // English + cloud assistant: ONE-SHOT route-or-answer — a single
@@ -1996,20 +1995,19 @@ fn assistant_display_name(skill_id: &str) -> String {
 /// bulleted list, then the user's input fenced in quotes. Output
 /// constraint kept minimal so we get a parseable response on the
 /// first line even when the model insists on adding prose.
-/// Whether the assistant is asked to ROUTE what the on-device router left
-/// behind, rather than only to answer it. Consulted AFTER the router has had
-/// its turn (see `process_input_traced`), so this decides the second tier,
-/// not the first.
+/// Whether the assistant is asked to ROUTE what the router left behind, rather
+/// than only to answer it. Consulted AFTER the router has had its turn (see
+/// `process_input_traced`), so this decides the second tier, not the first.
 ///
-/// A cloud assistant arbitrates well — it tells a skill request from a
-/// general question reliably, which the 270M FunctionGemma cannot — so it is
-/// worth asking in every language. Non-English asks whichever backend is
-/// wired, cloud or on-device. English with no cloud assistant asks nothing:
-/// the on-device LLM takes ~22s to route because the catalogue prefill
-/// dominates, so the router's verdict stands and the leftovers go straight to
-/// the answer path.
-fn uses_assistant_routing(locale: &str, has_cloud_assistant: bool) -> bool {
-    locale != "en" || has_cloud_assistant
+/// Routing is cloud-only. A cloud assistant arbitrates well — it tells a skill
+/// request from a general question reliably, in any language. The on-device
+/// Gemma cannot (it's ~22s to route, catalogue prefill dominates, and at its
+/// size the picks aren't reliable), so when there's no cloud assistant nothing
+/// is asked to route: the request falls to the answer path and is answered
+/// directly. English still gets FunctionGemma as its offline routing tier;
+/// other languages get keyword matching and direct answers offline.
+fn uses_assistant_routing(has_cloud_assistant: bool) -> bool {
+    has_cloud_assistant
 }
 
 /// Outcome of a one-shot [`Engine::route_or_answer`]: either the assistant
@@ -3945,13 +3943,12 @@ mod tests {
 
     #[test]
     fn routing_backend_choice() {
-        // English + cloud assistant → assistant arbitrates (skips FunctionGemma).
-        assert!(uses_assistant_routing("en", true));
-        // English + no cloud assistant → FunctionGemma (only on-device option).
-        assert!(!uses_assistant_routing("en", false));
-        // Non-English always routes via the assistant, with or without cloud.
-        assert!(uses_assistant_routing("it", true));
-        assert!(uses_assistant_routing("it", false));
+        // Routing via the assistant happens only when a cloud assistant is
+        // present — for every locale. Offline (on-device LLM only), a
+        // non-keyword request gets a direct answer, never a routing round-trip
+        // through the slow on-device LLM.
+        assert!(uses_assistant_routing(true));
+        assert!(!uses_assistant_routing(false));
     }
 
     #[test]
