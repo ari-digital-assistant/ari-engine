@@ -95,6 +95,13 @@ pub enum RegistryError {
     #[error("registry index has no preview manifest for {id}")]
     ManifestUnavailable { id: String },
 
+    #[error("refusing to downgrade {id}: {installed} is installed, the registry bundle is older ({attempted})")]
+    Downgrade {
+        id: String,
+        installed: String,
+        attempted: String,
+    },
+
     #[error(transparent)]
     Install(#[from] BundleError),
 }
@@ -433,13 +440,28 @@ pub fn install_update(
         });
     }
 
-    // The store's install() enforces downgrade defence and updates the
-    // index. It takes its own trust root via SkillStore::open, so we need
-    // a variant that lets us pass one in — currently SkillStore uses the
-    // trust root it was opened with. For the registry path we re-open the
-    // store's install pipeline with the caller-supplied trust root by
-    // going through install_from_bytes directly, then calling rescan()
-    // so the store's in-memory index picks up the new install.
+    // Downgrade defence. SkillStore::install() runs this guard, but it uses
+    // the trust root the store was opened with; the registry path needs to
+    // pass a caller-supplied trust root, so it calls install_from_bytes
+    // directly and would otherwise skip the check — letting a validly signed
+    // but OLDER bundle roll a skill back silently. Re-apply the same guard
+    // here, before any disk state changes.
+    let (incoming_id, incoming_version) = crate::store::peek_bundle_manifest(&bundle)
+        .map_err(|e| RegistryError::Parse(format!("peek bundle manifest: {e}")))?;
+    if let Some(prior) = store.get(&incoming_id) {
+        if crate::store::compare_versions(&incoming_version, &prior.version)
+            == std::cmp::Ordering::Less
+        {
+            return Err(RegistryError::Downgrade {
+                id: incoming_id,
+                installed: prior.version.clone(),
+                attempted: incoming_version,
+            });
+        }
+    }
+
+    // Install with the caller-supplied trust root, then rescan() so the
+    // store's in-memory index picks up the new install.
     install_from_bytes(
         &bundle,
         &sig,
@@ -466,8 +488,8 @@ pub fn install_update(
 ///
 /// Reinstalls of the currently-installed version are allowed — the store's
 /// install pipeline overwrites in place. Installing an *older* version than
-/// what's currently on disk is a no-op from the perspective of the user but
-/// succeeds silently; downgrade protection is a TODO on the store side.
+/// what's on disk is refused: [`install_update`] applies the same downgrade
+/// guard [`SkillStore::install`] does, returning [`RegistryError::Downgrade`].
 ///
 /// Returns [`RegistryError::NotFound`] if `id` isn't in the index at all,
 /// which is distinct from every other error mode so the FFI layer can
@@ -1002,6 +1024,93 @@ metadata:
         )
         .unwrap_err();
         assert!(matches!(err, RegistryError::ShaMismatch { .. }));
+
+        let _ = std::fs::remove_dir_all(&store_root);
+        let _ = std::fs::remove_dir_all(&storage_root);
+    }
+
+    #[test]
+    fn install_update_rejects_downgrade_to_older_version() {
+        // Install 0.2.0 locally, then have the (validly signed) registry offer
+        // 0.1.0. install_update calls install_from_bytes directly to pass its
+        // own trust root, which used to skip the store's downgrade guard — an
+        // older signed bundle rolled the skill back silently. It must refuse
+        // now, and leave the on-disk install untouched.
+        let sk = SigningKey::from_bytes(&[101u8; 32]);
+        let trust = TrustRoot::single(sk.verifying_key().as_bytes()).unwrap();
+
+        let v2 = make_bundle("coin-flip", &coin_md("0.2.0"));
+        let v2_hash = sha256_hex(&v2);
+        let mut h2 = Sha256::new();
+        h2.update(&v2);
+        let v2_sig = sk.sign(&h2.finalize()).to_bytes().to_vec();
+
+        let v1 = make_bundle("coin-flip", &coin_md("0.1.0"));
+        let v1_hash = sha256_hex(&v1);
+        let mut h1 = Sha256::new();
+        h1.update(&v1);
+        let v1_sig = sk.sign(&h1.finalize()).to_bytes().to_vec();
+
+        let store_root = unique_dir("downgrade-store");
+        let storage_root = unique_dir("downgrade-storage");
+        let mut store = SkillStore::open(
+            &store_root,
+            StorageConfig::new(&storage_root),
+            trust.clone(),
+        )
+        .unwrap();
+        store
+            .install(&v2, &v2_sig, &v2_hash, &LoadOptions::default())
+            .unwrap();
+        assert_eq!(store.get("dev.heyari.coinflip").unwrap().version, "0.2.0");
+
+        // Registry offers the OLDER 0.1.0.
+        let index_json = format!(
+            r#"{{"index_version":1,"generated_at":"t","skills":[{{
+                "id":"dev.heyari.coinflip","version":"0.1.0","name":"coin-flip",
+                "description":"","bundle":"bundles/v1.tar.gz",
+                "signature":"bundles/v1.tar.gz.sig","sha256":"{}"
+            }}]}}"#,
+            v1_hash
+        );
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/index.json".to_string(),
+            http_response(index_json.as_bytes(), "application/json"),
+        );
+        routes.insert(
+            "/bundles/v1.tar.gz".to_string(),
+            http_response(&v1, "application/gzip"),
+        );
+        routes.insert(
+            "/bundles/v1.tar.gz.sig".to_string(),
+            http_response(&v1_sig, "application/octet-stream"),
+        );
+        let server = TestServer::start(routes);
+
+        let client = RegistryClient::new()
+            .with_index_url(server.url("/index.json"))
+            .with_base_url(server.base());
+        let index = client.fetch_index().unwrap();
+        let entry = &index.skills[0];
+
+        let err = install_update(
+            &client,
+            entry,
+            &mut store,
+            &trust,
+            &LoadOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RegistryError::Downgrade { .. }),
+            "expected Downgrade, got {err:?}"
+        );
+        assert_eq!(
+            store.get("dev.heyari.coinflip").unwrap().version,
+            "0.2.0",
+            "a refused downgrade must not touch the installed version",
+        );
 
         let _ = std::fs::remove_dir_all(&store_root);
         let _ = std::fs::remove_dir_all(&storage_root);

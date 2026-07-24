@@ -245,9 +245,11 @@ impl SkillStore {
 /// Peek at a bundle without unpacking it to disk: scan the tar in memory
 /// for `<slug>/SKILL.en.md` (per-locale layout) or `<slug>/SKILL.md`
 /// (legacy), parse the manifest, and return `(id, version)`. Used by
-/// the store to enforce downgrade defence before committing to an
-/// install.
-fn peek_bundle_manifest(bundle_bytes: &[u8]) -> Result<(String, String), StoreError> {
+/// the store — and the registry install path — to enforce downgrade
+/// defence before committing to an install.
+pub(crate) fn peek_bundle_manifest(
+    bundle_bytes: &[u8],
+) -> Result<(String, String), StoreError> {
     let gz = flate2::read::GzDecoder::new(bundle_bytes);
     let mut archive = tar::Archive::new(gz);
     let entries = archive
