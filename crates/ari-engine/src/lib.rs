@@ -876,6 +876,20 @@ impl Engine {
         self.skills.push(Arc::from(skill));
     }
 
+    /// Swap the entire skill set in place, leaving every other field of the
+    /// engine untouched — LLM, router, remembered facts, conversation-memory
+    /// toggle, pending turn, let's-talk state, conversation buffer, sinks and
+    /// named assistants all survive.
+    ///
+    /// This is what the host's reload path (community skill install / update /
+    /// uninstall, and startup) must use. Rebuilding a fresh `Engine` to pick
+    /// up a new skill set — the previous approach — silently discarded all of
+    /// that runtime state, which the frontend hydrates once and does not
+    /// re-apply after a reload.
+    pub fn replace_skills(&mut self, skills: Vec<Box<dyn Skill>>) {
+        self.skills = skills.into_iter().map(Arc::from).collect();
+    }
+
     /// Set the LLM fallback. When set, the engine will consult the LLM
     /// before returning the fallback response, attempting skill rerouting
     /// or direct answers for unmatched input. Stored as `Arc` so the
@@ -2769,6 +2783,84 @@ mod tests {
                 requires_setting: Some(k.to_string()),
             })
         }
+    }
+
+    // --- Reload state preservation (P0) ---
+    //
+    // `replace_skills` is the in-place seam the FFI `reload_community_skills`
+    // uses instead of building a throwaway Engine. Only the skill set may
+    // change; every other field must survive. The old rebuild-and-swap silently
+    // wiped remembered facts (and the first later "remember" clobbered the
+    // on-disk list), re-enabled conversation memory, and dropped the pending
+    // turn / let's-talk state / router / LLM. These lock that door shut.
+
+    fn mock(id: &'static str) -> Box<dyn Skill> {
+        Box::new(MockSkill {
+            id,
+            specificity: Specificity::High,
+            fixed_score: 1.0,
+            response: "ok",
+            requires_setting: None,
+        })
+    }
+
+    #[test]
+    fn replace_skills_installs_the_new_set_and_drops_the_old() {
+        let mut engine = Engine::new();
+        engine.register_skill(mock("old"));
+        engine.replace_skills(vec![mock("new_a"), mock("new_b")]);
+        let ids: Vec<&str> = engine.skills.iter().map(|s| s.id()).collect();
+        assert_eq!(ids, vec!["new_a", "new_b"], "old set replaced wholesale");
+    }
+
+    #[test]
+    fn replace_skills_preserves_remembered_facts() {
+        let mut engine = Engine::new();
+        engine.set_remembered_facts(vec!["my name is Keith".to_string()]);
+        engine.replace_skills(vec![mock("x")]);
+        assert_eq!(
+            engine.remembered_facts(),
+            vec!["my name is Keith".to_string()],
+            "reload must not wipe remembered facts",
+        );
+    }
+
+    #[test]
+    fn replace_skills_preserves_conversation_memory_toggle() {
+        let mut engine = Engine::new();
+        engine.set_conversation_memory_enabled(false);
+        engine.replace_skills(vec![mock("x")]);
+        assert!(
+            !engine.is_conversation_memory_enabled(),
+            "reload must not silently re-enable conversation memory",
+        );
+    }
+
+    #[test]
+    fn replace_skills_preserves_pending_turn() {
+        let mut engine = Engine::new();
+        engine.set_pending_turn("music", "pick a service".to_string());
+        assert!(engine.has_pending_turn(), "sanity: pending turn armed");
+        engine.replace_skills(vec![mock("x")]);
+        assert!(
+            engine.has_pending_turn(),
+            "reload must not strand an in-flight pending turn",
+        );
+    }
+
+    #[test]
+    fn replace_skills_preserves_lets_talk_active_state() {
+        let mut engine = Engine::new();
+        engine.set_conversation_active(true); // memory defaults on, so this sticks
+        assert!(
+            engine.conversation_active.load(Ordering::SeqCst),
+            "sanity: let's-talk active",
+        );
+        engine.replace_skills(vec![mock("x")]);
+        assert!(
+            engine.conversation_active.load(Ordering::SeqCst),
+            "reload must not drop an active let's-talk session",
+        );
     }
 
     // --- Multi-turn pending-turn ---

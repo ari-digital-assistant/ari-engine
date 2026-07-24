@@ -1,5 +1,6 @@
 #![allow(clippy::new_without_default)]
 
+use ari_core::Skill;
 use ari_engine::{fallback_response_for, Engine, EnvelopeSink, FALLBACK_RESPONSE};
 use ari_skill_loader::assistant::{ConfigStore, MemoryConfigStore};
 use ari_skill_loader::{
@@ -747,25 +748,30 @@ pub struct AriEngine {
     /// don't supply a real one (CLI, tests). The Android host wires a
     /// provider that opens the system browser and returns callback params.
     pub(crate) authorize_provider: Arc<dyn AuthorizeProvider>,
-    /// Envelope sink the engine uses to push phase-2 Layer C envelopes
-    /// asynchronously. Stored here (not just on [`Engine`]) so
-    /// `reload_community_skills` can re-attach it to the fresh engine
-    /// it swaps in — otherwise the first community-skill reload would
-    /// silently disable Layer C for every session afterwards.
-    pub(crate) envelope_sink: Option<Arc<dyn EnvelopeSink>>,
 }
 
 /// Build an [`Engine`] with the full set of built-in skills registered — the
 /// same catalogue used at runtime. Exposed so the `route-eval` binary can
 /// exercise the real router catalogue without duplicating the skill list.
+/// The 6 built-in Rust skills, freshly constructed. Kept in one place so the
+/// initial engine build and every `reload_community_skills` register exactly
+/// the same set — a reload that forgot one would silently drop that skill.
+fn builtin_skills() -> Vec<Box<dyn Skill>> {
+    vec![
+        Box::new(CurrentTimeSkill::new()),
+        Box::new(DateSkill::new()),
+        Box::new(CalculatorSkill::new()),
+        Box::new(GreetingSkill::new()),
+        Box::new(OpenSkill::new()),
+        Box::new(SearchSkill::new()),
+    ]
+}
+
 pub fn build_engine_with_builtins() -> Engine {
     let mut engine = Engine::new();
-    engine.register_skill(Box::new(CurrentTimeSkill::new()));
-    engine.register_skill(Box::new(DateSkill::new()));
-    engine.register_skill(Box::new(CalculatorSkill::new()));
-    engine.register_skill(Box::new(GreetingSkill::new()));
-    engine.register_skill(Box::new(OpenSkill::new()));
-    engine.register_skill(Box::new(SearchSkill::new()));
+    for skill in builtin_skills() {
+        engine.register_skill(skill);
+    }
     engine
 }
 
@@ -899,7 +905,6 @@ fn assemble_with_providers(
         config_store,
         setting_writer,
         authorize_provider,
-        envelope_sink: adapted_envelope_sink,
     }
 }
 
@@ -922,7 +927,6 @@ impl AriEngine {
             config_store,
             setting_writer: Arc::new(NullSettingWriter),
             authorize_provider: Arc::new(NullAuthorizeProvider),
-            envelope_sink: None,
         }
     }
 
@@ -949,7 +953,6 @@ impl AriEngine {
             config_store,
             setting_writer: Arc::new(NullSettingWriter),
             authorize_provider: Arc::new(NullAuthorizeProvider),
-            envelope_sink: None,
         }
     }
 
@@ -1169,19 +1172,6 @@ impl AriEngine {
         skill_store_dir: String,
         storage_dir: String,
     ) -> u32 {
-        let mut fresh = build_engine_with_builtins();
-        // Re-attach the engine-level sinks the host installed at
-        // construction time. Without this, the fresh Engine starts
-        // with `log_sink = None` and `envelope_sink = None`, which
-        // silently disables both the engine's diagnostic log stream
-        // and Layer C phase-2 push for every session after the first
-        // reload_community_skills call (that is: for every session
-        // at all on Android, since EngineModule always reloads).
-        fresh.set_log_sink(Some(self.log_sink.clone()));
-        fresh.set_config_store(Some(self.config_store.clone()));
-        if let Some(ref es) = self.envelope_sink {
-            fresh.set_envelope_sink(Some(es.clone()));
-        }
         // Start from the shared default LoadOptions (host caps, HTTP, storage)
         // and override the log sink with whatever the host installed at
         // construction time. Install/validation paths elsewhere keep the
@@ -1199,18 +1189,30 @@ impl AriEngine {
         options.locale_provider = self.locale_provider.clone();
         options.setting_writer = self.setting_writer.clone();
         options.authorize_provider = self.authorize_provider.clone();
-        let loaded: u32 =
-            match load_skill_directory_with(&PathBuf::from(&skill_store_dir), &options) {
-                Ok(report) => {
-                    let n = report.skills.len() as u32;
-                    for skill in report.skills {
-                        fresh.register_skill(skill);
-                    }
-                    n
-                }
-                Err(_) => 0,
-            };
-        *self.inner.lock().expect("engine mutex poisoned") = fresh;
+        // Load the community skills from disk BEFORE touching the live engine,
+        // so a whole-directory read failure leaves the current set intact
+        // rather than half-swapped.
+        let community = match load_skill_directory_with(&PathBuf::from(&skill_store_dir), &options)
+        {
+            Ok(report) => report.skills,
+            Err(_) => Vec::new(),
+        };
+        let loaded = community.len() as u32;
+
+        // Swap the skill set IN PLACE. We deliberately do NOT build a fresh
+        // Engine: that discarded every other field — remembered facts (and the
+        // first later "remember" then clobbered the on-disk list), the
+        // conversation-memory toggle, the on-device LLM, the router, the
+        // pending turn, let's-talk state and the conversation buffer — none of
+        // which the frontend re-applies after a reload. `replace_skills`
+        // touches only the skills; the engine's sinks/providers were installed
+        // once at construction and persist. Built-ins lead the community set.
+        let mut skills = builtin_skills();
+        skills.extend(community);
+        self.inner
+            .lock()
+            .expect("engine mutex poisoned")
+            .replace_skills(skills);
         loaded
     }
 }
@@ -1506,6 +1508,46 @@ mod tests {
         });
         assert_eq!(out.ok, false);
         assert_eq!(out.error.as_deref(), Some("cancelled"));
+    }
+
+    #[test]
+    fn reload_community_skills_preserves_facts_and_keeps_builtins() {
+        // An empty store dir → zero community skills. The reload must still
+        // re-register the built-ins AND leave runtime state (here: remembered
+        // facts) untouched. Rebuilding a fresh Engine — the old approach —
+        // discarded the facts, which is the P0 this guards against.
+        let base = std::env::temp_dir()
+            .join(format!("ari_reload_test_{}", std::process::id()));
+        let store = base.join("skills");
+        let storage = base.join("storage");
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&store).expect("store dir");
+        std::fs::create_dir_all(&storage).expect("storage dir");
+
+        let engine = AriEngine::new();
+        engine.set_remembered_facts(vec!["my name is Keith".to_string()]);
+
+        let community = engine.reload_community_skills(
+            store.to_string_lossy().into_owned(),
+            storage.to_string_lossy().into_owned(),
+        );
+        assert_eq!(community, 0, "empty store dir yields no community skills");
+
+        assert_eq!(
+            engine.remembered_facts(),
+            vec!["my name is Keith".to_string()],
+            "reload_community_skills discarded remembered facts",
+        );
+
+        // Built-ins must survive the reload: the calculator still answers.
+        match engine.process_input("2 + 2".to_string()) {
+            FfiResponse::Text { body, .. } => {
+                assert_eq!(body, "4", "calculator built-in lost after reload")
+            }
+            _ => panic!("expected the calculator built-in to answer with text"),
+        }
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     struct DeniedLocation;
