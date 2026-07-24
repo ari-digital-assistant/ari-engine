@@ -1543,18 +1543,18 @@ impl Engine {
         }
 
         // Tier 2. Whether the assistant is asked to ROUTE what tier 1 left
-        // behind (as opposed to only answering it) depends on the backend:
+        // behind (as opposed to only answering it) turns on ONE thing: is a
+        // cloud assistant wired? Routing is cloud-only.
         //
         // - A cloud assistant (ChatGPT et al.) arbitrates reliably — it picks
         //   a skill or says NONE, so a general "what is X" falls through to
         //   the answer path instead of being force-mapped onto the nearest
-        //   skill. For English that's the one-shot below: route AND answer in
-        //   a single call.
-        // - Non-English asks whichever backend is wired (cloud API or the
-        //   on-device Gemma) to pick from the catalogue.
-        // - English with no cloud assistant asks nothing: the on-device LLM
-        //   is far too slow at routing (the catalogue prefill dominates), so
-        //   tier 1's verdict stands and anything left goes to the answer path.
+        //   skill. For English that's the one-shot below (route AND answer in
+        //   a single call); other languages get the two-step routing prompt.
+        // - No cloud assistant, any locale: ask nothing. The on-device LLM is
+        //   far too slow at routing (the catalogue prefill dominates) and, at
+        //   its size, unreliable — so tier 1's verdict stands (English only)
+        //   and anything left goes to the answer path, answered directly.
         let has_cloud_assistant =
             matches!(&self.active_assistant, Some(ActiveAssistant::Api { .. }));
         let use_assistant_routing = uses_assistant_routing(has_cloud_assistant);
