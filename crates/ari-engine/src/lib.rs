@@ -1463,8 +1463,9 @@ impl Engine {
         //    own manifest shipped, so the phrasings it isn't sure about cost
         //    nothing and fall to tier 2.
         // 2. The assistant — cloud (one call that routes OR answers) or the
-        //    on-device LLM. Slower and, for cloud, a network round-trip, but
-        //    it handles what tier 1 declined and answers general questions.
+        //    on-device LLM, which only answers. Slower and, for cloud, a
+        //    network round-trip, but it handles what tier 1 declined and
+        //    answers general questions.
 
         let skill_catalog = self.router_catalog();
 
