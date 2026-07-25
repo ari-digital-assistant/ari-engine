@@ -191,6 +191,21 @@ pub struct FfiInsertCalendarEventParams {
     pub tz_id: String,
 }
 
+/// One installed launchable app, pushed into the engine so scoring can tell
+/// "open <app>" from "open <smart-home device>". Mirrors
+/// [`ari_core::AppEntry`] across the UniFFI boundary.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAppEntry {
+    pub label: String,
+    pub package: String,
+}
+
+impl From<FfiAppEntry> for ari_core::AppEntry {
+    fn from(a: FfiAppEntry) -> Self {
+        ari_core::AppEntry { label: a.label, package: a.package }
+    }
+}
+
 /// Row returned by [`FfiTasksProvider::query_in_range`]. Mirrors
 /// [`ari_skill_loader::TaskRow`] across the UniFFI boundary.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -548,7 +563,7 @@ impl AuthorizeProvider for ForeignAuthorizeProviderAdapter {
     }
 }
 
-#[derive(uniffi::Enum)]
+#[derive(Debug, uniffi::Enum)]
 pub enum FfiResponse {
     /// `rearm` true means the engine is awaiting a spoken reply — the host
     /// should re-arm the mic without a wake word (see multi-turn design).
@@ -1139,6 +1154,15 @@ impl AriEngine {
             .set_remembered_facts(facts);
     }
 
+    /// Replace the engine's snapshot of installed launchable apps. The frontend
+    /// pushes this at build time and refreshes it on app install/uninstall.
+    pub fn set_installed_apps(&self, apps: Vec<FfiAppEntry>) {
+        self.inner
+            .lock()
+            .expect("engine mutex poisoned")
+            .set_installed_apps(apps.into_iter().map(Into::into).collect());
+    }
+
     /// Snapshot of the engine's durable personal facts (oldest first). The
     /// frontend reads this after a turn that signalled `facts_changed` and
     /// persists the result.
@@ -1708,5 +1732,32 @@ mod tests {
         let engine = AriEngine::new();
         engine.set_remembered_facts(vec!["i am vegetarian".to_string()]);
         assert_eq!(engine.remembered_facts(), vec!["i am vegetarian".to_string()]);
+    }
+
+    #[test]
+    fn ffi_app_entry_converts_to_core() {
+        let core: ari_core::AppEntry = FfiAppEntry {
+            label: "Spotify".to_string(),
+            package: "com.spotify.music".to_string(),
+        }
+        .into();
+        assert_eq!(core.label, "Spotify");
+        assert_eq!(core.package, "com.spotify.music");
+    }
+
+    #[test]
+    fn set_installed_apps_marshals_and_open_still_launches() {
+        let engine = AriEngine::new(); // built-ins incl. `open`
+        engine.set_installed_apps(vec![FfiAppEntry {
+            label: "Spotify".to_string(),
+            package: "com.spotify.music".to_string(),
+        }]);
+        match engine.process_input("open spotify".to_string()) {
+            FfiResponse::Action { json, .. } => {
+                assert!(json.contains("launch_app"), "expected a launch_app envelope: {json}");
+                assert!(json.to_lowercase().contains("spotify"), "target preserved: {json}");
+            }
+            other => panic!("expected a launch action for an installed app, got {other:?}"),
+        }
     }
 }
