@@ -237,8 +237,10 @@ impl Skill for OpenSkill {
         let words: Vec<&str> = input.split_whitespace().collect();
         let has_trigger = words.iter().any(|w| TRIGGER_WORDS.contains(w));
         if !has_trigger {
-            // Only reachable via the fallback tier (open never wins the keyword
-            // tier without a trigger). Decline so the engine keeps routing.
+            // Reached from the fallback tier AND from router/assistant dispatch
+            // when a no-launch-verb utterance is routed here with no usable
+            // app_name. All of those tiers treat this sentinel as "declined" and
+            // keep routing, so returning it here never surfaces to the user.
             return Response::Action(serde_json::json!({ "v": 1, "_ari_no_match": true }));
         }
         match extract_target(input) {

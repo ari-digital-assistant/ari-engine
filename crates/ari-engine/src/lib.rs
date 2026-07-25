@@ -1520,14 +1520,21 @@ impl Engine {
                             ),
                         );
                     } else if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
-                        trace.winner = Some(format!("router:{id}"));
                         self.log(
                             LogLevel::Info,
                             &format!("router: dispatching skill={id} (confidence {confidence:.3})"),
                         );
                         let response = skill.execute(&normalized, &self.ctx);
-                        let response = self.maybe_intercept_consult(skill, &normalized, response);
-                        return (response, Some(trace));
+                        if Self::is_no_match_envelope(&response) {
+                            self.log(
+                                LogLevel::Info,
+                                &format!("router: skill={id} declined (_ari_no_match); falling through"),
+                            );
+                        } else {
+                            trace.winner = Some(format!("router:{id}"));
+                            let response = self.maybe_intercept_consult(skill, &normalized, response);
+                            return (response, Some(trace));
+                        }
                     }
                 }
                 RouteResult::SkillWithArgs {
@@ -1545,7 +1552,6 @@ impl Engine {
                             ),
                         );
                     } else if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
-                        trace.winner = Some(format!("router:{id}+args"));
                         self.log(
                             LogLevel::Info,
                             &format!(
@@ -1554,8 +1560,16 @@ impl Engine {
                             ),
                         );
                         let response = skill.execute_with_args(&normalized, args_json, &self.ctx);
-                        let response = self.maybe_intercept_consult(skill, &normalized, response);
-                        return (response, Some(trace));
+                        if Self::is_no_match_envelope(&response) {
+                            self.log(
+                                LogLevel::Info,
+                                &format!("router: skill={id} declined (_ari_no_match); falling through"),
+                            );
+                        } else {
+                            trace.winner = Some(format!("router:{id}+args"));
+                            let response = self.maybe_intercept_consult(skill, &normalized, response);
+                            return (response, Some(trace));
+                        }
                     }
                 }
                 RouteResult::Action(action) => {
@@ -1591,14 +1605,21 @@ impl Engine {
             match self.route_or_answer(&normalized, &history, &facts) {
                 Ok(RouteOrAnswer::Skill(id)) => {
                     if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
-                        trace.winner = Some(format!("router:assistant:{id}"));
                         self.log(
                             LogLevel::Info,
                             &format!("router:assistant: one-shot routed skill={id}"),
                         );
                         let response = skill.execute(&normalized, &self.ctx);
-                        let response = self.maybe_intercept_consult(skill, &normalized, response);
-                        return (response, Some(trace));
+                        if Self::is_no_match_envelope(&response) {
+                            self.log(
+                                LogLevel::Info,
+                                &format!("router:assistant: skill={id} declined (_ari_no_match); falling through"),
+                            );
+                        } else {
+                            trace.winner = Some(format!("router:assistant:{id}"));
+                            let response = self.maybe_intercept_consult(skill, &normalized, response);
+                            return (response, Some(trace));
+                        }
                     }
                 }
                 Ok(RouteOrAnswer::Answer(text)) => {
@@ -1631,7 +1652,6 @@ impl Engine {
                     .find(|s| s.id() == picked_id)
                     .cloned()
                 {
-                    trace.winner = Some(format!("router:assistant:{picked_id}"));
                     self.log(
                         LogLevel::Info,
                         &format!(
@@ -1640,8 +1660,16 @@ impl Engine {
                         ),
                     );
                     let response = skill.execute(&normalized, &self.ctx);
-                    let response = self.maybe_intercept_consult(skill, &normalized, response);
-                    return (response, Some(trace));
+                    if Self::is_no_match_envelope(&response) {
+                        self.log(
+                            LogLevel::Info,
+                            &format!("router:assistant: skill={picked_id} declined (_ari_no_match); falling through"),
+                        );
+                    } else {
+                        trace.winner = Some(format!("router:assistant:{picked_id}"));
+                        let response = self.maybe_intercept_consult(skill, &normalized, response);
+                        return (response, Some(trace));
+                    }
                 }
             }
         }
@@ -1681,12 +1709,7 @@ impl Engine {
                 }
             }
             let response = skill.execute(&normalized, &self.ctx);
-            let fell_through = matches!(
-                &response,
-                Response::Action(v)
-                    if v.get("_ari_no_match").and_then(|b| b.as_bool()).unwrap_or(false)
-            );
-            if !fell_through {
+            if !Self::is_no_match_envelope(&response) {
                 trace.winner = Some(format!("fallback:{}", skill.id()));
                 let response = self.maybe_intercept_consult(skill, &normalized, response);
                 return (response, Some(trace));
@@ -1880,6 +1903,18 @@ impl Engine {
         let prompt = build_combined_route_or_answer_prompt(input, &catalog);
         let response = self.call_active_assistant(&prompt, history, facts)?;
         Ok(parse_combined_response(&response, &catalog))
+    }
+
+    /// True when a skill's response is the `_ari_no_match` sentinel envelope —
+    /// the skill's way of saying "not me, keep routing". Every dispatch tier
+    /// (router, assistant, fallback) must treat this as a decline and fall
+    /// through rather than surfacing the inert envelope to the user.
+    fn is_no_match_envelope(response: &Response) -> bool {
+        matches!(
+            response,
+            Response::Action(v)
+                if v.get("_ari_no_match").and_then(|b| b.as_bool()).unwrap_or(false)
+        )
     }
 
     fn maybe_intercept_consult(
@@ -3108,6 +3143,62 @@ mod tests {
             !seen.contains(&"keyword_only".to_string()),
             "router-ineligible skill must be filtered out, got {seen:?}"
         );
+    }
+
+    // --- Router/assistant dispatch must not leak the _ari_no_match sentinel ---
+
+    /// A skill that always declines via the `_ari_no_match` sentinel (like
+    /// `open` does for a no-trigger utterance). Never scores at the keyword
+    /// tier, so only a router/assistant can dispatch it.
+    struct DeclineSkill;
+    impl Skill for DeclineSkill {
+        fn id(&self) -> &str { "decliner" }
+        fn specificity(&self) -> Specificity { Specificity::Low }
+        fn score(&self, _: &str, _: &SkillContext) -> f32 { 0.0 }
+        fn execute(&self, _: &str, _: &SkillContext) -> Response {
+            Response::Action(serde_json::json!({ "v": 1, "_ari_no_match": true }))
+        }
+        fn execute_with_args(&self, _: &str, _: &str, _: &SkillContext) -> Response {
+            Response::Action(serde_json::json!({ "v": 1, "_ari_no_match": true }))
+        }
+    }
+
+    /// Router that routes everything to `decliner`. `with_args` toggles which
+    /// `RouteResult` variant it emits, exercising both router dispatch sites.
+    struct AlwaysRouteTo { id: String, with_args: bool }
+    impl SkillRouter for AlwaysRouteTo {
+        fn route(&self, _input: &str, _skills: &[(String, String, String)]) -> RouteResult {
+            if self.with_args {
+                RouteResult::SkillWithArgs { id: self.id.clone(), args_json: "{}".to_string(), confidence: 1.0 }
+            } else {
+                RouteResult::Skill { id: self.id.clone(), confidence: 1.0 }
+            }
+        }
+    }
+
+    #[test]
+    fn router_skill_dispatch_does_not_leak_no_match_sentinel() {
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(DeclineSkill));
+        engine.set_router(Some((Box::new(AlwaysRouteTo { id: "decliner".to_string(), with_args: false }), "en".to_string())));
+        // Keyword tier: decliner scores 0.0 → no winner → router routes to
+        // decliner → execute returns the sentinel → must be filtered, NOT
+        // returned to the user.
+        match engine.process_input("show me the camera") {
+            Response::Text(t) => assert_eq!(t, fallback_response_for("en")),
+            other => panic!("sentinel leaked instead of falling through: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn router_skill_with_args_dispatch_does_not_leak_no_match_sentinel() {
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(DeclineSkill));
+        engine.set_router(Some((Box::new(AlwaysRouteTo { id: "decliner".to_string(), with_args: true }), "en".to_string())));
+        match engine.process_input("show me the camera") {
+            Response::Text(t) => assert_eq!(t, fallback_response_for("en")),
+            other => panic!("sentinel leaked instead of falling through: {other:?}"),
+        }
     }
 
     // --- Router locale gating and precedence ---
