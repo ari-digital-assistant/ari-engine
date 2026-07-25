@@ -713,18 +713,18 @@ metadata:
         let skill = DeclarativeSkill::from_localized(&set, std::path::Path::new("/nonexistent")).unwrap();
 
         // English context: English patterns match, Italian don't.
-        let en_ctx = SkillContext { locale: "en".to_string() };
+        let en_ctx = SkillContext { locale: "en".to_string(), ..Default::default() };
         assert_eq!(skill.score("hello", &en_ctx), 1.0);
         assert_eq!(skill.score("ciao", &en_ctx), 0.0);
 
         // Italian context: Italian patterns match, English don't.
-        let it_ctx = SkillContext { locale: "it".to_string() };
+        let it_ctx = SkillContext { locale: "it".to_string(), ..Default::default() };
         assert_eq!(skill.score("ciao", &it_ctx), 1.0);
         assert_eq!(skill.score("hello", &it_ctx), 0.0);
 
         // Spanish context (no es manifest shipped): falls back to
         // canonical English patterns.
-        let es_ctx = SkillContext { locale: "es".to_string() };
+        let es_ctx = SkillContext { locale: "es".to_string(), ..Default::default() };
         assert_eq!(skill.score("hello", &es_ctx), 1.0);
         assert_eq!(skill.score("ciao", &es_ctx), 0.0);
 
