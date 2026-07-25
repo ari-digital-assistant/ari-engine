@@ -1,5 +1,6 @@
 use ari_core::{
-    normalize_input, Response, RouteResult, Skill, SkillContext, SkillRouter, Specificity,
+    normalize_input, AppEntry, Response, RouteResult, Skill, SkillContext, SkillRouter,
+    Specificity,
 };
 use ari_skill_loader::assistant::{AssistantApiError, ConfigStore};
 use ari_skill_loader::manifest::ApiConfig;
@@ -847,6 +848,14 @@ impl Engine {
     /// SkillContext.
     pub fn set_locale(&mut self, locale: String) {
         self.ctx.locale = locale;
+    }
+
+    /// Replace the engine's snapshot of installed launchable apps. The frontend
+    /// pushes this at build time and refreshes it on app install/uninstall; the
+    /// `open` skill consults it so "open <app>" launches while "open <device>"
+    /// (no matching app) steps aside for smart-home skills.
+    pub fn set_installed_apps(&mut self, apps: Vec<AppEntry>) {
+        self.ctx.installed_apps = apps;
     }
 
     /// Install an envelope sink so the engine can push phase-2 Layer C
@@ -2666,6 +2675,26 @@ impl Default for Engine {
 mod tests {
     use super::*;
     use ari_core::FallbackTier;
+
+    #[test]
+    fn set_installed_apps_reaches_scoring() {
+        struct Probe;
+        impl Skill for Probe {
+            fn id(&self) -> &str { "probe" }
+            fn specificity(&self) -> Specificity { Specificity::Low }
+            fn score(&self, _: &str, ctx: &SkillContext) -> f32 { ctx.installed_apps.len() as f32 }
+            fn execute(&self, _: &str, _: &SkillContext) -> Response { Response::Text("x".to_string()) }
+        }
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(Probe));
+        engine.set_installed_apps(vec![
+            ari_core::AppEntry { label: "Spotify".to_string(), package: "com.spotify.music".to_string() },
+            ari_core::AppEntry { label: "Camera".to_string(), package: "com.android.camera".to_string() },
+        ]);
+        let scores = engine.keyword_scores("anything");
+        let probe = scores.iter().find(|s| s.skill_id == "probe").expect("probe scored");
+        assert_eq!(probe.score, 2.0, "the two pushed apps reach ctx.installed_apps");
+    }
 
     #[test]
     fn bare_name_request_detected_per_locale() {
