@@ -1,4 +1,4 @@
-use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
+use ari_core::{AppEntry, ExampleUtterance, Response, Skill, SkillContext, Specificity};
 
 // English + Italian trigger verbs. Same union-dictionary pattern as
 // the other built-ins — words don't collide across these languages so
@@ -156,6 +156,32 @@ fn extract_target(input: &str) -> Option<String> {
     None
 }
 
+/// Does `target` resolve to one of `apps`? Mirrors the Android
+/// `AppLauncher.findApp` ladder so the engine and the launcher agree on what
+/// counts as "an installed app":
+/// 1. exact (case-insensitive) label match
+/// 2. label starts with target
+/// 3. label contains every word of target (any order)
+/// 4. package name contains every word of target (last resort)
+fn target_matches_app(target: &str, apps: &[AppEntry]) -> bool {
+    let needle = target.trim().to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    let words: Vec<&str> = needle.split_whitespace().filter(|w| !w.is_empty()).collect();
+
+    apps.iter().any(|a| a.label.to_lowercase() == needle)
+        || apps.iter().any(|a| a.label.to_lowercase().starts_with(&needle))
+        || apps.iter().any(|a| {
+            let label = a.label.to_lowercase();
+            words.iter().all(|w| label.contains(w))
+        })
+        || apps.iter().any(|a| {
+            let pkg = a.package.to_lowercase();
+            words.iter().all(|w| pkg.contains(w))
+        })
+}
+
 impl Skill for OpenSkill {
     fn id(&self) -> &str {
         "open"
@@ -184,18 +210,26 @@ impl Skill for OpenSkill {
         }
     }
 
-    fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {
+    fn score(&self, input: &str, ctx: &SkillContext) -> f32 {
         let words: Vec<&str> = input.split_whitespace().collect();
-
         let has_trigger = words.iter().any(|w| TRIGGER_WORDS.contains(w));
         if !has_trigger {
             return 0.0;
         }
-
-        if extract_target(input).is_some() {
-            0.9
-        } else {
-            0.3
+        match extract_target(input) {
+            None => 0.3,
+            Some(target) => {
+                // No inventory pushed (Linux, headless, pre-hydration): keep the
+                // legacy "any target is an app" behaviour so nothing regresses.
+                if ctx.installed_apps.is_empty() || target_matches_app(&target, &ctx.installed_apps) {
+                    0.9
+                } else {
+                    // Target names no installed app — almost certainly a smart-home
+                    // device or other intent. Step aside so Home Assistant (or the
+                    // router / assistant) can claim it.
+                    0.0
+                }
+            }
         }
     }
 
@@ -251,6 +285,62 @@ mod tests {
 
     fn ctx() -> SkillContext {
         SkillContext::default()
+    }
+
+    fn app(label: &str, package: &str) -> AppEntry {
+        AppEntry { label: label.to_string(), package: package.to_string() }
+    }
+    fn inventory() -> Vec<AppEntry> {
+        vec![
+            app("Spotify", "com.spotify.music"),
+            app("Google Chrome", "com.android.chrome"),
+            app("Camera", "com.android.camera"),
+        ]
+    }
+    fn ctx_with(apps: Vec<AppEntry>) -> SkillContext {
+        let mut c = SkillContext::default();
+        c.installed_apps = apps;
+        c
+    }
+
+    #[test]
+    fn score_matching_app_is_high() {
+        let s = OpenSkill::new();
+        assert_eq!(s.score("open spotify", &ctx_with(inventory())), 0.9);        // exact label
+        assert_eq!(s.score("open chrome", &ctx_with(inventory())), 0.9);         // label contains word
+        assert_eq!(s.score("open chrome google", &ctx_with(inventory())), 0.9);  // all-words, any order
+    }
+
+    #[test]
+    fn score_non_app_target_steps_aside() {
+        let s = OpenSkill::new();
+        assert_eq!(s.score("open the main bedroom blinds", &ctx_with(inventory())), 0.0);
+        assert_eq!(s.score("open the garage door", &ctx_with(inventory())), 0.0);
+    }
+
+    #[test]
+    fn score_empty_inventory_preserves_legacy() {
+        let s = OpenSkill::new();
+        assert_eq!(s.score("open the main bedroom blinds", &SkillContext::default()), 0.9);
+        assert_eq!(s.score("open spotify", &SkillContext::default()), 0.9);
+    }
+
+    #[test]
+    fn score_trigger_without_target_unchanged() {
+        let s = OpenSkill::new();
+        assert_eq!(s.score("open", &ctx_with(inventory())), 0.3);
+        assert_eq!(s.score("what time is it", &ctx_with(inventory())), 0.0);
+    }
+
+    #[test]
+    fn matcher_ladder_hits_and_misses() {
+        let inv = inventory();
+        assert!(target_matches_app("spotify", &inv));           // exact (ci)
+        assert!(target_matches_app("goog", &inv));              // prefix of "google chrome"
+        assert!(target_matches_app("chrome google", &inv));     // all words, any order
+        assert!(target_matches_app("camera", &inv));            // exact
+        assert!(!target_matches_app("the main bedroom blinds", &inv));
+        assert!(!target_matches_app("", &inv));
     }
 
     // Scoring: trigger + target = 0.9, trigger alone = 0.3, no trigger = 0.0
