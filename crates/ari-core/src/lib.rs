@@ -154,15 +154,32 @@ impl SettingsQueryResult {
     }
 }
 
+/// One installed launchable app the frontend knows about, pushed into the
+/// engine so scoring can distinguish "open <installed app>" from
+/// "open <a physical thing>". `label` is the user-visible name; `package` is
+/// the platform package id. Both feed resolution (mirroring the frontend
+/// launcher's matcher), never display — so neither is translated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppEntry {
+    pub label: String,
+    pub package: String,
+}
+
 #[derive(Clone)]
 pub struct SkillContext {
     pub locale: String,
+    /// Installed launchable apps, pushed by the frontend via
+    /// `Engine::set_installed_apps`. Empty on platforms that don't supply it
+    /// (Linux, headless) or before the first push, which preserves the legacy
+    /// "any target is an app" behaviour in `open`'s scoring.
+    pub installed_apps: Vec<AppEntry>,
 }
 
 impl Default for SkillContext {
     fn default() -> Self {
         Self {
             locale: "en".to_string(),
+            installed_apps: Vec::new(),
         }
     }
 }
@@ -646,6 +663,22 @@ fn strip_italian_elisions(lower: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- SkillContext / AppEntry ---
+
+    #[test]
+    fn skill_context_default_has_no_installed_apps() {
+        let ctx = SkillContext::default();
+        assert_eq!(ctx.locale, "en");
+        assert!(ctx.installed_apps.is_empty());
+    }
+
+    #[test]
+    fn app_entry_holds_label_and_package() {
+        let a = AppEntry { label: "Spotify".to_string(), package: "com.spotify.music".to_string() };
+        assert_eq!(a.label, "Spotify");
+        assert_eq!(a.package, "com.spotify.music");
+    }
 
     // --- remembered_facts_block ---
 
