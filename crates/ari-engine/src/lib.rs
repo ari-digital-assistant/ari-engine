@@ -1647,14 +1647,28 @@ impl Engine {
         }
 
         // Fallback tier(s). When the router + scorers all miss, forward the raw
-        // utterance to any skill that declared `metadata.ari.fallback`. A skill
-        // with a `requires_setting` is engaged only while that setting is
-        // non-empty. The first fallback whose response is not `_ari_no_match`
-        // wins; otherwise we fall through to the assistant below.
-        for skill in self.skills.iter() {
-            let Some(tier) = skill.fallback_tier() else {
-                continue;
-            };
+        // utterance to any skill that declared `metadata.ari.fallback`. Gated
+        // integrations (a `requires_setting` engaged only while configured, e.g.
+        // Home Assistant) take precedence over unconditional catch-alls (the
+        // `open` launcher's last-resort "couldn't find an app" reply), so a
+        // configured smart-home forward beats the generic app miss. Stable sort
+        // preserves registration order within each group. The first fallback
+        // whose response is not `_ari_no_match` wins; otherwise we fall through
+        // to the assistant below.
+        let mut fallbacks: Vec<Arc<dyn Skill>> = self
+            .skills
+            .iter()
+            .filter(|s| s.fallback_tier().is_some())
+            .cloned()
+            .collect();
+        fallbacks.sort_by_key(|s| {
+            // false (gated) sorts before true (unconditional).
+            s.fallback_tier()
+                .map(|t| t.requires_setting.is_none())
+                .unwrap_or(true)
+        });
+        for skill in fallbacks {
+            let tier = skill.fallback_tier().expect("filtered to Some above");
             if let Some(key) = &tier.requires_setting {
                 let ready = self
                     .config_store
@@ -1666,7 +1680,6 @@ impl Engine {
                     continue;
                 }
             }
-            let skill = skill.clone();
             let response = skill.execute(&normalized, &self.ctx);
             let fell_through = matches!(
                 &response,
@@ -4293,6 +4306,56 @@ mod tests {
         match resp {
             Response::Text(t) => assert_eq!(t, fallback_response_for("en")),
             other => panic!("expected fallback text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_prefers_gated_integration_over_unconditional_catch_all() {
+        use ari_skill_loader::assistant::MemoryConfigStore;
+        use std::sync::Arc;
+
+        // Unconditional catch-all, registered FIRST (mimics a built-in before WASM).
+        struct Uncond;
+        impl Skill for Uncond {
+            fn id(&self) -> &str { "uncond" }
+            fn specificity(&self) -> Specificity { Specificity::Low }
+            fn score(&self, _: &str, _: &SkillContext) -> f32 { 0.0 }
+            fn execute(&self, _: &str, _: &SkillContext) -> Response {
+                Response::Text("uncond".to_string())
+            }
+            fn fallback_tier(&self) -> Option<FallbackTier> {
+                Some(FallbackTier { requires_setting: None })
+            }
+        }
+
+        // Gated integration, registered SECOND, requires setting "base_url".
+        struct Gated;
+        impl Skill for Gated {
+            fn id(&self) -> &str { "gated" }
+            fn specificity(&self) -> Specificity { Specificity::Low }
+            fn score(&self, _: &str, _: &SkillContext) -> f32 { 0.0 }
+            fn execute(&self, _: &str, _: &SkillContext) -> Response {
+                Response::Text("gated".to_string())
+            }
+            fn fallback_tier(&self) -> Option<FallbackTier> {
+                Some(FallbackTier { requires_setting: Some("base_url".to_string()) })
+            }
+        }
+
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(Uncond)); // first
+        engine.register_skill(Box::new(Gated));  // second
+        let mut store = MemoryConfigStore::new();
+        store.set("gated", "base_url", "http://ha.local");
+        engine.set_config_store(Some(Arc::new(store)));
+
+        // Nothing keyword/router/assistant matches "asdf qwer" → both fallbacks
+        // eligible. Gated must win despite being registered AFTER Uncond.
+        let (resp, trace) = engine.process_input_traced("asdf qwer");
+        assert_eq!(trace.unwrap().winner, Some("fallback:gated".to_string()));
+        match resp {
+            Response::Text(t) => assert_eq!(t, "gated"),
+            other => panic!("expected gated fallback text, got {other:?}"),
         }
     }
 
