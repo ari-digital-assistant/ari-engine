@@ -1,4 +1,4 @@
-use ari_core::{AppEntry, ExampleUtterance, Response, Skill, SkillContext, Specificity};
+use ari_core::{AppEntry, ExampleUtterance, FallbackTier, Response, Skill, SkillContext, Specificity};
 
 // English + Italian trigger verbs. Same union-dictionary pattern as
 // the other built-ins — words don't collide across these languages so
@@ -234,11 +234,17 @@ impl Skill for OpenSkill {
     }
 
     fn execute(&self, input: &str, ctx: &SkillContext) -> Response {
+        let words: Vec<&str> = input.split_whitespace().collect();
+        let has_trigger = words.iter().any(|w| TRIGGER_WORDS.contains(w));
+        if !has_trigger {
+            // Only reachable via the fallback tier (open never wins the keyword
+            // tier without a trigger). Decline so the engine keeps routing.
+            return Response::Action(serde_json::json!({ "v": 1, "_ari_no_match": true }));
+        }
         match extract_target(input) {
             // `speak` is omitted deliberately — the frontend owns the
-            // platform-appropriate phrasing ("Opening Spotify" on Android,
-            // possibly a different verb on Linux) and can override with a
-            // failure message if the launch doesn't work.
+            // platform-appropriate phrasing ("Opening Spotify" on Android) and the
+            // "couldn't find an app" failure message.
             Some(target) => Response::Action(serde_json::json!({
                 "v": 1,
                 "launch_app": target,
@@ -276,6 +282,14 @@ impl Skill for OpenSkill {
             })),
             None => self.execute(input, ctx),
         }
+    }
+
+    /// Unconditional last resort: when nothing else claims an "open X", fire so
+    /// the frontend's launcher can produce the localized "couldn't find an app"
+    /// reply. The engine orders this AFTER gated integrations (e.g. Home
+    /// Assistant), so a configured smart-home forward always wins first.
+    fn fallback_tier(&self) -> Option<FallbackTier> {
+        Some(FallbackTier { requires_setting: None })
     }
 }
 
@@ -516,5 +530,34 @@ mod tests {
         // the plain `apri` trigger misses entirely.
         assert!(skill.score("aprimi duolingo", &ctx) >= 0.8, "aprimi must trigger open");
         assert!(skill.score("avviami spotify", &ctx) >= 0.8, "avviami must trigger open");
+    }
+
+    #[test]
+    fn execute_no_trigger_declines_for_fallback() {
+        // Reached only via the fallback tier. With no trigger word, decline so the
+        // engine keeps looking instead of asking "what would you like me to open?".
+        match OpenSkill::new().execute("what is the weather like", &ctx()) {
+            Response::Action(v) => {
+                assert_eq!(v["_ari_no_match"], true);
+                assert!(v.get("launch_app").is_none());
+            }
+            other => panic!("expected _ari_no_match Action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_trigger_and_target_still_launches() {
+        match OpenSkill::new().execute("open the main bedroom blinds", &ctx()) {
+            Response::Action(v) => assert_eq!(v["launch_app"], "the main bedroom blinds"),
+            other => panic!("expected launch_app Action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_tier_is_unconditional() {
+        assert_eq!(
+            OpenSkill::new().fallback_tier(),
+            Some(FallbackTier { requires_setting: None }),
+        );
     }
 }
