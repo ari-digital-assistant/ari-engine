@@ -1434,9 +1434,26 @@ mod tests {
             it.contains("Non puoi accedere a informazioni in tempo reale"),
             "capability-honesty line missing from IT system prompt: {it}"
         );
+        // A single memorised refusal example didn't generalise on-device
+        // (gemma3-1b-q4 still hallucinated for a differently-phrased
+        // weather question) — two refusal examples across different
+        // domains (weather, device control) are needed to demonstrate
+        // the REFUSAL PATTERN rather than one fixed sentence to match.
+        // The weather example uses the apostrophe-free phrasing the
+        // engine's normaliser actually feeds the model ("com e il tempo",
+        // not "com'è il tempo").
+        assert_eq!(
+            it.matches("Response: Non ho una skill installata per farlo").count(),
+            2,
+            "expected two refusal examples (weather + device control) in IT system prompt: {it}"
+        );
         assert!(
-            it.contains("Response: Non ho una skill installata per farlo"),
-            "few-shot refusal example missing from IT system prompt: {it}"
+            it.contains("User: com e il tempo a Roma?"),
+            "normalised-phrasing weather refusal example missing from IT system prompt: {it}"
+        );
+        assert!(
+            it.contains("User: accendi le luci del soggiorno"),
+            "device-control refusal example missing from IT system prompt: {it}"
         );
         assert!(
             it.contains("Response: Il cielo è blu."),
