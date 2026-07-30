@@ -1410,11 +1410,25 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_forbids_bluffing_about_live_data_and_devices() {
+        let p = build_system_prompt(&[], "en", false, &[]);
+        assert!(
+            p.contains("You cannot access live information"),
+            "capability-honesty line missing from EN system prompt: {p}"
+        );
+        let it = build_system_prompt(&[], "it", false, &[]);
+        assert!(
+            it.contains("Non puoi accedere a informazioni in tempo reale"),
+            "capability-honesty line missing from IT system prompt: {it}"
+        );
+    }
+
+    #[test]
     fn system_prompt_italian_is_localized() {
         let prompt = build_system_prompt(&test_skills(), "it", false, &[]);
         assert!(prompt.contains("Ari"));
         assert!(prompt.contains("italiano"));
-        assert!(prompt.contains("breve frase"));
+        assert!(prompt.contains("frase breve"));
         // Italian template must NOT carry the English fence — that
         // would confuse the model into mixing languages.
         assert!(!prompt.contains("English"));
