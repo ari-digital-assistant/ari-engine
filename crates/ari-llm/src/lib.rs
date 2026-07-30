@@ -1416,10 +1416,31 @@ mod tests {
             p.contains("You cannot access live information"),
             "capability-honesty line missing from EN system prompt: {p}"
         );
+        // A rule alone doesn't bind a small on-device Gemma (device
+        // evidence: it still hallucinated a Rome temperature with the
+        // rule-only copy) — the few-shot refusal + answerable pair is
+        // the actual fix, so pin both examples down.
+        assert!(
+            p.contains("Response: I don't have a skill installed that can do that"),
+            "few-shot refusal example missing from EN system prompt: {p}"
+        );
+        assert!(
+            p.contains("Response: The sky is blue."),
+            "few-shot answerable example missing from EN system prompt: {p}"
+        );
+
         let it = build_system_prompt(&[], "it", false, &[]);
         assert!(
             it.contains("Non puoi accedere a informazioni in tempo reale"),
             "capability-honesty line missing from IT system prompt: {it}"
+        );
+        assert!(
+            it.contains("Response: Non ho una skill installata per farlo"),
+            "few-shot refusal example missing from IT system prompt: {it}"
+        );
+        assert!(
+            it.contains("Response: Il cielo è blu."),
+            "few-shot answerable example missing from IT system prompt: {it}"
         );
     }
 
