@@ -11,7 +11,7 @@ User speaks
 1. Wake word detection (microWakeWord, always listening)
     │
     ▼
-2. Speech to text (sherpa-onnx streaming zipformer)
+2. Speech to text (on-device sherpa-onnx, or a cloud Whisper endpoint)
     │
     ▼
 3. Input normalisation
@@ -76,13 +76,37 @@ privilege.
 
 ### 2. Speech to text
 
-sherpa-onnx streaming zipformer decodes audio in 100ms batches, starting
-from the 2-second pre-roll. The wake phrase is stripped from the transcript
-via regex (`WakePhrase.kt`).
+The user picks on-device or cloud; which *model* serves on-device is decided
+by their locale, not by them (`SttModelRegistry.onDeviceFor`). Three paths
+result:
 
-Endpoint detection is custom: 1500ms of unchanged partial text = done.
-sherpa's built-in endpoint is disabled (it freezes the stream on fire and
-`reset()` destroys encoder context).
+- **On-device streaming** (English → Kroko zipformer2): decodes in 100ms
+  batches from the 2-second pre-roll, emitting partials as the user speaks.
+- **On-device buffered** (everything else → Whisper-turbo): no partials; the
+  whole utterance is decoded in one shot at end of speech. Kroko is
+  English-only, so this is the only local option for other languages.
+- **Cloud**: the utterance is buffered the same way, then POSTed to any
+  OpenAI-compatible `/audio/transcriptions` endpoint — OpenAI's, or a
+  self-hosted `faster-whisper` (Home Assistant's Whisper add-on among them).
+
+Whichever path ran, the wake phrase is stripped from the transcript via regex
+(`WakePhrase.kt`).
+
+Endpoint detection is custom, because sherpa's built-in endpoint is disabled
+(it freezes the stream on fire, and `reset()` destroys encoder context). The
+streaming path ends an utterance when the partial text has been unchanged for
+1500ms **and** the silero VAD has heard no speech for 1000ms — stability alone
+measures the *decoder* going quiet, which in noise diverges from the user
+going quiet, and amputated utterances. A 4s stability override stops
+continuous speech-like noise (a television) from vetoing the endpoint forever,
+and a 30s hard cap backstops both. The buffered paths use RMS silence
+detection instead, having no partials to watch.
+
+Model choice matters more than any of this. Nemotron 0.6B int8 was retired
+after `ari-tools/scripts/stt_bench.py` replayed captured audio through it and
+the 71 MB Kroko: identical input, "how's the weather" → "how's the weat"
+versus the full phrase. Run the bench before changing pipeline code to chase a
+transcription bug.
 
 ### 3. Input normalisation
 
@@ -194,6 +218,15 @@ different audio processing:
    different transcript.
 2. **Offline full-buffer** — fresh stream, entire captured PCM in one
    `acceptWaveform` + `inputFinished`. Maximum decoder context.
+
+Streaming (on-device English) only. The buffered paths have no second decoder
+to disagree with, and a cloud retry would be the same request billed twice, so
+both report `parallel = null` and skip the ladder entirely.
+
+Worth knowing before relying on this: the ladder fires on `NotUnderstood`,
+which a configured assistant makes rare — it answers the mangled transcript
+rather than giving up, so the retries never run. A transcript arriving wrong
+but *plausible* is not rescued here.
 
 Each retry re-enters the pipeline at step 3 (normalisation) with the new
 transcript. If a retry produces a transcript that matches a skill, the
