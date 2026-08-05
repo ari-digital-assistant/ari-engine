@@ -16,8 +16,8 @@
 use ari_skill_loader::manifest::ConfigFieldType;
 use ari_skill_loader::{
     capability_name, check_updates, install_by_id, install_update, IndexEntry, ManifestError,
-    RegistryClient, RegistryError, Skillfile, SkillStore, StorageConfig, StoreError, TrustRoot,
-    REGISTRY_TRUST_KEY,
+    ModelCatalog, RegistryClient, RegistryError, Skillfile, SkillStore, StorageConfig, StoreError,
+    TrustRoot, REGISTRY_TRUST_KEY,
 };
 
 use crate::assistant_registry::{FfiConfigField, FfiSelectOption};
@@ -330,6 +330,41 @@ impl SkillRegistry {
                 description: u.entry.description,
             })
             .collect())
+    }
+
+    /// Fetch, verify and cache the registry's tier→model catalog, returning the
+    /// path it was written to. Hand that path to
+    /// [`crate::AriEngine::load_model_catalog`] so cloud assistant skills
+    /// resolve their `fast`/`balanced`/`smartest` setting to a current model ID.
+    ///
+    /// Cached next to the installed skills so a device that later goes offline
+    /// keeps using the last known catalog instead of falling all the way back to
+    /// the per-tier pins baked into each skill's manifest. `SkillStore::rescan`
+    /// only looks at directories, so the file is inert there.
+    ///
+    /// Blocks on the network — callers must run this off the main thread.
+    pub fn refresh_model_catalog(&self) -> Result<String, FfiRegistryError> {
+        let client = RegistryClient::new();
+        let index = client.fetch_index().map_err(map_registry_error)?;
+        let trust = trust_root()?;
+        let bytes = client
+            .fetch_catalog_bytes(&index, &trust)
+            .map_err(map_registry_error)?;
+
+        // Parse before caching so a catalog this build can't understand fails
+        // here, rather than being written and silently ignored at call time.
+        ModelCatalog::from_json_bytes(&bytes).map_err(|e| FfiRegistryError::Registry {
+            message: e.to_string(),
+        })?;
+
+        let path = {
+            let store = self.store.lock().expect("skill store mutex poisoned");
+            store.root_path().join("models.json")
+        };
+        std::fs::write(&path, &bytes).map_err(|e| FfiRegistryError::Store {
+            message: format!("caching models.json: {e}"),
+        })?;
+        Ok(path.to_string_lossy().into_owned())
     }
 
     /// Download and install the registry's current version of `id` over

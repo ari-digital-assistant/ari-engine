@@ -547,6 +547,12 @@ pub struct Engine {
     /// installed skill set. Empty when no community assistants are
     /// installed (or none declare aliases).
     named_assistants: Vec<NamedAssistantBinding>,
+    /// Registry model catalog, mapping a cloud assistant's tier choice
+    /// (`fast`/`balanced`/`smartest`) to a concrete model ID. Pushed by the
+    /// frontend after a registry refresh; `None` until then, which makes tier
+    /// skills fall back to the per-tier pins in their own manifests. Shared as
+    /// an `Arc` because Layer C's consult thread needs its own handle.
+    model_catalog: Option<Arc<ari_skill_loader::ModelCatalog>>,
     /// Config store for reading skill settings from engine-internal paths
     /// (used by the fallback tier(s)' required-setting gate). `None` in
     /// bare/test engines that never wired one.
@@ -597,6 +603,7 @@ impl Engine {
             log_sink: None,
             envelope_sink: None,
             named_assistants: Vec::new(),
+            model_catalog: None,
             config_store: None,
             pending_turn: Mutex::new(None),
             conversation: Mutex::new(None),
@@ -993,6 +1000,13 @@ impl Engine {
     /// engine-internal paths (the fallback tier(s)).
     pub fn set_config_store(&mut self, store: Option<Arc<dyn ConfigStore>>) {
         self.config_store = store;
+    }
+
+    /// Install the registry's model catalog. Frontends call this after a
+    /// registry refresh; passing `None` (or never calling it) leaves tier
+    /// skills on the per-tier pins in their manifests.
+    pub fn set_model_catalog(&mut self, catalog: Option<Arc<ari_skill_loader::ModelCatalog>>) {
+        self.model_catalog = catalog;
     }
 
     /// Settings-time invocation: route to a loaded skill by id and run its
@@ -1446,7 +1460,7 @@ impl Engine {
                     m.remainder.len()
                 ),
             );
-            let response = dispatch_named_assistant(m.binding, &m.remainder, &self.ctx.locale, |level, msg| {
+            let response = dispatch_named_assistant(m.binding, &m.remainder, &self.ctx.locale, self.model_catalog.as_deref(), |level, msg| {
                 self.log(level, msg)
             });
             return (response, Some(trace));
@@ -1787,6 +1801,7 @@ impl Engine {
                     &self.ctx.locale,
                     &history,
                     &facts,
+                    self.model_catalog.as_deref(),
                 ) {
                     Ok(text) if !text.is_empty() => {
                         let (clean, flag) = parse_continuation_flag(&text);
@@ -1870,6 +1885,7 @@ impl Engine {
                 &self.ctx.locale,
                 history,
                 facts,
+                self.model_catalog.as_deref(),
             ) {
                 Ok(text) => Ok(text),
                 Err(e) => fail(format!("cloud call failed: {e}")),
@@ -1988,6 +2004,7 @@ impl Engine {
         let llm = self.llm.clone();
         let log_sink = self.log_sink.clone();
         let ctx = self.ctx.clone();
+        let catalog = self.model_catalog.clone();
         let skill_id = skill.id().to_string();
 
         self.log(
@@ -2010,6 +2027,7 @@ impl Engine {
                 ctx,
                 sink,
                 log_sink,
+                catalog,
             );
         });
 
@@ -2222,6 +2240,7 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
     binding: &NamedAssistantBinding,
     prompt: &str,
     locale: &str,
+    catalog: Option<&ari_skill_loader::ModelCatalog>,
     log: F,
 ) -> Response {
     let display = assistant_display_name(&binding.skill_id);
@@ -2233,6 +2252,7 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
         locale,
         &[],
         &[],
+        catalog,
     ) {
         Ok(text) if !text.is_empty() => Response::Text(text),
         Ok(_) => {
@@ -2429,6 +2449,7 @@ fn run_consult_phase_two(
     ctx: SkillContext,
     sink: Arc<dyn EnvelopeSink>,
     log_sink: Option<Arc<dyn LogSink>>,
+    catalog: Option<Arc<ari_skill_loader::ModelCatalog>>,
 ) {
     let log = |level: LogLevel, msg: &str| {
         if let Some(ref s) = log_sink {
@@ -2457,6 +2478,7 @@ fn run_consult_phase_two(
     let locale_for_thread = ctx.locale.clone();
     #[cfg(feature = "llm")]
     let llm_for_thread = llm.clone();
+    let catalog_for_thread = catalog.clone();
     std::thread::spawn(move || {
         #[cfg(feature = "llm")]
         let result = call_assistant_for_consult(
@@ -2464,12 +2486,14 @@ fn run_consult_phase_two(
             &llm_for_thread,
             &prompt_for_thread,
             &locale_for_thread,
+            catalog_for_thread.as_deref(),
         );
         #[cfg(not(feature = "llm"))]
         let result = call_assistant_for_consult(
             &assistant_for_thread,
             &prompt_for_thread,
             &locale_for_thread,
+            catalog_for_thread.as_deref(),
         );
         let _ = tx.send(result);
     });
@@ -2594,6 +2618,7 @@ fn call_assistant_for_consult(
     llm: &Option<Arc<dyn ari_llm::Fallback>>,
     prompt: &str,
     locale: &str,
+    catalog: Option<&ari_skill_loader::ModelCatalog>,
 ) -> Result<String, String> {
     match assistant {
         Some(ActiveAssistant::Api {
@@ -2609,6 +2634,7 @@ fn call_assistant_for_consult(
                 locale,
                 &[],
                 &[],
+                catalog,
             )
             .map_err(|e| e.to_string())?;
             if text.trim().is_empty() {
@@ -2658,6 +2684,7 @@ fn call_assistant_for_consult(
     assistant: &Option<ActiveAssistant>,
     prompt: &str,
     locale: &str,
+    catalog: Option<&ari_skill_loader::ModelCatalog>,
 ) -> Result<String, String> {
     match assistant {
         Some(ActiveAssistant::Api {
@@ -2673,6 +2700,7 @@ fn call_assistant_for_consult(
                 locale,
                 &[],
                 &[],
+                catalog,
             )
             .map_err(|e| e.to_string())?;
             if text.trim().is_empty() {
@@ -3246,6 +3274,10 @@ mod tests {
                 auth_header: None,
                 auth_config_key: None,
                 model_config_key: None,
+                model_provider: None,
+                tier_config_key: None,
+                default_tier: None,
+                default_models: Default::default(),
                 default_model: "test-model".to_string(),
                 system_prompt: LocalizedPrompt::from_english("test".to_string()),
                 request_format: RequestFormat::Openai,

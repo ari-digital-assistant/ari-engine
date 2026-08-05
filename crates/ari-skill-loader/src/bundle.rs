@@ -143,20 +143,8 @@ pub fn install_from_bytes(
     dest_root: &Path,
     load_options: &LoadOptions,
 ) -> Result<InstalledBundle, BundleError> {
-    // Step 1: hash and compare.
-    let actual = sha256_hex(bundle_bytes);
-    if !constant_time_eq_str(&actual, expected_sha256) {
-        return Err(BundleError::HashMismatch {
-            expected: expected_sha256.to_string(),
-            actual,
-        });
-    }
-
-    // Step 2: signature verification.
-    let mut hasher = Sha256::new();
-    hasher.update(bundle_bytes);
-    let digest = hasher.finalize();
-    trust_root.verify(&digest, signature_bytes)?;
+    // Steps 1 and 2: hash-compare, then verify the detached signature.
+    verify_detached(bundle_bytes, signature_bytes, expected_sha256, trust_root)?;
 
     // Step 3: extract to a temp directory inside dest_root. We use a temp
     // dir alongside the final destination so the rename in step 5 is on the
@@ -251,6 +239,32 @@ pub fn install_from_bytes(
 /// Constant-time string comparison. Hex-encoded SHA-256 is small enough that
 /// the variable-time `==` would only leak a millisecond or two of side-channel
 /// information, but it's free to do this right.
+/// Hash-compare `bytes` against `expected_sha256`, then verify the detached
+/// Ed25519 signature over that digest. Both checks are required: the hash
+/// catches transit corruption fast, the signature catches everything else.
+///
+/// Used by the bundle install path and by the registry's `models.json` fetch,
+/// which needs the same guarantee without any of the extract-and-swap steps.
+pub fn verify_detached(
+    bytes: &[u8],
+    signature_bytes: &[u8],
+    expected_sha256: &str,
+    trust_root: &TrustRoot,
+) -> Result<(), BundleError> {
+    let actual = sha256_hex(bytes);
+    if !constant_time_eq_str(&actual, expected_sha256) {
+        return Err(BundleError::HashMismatch {
+            expected: expected_sha256.to_string(),
+            actual,
+        });
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    trust_root.verify(&hasher.finalize(), signature_bytes)?;
+    Ok(())
+}
+
 fn constant_time_eq_str(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();

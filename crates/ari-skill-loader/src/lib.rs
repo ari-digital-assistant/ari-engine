@@ -8,6 +8,7 @@ pub mod loader;
 pub mod localized_manifest;
 pub mod localized_strings;
 pub mod manifest;
+pub mod models;
 pub mod platform_capabilities;
 pub mod scoring;
 pub mod registry;
@@ -18,6 +19,7 @@ mod tls;
 pub mod wasm;
 
 pub use assistant::{AssistantApiError, ConfigStore, MemoryConfigStore, call_assistant_api};
+pub use models::{ModelCatalog, ModelCatalogError, TierModel};
 pub use bundle::{install_from_bytes, sha256_hex, BundleError, InstalledBundle};
 pub use declarative::{AdapterError, DeclarativeSkill};
 pub use signature::{SignatureError, TrustRoot, VERIFYING_KEY_LENGTH};

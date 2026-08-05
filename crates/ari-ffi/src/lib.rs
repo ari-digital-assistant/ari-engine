@@ -8,8 +8,9 @@ use ari_skill_loader::{
     CalendarEventRow, CalendarProvider, Capability, EnglishLocaleProvider, HostCapabilities,
     HttpConfig, InsertCalendarEventParams, InsertTaskParams, LoadOptions, LocalClock,
     LocalTimeComponents, LocaleProvider, LocationProvider, LocationResult, LocationStatus, LogLevel,
-    LogSink, NullAuthorizeProvider, NullCalendarProvider, NullLocationProvider, NullLogSink,
-    MediaServicesProvider, NullMediaServicesProvider, NullSettingWriter, NullTasksProvider,
+    LogSink, ModelCatalog, NullAuthorizeProvider, NullCalendarProvider, NullLocationProvider,
+    NullLogSink, MediaServicesProvider, NullMediaServicesProvider, NullSettingWriter,
+    NullTasksProvider,
     SettingWriter, StorageConfig, TaskList, TaskRow, TasksProvider, UtcLocalClock,
 };
 use ari_skills::{
@@ -986,6 +987,47 @@ impl AriEngine {
     /// latest value and read it without blocking.
     pub fn current_locale(&self) -> String {
         self.locale_provider.current_locale()
+    }
+
+    /// Load the cached tier→model catalog written by
+    /// [`crate::SkillRegistry::refresh_model_catalog`], so cloud assistant
+    /// skills resolve their `fast`/`balanced`/`smartest` setting to a current
+    /// model ID. Call this at startup with the path that method returned, and
+    /// again after each refresh.
+    ///
+    /// Returns whether a catalog was installed. `false` is a normal state, not
+    /// a failure — a first run has nothing cached yet, and skills fall back to
+    /// the per-tier pins in their own manifests. The reason is logged either
+    /// way, since a catalog that stops loading is otherwise invisible: the
+    /// skills keep working, just on ageing pinned models.
+    pub fn load_model_catalog(&self, path: String) -> bool {
+        let outcome = std::fs::read(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| ModelCatalog::from_json_bytes(&bytes).map_err(|e| e.to_string()));
+
+        match outcome {
+            Ok(catalog) => {
+                let mut engine = self.inner.lock().expect("engine mutex poisoned");
+                engine.set_model_catalog(Some(Arc::new(catalog)));
+                self.log_sink.log(
+                    "ari-ffi",
+                    LogLevel::Info,
+                    &format!("model catalog loaded from {path}"),
+                );
+                true
+            }
+            Err(message) => {
+                self.log_sink.log(
+                    "ari-ffi",
+                    LogLevel::Warn,
+                    &format!(
+                        "no model catalog from {path} ({message}) — \
+                         cloud assistants will use their pinned models"
+                    ),
+                );
+                false
+            }
+        }
     }
 
     /// Settings-time skill invocation: run `skill_id`'s `settings_query` for

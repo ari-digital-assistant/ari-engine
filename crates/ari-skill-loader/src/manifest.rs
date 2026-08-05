@@ -79,6 +79,22 @@ pub struct ApiConfig {
     pub auth_header: Option<String>,
     pub auth_config_key: Option<String>,
     pub model_config_key: Option<String>,
+    /// Key into `models.json`'s `providers` map (`openai`, `anthropic`,
+    /// `google`). Set together with `tier_config_key`.
+    pub model_provider: Option<String>,
+    /// Which setting holds the user's tier choice. When set, the model ID is
+    /// resolved from the registry catalog rather than stored verbatim, so a new
+    /// provider release doesn't need a skill release. Mutually exclusive with
+    /// `model_config_key`.
+    pub tier_config_key: Option<String>,
+    /// The tier select's own `default`, captured at parse time so resolution
+    /// doesn't need the settings list threaded through it.
+    pub default_tier: Option<String>,
+    /// Per-tier pinned model, used when the catalog is missing or has no entry
+    /// for the tier — first run, offline, or a failed fetch. Validation
+    /// requires one entry per selectable tier, so the fallback can never leave
+    /// a user's choice unhonoured.
+    pub default_models: BTreeMap<String, String>,
     pub default_model: String,
     pub system_prompt: LocalizedPrompt,
     pub request_format: RequestFormat,
@@ -439,6 +455,24 @@ pub enum ManifestError {
 
     #[error("`metadata.ari.assistant.api.default_model` is required")]
     MissingDefaultModel,
+
+    #[error("`metadata.ari.assistant.api.tier_config_key` requires `model_provider`")]
+    MissingModelProvider,
+
+    #[error(
+        "`metadata.ari.assistant.api` must not have both `model_config_key` and \
+         `tier_config_key` — a skill either stores a model ID or resolves a tier"
+    )]
+    ConflictingModelSource,
+
+    #[error(
+        "`metadata.ari.assistant.api.default_models` has no entry for tier `{tier}`, \
+         offered by setting `{key}` — there would be no offline fallback for it"
+    )]
+    MissingTierDefault { tier: String, key: String },
+
+    #[error("setting `{key}` referenced by `tier_config_key` must be a `select` with options")]
+    TierKeyNotSelect { key: String },
 
     #[error("`metadata.ari.assistant.api.system_prompt` is required")]
     MissingSystemPrompt,
@@ -1014,6 +1048,7 @@ impl ApiConfig {
         }
 
         let auth = raw.auth.unwrap_or(AuthScheme::None);
+        let mut default_tier = None;
 
         // Auth config key required when auth is not none.
         if !matches!(auth, AuthScheme::None) && raw.auth_config_key.is_none() {
@@ -1071,6 +1106,43 @@ impl ApiConfig {
             }
         }
 
+        if let Some(ref key) = raw.tier_config_key {
+            if raw.model_config_key.is_some() {
+                return Err(ManifestError::ConflictingModelSource);
+            }
+            if raw.model_provider.is_none() {
+                return Err(ManifestError::MissingModelProvider);
+            }
+
+            let field = settings
+                .iter()
+                .find(|f| &f.key == key)
+                .ok_or_else(|| ManifestError::ConfigKeyNotFound {
+                    key: key.clone(),
+                    field: "tier_config_key".to_string(),
+                })?;
+
+            let ConfigFieldType::Select { options } = &field.field_type else {
+                return Err(ManifestError::TierKeyNotSelect { key: key.clone() });
+            };
+            if options.is_empty() {
+                return Err(ManifestError::TierKeyNotSelect { key: key.clone() });
+            }
+
+            // Every tier the user can pick needs a pin, or an offline device
+            // silently serves them a different tier than they chose.
+            for option in options {
+                if !raw.default_models.contains_key(&option.value) {
+                    return Err(ManifestError::MissingTierDefault {
+                        tier: option.value.clone(),
+                        key: key.clone(),
+                    });
+                }
+            }
+
+            default_tier = field.default.clone();
+        }
+
         Ok(ApiConfig {
             endpoint: raw.endpoint.clone(),
             endpoint_config_key: raw.endpoint_config_key.clone(),
@@ -1079,6 +1151,10 @@ impl ApiConfig {
             auth_header: raw.auth_header.clone(),
             auth_config_key: raw.auth_config_key.clone(),
             model_config_key: raw.model_config_key.clone(),
+            model_provider: raw.model_provider.clone(),
+            tier_config_key: raw.tier_config_key.clone(),
+            default_tier,
+            default_models: raw.default_models.clone(),
             default_model,
             system_prompt,
             request_format: raw.request_format.unwrap_or_default(),
@@ -1451,6 +1527,10 @@ struct RawApiConfig {
     auth_header: Option<String>,
     auth_config_key: Option<String>,
     model_config_key: Option<String>,
+    model_provider: Option<String>,
+    tier_config_key: Option<String>,
+    #[serde(default)]
+    default_models: BTreeMap<String, String>,
     default_model: Option<String>,
     /// Accepts either a plain string (legacy form, parsed as
     /// English) or a `{locale: prompt}` map. See [`LocalizedPrompt`].
@@ -2262,6 +2342,159 @@ metadata:
         let sf = Skillfile::parse(chatgpt_assistant_source(), Some("chatgpt")).unwrap();
         let asst = sf.ari_extension.unwrap().assistant.unwrap();
         assert!(asst.aliases.is_empty());
+    }
+
+    /// A tier-resolved assistant manifest, with `{EXTRA}` as an injection point
+    /// and the api block laid out so individual lines can be removed per test.
+    fn tier_assistant_source(api_extra: &str, tier_key: &str) -> String {
+        format!(
+            r#"---
+name: claude
+description: Anthropic Claude.
+metadata:
+  ari:
+    id: dev.heyari.assistant.claude
+    version: "0.4.0"
+    type: assistant
+    engine: ">=0.1"
+    languages: [en]
+    settings:
+      - key: api_key
+        label: API Key
+        type: secret
+        required: true
+      - key: tier
+        label: Model
+        type: select
+        default: balanced
+        options:
+          - value: fast
+            label: Fast
+          - value: balanced
+            label: Balanced
+    assistant:
+      provider: api
+      privacy: cloud
+      aliases: [claude]
+      api:
+        endpoint: https://api.anthropic.com/v1/messages
+        auth: header
+        auth_header: x-api-key
+        auth_config_key: api_key
+        tier_config_key: {tier_key}
+{api_extra}        default_model: claude-sonnet-5
+        request_format: anthropic
+        system_prompt: be brief
+        response_path: "content[0].text"
+---
+"#
+        )
+    }
+
+    const TIER_PROVIDER_AND_PINS: &str = "        model_provider: anthropic\n\
+        \x20       default_models:\n\
+        \x20         fast: claude-haiku-4-5\n\
+        \x20         balanced: claude-sonnet-5\n";
+
+    #[test]
+    fn parses_tier_resolution_fields() {
+        let src = tier_assistant_source(TIER_PROVIDER_AND_PINS, "tier");
+        let sf = Skillfile::parse(&src, Some("claude")).unwrap();
+        let api = sf
+            .ari_extension
+            .unwrap()
+            .assistant
+            .expect("assistant present")
+            .api
+            .expect("api block present");
+
+        assert_eq!(api.model_provider.as_deref(), Some("anthropic"));
+        assert_eq!(api.tier_config_key.as_deref(), Some("tier"));
+        // Captured from the select so resolution doesn't need the settings list.
+        assert_eq!(api.default_tier.as_deref(), Some("balanced"));
+        assert_eq!(
+            api.default_models.get("fast").map(String::as_str),
+            Some("claude-haiku-4-5")
+        );
+        assert_eq!(
+            api.default_models.get("balanced").map(String::as_str),
+            Some("claude-sonnet-5")
+        );
+        assert!(api.model_config_key.is_none());
+    }
+
+    #[test]
+    fn tier_config_key_without_model_provider_is_rejected() {
+        // Same source minus the model_provider line.
+        let pins = "        default_models:\n\
+            \x20         fast: claude-haiku-4-5\n\
+            \x20         balanced: claude-sonnet-5\n";
+        let src = tier_assistant_source(pins, "tier");
+        let err = Skillfile::parse(&src, Some("claude")).unwrap_err();
+        assert!(matches!(err, ManifestError::MissingModelProvider), "got {err:?}");
+    }
+
+    #[test]
+    fn a_tier_with_no_pinned_default_is_rejected() {
+        let pins = "        model_provider: anthropic\n\
+            \x20       default_models:\n\
+            \x20         fast: claude-haiku-4-5\n";
+        let src = tier_assistant_source(pins, "tier");
+        let err = Skillfile::parse(&src, Some("claude")).unwrap_err();
+        match err {
+            ManifestError::MissingTierDefault { tier, key } => {
+                assert_eq!(tier, "balanced");
+                assert_eq!(key, "tier");
+            }
+            other => panic!("expected MissingTierDefault, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tier_config_key_must_point_at_a_select() {
+        let src = tier_assistant_source(TIER_PROVIDER_AND_PINS, "api_key");
+        let err = Skillfile::parse(&src, Some("claude")).unwrap_err();
+        match err {
+            ManifestError::TierKeyNotSelect { key } => assert_eq!(key, "api_key"),
+            other => panic!("expected TierKeyNotSelect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tier_config_key_referencing_an_absent_setting_is_rejected() {
+        let src = tier_assistant_source(TIER_PROVIDER_AND_PINS, "nope");
+        let err = Skillfile::parse(&src, Some("claude")).unwrap_err();
+        match err {
+            ManifestError::ConfigKeyNotFound { key, field } => {
+                assert_eq!(key, "nope");
+                assert_eq!(field, "tier_config_key");
+            }
+            other => panic!("expected ConfigKeyNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_config_key_and_tier_config_key_together_are_rejected() {
+        let extra = format!("{TIER_PROVIDER_AND_PINS}        model_config_key: api_key\n");
+        let src = tier_assistant_source(&extra, "tier");
+        let err = Skillfile::parse(&src, Some("claude")).unwrap_err();
+        assert!(matches!(err, ManifestError::ConflictingModelSource), "got {err:?}");
+    }
+
+    #[test]
+    fn a_non_tier_assistant_leaves_the_tier_fields_empty() {
+        let sf = Skillfile::parse(chatgpt_assistant_source(), Some("chatgpt")).unwrap();
+        let api = sf
+            .ari_extension
+            .unwrap()
+            .assistant
+            .unwrap()
+            .api
+            .expect("api block present");
+        assert!(api.tier_config_key.is_none());
+        assert!(api.model_provider.is_none());
+        assert!(api.default_tier.is_none());
+        assert!(api.default_models.is_empty());
     }
 
     #[test]

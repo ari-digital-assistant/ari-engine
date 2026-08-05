@@ -11,7 +11,9 @@
 //! [`REGISTRY_TRUST_KEY`]. Every bundle the client downloads is verified
 //! against this key via the usual [`crate::bundle::install_from_bytes`]
 //! pipeline (which means the bundle pipeline doesn't need to care whether
-//! bytes came from a sideload or from the network).
+//! bytes came from a sideload or from the network). The `models.json`
+//! catalog fetched by [`RegistryClient::fetch_catalog`] is signed with the
+//! same key and verified the same way.
 //!
 //! This module deliberately only covers the **engine-side machinery**. The
 //! background scheduling (Android WorkManager, etc.) and the UI that shows
@@ -95,6 +97,12 @@ pub enum RegistryError {
     #[error("registry index has no preview manifest for {id}")]
     ManifestUnavailable { id: String },
 
+    #[error("registry index has no models.json entry")]
+    CatalogUnavailable,
+
+    #[error(transparent)]
+    Catalog(#[from] crate::models::ModelCatalogError),
+
     #[error("refusing to downgrade {id}: {installed} is installed, the registry bundle is older ({attempted})")]
     Downgrade {
         id: String,
@@ -115,7 +123,20 @@ const SUPPORTED_INDEX_VERSION: u32 = 1;
 pub struct Index {
     pub index_version: u32,
     pub generated_at: String,
+    /// Where to find the tier→model catalog. `#[serde(default)]` because
+    /// indexes published before the catalog existed don't carry it, and an
+    /// older client reading a newer index must not choke on it either.
+    #[serde(default)]
+    pub models: Option<ModelsEntry>,
     pub skills: Vec<IndexEntry>,
+}
+
+/// Pointer to the signed `models.json` in the registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsEntry {
+    pub path: String,
+    pub signature: String,
+    pub sha256: String,
 }
 
 fn default_skill_type() -> String {
@@ -349,6 +370,48 @@ impl RegistryClient {
         let bundle = self.get_bytes(&bundle_url, MAX_BUNDLE_BYTES)?;
         let sig = self.get_bytes(&sig_url, 1024)?;
         Ok((bundle, sig))
+    }
+
+    /// Download, verify and parse the registry's tier→model catalog.
+    ///
+    /// `models.json` decides which model a cloud assistant skill actually
+    /// calls, so it gets the same Ed25519 guarantee as a bundle — `index.json`
+    /// itself is unsigned, and the sha256 it carries is only a cross-check that
+    /// separates "the index lied" from "the signature is wrong".
+    ///
+    /// Callers persist the returned catalog and hand it to the engine via
+    /// `set_model_catalog`. A failure here is not fatal: skills fall back to the
+    /// per-tier pins in their own manifests.
+    pub fn fetch_catalog(
+        &self,
+        index: &Index,
+        trust_root: &TrustRoot,
+    ) -> Result<crate::models::ModelCatalog, RegistryError> {
+        let bytes = self.fetch_catalog_bytes(index, trust_root)?;
+        Ok(crate::models::ModelCatalog::from_json_bytes(&bytes)?)
+    }
+
+    /// As [`Self::fetch_catalog`], but stops after verification and hands back
+    /// the raw bytes. Callers that cache the catalog on disk want these — the
+    /// bytes they persist are then exactly the ones the signature covered.
+    pub fn fetch_catalog_bytes(
+        &self,
+        index: &Index,
+        trust_root: &TrustRoot,
+    ) -> Result<Vec<u8>, RegistryError> {
+        let entry = index
+            .models
+            .as_ref()
+            .ok_or(RegistryError::CatalogUnavailable)?;
+
+        let bytes = self.get_bytes(
+            &self.resolve(&entry.path),
+            crate::models::MAX_CATALOG_BYTES,
+        )?;
+        let sig = self.get_bytes(&self.resolve(&entry.signature), 1024)?;
+
+        crate::bundle::verify_detached(&bytes, &sig, &entry.sha256, trust_root)?;
+        Ok(bytes)
     }
 
     fn resolve(&self, relative: &str) -> String {
@@ -782,6 +845,7 @@ metadata:
         let index = Index {
             index_version: 1,
             generated_at: "t".into(),
+            models: None,
             skills: vec![
                 IndexEntry {
                     id: "dev.heyari.coinflip".into(),
@@ -867,6 +931,7 @@ metadata:
         let mut index = Index {
             index_version: 1,
             generated_at: "t".into(),
+            models: None,
             skills: vec![entry.clone()],
         };
         assert!(check_updates(&store, &index).is_empty());
@@ -1207,6 +1272,7 @@ metadata:
         let empty_index = Index {
             index_version: 1,
             generated_at: "t".to_string(),
+            models: None,
             skills: vec![],
         };
         let client = RegistryClient::new();

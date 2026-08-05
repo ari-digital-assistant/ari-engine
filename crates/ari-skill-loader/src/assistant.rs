@@ -7,8 +7,16 @@
 use crate::manifest::{
     ApiConfig, AuthScheme, RequestFormat, extract_by_path, parse_response_path,
 };
+use crate::models::ModelCatalog;
 use crate::tls;
 use thiserror::Error;
+
+/// Sampling fields dropped when a tier falls back to its manifest pin. The
+/// catalog is what tells us whether a model accepts them, so without it we
+/// don't know — and guessing wrong costs a 400 on every request, whereas
+/// omitting them just means provider-default sampling. Only the tier path uses
+/// this; skills still storing a model ID verbatim keep sending `temperature`.
+const UNKNOWN_MODEL_OMIT_PARAMS: [&str; 3] = ["temperature", "top_p", "top_k"];
 
 // ── ConfigStore trait ──────────────────────────────────────────────────
 
@@ -56,12 +64,20 @@ struct ResolvedConfig {
     endpoint: String,
     model: String,
     api_key: Option<String>,
+    omit_params: Vec<String>,
+}
+
+impl ResolvedConfig {
+    fn omits(&self, param: &str) -> bool {
+        self.omit_params.iter().any(|p| p == param)
+    }
 }
 
 fn resolve_config(
     config: &ApiConfig,
     skill_id: &str,
     store: &dyn ConfigStore,
+    catalog: Option<&ModelCatalog>,
 ) -> Result<ResolvedConfig, AssistantApiError> {
     let endpoint = if let Some(ref fixed) = config.endpoint {
         fixed.clone()
@@ -78,12 +94,38 @@ fn resolve_config(
         });
     };
 
-    let model = if let Some(ref key) = config.model_config_key {
-        store
-            .get(skill_id, key)
-            .unwrap_or_else(|| config.default_model.clone())
+    // Tier skills resolve through the registry catalog; the rest still store a
+    // concrete model ID in config.
+    let (model, omit_params) = if let Some(ref tier_key) = config.tier_config_key {
+        let tier = store
+            .get(skill_id, tier_key)
+            .or_else(|| config.default_tier.clone())
+            .unwrap_or_default();
+        let provider = config.model_provider.as_deref().unwrap_or_default();
+
+        match catalog.and_then(|c| c.lookup(provider, &tier)) {
+            Some(resolved) => (resolved.id.clone(), resolved.omit_params.clone()),
+            None => {
+                let pinned = config
+                    .default_models
+                    .get(&tier)
+                    .cloned()
+                    .unwrap_or_else(|| config.default_model.clone());
+                (
+                    pinned,
+                    UNKNOWN_MODEL_OMIT_PARAMS.iter().map(|s| s.to_string()).collect(),
+                )
+            }
+        }
+    } else if let Some(ref key) = config.model_config_key {
+        (
+            store
+                .get(skill_id, key)
+                .unwrap_or_else(|| config.default_model.clone()),
+            Vec::new(),
+        )
     } else {
-        config.default_model.clone()
+        (config.default_model.clone(), Vec::new())
     };
 
     let api_key = if let Some(ref key) = config.auth_config_key {
@@ -99,6 +141,7 @@ fn resolve_config(
         endpoint,
         model,
         api_key,
+        omit_params,
     })
 }
 
@@ -135,8 +178,9 @@ pub fn call_assistant_api(
     locale: &str,
     history: &[(String, String)],
     facts: &[String],
+    catalog: Option<&ModelCatalog>,
 ) -> Result<String, AssistantApiError> {
-    let resolved = resolve_config(config, skill_id, store)?;
+    let resolved = resolve_config(config, skill_id, store, catalog)?;
 
     let body = build_request_body(config, &resolved, user_input, locale, history, facts);
 
@@ -290,12 +334,15 @@ fn build_request_body(
                 messages.push(serde_json::json!({"role": role, "content": content}));
             }
             messages.push(serde_json::json!({"role": "user", "content": user_input}));
-            serde_json::json!({
+            let mut obj = serde_json::json!({
                 "model": resolved.model,
                 "max_completion_tokens": config.max_tokens,
-                "temperature": config.temperature,
                 "messages": messages,
-            })
+            });
+            if !resolved.omits("temperature") {
+                obj["temperature"] = serde_json::json!(config.temperature);
+            }
+            obj
         }
         RequestFormat::Anthropic => {
             let mut messages = Vec::new();
@@ -309,7 +356,9 @@ fn build_request_body(
                 "system": system_prompt,
                 "messages": messages,
             });
-            obj["temperature"] = serde_json::json!(config.temperature);
+            if !resolved.omits("temperature") {
+                obj["temperature"] = serde_json::json!(config.temperature);
+            }
             obj
         }
     };
@@ -392,6 +441,10 @@ mod tests {
             auth_header: None,
             auth_config_key: Some("api_key".into()),
             model_config_key: None,
+            model_provider: None,
+            tier_config_key: None,
+            default_tier: None,
+            default_models: Default::default(),
             default_model: "gpt-4o-mini".into(),
             system_prompt: "You are Ari.".into(),
             request_format: RequestFormat::Openai,
@@ -405,6 +458,7 @@ mod tests {
             endpoint: "https://api.example.com".into(),
             model: "gpt-4o-mini".into(),
             api_key: Some("sk-test".into()),
+            omit_params: Vec::new(),
         };
         let body = build_request_body(&config, &resolved, "What is 2+2?", "en", &[], &[]);
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -430,6 +484,10 @@ mod tests {
             auth_header: None,
             auth_config_key: Some("api_key".into()),
             model_config_key: None,
+            model_provider: None,
+            tier_config_key: None,
+            default_tier: None,
+            default_models: Default::default(),
             default_model: "gpt-4o-mini".into(),
             system_prompt: "You are Ari.".into(),
             request_format: RequestFormat::Openai,
@@ -443,6 +501,7 @@ mod tests {
             endpoint: "https://api.example.com".into(),
             model: "gpt-4o-mini".into(),
             api_key: Some("sk-test".into()),
+            omit_params: Vec::new(),
         };
         let facts = vec!["i am vegetarian".to_string()];
         let body = build_request_body(&config, &resolved, "what should i cook", "en", &[], &facts);
@@ -459,6 +518,10 @@ mod tests {
             auth_header: None,
             auth_config_key: Some("api_key".into()),
             model_config_key: None,
+            model_provider: None,
+            tier_config_key: None,
+            default_tier: None,
+            default_models: Default::default(),
             default_model: "gpt-4o-mini".into(),
             system_prompt: "You are Ari.".into(),
             request_format: RequestFormat::Openai,
@@ -472,6 +535,7 @@ mod tests {
             endpoint: "https://api.example.com".into(),
             model: "gpt-4o-mini".into(),
             api_key: Some("sk-test".into()),
+            omit_params: Vec::new(),
         };
         let body = build_request_body(&config, &resolved, "hi", "en", &[], &[]);
         assert!(!body.contains("Things you know about the user"));
@@ -492,6 +556,10 @@ mod tests {
             auth_header: None,
             auth_config_key: Some("api_key".into()),
             model_config_key: None,
+            model_provider: None,
+            tier_config_key: None,
+            default_tier: None,
+            default_models: Default::default(),
             default_model: "gpt-4o-mini".into(),
             system_prompt: "You are Ari.".into(),
             request_format: RequestFormat::Openai,
@@ -505,6 +573,7 @@ mod tests {
             endpoint: "https://api.example.com".into(),
             model: "gpt-4o-mini".into(),
             api_key: Some("sk-test".into()),
+            omit_params: Vec::new(),
         };
         let body = build_request_body(&config, &resolved, "che ora è?", "it", &[], &[]);
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -531,6 +600,10 @@ mod tests {
             auth_header: None,
             auth_config_key: Some("api_key".into()),
             model_config_key: None,
+            model_provider: None,
+            tier_config_key: None,
+            default_tier: None,
+            default_models: Default::default(),
             default_model: "gpt-4o-mini".into(),
             system_prompt: crate::manifest::LocalizedPrompt::from_map(prompts).unwrap(),
             request_format: RequestFormat::Openai,
@@ -544,6 +617,7 @@ mod tests {
             endpoint: "https://api.example.com".into(),
             model: "gpt-4o-mini".into(),
             api_key: Some("sk-test".into()),
+            omit_params: Vec::new(),
         };
         let body = build_request_body(&config, &resolved, "ciao", "it", &[], &[]);
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -560,6 +634,10 @@ mod tests {
             auth_header: None,
             auth_config_key: Some("api_key".into()),
             model_config_key: None,
+            model_provider: None,
+            tier_config_key: None,
+            default_tier: None,
+            default_models: Default::default(),
             default_model: "gpt-4o-mini".into(),
             system_prompt: "You are Ari.".into(),
             request_format: RequestFormat::Openai,
@@ -573,6 +651,7 @@ mod tests {
             endpoint: "https://api.example.com".into(),
             model: "gpt-4o-mini".into(),
             api_key: Some("sk-test".into()),
+            omit_params: Vec::new(),
         };
         let body = build_request_body(&config, &resolved, "what time?", "en", &[], &[]);
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -589,6 +668,10 @@ mod tests {
             auth_header: Some("x-api-key".into()),
             auth_config_key: Some("api_key".into()),
             model_config_key: None,
+            model_provider: None,
+            tier_config_key: None,
+            default_tier: None,
+            default_models: Default::default(),
             default_model: "claude-sonnet-4-6".into(),
             system_prompt: "You are Ari.".into(),
             request_format: RequestFormat::Anthropic,
@@ -602,6 +685,7 @@ mod tests {
             endpoint: "https://api.anthropic.com/v1/messages".into(),
             model: "claude-sonnet-4-6".into(),
             api_key: Some("sk-ant-test".into()),
+            omit_params: Vec::new(),
         };
         let body = build_request_body(&config, &resolved, "Hello", "en", &[], &[]);
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -621,6 +705,10 @@ mod tests {
             auth_header: None,
             auth_config_key: Some("api_key".into()),
             model_config_key: None,
+            model_provider: None,
+            tier_config_key: None,
+            default_tier: None,
+            default_models: Default::default(),
             default_model: "gpt-4o-mini".into(),
             system_prompt: "You are Ari.".into(),
             request_format: RequestFormat::Openai,
@@ -634,6 +722,7 @@ mod tests {
             endpoint: "https://api.example.com".into(),
             model: "gpt-4o-mini".into(),
             api_key: Some("sk-test".into()),
+            omit_params: Vec::new(),
         };
         let history = vec![
             ("user".to_string(), "what is the capital of uae?".to_string()),
@@ -663,6 +752,10 @@ mod tests {
             auth_header: None,
             auth_config_key: Some("api_key".into()),
             model_config_key: None,
+            model_provider: None,
+            tier_config_key: None,
+            default_tier: None,
+            default_models: Default::default(),
             default_model: "gpt-4o-mini".into(),
             system_prompt: "You are Ari.".into(),
             request_format: RequestFormat::Openai,
@@ -676,6 +769,7 @@ mod tests {
             endpoint: "https://api.example.com".into(),
             model: "gpt-4o-mini".into(),
             api_key: Some("sk-test".into()),
+            omit_params: Vec::new(),
         };
         let body = build_request_body(&config, &resolved, "hello", "en", &[], &[]);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -705,6 +799,10 @@ mod tests {
             auth_header: None,
             auth_config_key: Some("api_key".into()),
             model_config_key: Some("model".into()),
+            model_provider: None,
+            tier_config_key: None,
+            default_tier: None,
+            default_models: Default::default(),
             default_model: "default-model".into(),
             system_prompt: "test".into(),
             request_format: RequestFormat::Openai,
@@ -715,7 +813,7 @@ mod tests {
             temperature: 0.7,
         };
 
-        let resolved = resolve_config(&config, "test.id", &store).unwrap();
+        let resolved = resolve_config(&config, "test.id", &store, None).unwrap();
         assert_eq!(resolved.endpoint, "https://api.example.com");
         assert_eq!(resolved.model, "default-model");
         assert_eq!(resolved.api_key.as_deref(), Some("sk-123"));
@@ -735,6 +833,10 @@ mod tests {
             auth_header: None,
             auth_config_key: Some("api_key".into()),
             model_config_key: Some("model".into()),
+            model_provider: None,
+            tier_config_key: None,
+            default_tier: None,
+            default_models: Default::default(),
             default_model: "gpt-4o-mini".into(),
             system_prompt: "test".into(),
             request_format: RequestFormat::Openai,
@@ -745,7 +847,7 @@ mod tests {
             temperature: 0.7,
         };
 
-        let resolved = resolve_config(&config, "test.id", &store).unwrap();
+        let resolved = resolve_config(&config, "test.id", &store, None).unwrap();
         assert_eq!(resolved.model, "gpt-4o");
     }
 
@@ -791,7 +893,7 @@ mod tests {
         let mut store = MemoryConfigStore::new();
         store.set(&entry.id, "api_key", &api_key);
 
-        let result = call_assistant_api(api, &entry.id, &store, "what is the capital of malta", "en", &[], &[]);
+        let result = call_assistant_api(api, &entry.id, &store, "what is the capital of malta", "en", &[], &[], None);
         match result {
             Ok(text) => {
                 eprintln!("ChatGPT response: {text}");
@@ -812,6 +914,10 @@ mod tests {
             auth_header: None,
             auth_config_key: Some("api_key".into()),
             model_config_key: None,
+            model_provider: None,
+            tier_config_key: None,
+            default_tier: None,
+            default_models: Default::default(),
             default_model: "model".into(),
             system_prompt: "test".into(),
             request_format: RequestFormat::Openai,
@@ -822,7 +928,7 @@ mod tests {
             temperature: 0.7,
         };
 
-        let err = resolve_config(&config, "test.id", &store).unwrap_err();
+        let err = resolve_config(&config, "test.id", &store, None).unwrap_err();
         assert!(matches!(err, AssistantApiError::MissingConfig { key } if key == "api_key"));
     }
 
@@ -836,6 +942,10 @@ mod tests {
             auth_header: Some("x-api-key".into()),
             auth_config_key: Some("api_key".into()),
             model_config_key: None,
+            model_provider: None,
+            tier_config_key: None,
+            default_tier: None,
+            default_models: Default::default(),
             default_model: "claude-sonnet-4-6".into(),
             system_prompt: "You are Ari.".into(),
             request_format: RequestFormat::Anthropic,
@@ -849,6 +959,7 @@ mod tests {
             endpoint: "https://api.anthropic.com/v1/messages".into(),
             model: "claude-sonnet-4-6".into(),
             api_key: Some("sk-ant-test".into()),
+            omit_params: Vec::new(),
         };
         let history = vec![
             ("user".to_string(), "what is the capital of uae?".to_string()),
@@ -865,5 +976,175 @@ mod tests {
         assert_eq!(msgs[2]["role"], "user");
         assert_eq!(msgs[2]["content"], "what is the population?");
         assert!(v["system"].as_str().unwrap().contains("[continuation]"));
+    }
+
+    const TIER_CATALOG: &str = r#"{
+      "schema_version": 1,
+      "providers": {
+        "openai": {
+          "fast": {"id": "gpt-5.6-luna", "omit_params": ["temperature", "top_p", "top_k"]},
+          "balanced": {"id": "gpt-5.6-terra", "omit_params": []}
+        },
+        "anthropic": {
+          "smartest": {"id": "claude-opus-5", "omit_params": ["temperature"]}
+        }
+      }
+    }"#;
+
+    fn tier_config(provider: &str, format: RequestFormat) -> ApiConfig {
+        let mut default_models = std::collections::BTreeMap::new();
+        default_models.insert("fast".to_string(), "pinned-fast".to_string());
+        default_models.insert("balanced".to_string(), "pinned-balanced".to_string());
+        default_models.insert("smartest".to_string(), "pinned-smartest".to_string());
+        ApiConfig {
+            endpoint: Some("https://api.example.com".into()),
+            endpoint_config_key: None,
+            default_endpoint: None,
+            auth: AuthScheme::None,
+            auth_header: None,
+            auth_config_key: None,
+            model_config_key: None,
+            model_provider: Some(provider.into()),
+            tier_config_key: Some("tier".into()),
+            default_tier: Some("balanced".into()),
+            default_models,
+            default_model: "last-resort".into(),
+            system_prompt: "You are Ari.".into(),
+            request_format: format,
+            response_path: "choices[0].message.content".into(),
+            api_version: None,
+            api_version_header: None,
+            max_tokens: 256,
+            temperature: 0.7,
+        }
+    }
+
+    #[test]
+    fn tier_resolves_the_users_choice_through_the_catalog() {
+        let catalog = ModelCatalog::from_json_bytes(TIER_CATALOG.as_bytes()).unwrap();
+        let config = tier_config("openai", RequestFormat::Openai);
+        let mut store = MemoryConfigStore::new();
+        store.set("test.id", "tier", "fast");
+
+        let resolved = resolve_config(&config, "test.id", &store, Some(&catalog)).unwrap();
+        assert_eq!(resolved.model, "gpt-5.6-luna");
+        assert_eq!(
+            resolved.omit_params,
+            vec!["temperature".to_string(), "top_p".to_string(), "top_k".to_string()]
+        );
+    }
+
+    #[test]
+    fn tier_falls_back_to_the_selects_default_when_unset() {
+        let catalog = ModelCatalog::from_json_bytes(TIER_CATALOG.as_bytes()).unwrap();
+        let config = tier_config("openai", RequestFormat::Openai);
+        let store = MemoryConfigStore::new();
+
+        let resolved = resolve_config(&config, "test.id", &store, Some(&catalog)).unwrap();
+        assert_eq!(resolved.model, "gpt-5.6-terra");
+        assert!(resolved.omit_params.is_empty());
+    }
+
+    #[test]
+    fn no_catalog_uses_the_pin_for_that_tier_and_drops_sampling_params() {
+        let config = tier_config("openai", RequestFormat::Openai);
+        let mut store = MemoryConfigStore::new();
+        store.set("test.id", "tier", "smartest");
+
+        let resolved = resolve_config(&config, "test.id", &store, None).unwrap();
+        assert_eq!(resolved.model, "pinned-smartest");
+        // Without the catalog we don't know whether the pin accepts sampling
+        // params, and a wrong guess is a 400 on every request.
+        assert_eq!(
+            resolved.omit_params,
+            vec!["temperature".to_string(), "top_p".to_string(), "top_k".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_tier_missing_from_the_catalog_uses_its_pin() {
+        let catalog = ModelCatalog::from_json_bytes(TIER_CATALOG.as_bytes()).unwrap();
+        // The catalog has no openai/smartest entry.
+        let config = tier_config("openai", RequestFormat::Openai);
+        let mut store = MemoryConfigStore::new();
+        store.set("test.id", "tier", "smartest");
+
+        let resolved = resolve_config(&config, "test.id", &store, Some(&catalog)).unwrap();
+        assert_eq!(resolved.model, "pinned-smartest");
+    }
+
+    #[test]
+    fn an_unrecognised_tier_value_falls_all_the_way_to_default_model() {
+        let catalog = ModelCatalog::from_json_bytes(TIER_CATALOG.as_bytes()).unwrap();
+        let config = tier_config("openai", RequestFormat::Openai);
+        let mut store = MemoryConfigStore::new();
+        store.set("test.id", "tier", "turbo");
+
+        let resolved = resolve_config(&config, "test.id", &store, Some(&catalog)).unwrap();
+        assert_eq!(resolved.model, "last-resort");
+    }
+
+    #[test]
+    fn omit_params_removes_temperature_from_an_openai_body() {
+        let catalog = ModelCatalog::from_json_bytes(TIER_CATALOG.as_bytes()).unwrap();
+        let config = tier_config("openai", RequestFormat::Openai);
+        let mut store = MemoryConfigStore::new();
+        store.set("test.id", "tier", "fast");
+        let resolved = resolve_config(&config, "test.id", &store, Some(&catalog)).unwrap();
+
+        let body = build_request_body(&config, &resolved, "hello", "en", &[], &[]);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["model"], "gpt-5.6-luna");
+        assert_eq!(parsed["max_completion_tokens"], 256);
+        assert!(parsed.get("temperature").is_none());
+    }
+
+    #[test]
+    fn a_tier_that_accepts_temperature_still_gets_it() {
+        let catalog = ModelCatalog::from_json_bytes(TIER_CATALOG.as_bytes()).unwrap();
+        let config = tier_config("openai", RequestFormat::Openai);
+        let mut store = MemoryConfigStore::new();
+        store.set("test.id", "tier", "balanced");
+        let resolved = resolve_config(&config, "test.id", &store, Some(&catalog)).unwrap();
+
+        let body = build_request_body(&config, &resolved, "hello", "en", &[], &[]);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["model"], "gpt-5.6-terra");
+        assert_eq!(parsed["temperature"], serde_json::json!(0.7f32));
+    }
+
+    #[test]
+    fn omit_params_removes_temperature_from_an_anthropic_body() {
+        let catalog = ModelCatalog::from_json_bytes(TIER_CATALOG.as_bytes()).unwrap();
+        let config = tier_config("anthropic", RequestFormat::Anthropic);
+        let mut store = MemoryConfigStore::new();
+        store.set("test.id", "tier", "smartest");
+        let resolved = resolve_config(&config, "test.id", &store, Some(&catalog)).unwrap();
+
+        let body = build_request_body(&config, &resolved, "hello", "en", &[], &[]);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["model"], "claude-opus-5");
+        assert_eq!(parsed["max_tokens"], 256);
+        assert!(parsed.get("temperature").is_none());
+        assert_eq!(parsed["system"], "You are Ari.");
+    }
+
+    #[test]
+    fn a_stored_model_id_skill_is_unaffected_by_the_tier_path() {
+        let mut config = tier_config("openai", RequestFormat::Openai);
+        config.tier_config_key = None;
+        config.model_provider = None;
+        config.default_tier = None;
+        config.model_config_key = Some("model".into());
+        let mut store = MemoryConfigStore::new();
+        store.set("test.id", "model", "gpt-4o-mini");
+
+        let resolved = resolve_config(&config, "test.id", &store, None).unwrap();
+        assert_eq!(resolved.model, "gpt-4o-mini");
+        assert!(resolved.omit_params.is_empty());
+
+        let body = build_request_body(&config, &resolved, "hello", "en", &[], &[]);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["temperature"], serde_json::json!(0.7f32));
     }
 }
