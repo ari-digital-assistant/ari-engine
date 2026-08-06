@@ -544,6 +544,42 @@ impl SkillRegistry {
         })
     }
 
+    /// URLs of the registry's preview screenshots for `id`, in display
+    /// order, for a frontend running on `platform` (`"android"`,
+    /// `"linux"`, …).
+    ///
+    /// A skill with no shots for this platform falls back to whichever
+    /// platform it *has* been photographed on — see
+    /// [`ari_skill_loader::IndexEntry::screenshots_for_platform`]. An
+    /// empty result means the skill ships none at all, and the UI should
+    /// simply not render a gallery.
+    ///
+    /// Screenshots live in the registry rather than the bundle, so this
+    /// works the same for installed and not-yet-installed skills. The
+    /// frontend fetches the image bytes itself — every platform already
+    /// has an image pipeline and a cache policy better than anything we'd
+    /// bolt on here.
+    ///
+    /// Errors:
+    ///   * [`FfiRegistryError::NotFound`] — the id isn't in the registry.
+    ///   * [`FfiRegistryError::Registry`] — network / HTTP failure.
+    ///
+    /// Blocks on the network — callers must run this off the main thread.
+    pub fn fetch_screenshot_urls(
+        &self,
+        id: String,
+        platform: String,
+    ) -> Result<Vec<String>, FfiRegistryError> {
+        let client = RegistryClient::new();
+        let index = client.fetch_index().map_err(map_registry_error)?;
+        let entry: IndexEntry = index
+            .skills
+            .into_iter()
+            .find(|e| e.id == id)
+            .ok_or_else(|| FfiRegistryError::NotFound { id: id.clone() })?;
+        Ok(client.screenshot_urls(&entry, &platform))
+    }
+
     /// Read the on-disk manifest for an already-installed skill and
     /// return the rich record the list/row view doesn't have room for —
     /// author, homepage, capabilities, supported languages, full body.

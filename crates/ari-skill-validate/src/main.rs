@@ -19,6 +19,25 @@
 //!
 //! Exit codes: 0 = all good, 1 = at least one skill failed, 2 = bad CLI usage.
 
+/// Platform directory names allowed under `screenshots/`. A typo here is
+/// worse than useless — the shots would publish and then never be shown
+/// to anybody — so an unrecognised directory fails the skill outright.
+const SCREENSHOT_PLATFORMS: &[&str] = &["android", "ios", "linux", "macos", "windows"];
+
+/// File extensions allowed for screenshots. Lowercase only, checked
+/// literally: `Photo.PNG` straight off a desktop fails rather than
+/// silently publishing a path some case-sensitive host will 404 on.
+const SCREENSHOT_EXTENSIONS: &[&str] = &[".png", ".webp", ".jpg"];
+
+/// Per-file size ceiling. A phone screenshot saved as WebP lands well
+/// under this; a raw PNG straight off a 3x display does not, and every
+/// browse-time viewer would pay for it.
+const MAX_SCREENSHOT_BYTES: u64 = 1024 * 1024;
+
+/// Per-platform count ceiling. Six is already more than anybody scrolls
+/// through on a skill detail page.
+const MAX_SCREENSHOTS_PER_PLATFORM: usize = 6;
+
 use ari_skill_loader::{
     capability_name, load_single_skill_dir_with, load_skill_directory_with, HostCapabilities,
     LoadFailure, LoadOptions, LoadReport, Skillfile,
@@ -197,6 +216,12 @@ struct Row {
     /// right copy without downloading the bundle. English is omitted
     /// — `name` + `description` above already carry it.
     localizations: BTreeMap<String, LocalizedDisplay>,
+    /// Preview screenshots discovered under `screenshots/<platform>/`,
+    /// keyed by platform and ordered by filename. Paths are relative to
+    /// the skill directory; `tools/build-index.sh` rewrites them to
+    /// registry-relative ones when it copies the files out. Emitted as
+    /// the JSON key `screenshots`.
+    screenshots: BTreeMap<String, Vec<String>>,
     failures: Vec<String>,
     warnings: Vec<String>,
 }
@@ -224,6 +249,7 @@ impl Row {
             languages: Vec::new(),
             examples: 0,
             localizations: BTreeMap::new(),
+            screenshots: BTreeMap::new(),
             failures: vec!["path does not exist".to_string()],
             warnings: Vec::new(),
         }
@@ -244,6 +270,7 @@ impl Row {
             languages: Vec::new(),
             examples: 0,
             localizations: BTreeMap::new(),
+            screenshots: BTreeMap::new(),
             failures: vec![msg.to_string()],
             warnings: Vec::new(),
         }
@@ -259,9 +286,10 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
     //       Ari skill, silently skipped by the loader)
     if let Some(skill) = report.skills.first() {
         let fields = read_manifest_fields(path);
+        let shots = read_screenshots(path);
         out.push(Row {
             path: path.to_path_buf(),
-            ok: true,
+            ok: shots.failures.is_empty(),
             id: Some(skill.id().to_string()),
             skill_type: "skill".to_string(),
             version: fields.version,
@@ -274,7 +302,8 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             languages: fields.languages,
             examples: fields.examples,
             localizations: fields.localizations,
-            failures: Vec::new(),
+            screenshots: shots.by_platform,
+            failures: shots.failures,
             warnings: fields.warnings,
         });
         return;
@@ -283,9 +312,10 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
     // `report.assistants`. Treat them as valid if they parsed.
     if let Some(entry) = report.assistants.first() {
         let fields = read_manifest_fields(path);
+        let shots = read_screenshots(path);
         out.push(Row {
             path: path.to_path_buf(),
-            ok: true,
+            ok: shots.failures.is_empty(),
             id: Some(entry.id.clone()),
             skill_type: "assistant".to_string(),
             version: fields.version,
@@ -298,7 +328,8 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             languages: fields.languages,
             examples: fields.examples,
             localizations: fields.localizations,
-            failures: Vec::new(),
+            screenshots: shots.by_platform,
+            failures: shots.failures,
             warnings: fields.warnings,
         });
         return;
@@ -319,6 +350,7 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             languages: Vec::new(),
             examples: 0,
             localizations: BTreeMap::new(),
+            screenshots: BTreeMap::new(),
             failures: report.failures.iter().map(LoadFailure::to_string).collect(),
             warnings: Vec::new(),
         });
@@ -339,6 +371,7 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
         languages: Vec::new(),
         examples: 0,
         localizations: BTreeMap::new(),
+        screenshots: BTreeMap::new(),
         failures: vec!["SKILL.md has no metadata.ari extension (not an Ari skill)".to_string()],
         warnings: Vec::new(),
     });
@@ -481,6 +514,125 @@ fn read_localizations(skill_dir: &Path) -> BTreeMap<String, LocalizedDisplay> {
     out
 }
 
+/// Outcome of walking a skill's `screenshots/` directory.
+#[derive(Default)]
+struct Screenshots {
+    /// Platform → filenames-relative-to-the-skill-dir, filename-ordered.
+    by_platform: BTreeMap<String, Vec<String>>,
+    /// Anything that must block the publish. Screenshots are cosmetic,
+    /// but a broken one is invisible until a user hits the detail page,
+    /// which is far too late to find out — so these fail the skill
+    /// rather than warn.
+    failures: Vec<String>,
+}
+
+/// Walk `skill_dir/screenshots/` and collect the preview images.
+///
+/// Layout is convention, not manifest: one directory per platform, images
+/// inside it, shown in filename order. That keeps ordering obvious from
+/// `ls` and means adding a screenshot never touches the frontmatter.
+/// There are no captions on purpose — captions would need translating for
+/// every locale the skill ships, and a screenshot that only makes sense
+/// with a caption is a bad screenshot.
+fn read_screenshots(skill_dir: &Path) -> Screenshots {
+    let mut out = Screenshots::default();
+    let root = skill_dir.join("screenshots");
+    if !root.exists() {
+        return out;
+    }
+    if !root.is_dir() {
+        out.failures
+            .push("screenshots must be a directory of per-platform directories".to_string());
+        return out;
+    }
+    let entries = match std::fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(e) => {
+            out.failures.push(format!("could not read screenshots/: {e}"));
+            return out;
+        }
+    };
+    // Sort the platform dirs before walking them so failure messages come
+    // out in a stable order across runs and filesystems.
+    let mut platform_dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    platform_dirs.sort();
+    for dir in platform_dirs {
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !dir.is_dir() {
+            out.failures.push(format!(
+                "screenshots/{name} is not inside a platform directory — put it in screenshots/<platform>/"
+            ));
+            continue;
+        }
+        if !SCREENSHOT_PLATFORMS.contains(&name) {
+            out.failures.push(format!(
+                "screenshots/{name}/ is not a known platform — expected one of {}",
+                SCREENSHOT_PLATFORMS.join(", ")
+            ));
+            continue;
+        }
+        let files = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                out.failures
+                    .push(format!("could not read screenshots/{name}/: {e}"));
+                continue;
+            }
+        };
+        let mut paths: Vec<PathBuf> = files.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        let mut kept: Vec<String> = Vec::new();
+        for path in paths {
+            let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !path.is_file() {
+                out.failures.push(format!(
+                    "screenshots/{name}/{filename} is not a file — platform directories hold images, nothing else"
+                ));
+                continue;
+            }
+            if !SCREENSHOT_EXTENSIONS.iter().any(|ext| filename.ends_with(ext)) {
+                out.failures.push(format!(
+                    "screenshots/{name}/{filename} is not a supported image — use {}",
+                    SCREENSHOT_EXTENSIONS.join(", ")
+                ));
+                continue;
+            }
+            match path.metadata() {
+                Ok(meta) if meta.len() > MAX_SCREENSHOT_BYTES => {
+                    out.failures.push(format!(
+                        "screenshots/{name}/{filename} is {} KiB — the limit is {} KiB, so compress it or save it as WebP",
+                        meta.len() / 1024,
+                        MAX_SCREENSHOT_BYTES / 1024
+                    ));
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    out.failures
+                        .push(format!("could not stat screenshots/{name}/{filename}: {e}"));
+                    continue;
+                }
+            }
+            kept.push(format!("screenshots/{name}/{filename}"));
+        }
+        if kept.len() > MAX_SCREENSHOTS_PER_PLATFORM {
+            out.failures.push(format!(
+                "screenshots/{name}/ has {} images — the limit is {MAX_SCREENSHOTS_PER_PLATFORM}",
+                kept.len()
+            ));
+            continue;
+        }
+        if !kept.is_empty() {
+            out.by_platform.insert(name.to_string(), kept);
+        }
+    }
+    out
+}
+
 fn render_text(rows: &[Row], ok: usize, failed: usize, quiet: bool) {
     for row in rows {
         if row.ok {
@@ -602,6 +754,30 @@ fn json_for_rows(rows: &[Row]) -> String {
             out.push('}');
         }
         if !row.localizations.is_empty() {
+            out.push(' ');
+        }
+        out.push_str("},\n");
+        // Preview screenshots — `{ "android": ["screenshots/android/01.webp"] }`,
+        // paths relative to the skill directory. `tools/build-index.sh`
+        // rewrites them as it copies the files into the registry's
+        // screenshots/ sidecar.
+        out.push_str("    \"screenshots\": {");
+        for (j, (platform, files)) in row.screenshots.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push(' ');
+            out.push_str(&json_string(platform));
+            out.push_str(": [");
+            for (k, file) in files.iter().enumerate() {
+                if k > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&json_string(file));
+            }
+            out.push(']');
+        }
+        if !row.screenshots.is_empty() {
             out.push(' ');
         }
         out.push_str("},\n");
@@ -924,6 +1100,182 @@ metadata:
         push_rows_from_report(&mut rows, &skill, &report);
         assert_eq!(rows.len(), 1, "expected exactly one row, got {rows:?}");
         rows.into_iter().next().unwrap()
+    }
+
+    /// Write a screenshot of `bytes` length at `screenshots/<rel>` under a
+    /// fresh skill dir, returning the dir so the caller can add more.
+    fn skill_dir_with_screenshots(files: &[(&str, usize)]) -> (tempdir_lite::TempDir, PathBuf) {
+        use std::fs;
+        let dir = tempdir_lite::TempDir::new("ari-validate-shots");
+        let skill = dir.path().join("timer");
+        fs::create_dir_all(&skill).unwrap();
+        for (rel, len) in files {
+            let path = skill.join("screenshots").join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, vec![0u8; *len]).unwrap();
+        }
+        (dir, skill)
+    }
+
+    #[test]
+    fn screenshots_are_grouped_by_platform_in_filename_order() {
+        let (_tmp, skill) = skill_dir_with_screenshots(&[
+            ("android/02-list.webp", 10),
+            ("android/01-set.webp", 10),
+            ("linux/01-set.png", 10),
+        ]);
+        let shots = read_screenshots(&skill);
+        assert!(shots.failures.is_empty(), "unexpected: {:?}", shots.failures);
+        assert_eq!(
+            shots.by_platform.get("android").unwrap(),
+            &vec![
+                "screenshots/android/01-set.webp".to_string(),
+                "screenshots/android/02-list.webp".to_string(),
+            ]
+        );
+        assert_eq!(
+            shots.by_platform.get("linux").unwrap(),
+            &vec!["screenshots/linux/01-set.png".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_screenshots_directory_is_not_a_problem() {
+        let (_tmp, skill) = skill_dir_with_screenshots(&[]);
+        let shots = read_screenshots(&skill);
+        assert!(shots.failures.is_empty());
+        assert!(shots.by_platform.is_empty());
+    }
+
+    #[test]
+    fn unknown_platform_directory_fails() {
+        let (_tmp, skill) = skill_dir_with_screenshots(&[("andriod/01.webp", 10)]);
+        let shots = read_screenshots(&skill);
+        assert_eq!(shots.failures.len(), 1, "got {:?}", shots.failures);
+        assert!(
+            shots.failures[0].contains("screenshots/andriod/ is not a known platform"),
+            "message must name the offending directory, got {:?}",
+            shots.failures[0]
+        );
+        assert!(shots.by_platform.is_empty());
+    }
+
+    #[test]
+    fn unsupported_extension_fails() {
+        let (_tmp, skill) = skill_dir_with_screenshots(&[
+            ("android/01.gif", 10),
+            ("android/02.PNG", 10),
+            ("android/03.webp", 10),
+        ]);
+        let shots = read_screenshots(&skill);
+        assert_eq!(shots.failures.len(), 2, "got {:?}", shots.failures);
+        assert!(shots.failures[0].contains("screenshots/android/01.gif"));
+        assert!(shots.failures[1].contains("screenshots/android/02.PNG"));
+        // The good one still comes through — one bad file doesn't erase the rest.
+        assert_eq!(
+            shots.by_platform.get("android").unwrap(),
+            &vec!["screenshots/android/03.webp".to_string()]
+        );
+    }
+
+    #[test]
+    fn oversized_screenshot_fails() {
+        let over = (MAX_SCREENSHOT_BYTES + 1) as usize;
+        let (_tmp, skill) = skill_dir_with_screenshots(&[("android/01.png", over)]);
+        let shots = read_screenshots(&skill);
+        assert_eq!(shots.failures.len(), 1, "got {:?}", shots.failures);
+        assert!(
+            shots.failures[0].contains("1024 KiB"),
+            "message must state the limit, got {:?}",
+            shots.failures[0]
+        );
+        assert!(shots.by_platform.is_empty());
+    }
+
+    #[test]
+    fn too_many_screenshots_for_one_platform_fails() {
+        let files: Vec<(String, usize)> = (0..=MAX_SCREENSHOTS_PER_PLATFORM)
+            .map(|i| (format!("android/{i:02}.webp"), 10))
+            .collect();
+        let refs: Vec<(&str, usize)> = files.iter().map(|(p, n)| (p.as_str(), *n)).collect();
+        let (_tmp, skill) = skill_dir_with_screenshots(&refs);
+        let shots = read_screenshots(&skill);
+        assert_eq!(shots.failures.len(), 1, "got {:?}", shots.failures);
+        assert!(shots.failures[0].contains("has 7 images"));
+        assert!(shots.by_platform.is_empty());
+    }
+
+    #[test]
+    fn loose_file_at_the_screenshots_root_fails() {
+        use std::fs;
+        let (_tmp, skill) = skill_dir_with_screenshots(&[("android/01.webp", 10)]);
+        fs::write(skill.join("screenshots/hero.png"), vec![0u8; 10]).unwrap();
+        let shots = read_screenshots(&skill);
+        assert_eq!(shots.failures.len(), 1, "got {:?}", shots.failures);
+        assert!(shots.failures[0].contains("screenshots/hero.png is not inside a platform directory"));
+    }
+
+    #[test]
+    fn bad_screenshots_fail_the_whole_skill_and_good_ones_reach_the_json() {
+        use std::fs;
+        let md = r#"---
+name: greet
+description: Greets the user.
+metadata:
+  ari:
+    id: ai.example.greet
+    version: "0.1.0"
+    engine: ">=0.3"
+    languages: [en]
+    matching:
+      patterns:
+        - keywords: [hello, hi]
+          weight: 0.95
+    examples:
+      - text: "hello"
+      - text: "hi there"
+      - text: "good morning"
+      - text: "hey"
+      - text: "greetings"
+    declarative:
+      response: "Hello!"
+---
+Greet skill.
+"#;
+        let dir = tempdir_lite::TempDir::new("ari-validate-shots-row");
+        let skill = dir.path().join("greet");
+        fs::create_dir_all(skill.join("screenshots/android")).unwrap();
+        fs::write(skill.join("SKILL.en.md"), md).unwrap();
+        fs::write(skill.join("screenshots/android/01.webp"), vec![0u8; 10]).unwrap();
+
+        let options = LoadOptions {
+            host_capabilities: HostCapabilities::all(),
+            ..LoadOptions::default()
+        };
+        let mut rows: Vec<Row> = Vec::new();
+        push_rows_from_report(
+            &mut rows,
+            &skill,
+            &load_single_skill_dir_with(&skill, &options),
+        );
+        assert!(rows[0].ok, "clean screenshots must not fail the skill");
+        let json = json_for_rows(&rows);
+        assert!(
+            json.contains("\"screenshots\": { \"android\": [\"screenshots/android/01.webp\"] }"),
+            "JSON must carry the discovered screenshots, got:\n{json}"
+        );
+
+        // Now break it: an unknown platform dir takes the whole skill down,
+        // so a typo can never reach the registry unnoticed.
+        fs::create_dir_all(skill.join("screenshots/nokia")).unwrap();
+        fs::write(skill.join("screenshots/nokia/01.webp"), vec![0u8; 10]).unwrap();
+        let mut rows: Vec<Row> = Vec::new();
+        push_rows_from_report(
+            &mut rows,
+            &skill,
+            &load_single_skill_dir_with(&skill, &options),
+        );
+        assert!(!rows[0].ok, "an unknown platform dir must fail the skill");
     }
 
     #[test]
