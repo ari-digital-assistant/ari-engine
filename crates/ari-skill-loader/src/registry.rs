@@ -210,6 +210,20 @@ pub struct IndexEntry {
     /// (`name`, `description`) pair with English fallback.
     #[serde(default)]
     pub localizations: std::collections::HashMap<String, LocalizedDisplay>,
+    /// Preview screenshots keyed by platform (`"android"`, `"linux"`, …),
+    /// each an ordered list of paths relative to [`REGISTRY_BASE_URL`].
+    /// Written by the publish pipeline from `skills/<slug>/screenshots/`.
+    ///
+    /// These are browse-time decoration and deliberately **not** shipped
+    /// inside the signed bundle — a user installing a skill shouldn't pay
+    /// to download pictures of it. Like the manifest sidecar, they carry
+    /// no signature, so trust them exactly as far as you trust the
+    /// registry host.
+    ///
+    /// Use [`IndexEntry::screenshots_for_platform`] rather than indexing
+    /// this map directly — it implements the cross-platform fallback.
+    #[serde(default)]
+    pub screenshots: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// One locale's worth of display strings for a skill — the parts the
@@ -244,6 +258,28 @@ impl IndexEntry {
             description: &self.description,
             is_localized: false,
         }
+    }
+
+    /// Screenshot paths to show on `platform` (`"android"`, `"linux"`, …).
+    ///
+    /// Prefers the platform's own shots. A skill that hasn't been
+    /// photographed on this platform yet falls back to the first platform
+    /// it *has* been photographed on — a Linux user looking at a skill
+    /// with only Android shots still gets a feel for it, which beats an
+    /// empty panel. `BTreeMap` ordering makes that choice deterministic
+    /// rather than whatever the hash map felt like today.
+    ///
+    /// The returned paths are relative to [`REGISTRY_BASE_URL`]; see
+    /// [`RegistryClient::screenshot_urls`] for absolute ones.
+    pub fn screenshots_for_platform(&self, platform: &str) -> &[String] {
+        if let Some(shots) = self.screenshots.get(platform).filter(|s| !s.is_empty()) {
+            return shots;
+        }
+        self.screenshots
+            .values()
+            .find(|s| !s.is_empty())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 
@@ -359,6 +395,23 @@ impl RegistryClient {
         let url = self.resolve(path);
         let bytes = self.get_bytes(&url, MAX_MANIFEST_BYTES)?;
         String::from_utf8(bytes).map_err(|e| RegistryError::Parse(format!("{url}: {e}")))
+    }
+
+    /// Absolute URLs for one entry's screenshots on `platform`, in the
+    /// order they should be shown. Empty when the skill ships none at all.
+    ///
+    /// Resolution (including the cross-platform fallback) is
+    /// [`IndexEntry::screenshots_for_platform`]'s job; this only turns
+    /// registry-relative paths into something a frontend can GET. The
+    /// bytes themselves are the frontend's to fetch — every client already
+    /// has an image pipeline and a cache policy, and neither wants to be
+    /// re-invented behind the FFI.
+    pub fn screenshot_urls(&self, entry: &IndexEntry, platform: &str) -> Vec<String> {
+        entry
+            .screenshots_for_platform(platform)
+            .iter()
+            .map(|path| self.resolve(path))
+            .collect()
     }
 
     /// Download the bundle and its detached signature for one index entry.
@@ -863,6 +916,7 @@ metadata:
                     sha256: "deadbeef".into(),
                     manifest: None,
                     localizations: Default::default(),
+                    screenshots: Default::default(),
                 },
                 IndexEntry {
                     id: "dev.heyari.counter".into(),
@@ -880,6 +934,7 @@ metadata:
                     sha256: "cafe".into(),
                     manifest: None,
                     localizations: Default::default(),
+                    screenshots: Default::default(),
                 },
             ],
         };
@@ -927,6 +982,7 @@ metadata:
             sha256: "x".into(),
             manifest: None,
             localizations: Default::default(),
+            screenshots: Default::default(),
         };
         let mut index = Index {
             index_version: 1,
@@ -1344,6 +1400,7 @@ metadata:
             sha256: "deadbeef".into(),
             manifest: Some("manifests/dev.heyari.coinflip-0.3.0.md".into()),
             localizations: Default::default(),
+            screenshots: Default::default(),
         };
         let got = client.fetch_manifest(&entry).unwrap();
         assert_eq!(got, md, "fetched sidecar must be byte-identical to served");
@@ -1368,6 +1425,7 @@ metadata:
             sha256: "x".into(),
             manifest: None,
             localizations: Default::default(),
+            screenshots: Default::default(),
         };
         let err = client.fetch_manifest(&entry).unwrap_err();
         match err {
@@ -1396,5 +1454,112 @@ metadata:
         }"#;
         let parsed: IndexEntry = serde_json::from_str(without).unwrap();
         assert!(parsed.manifest.is_none());
+    }
+
+    /// Entry carrying screenshots for the given platforms, in the order
+    /// the publish pipeline would emit them.
+    fn entry_with_screenshots(platforms: &[(&str, &[&str])]) -> IndexEntry {
+        IndexEntry {
+            id: "dev.heyari.timer".into(),
+            version: "0.2.0".into(),
+            name: "timer".into(),
+            description: "".into(),
+            skill_type: "skill".into(),
+            license: None,
+            author: None,
+            homepage: None,
+            capabilities: Vec::new(),
+            languages: Vec::new(),
+            bundle: "bundles/dev.heyari.timer-0.2.0.tar.gz".into(),
+            signature: "bundles/dev.heyari.timer-0.2.0.tar.gz.sig".into(),
+            sha256: "h".into(),
+            manifest: None,
+            localizations: Default::default(),
+            screenshots: platforms
+                .iter()
+                .map(|(p, files)| {
+                    (
+                        (*p).to_string(),
+                        files.iter().map(|f| (*f).to_string()).collect(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn screenshots_prefer_the_requested_platform() {
+        let entry = entry_with_screenshots(&[
+            ("android", &["screenshots/t/android/01.webp"]),
+            ("linux", &["screenshots/t/linux/01.webp"]),
+        ]);
+        assert_eq!(
+            entry.screenshots_for_platform("linux"),
+            ["screenshots/t/linux/01.webp".to_string()]
+        );
+    }
+
+    #[test]
+    fn screenshots_fall_back_to_the_first_platform_available() {
+        // No linux shots — a Linux client still gets the Android ones
+        // rather than an empty panel. BTreeMap ordering makes "first"
+        // mean alphabetically first, so this is stable across runs.
+        let entry = entry_with_screenshots(&[
+            ("windows", &["screenshots/t/windows/01.webp"]),
+            ("android", &["screenshots/t/android/01.webp"]),
+        ]);
+        assert_eq!(
+            entry.screenshots_for_platform("linux"),
+            ["screenshots/t/android/01.webp".to_string()]
+        );
+    }
+
+    #[test]
+    fn screenshots_are_empty_when_the_skill_ships_none() {
+        let entry = entry_with_screenshots(&[]);
+        assert!(entry.screenshots_for_platform("android").is_empty());
+    }
+
+    #[test]
+    fn screenshot_urls_resolve_against_the_base_url_in_order() {
+        let client = RegistryClient::new().with_base_url("http://example.test/reg/");
+        let entry = entry_with_screenshots(&[(
+            "android",
+            &[
+                "screenshots/dev.heyari.timer-0.2.0/android/01-set.webp",
+                "screenshots/dev.heyari.timer-0.2.0/android/02-list.webp",
+            ],
+        )]);
+        assert_eq!(
+            client.screenshot_urls(&entry, "android"),
+            vec![
+                "http://example.test/reg/screenshots/dev.heyari.timer-0.2.0/android/01-set.webp"
+                    .to_string(),
+                "http://example.test/reg/screenshots/dev.heyari.timer-0.2.0/android/02-list.webp"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn index_entry_parses_screenshots_and_tolerates_their_absence() {
+        let with = r#"{
+            "id":"a","version":"0.1.0","name":"a","description":"",
+            "bundle":"b","signature":"s","sha256":"h",
+            "screenshots":{"android":["screenshots/a-0.1.0/android/01.webp"]}
+        }"#;
+        let parsed: IndexEntry = serde_json::from_str(with).unwrap();
+        assert_eq!(
+            parsed.screenshots.get("android").map(Vec::as_slice),
+            Some(["screenshots/a-0.1.0/android/01.webp".to_string()].as_slice())
+        );
+
+        // Rows published before screenshots existed must still parse.
+        let without = r#"{
+            "id":"a","version":"0.1.0","name":"a","description":"",
+            "bundle":"b","signature":"s","sha256":"h"
+        }"#;
+        let parsed: IndexEntry = serde_json::from_str(without).unwrap();
+        assert!(parsed.screenshots.is_empty());
     }
 }
