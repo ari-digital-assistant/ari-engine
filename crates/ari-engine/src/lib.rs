@@ -1659,7 +1659,17 @@ impl Engine {
                     trace.winner = Some(label);
                     return (Response::Text(clean), Some(trace));
                 }
-                Err(reason) => {
+                // A dead key or an exhausted balance is the answer the user
+                // needs. Falling through would hand their words to whichever
+                // fallback skill is configured and reply in its voice, hiding
+                // the real problem behind a plausible one. Not recorded as a
+                // turn — this is Ari explaining itself, not the assistant
+                // speaking.
+                Err(AssistantCallError::Terminal(spoken)) => {
+                    trace.winner = Some("assistant:failed".to_string());
+                    return (Response::Text(spoken), Some(trace));
+                }
+                Err(AssistantCallError::Transient(reason)) => {
                     self.log(
                         LogLevel::Warn,
                         &format!("router:assistant: one-shot failed: {reason}; falling through"),
@@ -1672,7 +1682,15 @@ impl Engine {
             // Non-English: translated two-step routing prompt (FunctionGemma is
             // English-only). A general question falls through to the
             // assistant-answer path below.
-            if let Some(picked_id) = self.try_assistant_route(&normalized, &skill_catalog) {
+            let picked = match self.try_assistant_route(&normalized, &skill_catalog) {
+                Ok(picked) => picked,
+                Err(AssistantCallError::Terminal(spoken)) => {
+                    trace.winner = Some("assistant:failed".to_string());
+                    return (Response::Text(spoken), Some(trace));
+                }
+                Err(AssistantCallError::Transient(_)) => None,
+            };
+            if let Some(picked_id) = picked {
                 if let Some(skill) = self
                     .skills
                     .iter()
@@ -1847,21 +1865,28 @@ impl Engine {
     /// (cloud assistant API or on-device Gemma E2B/E4B), and parse
     /// the response back to a skill id.
     ///
-    /// Returns `None` when:
+    /// Returns `Ok(None)` when:
     /// - No active assistant is configured (regex-only world; engine
     ///   surfaces FALLBACK_RESPONSE downstream).
     /// - The active assistant is Builtin but the LLM isn't loaded
     ///   (or the `llm` feature isn't compiled in).
-    /// - The model call failed.
+    /// - The model call failed transiently.
     /// - The model picked "NONE" or returned an unparseable response.
     /// - The model picked an id that isn't in the catalogue.
+    ///
+    /// Returns `Err` only for a terminal failure, which the caller surfaces
+    /// instead of falling through — same reasoning as the one-shot path.
     fn try_assistant_route(
         &self,
         input: &str,
         skill_catalog: &[(String, String, String)],
-    ) -> Option<String> {
+    ) -> Result<Option<String>, AssistantCallError> {
         let prompt = build_assistant_routing_prompt(input, skill_catalog, &self.ctx.locale);
-        let response = self.call_active_assistant(&prompt, &[], &[]).ok()?;
+        let response = match self.call_active_assistant(&prompt, &[], &[]) {
+            Ok(response) => response,
+            Err(e @ AssistantCallError::Terminal(_)) => return Err(e),
+            Err(AssistantCallError::Transient(_)) => return Ok(None),
+        };
         let picked = parse_assistant_routing_response(&response, skill_catalog);
         if picked.is_none() {
             let preview: String = response.chars().take(120).collect();
@@ -1872,19 +1897,24 @@ impl Engine {
                 ),
             );
         }
-        picked
+        Ok(picked)
     }
 
     /// Send `prompt` to whichever assistant backend is active (cloud API or
-    /// on-device LLM) and return its raw text reply. `None` when no assistant
+    /// on-device LLM) and return its raw text reply. Errors when no assistant
     /// is configured, the on-device LLM isn't loaded, the call failed, or the
-    /// backend answered with nothing at all.
+    /// backend answered with nothing at all — see [`AssistantCallError`] for
+    /// which of those the caller must surface rather than fall through.
     /// Shared by the routing prompt, the one-shot route-or-answer, and the
     /// debug commands.
-    fn call_active_assistant(&self, prompt: &str, history: &[(String, String)], facts: &[String]) -> Result<String, String> {
-        let fail = |reason: String| -> Result<String, String> {
+    fn call_active_assistant(&self, prompt: &str, history: &[(String, String)], facts: &[String]) -> Result<String, AssistantCallError> {
+        let fail = |reason: String| -> Result<String, AssistantCallError> {
             self.log(LogLevel::Warn, &format!("assistant: {reason}"));
-            Err(reason)
+            Err(AssistantCallError::Transient(reason))
+        };
+        let stop = |reason: String, spoken: String| -> Result<String, AssistantCallError> {
+            self.log(LogLevel::Warn, &format!("assistant: {reason}"));
+            Err(AssistantCallError::Terminal(spoken))
         };
         let text = match &self.active_assistant {
             Some(ActiveAssistant::Api {
@@ -1902,6 +1932,21 @@ impl Engine {
                 self.model_catalog.as_deref(),
             ) {
                 Ok(text) => text,
+                Err(AssistantApiError::MissingConfig { ref key }) => {
+                    let display = assistant_display_name(skill_id);
+                    return stop(
+                        format!("cloud call failed: missing config key={key}"),
+                        format!("{display} isn't set up yet. Add your API key in Settings → Assistants."),
+                    );
+                }
+                Err(AssistantApiError::ApiError { status, ref body }) if is_terminal_status(status) => {
+                    let display = assistant_display_name(skill_id);
+                    let spoken = match extract_api_error_message(body) {
+                        Some(msg) => format!("{display}: {msg}"),
+                        None => format!("{display} returned an error (HTTP {status})."),
+                    };
+                    return stop(format!("cloud call failed: API returned error status {status}: {body}"), spoken);
+                }
                 Err(e) => return fail(format!("cloud call failed: {e}")),
             },
             #[cfg(feature = "llm")]
@@ -1936,7 +1981,7 @@ impl Engine {
     /// be normalised. `None` when no assistant is configured or the call
     /// failed. English-instruction prompt for now; non-English callers should
     /// keep the translated two-step until a localised combined prompt exists.
-    fn route_or_answer(&self, input: &str, history: &[(String, String)], facts: &[String]) -> Result<RouteOrAnswer, String> {
+    fn route_or_answer(&self, input: &str, history: &[(String, String)], facts: &[String]) -> Result<RouteOrAnswer, AssistantCallError> {
         let catalog = self.router_catalog();
         let prompt = build_combined_route_or_answer_prompt(input, &catalog);
         let response = self.call_active_assistant(&prompt, history, facts)?;
@@ -2127,6 +2172,29 @@ fn uses_assistant_routing(has_cloud_assistant: bool) -> bool {
 enum RouteOrAnswer {
     Skill(String),
     Answer(String),
+}
+
+/// Why an active-assistant call produced no answer.
+///
+/// `Terminal` is a failure retrying cannot fix — a missing or revoked key, an
+/// exhausted balance, a model the account can't reach. Falling through to the
+/// tiers below on one of these hands the user's words to an unrelated skill
+/// and answers in its voice, so a configured smart-home fallback ends up
+/// fielding general questions while the real problem stays invisible. It
+/// carries the words to say instead.
+///
+/// `Transient` is everything else — rate limits, timeouts, 5xx, an empty
+/// reply — where falling through is still the right move.
+enum AssistantCallError {
+    Terminal(String),
+    Transient(String),
+}
+
+/// HTTP statuses from a cloud assistant that retrying won't fix. 429 and 5xx
+/// are deliberately absent: those clear on their own, and a blip shouldn't
+/// cost the user the skill tiers below.
+fn is_terminal_status(status: u16) -> bool {
+    matches!(status, 400 | 401 | 403 | 404)
 }
 
 /// One-shot prompt: ask the assistant to EITHER hand the request to a skill
@@ -3473,8 +3541,13 @@ mod tests {
                             break;
                         }
                     }
-                    let (status, payload) = match reply.strip_prefix("HTTP500 ") {
-                        Some(rest) => (500, rest.to_string()),
+                    let (status, payload) = match reply
+                        .strip_prefix("HTTP")
+                        .and_then(|rest| rest.split_once(' '))
+                    {
+                        Some((code, rest)) => {
+                            (code.parse::<u16>().expect("stub status code"), rest.to_string())
+                        }
                         None => (
                             200,
                             serde_json::json!({"choices": [{"message": {"content": reply}}]})
@@ -3617,6 +3690,108 @@ mod tests {
         assert_eq!(
             second[3],
             ("user".to_string(), "what is the population there".to_string()),
+        );
+    }
+
+    /// An engine wired to `stub` plus a configured gated fallback skill —
+    /// the shape a user gets with Home Assistant set up and a cloud
+    /// assistant active. Standing in for HA so the test doesn't need one.
+    fn engine_with_assistant_and_gated_fallback(stub: &StubAssistant) -> Engine {
+        use ari_skill_loader::assistant::MemoryConfigStore;
+
+        let mut engine = engine_with_named_assistant(stub);
+        engine.register_skill(Box::new(MockSkill {
+            id: "smarthome",
+            specificity: Specificity::Low,
+            fixed_score: 0.0,
+            response: "Which device did you mean?",
+            requires_setting: Some("base_url"),
+        }));
+        let mut store = MemoryConfigStore::new();
+        store.set("smarthome", "base_url", "http://homeassistant.local:8123");
+        engine.set_config_store(Some(Arc::new(store)));
+        engine
+    }
+
+    #[test]
+    fn a_terminal_assistant_failure_speaks_up_instead_of_falling_through() {
+        // The bug this exists to stop: a dead key or an exhausted balance
+        // silently handed the utterance to whichever fallback was configured,
+        // which answered confidently in its own voice while the real problem
+        // stayed invisible.
+        let stub = StubAssistant::start(vec![
+            r#"HTTP400 {"error":{"message":"Your credit balance is too low."}}"#,
+        ]);
+        let engine = engine_with_assistant_and_gated_fallback(&stub);
+
+        let (response, trace) = engine.process_input_traced("and its area");
+
+        match response {
+            Response::Text(t) => assert_eq!(t, "Chatgpt: Your credit balance is too low."),
+            other => panic!("expected the provider's reason, got {other:?}"),
+        }
+        assert_eq!(trace.unwrap().winner.as_deref(), Some("assistant:failed"));
+        assert!(
+            engine.conversation_context().is_empty(),
+            "Ari explaining itself is not a conversation turn"
+        );
+    }
+
+    #[test]
+    fn a_transient_assistant_failure_still_falls_through_to_skills() {
+        // 5xx and rate limits clear on their own, so a blip must not cost the
+        // user the tiers below.
+        let stub = StubAssistant::start(vec![
+            r#"HTTP500 {"error":{"message":"overloaded"}}"#,
+            r#"HTTP500 {"error":{"message":"overloaded"}}"#,
+        ]);
+        let engine = engine_with_assistant_and_gated_fallback(&stub);
+
+        let (response, trace) = engine.process_input_traced("turn on the kitchen light");
+
+        match response {
+            Response::Text(t) => assert_eq!(t, "Which device did you mean?"),
+            other => panic!("expected the fallback skill to answer, got {other:?}"),
+        }
+        assert_eq!(trace.unwrap().winner.as_deref(), Some("fallback:smarthome"));
+    }
+
+    #[test]
+    fn terminal_statuses_are_the_ones_retrying_cannot_fix() {
+        for status in [400, 401, 403, 404] {
+            assert!(is_terminal_status(status), "{status} should be terminal");
+        }
+        for status in [408, 429, 500, 502, 503, 529] {
+            assert!(!is_terminal_status(status), "{status} should be transient");
+        }
+    }
+
+    #[test]
+    fn a_plain_follow_up_carries_the_transcript() {
+        // Neither turn names an assistant, so both go through the one-shot
+        // route-or-answer path — the shape a user actually gets when they just
+        // talk to Ari. Every other transcript test addresses one by name.
+        let stub = StubAssistant::start(vec!["About 14 million.", "About 2,190 square kilometres."]);
+        let engine = engine_with_named_assistant(&stub);
+
+        engine.process_input_traced("what is the population of tokyo");
+        engine.process_input_traced("and its area");
+
+        assert_eq!(stub.request_count(), 2);
+        let second = stub.messages(1);
+        assert_eq!(
+            second[1],
+            ("user".to_string(), "what is the population of tokyo".to_string()),
+            "the first turn must reach the follow-up as history: {second:?}"
+        );
+        assert_eq!(
+            second[2],
+            ("assistant".to_string(), "About 14 million.".to_string()),
+        );
+        assert!(
+            second[3].1.contains("and its area"),
+            "current turn last, got {:?}",
+            second[3].1
         );
     }
 
