@@ -252,8 +252,12 @@ pub fn call_assistant_api(
         });
     }
 
-    let json: serde_json::Value = serde_json::from_str(&response_body)
+    let mut json: serde_json::Value = serde_json::from_str(&response_body)
         .map_err(|e| AssistantApiError::ResponseParse(e.to_string()))?;
+
+    if matches!(config.request_format, RequestFormat::Anthropic) {
+        drop_non_text_blocks(&mut json);
+    }
 
     let segments = parse_response_path(&config.response_path)
         .map_err(|e| AssistantApiError::ResponseParse(e.to_string()))?;
@@ -264,6 +268,20 @@ pub fn call_assistant_api(
             config.response_path,
         ))
     })
+}
+
+/// Drop every non-`text` block from an Anthropic `content` array.
+///
+/// Reasoning models interleave `thinking` blocks ahead of the answer, so the
+/// raw `content[0]` is often a block with no `text` field at all and the
+/// manifest's `content[0].text` resolves to nothing. A manifest means the
+/// first block of the *answer* by that path, so narrow the array before it
+/// runs. Leaves a response with no `content` array alone — the path will
+/// fail on it either way, and the error names the path the author wrote.
+fn drop_non_text_blocks(json: &mut serde_json::Value) {
+    if let Some(blocks) = json.get_mut("content").and_then(|c| c.as_array_mut()) {
+        blocks.retain(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"));
+    }
 }
 
 /// Map an ISO 639-1 locale code to its English language name, for the
@@ -422,6 +440,44 @@ mod tests {
         let segments = parse_response_path("content[0].text").unwrap();
         let result = extract_by_path(&json, &segments);
         assert_eq!(result.as_deref(), Some("Valletta is the capital."));
+    }
+
+    #[test]
+    fn extract_anthropic_response_past_a_thinking_block() {
+        // Reasoning models put `thinking` at content[0], which has no `text`
+        // field — without the filter the manifest path resolves to nothing and
+        // the user gets the engine's "didn't understand that" instead.
+        let mut json: serde_json::Value = serde_json::json!({
+            "content": [
+                {"type": "thinking", "thinking": ""},
+                {"type": "text", "text": "The Dead Sea."}
+            ]
+        });
+        drop_non_text_blocks(&mut json);
+        let segments = parse_response_path("content[0].text").unwrap();
+        let result = extract_by_path(&json, &segments);
+        assert_eq!(result.as_deref(), Some("The Dead Sea."));
+    }
+
+    #[test]
+    fn drop_non_text_blocks_leaves_an_openai_body_alone() {
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": "Valletta."}}]
+        });
+        let mut json = body.clone();
+        drop_non_text_blocks(&mut json);
+        assert_eq!(json, body);
+    }
+
+    #[test]
+    fn a_response_with_no_text_block_still_fails_the_path() {
+        let mut json: serde_json::Value = serde_json::json!({
+            "content": [{"type": "thinking", "thinking": ""}]
+        });
+        drop_non_text_blocks(&mut json);
+        assert_eq!(json["content"].as_array().unwrap().len(), 0);
+        let segments = parse_response_path("content[0].text").unwrap();
+        assert!(extract_by_path(&json, &segments).is_none());
     }
 
     #[test]
