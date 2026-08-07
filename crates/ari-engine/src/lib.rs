@@ -1877,7 +1877,8 @@ impl Engine {
 
     /// Send `prompt` to whichever assistant backend is active (cloud API or
     /// on-device LLM) and return its raw text reply. `None` when no assistant
-    /// is configured, the on-device LLM isn't loaded, or the call failed.
+    /// is configured, the on-device LLM isn't loaded, the call failed, or the
+    /// backend answered with nothing at all.
     /// Shared by the routing prompt, the one-shot route-or-answer, and the
     /// debug commands.
     fn call_active_assistant(&self, prompt: &str, history: &[(String, String)], facts: &[String]) -> Result<String, String> {
@@ -1885,7 +1886,7 @@ impl Engine {
             self.log(LogLevel::Warn, &format!("assistant: {reason}"));
             Err(reason)
         };
-        match &self.active_assistant {
+        let text = match &self.active_assistant {
             Some(ActiveAssistant::Api {
                 skill_id,
                 config,
@@ -1900,8 +1901,8 @@ impl Engine {
                 facts,
                 self.model_catalog.as_deref(),
             ) {
-                Ok(text) => Ok(text),
-                Err(e) => fail(format!("cloud call failed: {e}")),
+                Ok(text) => text,
+                Err(e) => return fail(format!("cloud call failed: {e}")),
             },
             #[cfg(feature = "llm")]
             Some(ActiveAssistant::Builtin { .. }) => {
@@ -1913,12 +1914,20 @@ impl Engine {
                     );
                 };
                 match llm.run_prompt(prompt) {
-                    Ok(text) => Ok(ari_llm::strip_thinking(&text)),
-                    Err(e) => fail(format!("on-device LLM error: {e}")),
+                    Ok(text) => ari_llm::strip_thinking(&text),
+                    Err(e) => return fail(format!("on-device LLM error: {e}")),
                 }
             }
-            None => fail("no assistant configured".to_string()),
+            None => return fail("no assistant configured".to_string()),
+        };
+        // A successful call that produced no text is still a failed turn — it
+        // means the answer budget ran out before any answer arrived. Treating
+        // it as success surfaces an empty bubble and records a blank turn in
+        // the conversation buffer; an Err falls through to the tiers below.
+        if text.trim().is_empty() {
+            return fail("backend returned an empty reply — max_tokens likely exhausted before any answer text".to_string());
         }
+        Ok(text)
     }
 
     /// One-shot routing: a single assistant call that either hands the request
@@ -3573,6 +3582,25 @@ mod tests {
             second[3].1.contains("what is the population there"),
             "current turn last, got {:?}",
             second[3].1
+        );
+    }
+
+    #[test]
+    fn an_empty_cloud_reply_is_a_failed_turn_not_a_blank_answer() {
+        // Reasoning models can spend the whole answer budget before emitting
+        // any text. Both assistant tiers retry, then give up gracefully.
+        let stub = StubAssistant::start(vec!["", ""]);
+        let engine = engine_with_named_assistant(&stub);
+
+        let (response, _) = engine.process_input_traced("which is the saltiest sea");
+
+        match response {
+            Response::Text(t) => assert_eq!(t, fallback_response_for("en")),
+            other => panic!("expected the spoken fallback, got {other:?}"),
+        }
+        assert!(
+            engine.conversation_context().is_empty(),
+            "a blank reply must not enter the transcript"
         );
     }
 
