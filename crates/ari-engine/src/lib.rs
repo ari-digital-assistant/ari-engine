@@ -1388,9 +1388,9 @@ impl Engine {
         let conversation = self.conversation_context();
         let history = history_messages(&conversation);
         // Personal memory: the durable facts snapshot handed to the assistant
-        // for THIS turn's free-text answer. Skill-serving assistant calls
-        // (routing, named-assistant, layer-C) pass &[] — facts are user-answer
-        // context only.
+        // for THIS turn's free-text answer, whether the user addressed an
+        // assistant by name or not. Skill-serving calls (routing, layer-C)
+        // pass &[] — facts are user-answer context only.
         let facts = self.remembered_facts();
 
         // Multi-turn: if a skill is awaiting a reply, this utterance belongs
@@ -1444,7 +1444,9 @@ impl Engine {
         // scoring so a high-specificity skill (e.g. time) can't snatch
         // utterances like "ask chatgpt what time is it" from the named
         // assistant. If no alias matches, the normal pipeline below
-        // runs untouched.
+        // runs untouched. Addressing an assistant by name is still a
+        // conversation with it, so this path both reads the transcript
+        // and extends it — exactly like the active-assistant path below.
         if let Some(m) = named_assistant::match_named(&normalized, &self.named_assistants) {
             let trace = DebugTrace {
                 normalized_input: normalized.clone(),
@@ -1460,9 +1462,20 @@ impl Engine {
                     m.remainder.len()
                 ),
             );
-            let response = dispatch_named_assistant(m.binding, &m.remainder, &self.ctx.locale, self.model_catalog.as_deref(), |level, msg| {
+            let outcome = dispatch_named_assistant(m.binding, &m.remainder, &self.ctx.locale, &history, &facts, self.model_catalog.as_deref(), |level, msg| {
                 self.log(level, msg)
             });
+            // The prompt actually sent is the remainder ("what is the capital
+            // of morocco"), not the addressing wrapper, so that's what goes in
+            // the transcript.
+            let response = match outcome {
+                NamedAssistantOutcome::Answer(text) => {
+                    let (clean, flag) = parse_continuation_flag(&text);
+                    self.record_assistant_turn(&m.remainder, &clean, flag);
+                    Response::Text(clean)
+                }
+                NamedAssistantOutcome::Failed(text) => Response::Text(text),
+            };
             return (response, Some(trace));
         }
 
@@ -2236,13 +2249,23 @@ fn parse_assistant_routing_response(
     None
 }
 
+/// What a named-assistant round-trip produced. Only `Answer` is a real
+/// conversation turn — `Failed` is Ari explaining itself, not the
+/// assistant speaking, so it must never enter the transcript.
+enum NamedAssistantOutcome {
+    Answer(String),
+    Failed(String),
+}
+
 fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
     binding: &NamedAssistantBinding,
     prompt: &str,
     locale: &str,
+    history: &[(String, String)],
+    facts: &[String],
     catalog: Option<&ari_skill_loader::ModelCatalog>,
     log: F,
-) -> Response {
+) -> NamedAssistantOutcome {
     let display = assistant_display_name(&binding.skill_id);
     match ari_skill_loader::call_assistant_api(
         &binding.config,
@@ -2250,11 +2273,11 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
         binding.config_store.as_ref(),
         prompt,
         locale,
-        &[],
-        &[],
+        history,
+        facts,
         catalog,
     ) {
-        Ok(text) if !text.is_empty() => Response::Text(text),
+        Ok(text) if !text.is_empty() => NamedAssistantOutcome::Answer(text),
         Ok(_) => {
             log(
                 LogLevel::Warn,
@@ -2263,7 +2286,7 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
                     binding.skill_id
                 ),
             );
-            Response::Text(format!("{display} couldn't reply right now."))
+            NamedAssistantOutcome::Failed(format!("{display} couldn't reply right now."))
         }
         Err(AssistantApiError::MissingConfig { ref key }) => {
             log(
@@ -2273,7 +2296,7 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
                     binding.skill_id, key
                 ),
             );
-            Response::Text(format!(
+            NamedAssistantOutcome::Failed(format!(
                 "{display} isn't set up yet. Add your API key in Settings → Assistants."
             ))
         }
@@ -2282,7 +2305,7 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
                 LogLevel::Warn,
                 &format!("named_assistant: skill={} timed out", binding.skill_id),
             );
-            Response::Text(format!("{display} took too long to reply — try again."))
+            NamedAssistantOutcome::Failed(format!("{display} took too long to reply — try again."))
         }
         Err(AssistantApiError::ApiError { status, ref body }) => {
             log(
@@ -2299,8 +2322,8 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
             // ~200 chars to keep an accidental verbose body from
             // dumping into the conversation UI.
             match extract_api_error_message(body) {
-                Some(msg) => Response::Text(format!("{display}: {msg}")),
-                None => Response::Text(format!(
+                Some(msg) => NamedAssistantOutcome::Failed(format!("{display}: {msg}")),
+                None => NamedAssistantOutcome::Failed(format!(
                     "{display} returned an error (HTTP {status})."
                 )),
             }
@@ -2310,7 +2333,7 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
                 LogLevel::Warn,
                 &format!("named_assistant: skill={} failed: {e}", binding.skill_id),
             );
-            Response::Text(format!("{display} couldn't reply right now."))
+            NamedAssistantOutcome::Failed(format!("{display} couldn't reply right now."))
         }
     }
 }
@@ -3388,6 +3411,247 @@ mod tests {
             ),
             other => panic!("expected the fallback, got {other:?}"),
         }
+    }
+
+    // --- Named assistants and the conversation transcript ---
+    //
+    // "Ask chatgpt X" used to send `&[]` history and never record its answer,
+    // so a named-assistant turn was invisible to the transcript in both
+    // directions: the follow-up "what is the population there" reached the
+    // model with nothing before it, and the model asked which place we meant.
+
+    /// A stub OpenAI-shaped endpoint. Serves `replies` in order, one per
+    /// connection, and keeps every request body it was sent.
+    struct StubAssistant {
+        addr: std::net::SocketAddr,
+        bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl StubAssistant {
+        fn start(replies: Vec<&'static str>) -> Self {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let bodies = Arc::new(Mutex::new(Vec::new()));
+            let sink = bodies.clone();
+            std::thread::spawn(move || {
+                for reply in replies {
+                    let Ok((mut stream, _)) = listener.accept() else { return };
+                    let mut acc: Vec<u8> = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    // Read until the whole declared body has arrived.
+                    while let Ok(n) = stream.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        acc.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&acc).to_string();
+                        let Some(head_end) = text.find("\r\n\r\n") else { continue };
+                        let len: usize = text
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse().ok())
+                            })
+                            .unwrap_or(0);
+                        if acc.len() >= head_end + 4 + len {
+                            let body = serde_json::from_str(&text[head_end + 4..])
+                                .expect("request body is json");
+                            sink.lock().unwrap().push(body);
+                            break;
+                        }
+                    }
+                    let (status, payload) = match reply.strip_prefix("HTTP500 ") {
+                        Some(rest) => (500, rest.to_string()),
+                        None => (
+                            200,
+                            serde_json::json!({"choices": [{"message": {"content": reply}}]})
+                                .to_string(),
+                        ),
+                    };
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                            payload.len(),
+                        )
+                        .as_bytes(),
+                    );
+                    let _ = stream.flush();
+                }
+            });
+            Self { addr, bodies }
+        }
+
+        fn config(&self) -> ApiConfig {
+            use ari_skill_loader::manifest::{AuthScheme, LocalizedPrompt, RequestFormat};
+            ApiConfig {
+                endpoint: Some(format!("http://{}/v1/chat/completions", self.addr)),
+                endpoint_config_key: None,
+                default_endpoint: None,
+                auth: AuthScheme::None,
+                auth_header: None,
+                auth_config_key: None,
+                model_config_key: None,
+                model_provider: None,
+                tier_config_key: None,
+                default_tier: None,
+                default_models: Default::default(),
+                default_model: "test-model".to_string(),
+                system_prompt: LocalizedPrompt::from_english("You are Ari.".to_string()),
+                request_format: RequestFormat::Openai,
+                response_path: "choices[0].message.content".to_string(),
+                api_version: None,
+                api_version_header: None,
+                max_tokens: 64,
+                temperature: 0.0,
+            }
+        }
+
+        /// The (role, content) pairs of the nth request, oldest first.
+        fn messages(&self, nth: usize) -> Vec<(String, String)> {
+            let bodies = self.bodies.lock().unwrap();
+            bodies[nth]["messages"]
+                .as_array()
+                .expect("messages array")
+                .iter()
+                .map(|m| {
+                    (
+                        m["role"].as_str().unwrap().to_string(),
+                        m["content"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect()
+        }
+
+        fn request_count(&self) -> usize {
+            self.bodies.lock().unwrap().len()
+        }
+    }
+
+    /// An engine wired to `stub` as both the active assistant and a
+    /// chatgpt-aliased named assistant — the shape a user gets after
+    /// installing the chatgpt skill and making it active.
+    fn engine_with_named_assistant(stub: &StubAssistant) -> Engine {
+        use ari_skill_loader::assistant::MemoryConfigStore;
+
+        let mut engine = Engine::new();
+        engine.set_active_assistant(Some(ActiveAssistant::Api {
+            skill_id: "dev.heyari.assistant.chatgpt".to_string(),
+            config: stub.config(),
+            config_store: Arc::new(MemoryConfigStore::new()),
+        }));
+        engine.set_named_assistants(vec![NamedAssistantBinding {
+            skill_id: "dev.heyari.assistant.chatgpt".to_string(),
+            aliases: vec!["chatgpt".to_string(), "chat gpt".to_string()],
+            config: stub.config(),
+            config_store: Arc::new(MemoryConfigStore::new()),
+        }]);
+        engine
+    }
+
+    #[test]
+    fn named_assistant_answer_extends_the_transcript() {
+        let stub = StubAssistant::start(vec!["Rabat.", "About 580,000 people."]);
+        let engine = engine_with_named_assistant(&stub);
+
+        engine.process_input_traced("ask chatgpt what is the capital city of morocco");
+        engine.process_input_traced("what is the population there");
+
+        assert_eq!(stub.request_count(), 2);
+        let second = stub.messages(1);
+        assert_eq!(
+            second[1],
+            ("user".to_string(), "what is the capital city of morocco".to_string()),
+            "the addressing wrapper is stripped; the prompt actually sent is recorded"
+        );
+        assert_eq!(second[2], ("assistant".to_string(), "Rabat.".to_string()));
+        assert!(
+            second[3].1.contains("what is the population there"),
+            "current turn last, got {:?}",
+            second[3].1
+        );
+    }
+
+    #[test]
+    fn named_assistant_reads_the_existing_transcript() {
+        let stub = StubAssistant::start(vec!["Rabat.", "About 580,000 people."]);
+        let engine = engine_with_named_assistant(&stub);
+
+        engine.process_input_traced("what is the capital city of morocco");
+        engine.process_input_traced("ask chatgpt what is the population there");
+
+        let second = stub.messages(1);
+        assert_eq!(second[2], ("assistant".to_string(), "Rabat.".to_string()));
+        assert_eq!(
+            second[3],
+            ("user".to_string(), "what is the population there".to_string()),
+        );
+    }
+
+    #[test]
+    fn named_assistant_strips_the_continuation_marker() {
+        let stub = StubAssistant::start(vec!["Rabat.", "About 580,000 people. [continuation]"]);
+        let engine = engine_with_named_assistant(&stub);
+
+        engine.process_input_traced("what is the capital city of morocco");
+        let (response, _) =
+            engine.process_input_traced("ask chatgpt what is the population there");
+
+        match response {
+            Response::Text(t) => assert_eq!(
+                t, "About 580,000 people.",
+                "the self-classification marker must never reach the user"
+            ),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_assistant_receives_remembered_facts() {
+        let stub = StubAssistant::start(vec!["Somewhere in Valletta."]);
+        let engine = engine_with_named_assistant(&stub);
+        engine.set_remembered_facts(vec!["i live in Malta".to_string()]);
+
+        engine.process_input_traced("ask chatgpt where should i go for lunch");
+
+        let (role, system) = stub.messages(0)[0].clone();
+        assert_eq!(role, "system");
+        assert!(
+            system.contains("Things you know about the user:\n- i live in Malta"),
+            "addressing an assistant by name is still a user answer, so durable \
+             facts belong in its prompt; got {system:?}"
+        );
+    }
+
+    #[test]
+    fn named_assistant_failure_is_not_recorded_as_a_turn() {
+        let stub = StubAssistant::start(vec![
+            r#"HTTP500 {"error":{"message":"out of credits"}}"#,
+            "Rabat.",
+        ]);
+        let engine = engine_with_named_assistant(&stub);
+
+        let (response, _) =
+            engine.process_input_traced("ask chatgpt what is the capital city of morocco");
+        match response {
+            Response::Text(t) => assert!(
+                t.contains("out of credits"),
+                "the provider's reason is surfaced, got {t:?}"
+            ),
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        engine.process_input_traced("what is the population there");
+        let second = stub.messages(1);
+        assert_eq!(
+            second.len(),
+            2,
+            "system + current turn only — a failed call is Ari talking, not a turn: {second:?}"
+        );
     }
 
     // --- Readiness gate (skill_is_ready) ---
