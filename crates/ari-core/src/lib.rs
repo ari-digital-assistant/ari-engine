@@ -567,8 +567,8 @@ pub fn replace_number_words(input: &str) -> String {
 ///
 /// Per-locale dispatch:
 /// - `"en"` — expand English contractions (`"don't"` → `"do not"`,
-///   `"what's"` → `"what is"`) and replace English number words
-///   (`"five"` → `"5"`).
+///   `"what's"` → `"what is"`), fold dotted meridiems (`"p.m."` → `"pm"`)
+///   and replace English number words (`"five"` → `"5"`).
 /// - `"it"` — strip Italian apostrophe-elisions (`"l'ora"` → `"l ora"`,
 ///   `"c'è"` → `"c è"`). No contraction expansion or number words yet
 ///   (Italian number words are a Phase-7 polish item, alongside the
@@ -605,9 +605,29 @@ pub fn normalize_input(input: &str, locale: &str) -> String {
         .join(" ");
 
     match locale {
-        "en" => replace_number_words(&cleaned),
+        "en" => replace_number_words(&collapse_meridiem(&cleaned)),
         _ => cleaned,
     }
+}
+
+/// Fold dotted meridiem tokens onto their bare forms: `"p.m."` → `"pm"`.
+///
+/// The punctuation strip deliberately keeps `.` so decimals survive, which
+/// means STT output like "4 p.m." reaches skills with the dots intact. The
+/// reminder skill's clock parser only knows `am`/`pm`, so "remind me to call
+/// Penny Blue tomorrow at 4 p.m." filed at 4am with "p.m." stranded in the
+/// title — and nothing in the residue scan flagged it, so it reported high
+/// confidence and never asked.
+fn collapse_meridiem(cleaned: &str) -> String {
+    cleaned
+        .split_whitespace()
+        .map(|w| match w {
+            "a.m." | "a.m" | "am." => "am",
+            "p.m." | "p.m" | "pm." => "pm",
+            _ => w,
+        })
+        .collect::<Vec<&str>>()
+        .join(" ")
 }
 
 fn is_between_digits(chars: &[char], i: usize) -> bool {
@@ -790,6 +810,23 @@ mod tests {
         assert_eq!(normalize_input("5, 6 and 7", "en"), "5 6 and 7");
         assert_eq!(normalize_input(",5", "en"), "5");
         assert_eq!(normalize_input("5,", "en"), "5");
+    }
+
+    #[test]
+    fn normalize_folds_dotted_meridiems() {
+        assert_eq!(
+            normalize_input("remind me to call Penny Blue tomorrow at 4 p.m.", "en"),
+            "remind me to call penny blue tomorrow at 4 pm"
+        );
+        assert_eq!(normalize_input("wake me at 6 a.m.", "en"), "wake me at 6 am");
+        assert_eq!(normalize_input("at four p.m", "en"), "at 4 pm");
+        assert_eq!(normalize_input("at 9 am.", "en"), "at 9 am");
+        // Bare forms and non-meridiem words are untouched.
+        assert_eq!(normalize_input("at 4 pm", "en"), "at 4 pm");
+        assert_eq!(normalize_input("yes i am", "en"), "yes i am");
+        assert_eq!(normalize_input("what is 3.5 times 2", "en"), "what is 3.5 times 2");
+        // English-only dispatch — Italian keeps whatever it was given.
+        assert_eq!(normalize_input("alle 4 p.m.", "it"), "alle 4 p.m.");
     }
 
     #[test]
