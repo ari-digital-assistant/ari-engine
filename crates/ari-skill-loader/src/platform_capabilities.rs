@@ -323,6 +323,80 @@ impl MediaServicesProvider for NullMediaServicesProvider {
     }
 }
 
+// ── Contacts ───────────────────────────────────────────────────────────
+
+/// One way to reach a person. `service` is a canonical id — "sms",
+/// "whatsapp", "telegram" — and `id` is whatever that service addresses
+/// them by (a phone number, a handle). Ids are opaque to the engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactChannel {
+    pub service: String,
+    pub id: String,
+}
+
+/// A person the user could message, and the ways they can be reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Contact {
+    pub display_name: String,
+    pub channels: Vec<ContactChannel>,
+}
+
+/// Read-only, **lookup-only** access to the user's address book.
+///
+/// There is deliberately no "list every contact". A skill asks about a name
+/// it already heard the user say and gets back the matches; it can never walk
+/// the address book. That matters more here than for any other capability —
+/// this is the most sensitive data a skill can reach, and a sandbox that can
+/// enumerate contacts *and* make HTTPS calls is the exact shape of a scraper.
+pub trait ContactsProvider: Send + Sync {
+    /// Whether the host currently holds the platform permission. Skills
+    /// should check this before scoring themselves as able to help, so a
+    /// refusal costs nothing rather than failing deep in execution.
+    fn has_permission(&self) -> bool;
+
+    /// Contacts whose name matches `query`. Matching is the host's business
+    /// — it knows about nicknames, given/family name splits and the user's
+    /// collation. Implementations should cap what they return; a spoken name
+    /// matching hundreds of people is a disambiguation failure, not a list.
+    fn lookup(&self, query: &str) -> Vec<Contact>;
+}
+
+/// Default for hosts with no address book (CLI, Linux, tests). Reports no
+/// permission so skills take their degraded path rather than assuming an
+/// empty address book means "no such person".
+pub struct NullContactsProvider;
+
+impl ContactsProvider for NullContactsProvider {
+    fn has_permission(&self) -> bool {
+        false
+    }
+
+    fn lookup(&self, _query: &str) -> Vec<Contact> {
+        Vec::new()
+    }
+}
+
+// ── Live conversations ─────────────────────────────────────────────────
+
+/// Conversations the user could be replied into right now.
+///
+/// Deliberately narrow: display names, nothing else. The frontend reads
+/// notifications to know this, and everything it learns doing so stays there
+/// — a skill never sees a notification, a message body, or an app package,
+/// only who there is a live thread with.
+pub trait LiveConversationsProvider: Send + Sync {
+    fn names(&self) -> Vec<String>;
+}
+
+/// Default for hosts with no notification access (CLI, Linux, tests).
+pub struct NullLiveConversationsProvider;
+
+impl LiveConversationsProvider for NullLiveConversationsProvider {
+    fn names(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 // ── Local clock ────────────────────────────────────────────────────────
 
 /// Components of the current local datetime, as seen by the host.
@@ -640,6 +714,15 @@ mod tests {
     fn null_media_services_provider_is_empty() {
         let p = NullMediaServicesProvider;
         assert!(p.installed_services().is_empty());
+    }
+
+    #[test]
+    fn null_contacts_provider_reports_no_permission_not_no_contacts() {
+        // The distinction a skill acts on: "I can't look" is a different
+        // answer to the user than "nobody by that name".
+        let p = NullContactsProvider;
+        assert!(!p.has_permission());
+        assert!(p.lookup("gail").is_empty());
     }
 }
 

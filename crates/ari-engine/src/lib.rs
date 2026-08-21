@@ -1276,6 +1276,14 @@ impl Engine {
 
     pub fn process_input_traced(&self, input: &str) -> (Response, Option<DebugTrace>) {
         let normalized = normalize_input(input.trim(), &self.ctx.locale);
+        // Skills that quote the user verbatim need the utterance as spoken, and
+        // normalisation is lossy in one direction only. Built once per turn and
+        // handed to `execute`; scoring deliberately keeps the stored ctx, whose
+        // `raw_input` stays empty.
+        let exec_ctx = SkillContext {
+            raw_input: input.trim().to_string(),
+            ..self.ctx.clone()
+        };
         if normalized.is_empty() {
             return (
                 Response::Text(fallback_response_for(&self.ctx.locale).to_string()),
@@ -1428,7 +1436,7 @@ impl Engine {
                 .find(|s| s.id() == pending.skill_id)
                 .cloned()
             {
-                let resp = skill.execute_reply(&pending.context, &normalized, &self.ctx);
+                let resp = skill.execute_reply(&pending.context, &normalized, &exec_ctx);
                 // Route through the same chokepoint so a chained await_reply
                 // (the skill asks again) re-arms.
                 let resp = self.maybe_intercept_consult(skill, &normalized, resp);
@@ -1499,7 +1507,7 @@ impl Engine {
                 .unwrap()
                 .clone();
 
-            let response = skill.execute(&normalized, &self.ctx);
+            let response = skill.execute(&normalized, &exec_ctx);
             let response = self.maybe_intercept_consult(skill, &normalized, response);
             return (response, Some(trace));
         }
@@ -1551,7 +1559,7 @@ impl Engine {
                             LogLevel::Info,
                             &format!("router: dispatching skill={id} (confidence {confidence:.3})"),
                         );
-                        let response = skill.execute(&normalized, &self.ctx);
+                        let response = skill.execute(&normalized, &exec_ctx);
                         if Self::is_no_match_envelope(&response) {
                             self.log(
                                 LogLevel::Info,
@@ -1586,7 +1594,7 @@ impl Engine {
                                 args_json.len()
                             ),
                         );
-                        let response = skill.execute_with_args(&normalized, args_json, &self.ctx);
+                        let response = skill.execute_with_args(&normalized, args_json, &exec_ctx);
                         if Self::is_no_match_envelope(&response) {
                             self.log(
                                 LogLevel::Info,
@@ -1636,7 +1644,7 @@ impl Engine {
                             LogLevel::Info,
                             &format!("router:assistant: one-shot routed skill={id}"),
                         );
-                        let response = skill.execute(&normalized, &self.ctx);
+                        let response = skill.execute(&normalized, &exec_ctx);
                         if Self::is_no_match_envelope(&response) {
                             self.log(
                                 LogLevel::Info,
@@ -1704,7 +1712,7 @@ impl Engine {
                             self.ctx.locale
                         ),
                     );
-                    let response = skill.execute(&normalized, &self.ctx);
+                    let response = skill.execute(&normalized, &exec_ctx);
                     if Self::is_no_match_envelope(&response) {
                         self.log(
                             LogLevel::Info,
@@ -1753,7 +1761,7 @@ impl Engine {
                     continue;
                 }
             }
-            let response = skill.execute(&normalized, &self.ctx);
+            let response = skill.execute(&normalized, &exec_ctx);
             if !Self::is_no_match_envelope(&response) {
                 trace.winner = Some(format!("fallback:{}", skill.id()));
                 let response = self.maybe_intercept_consult(skill, &normalized, response);
@@ -2025,6 +2033,26 @@ impl Engine {
                 LogLevel::Warn,
                 &format!(
                     "skill '{}' emitted {clamped} critical full-takeover alert(s) without declaring `{CRITICAL_ALERT_CAP}` — downgraded to high-priority",
+                    skill.id(),
+                ),
+            );
+        }
+
+        if strip_undeclared_message(&mut action, skill.has_capability(SEND_MESSAGE_CAP)) {
+            self.log(
+                LogLevel::Warn,
+                &format!(
+                    "skill '{}' emitted a message action without declaring `{SEND_MESSAGE_CAP}` — dropped",
+                    skill.id(),
+                ),
+            );
+        }
+
+        if strip_undeclared_reply(&mut action, skill.has_capability(REPLY_CAP)) {
+            self.log(
+                LogLevel::Warn,
+                &format!(
+                    "skill '{}' emitted a reply action without declaring `{REPLY_CAP}` — dropped",
                     skill.id(),
                 ),
             );
@@ -2499,6 +2527,8 @@ fn pick_delay_phrase() -> &'static str {
 /// alert — one that breaks through Do Not Disturb and takes over the
 /// locked screen. Snake_case, matching the manifest spelling.
 const CRITICAL_ALERT_CAP: &str = "critical_alert";
+const SEND_MESSAGE_CAP: &str = "send_message";
+const REPLY_CAP: &str = "reply";
 
 /// Demote any critical / full-takeover alert in an action envelope that the
 /// emitting skill never declared. A skill without the `critical_alert`
@@ -2508,6 +2538,26 @@ const CRITICAL_ALERT_CAP: &str = "critical_alert";
 /// skill declared the capability, or there was nothing to clamp) so the
 /// caller can log it. The frontend trusts the envelope, so this is the
 /// engine's job — a skill must not be able to do what it never declared.
+/// Remove a `message` slot from a skill that never declared `send_message`.
+/// Unlike the critical-alert clamp there is no degraded form to fall back to —
+/// a message half-sent to nobody is not a safer message — so the slot goes
+/// entirely and the rest of the envelope stands.
+fn strip_undeclared_message(action: &mut serde_json::Value, declared: bool) -> bool {
+    strip_slot(action, "message", declared)
+}
+
+/// Same rule for `reply`, which reaches another person just as irreversibly.
+fn strip_undeclared_reply(action: &mut serde_json::Value, declared: bool) -> bool {
+    strip_slot(action, "reply", declared)
+}
+
+fn strip_slot(action: &mut serde_json::Value, slot: &str, declared: bool) -> bool {
+    if declared {
+        return false;
+    }
+    action.as_object_mut().is_some_and(|obj| obj.remove(slot).is_some())
+}
+
 fn clamp_undeclared_critical_alerts(action: &mut serde_json::Value, declared: bool) -> usize {
     if declared {
         return 0;
@@ -2870,6 +2920,41 @@ mod tests {
         let scores = engine.keyword_scores("anything");
         let probe = scores.iter().find(|s| s.skill_id == "probe").expect("probe scored");
         assert_eq!(probe.score, 2.0, "the two pushed apps reach ctx.installed_apps");
+    }
+
+    #[test]
+    fn execute_receives_the_utterance_as_spoken() {
+        struct Probe(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+        impl Skill for Probe {
+            fn id(&self) -> &str { "probe" }
+            fn specificity(&self) -> Specificity { Specificity::High }
+            fn score(&self, _: &str, ctx: &SkillContext) -> f32 {
+                assert!(ctx.raw_input.is_empty(), "scoring runs on normalised text only");
+                1.0
+            }
+            fn execute(&self, input: &str, ctx: &SkillContext) -> Response {
+                self.0.lock().unwrap().push((input.to_string(), ctx.raw_input.clone()));
+                Response::Text("x".to_string())
+            }
+        }
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(Probe(seen.clone())));
+        engine.process_input("Tell Mario I'll be home soon");
+
+        let seen = seen.lock().unwrap();
+        let (normalized, raw) = seen.first().expect("skill executed");
+        // The normalised text is a matching surface, not a quotable one: it
+        // is lowercase and the contraction is expanded. Fine for keyword
+        // matching, wrong in somebody's chat window.
+        assert_eq!(
+            normalized, "tell mario i will be home soon",
+            "execute still gets the normalised text as its input argument",
+        );
+        assert_eq!(
+            raw, "Tell Mario I'll be home soon",
+            "capitals and the apostrophe survive for skills that quote the user",
+        );
     }
 
     #[test]
@@ -4177,6 +4262,64 @@ mod tests {
                 "id": "t", "title": "Timer", "urgency": "critical", "full_takeover": true
             }]
         })
+    }
+
+    fn message_envelope() -> serde_json::Value {
+        serde_json::json!({
+            "v": 1,
+            "speak": "That's ready for Mario — just tap send.",
+            "message": {
+                "service": "whatsapp",
+                "recipient_id": "35699000000",
+                "recipient_label": "Mario",
+                "text": "I'll be home soon",
+                "delivery": "compose"
+            }
+        })
+    }
+
+    #[test]
+    fn message_slot_survives_when_skill_declared_send_message() {
+        let mut env = message_envelope();
+        let before = env.clone();
+        assert!(!strip_undeclared_message(&mut env, true));
+        assert_eq!(env, before);
+    }
+
+    #[test]
+    fn message_slot_is_dropped_when_undeclared() {
+        let mut env = message_envelope();
+        assert!(strip_undeclared_message(&mut env, false));
+        assert!(env.get("message").is_none(), "the whole slot goes, not part of it");
+        assert_eq!(
+            env["speak"], "That's ready for Mario — just tap send.",
+            "the rest of the envelope is left alone",
+        );
+    }
+
+    #[test]
+    fn reply_slot_is_dropped_when_undeclared() {
+        let mut env = serde_json::json!({
+            "v": 1,
+            "speak": "Sent to Gail.",
+            "reply": { "recipient_label": "Gail", "text": "On my way" }
+        });
+        assert!(strip_undeclared_reply(&mut env, false));
+        assert!(env.get("reply").is_none());
+        assert_eq!(env["speak"], "Sent to Gail.", "the rest of the envelope stands");
+    }
+
+    #[test]
+    fn reply_slot_survives_when_declared() {
+        let mut env = serde_json::json!({ "v": 1, "reply": { "text": "hi" } });
+        assert!(!strip_undeclared_reply(&mut env, true));
+        assert!(env.get("reply").is_some());
+    }
+
+    #[test]
+    fn stripping_a_message_is_a_noop_when_there_is_none() {
+        let mut env = serde_json::json!({ "v": 1, "speak": "hello" });
+        assert!(!strip_undeclared_message(&mut env, false));
     }
 
     #[test]

@@ -141,6 +141,9 @@ pub struct LoadOptions {
     /// Media services provider implementation. Defaults to
     /// [`NullMediaServicesProvider`]; same rationale as `tasks_provider`.
     pub media_services_provider: Arc<dyn crate::platform_capabilities::MediaServicesProvider>,
+    pub contacts_provider: Arc<dyn crate::platform_capabilities::ContactsProvider>,
+    pub live_conversations_provider:
+        Arc<dyn crate::platform_capabilities::LiveConversationsProvider>,
     /// Wall-clock reader. Defaults to [`UtcLocalClock`] so tests and
     /// the CLI engine have something deterministic; real hosts wire
     /// their platform timezone database.
@@ -188,6 +191,10 @@ impl Default for LoadOptions {
             calendar_provider: Arc::new(crate::platform_capabilities::NullCalendarProvider),
             location_provider: Arc::new(crate::platform_capabilities::NullLocationProvider),
             media_services_provider: Arc::new(crate::platform_capabilities::NullMediaServicesProvider),
+            contacts_provider: Arc::new(crate::platform_capabilities::NullContactsProvider),
+            live_conversations_provider: Arc::new(
+                crate::platform_capabilities::NullLiveConversationsProvider,
+            ),
             local_clock: Arc::new(crate::platform_capabilities::UtcLocalClock),
             config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
             locale_provider: Arc::new(crate::platform_capabilities::EnglishLocaleProvider),

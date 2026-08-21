@@ -627,6 +627,37 @@ pub enum Capability {
     /// app owns routing, tiles and live traffic. Pure frontend: no WASM host
     /// import.
     Navigation,
+    /// Permission to emit a `message` action — the frontend either sends a
+    /// message outright or hands it to another app's compose surface with the
+    /// text already filled in. Pure frontend: no WASM host import.
+    ///
+    /// This is the only capability whose action can be *irreversible and
+    /// outward-facing* — a sent message cannot be recalled, and it reaches
+    /// somebody other than the user. Skills declaring it are expected to
+    /// confirm before a true send; see the send-message design doc.
+    SendMessage,
+    /// Lookup-only access to the user's address book: ask about a name,
+    /// get back matching people and the services they can be reached on.
+    /// Host-import capability. There is no enumeration — a skill can never
+    /// walk the contact list, only ask about a name the user already said.
+    ///
+    /// The most sensitive capability on the list, more so than `location`,
+    /// which is deliberately kept coarse. Declaring it alongside `http`
+    /// puts address-book access and arbitrary network egress in one
+    /// sandbox; that combination is legitimate for a messaging skill and
+    /// warrants a hard look in review everywhere else.
+    Contacts,
+    /// Reply into a conversation the user has a live notification for.
+    ///
+    /// Grants both halves of that: the `live_conversations` import, which
+    /// reports the display names of threads that can be answered right now,
+    /// and permission to emit a `reply` action. They are one capability
+    /// because a skill that could emit a reply without seeing what's live
+    /// would be guessing which thread it was answering.
+    ///
+    /// The frontend reads notifications to make this work, but a skill never
+    /// sees one — only names.
+    Reply,
 }
 
 #[derive(Debug, Clone, PartialEq)]

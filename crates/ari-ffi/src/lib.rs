@@ -5,12 +5,15 @@ use ari_engine::{fallback_response_for, Engine, EnvelopeSink, FALLBACK_RESPONSE}
 use ari_skill_loader::assistant::{ConfigStore, MemoryConfigStore};
 use ari_skill_loader::{
     load_skill_directory_with, AuthorizeInput, AuthorizeOutput, AuthorizeProvider, Calendar,
-    CalendarEventRow, CalendarProvider, Capability, EnglishLocaleProvider, HostCapabilities,
+    CalendarEventRow, CalendarProvider, Capability, Contact, ContactChannel, ContactsProvider,
+    LiveConversationsProvider,
+    EnglishLocaleProvider, HostCapabilities,
     HttpConfig, InsertCalendarEventParams, InsertTaskParams, LoadOptions, LocalClock,
     LocalTimeComponents, LocaleProvider, LocationProvider, LocationResult, LocationStatus, LogLevel,
     LogSink, ModelCatalog, NullAuthorizeProvider, NullCalendarProvider, NullLocationProvider,
-    NullLogSink, MediaServicesProvider, NullMediaServicesProvider, NullSettingWriter,
-    NullTasksProvider,
+    NullContactsProvider, NullLiveConversationsProvider, NullLogSink, MediaServicesProvider,
+    NullMediaServicesProvider,
+    NullSettingWriter, NullTasksProvider,
     SettingWriter, StorageConfig, TaskList, TaskRow, TasksProvider, UtcLocalClock,
 };
 use ari_skills::{
@@ -48,7 +51,9 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
         .with(Capability::Calendar)
         .with(Capability::Location)
         .with(Capability::Authorize)
-        .with(Capability::MediaServices);
+        .with(Capability::MediaServices)
+        .with(Capability::Contacts)
+        .with(Capability::Reply);
     LoadOptions {
         log_sink: Arc::new(NullLogSink),
         host_capabilities: host_caps,
@@ -58,6 +63,8 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
         calendar_provider: Arc::new(NullCalendarProvider),
         location_provider: Arc::new(NullLocationProvider),
         media_services_provider: Arc::new(NullMediaServicesProvider),
+        contacts_provider: Arc::new(NullContactsProvider),
+        live_conversations_provider: Arc::new(NullLiveConversationsProvider),
         local_clock: Arc::new(UtcLocalClock),
         config_store: Arc::new(MemoryConfigStore::new()),
         locale_provider: Arc::new(EnglishLocaleProvider),
@@ -317,6 +324,40 @@ pub trait FfiMediaServicesProvider: Send + Sync {
     fn installed_services(&self) -> Vec<String>;
 }
 
+/// One way to reach a contact — a canonical service id and whatever
+/// identifier that service addresses the person by.
+#[derive(uniffi::Record)]
+pub struct FfiContactChannel {
+    pub service: String,
+    pub id: String,
+}
+
+/// A person the user could message, and the ways they can be reached.
+#[derive(uniffi::Record)]
+pub struct FfiContact {
+    pub display_name: String,
+    pub channels: Vec<FfiContactChannel>,
+}
+
+/// Foreign-implemented address-book reader. **Lookup only** — there is no
+/// "list every contact", by design: a skill asks about a name the user
+/// already said and gets the matches, and can never walk the address book.
+#[uniffi::export(with_foreign)]
+pub trait FfiContactsProvider: Send + Sync {
+    fn has_permission(&self) -> bool;
+    fn lookup(&self, query: String) -> Vec<FfiContact>;
+}
+
+/// Foreign-implemented reader for conversations that can be replied into now.
+///
+/// Names only, deliberately. The frontend reads notifications to know this;
+/// nothing it learns doing so — the message, the app, the pending intent —
+/// crosses this boundary.
+#[uniffi::export(with_foreign)]
+pub trait FfiLiveConversationsProvider: Send + Sync {
+    fn names(&self) -> Vec<String>;
+}
+
 /// Foreign-implemented wall-clock reader. Needed so skills can
 /// resolve weekdays / "today" / local dates — WASM has no TZ
 /// database, the host does.
@@ -475,6 +516,37 @@ struct ForeignMediaServicesProviderAdapter(Arc<dyn FfiMediaServicesProvider>);
 impl MediaServicesProvider for ForeignMediaServicesProviderAdapter {
     fn installed_services(&self) -> Vec<String> {
         self.0.installed_services()
+    }
+}
+
+struct ForeignContactsProviderAdapter(Arc<dyn FfiContactsProvider>);
+
+impl ContactsProvider for ForeignContactsProviderAdapter {
+    fn has_permission(&self) -> bool {
+        self.0.has_permission()
+    }
+
+    fn lookup(&self, query: &str) -> Vec<Contact> {
+        self.0
+            .lookup(query.to_string())
+            .into_iter()
+            .map(|c| Contact {
+                display_name: c.display_name,
+                channels: c
+                    .channels
+                    .into_iter()
+                    .map(|ch| ContactChannel { service: ch.service, id: ch.id })
+                    .collect(),
+            })
+            .collect()
+    }
+}
+
+struct ForeignLiveConversationsProviderAdapter(Arc<dyn FfiLiveConversationsProvider>);
+
+impl LiveConversationsProvider for ForeignLiveConversationsProviderAdapter {
+    fn names(&self) -> Vec<String> {
+        self.0.names()
     }
 }
 
@@ -651,6 +723,8 @@ struct EngineBuilderState {
     setting_writer: Option<Arc<dyn FfiSettingWriter>>,
     authorize: Option<Arc<dyn FfiAuthorizeProvider>>,
     media_services: Option<Arc<dyn FfiMediaServicesProvider>>,
+    contacts: Option<Arc<dyn FfiContactsProvider>>,
+    live_conversations: Option<Arc<dyn FfiLiveConversationsProvider>>,
 }
 
 /// Builds an [`AriEngine`] one provider at a time. This exists specifically to
@@ -704,6 +778,12 @@ impl AriEngineBuilder {
     pub fn media_services(&self, v: Arc<dyn FfiMediaServicesProvider>) {
         self.state.lock().unwrap().media_services = Some(v);
     }
+    pub fn contacts(&self, v: Arc<dyn FfiContactsProvider>) {
+        self.state.lock().unwrap().contacts = Some(v);
+    }
+    pub fn live_conversations(&self, v: Arc<dyn FfiLiveConversationsProvider>) {
+        self.state.lock().unwrap().live_conversations = Some(v);
+    }
 
     pub fn build(&self) -> Arc<AriEngine> {
         let mut s = self.state.lock().unwrap();
@@ -719,6 +799,8 @@ impl AriEngineBuilder {
             s.setting_writer.take(),
             s.authorize.take(),
             s.media_services.take(),
+            s.contacts.take(),
+            s.live_conversations.take(),
         ))
     }
 }
@@ -742,6 +824,8 @@ pub struct AriEngine {
     pub(crate) calendar_provider: Arc<dyn CalendarProvider>,
     pub(crate) location_provider: Arc<dyn LocationProvider>,
     pub(crate) media_services_provider: Arc<dyn MediaServicesProvider>,
+    pub(crate) contacts_provider: Arc<dyn ContactsProvider>,
+    pub(crate) live_conversations_provider: Arc<dyn LiveConversationsProvider>,
     pub(crate) local_clock: Arc<dyn LocalClock>,
     /// Locale source of truth — engine reads through this whenever it
     /// needs to dispatch on language. Defaults to [`EnglishLocaleProvider`]
@@ -860,6 +944,8 @@ fn assemble_with_providers(
     setting_writer: Option<Arc<dyn FfiSettingWriter>>,
     authorize: Option<Arc<dyn FfiAuthorizeProvider>>,
     media_services: Option<Arc<dyn FfiMediaServicesProvider>>,
+    contacts: Option<Arc<dyn FfiContactsProvider>>,
+    live_conversations: Option<Arc<dyn FfiLiveConversationsProvider>>,
 ) -> AriEngine {
     let log_sink: Arc<dyn LogSink> = match sink {
         Some(s) => Arc::new(ForeignLogSinkAdapter(s)),
@@ -901,6 +987,14 @@ fn assemble_with_providers(
         Some(p) => Arc::new(ForeignMediaServicesProviderAdapter(p)),
         None => Arc::new(NullMediaServicesProvider),
     };
+    let contacts_provider: Arc<dyn ContactsProvider> = match contacts {
+        Some(p) => Arc::new(ForeignContactsProviderAdapter(p)),
+        None => Arc::new(NullContactsProvider),
+    };
+    let live_conversations_provider: Arc<dyn LiveConversationsProvider> = match live_conversations {
+        Some(p) => Arc::new(ForeignLiveConversationsProviderAdapter(p)),
+        None => Arc::new(NullLiveConversationsProvider),
+    };
     let adapted_envelope_sink: Option<Arc<dyn EnvelopeSink>> = envelope_sink
         .map(|es| Arc::new(ForeignEnvelopeSinkAdapter(es)) as Arc<dyn EnvelopeSink>);
     let mut engine = build_engine_with_builtins();
@@ -916,6 +1010,8 @@ fn assemble_with_providers(
         calendar_provider,
         location_provider,
         media_services_provider,
+        contacts_provider,
+        live_conversations_provider,
         local_clock,
         locale_provider,
         config_store,
@@ -938,6 +1034,8 @@ impl AriEngine {
             calendar_provider: Arc::new(NullCalendarProvider),
             location_provider: Arc::new(NullLocationProvider),
             media_services_provider: Arc::new(NullMediaServicesProvider),
+            contacts_provider: Arc::new(NullContactsProvider),
+            live_conversations_provider: Arc::new(NullLiveConversationsProvider),
             local_clock: Arc::new(UtcLocalClock),
             locale_provider: Arc::new(EnglishLocaleProvider),
             config_store,
@@ -964,6 +1062,8 @@ impl AriEngine {
             calendar_provider: Arc::new(NullCalendarProvider),
             location_provider: Arc::new(NullLocationProvider),
             media_services_provider: Arc::new(NullMediaServicesProvider),
+            contacts_provider: Arc::new(NullContactsProvider),
+            live_conversations_provider: Arc::new(NullLiveConversationsProvider),
             local_clock: Arc::new(UtcLocalClock),
             locale_provider: Arc::new(EnglishLocaleProvider),
             config_store,
@@ -1250,6 +1350,8 @@ impl AriEngine {
         options.calendar_provider = self.calendar_provider.clone();
         options.location_provider = self.location_provider.clone();
         options.media_services_provider = self.media_services_provider.clone();
+        options.contacts_provider = self.contacts_provider.clone();
+        options.live_conversations_provider = self.live_conversations_provider.clone();
         options.local_clock = self.local_clock.clone();
         options.config_store = self.config_store.clone();
         options.locale_provider = self.locale_provider.clone();
@@ -1732,9 +1834,18 @@ mod tests {
     }
 
     #[test]
-    fn android_host_grants_authorize_capability() {
+    fn android_host_grants_every_capability_that_exists() {
+        // Android is the reference frontend and implements the lot. Adding a
+        // capability to the enum without adding it here rejects the skill at
+        // install on a real phone while the CLI happily loads it — which is
+        // exactly how `contacts` was missed.
         let opts = android_load_options("/tmp/ignored");
-        assert!(opts.host_capabilities.provides(Capability::Authorize));
+        let missing: Vec<&str> = ari_skill_loader::ALL_CAPABILITIES
+            .iter()
+            .filter(|c| !opts.host_capabilities.provides(**c))
+            .map(|c| ari_skill_loader::capability_name(*c))
+            .collect();
+        assert!(missing.is_empty(), "android_load_options is missing: {missing:?}");
     }
 
     #[test]

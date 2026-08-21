@@ -115,6 +115,7 @@ const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
     ("setting_get", None),
     ("setting_set", None),
     ("args", None),
+    ("raw_input", None),
     ("get_locale", None),
     ("t", None),
     ("format_date", None),
@@ -137,6 +138,9 @@ const HOST_IMPORT_CAPABILITY_TABLE: &[(&str, Option<Capability>)] = &[
     ("calendar_query_in_range", Some(Capability::Calendar)),
     ("location_current", Some(Capability::Location)),
     ("media_services", Some(Capability::MediaServices)),
+    ("contacts_permission_granted", Some(Capability::Contacts)),
+    ("contacts_lookup", Some(Capability::Contacts)),
+    ("live_conversations", Some(Capability::Reply)),
     ("authorize", Some(Capability::Authorize)),
 ];
 
@@ -290,6 +294,9 @@ struct StoreData {
     calendar_provider: Option<Arc<dyn crate::platform_capabilities::CalendarProvider>>,
     location_provider: Option<Arc<dyn crate::platform_capabilities::LocationProvider>>,
     media_services_provider: Option<Arc<dyn crate::platform_capabilities::MediaServicesProvider>>,
+    contacts_provider: Option<Arc<dyn crate::platform_capabilities::ContactsProvider>>,
+    live_conversations_provider:
+        Option<Arc<dyn crate::platform_capabilities::LiveConversationsProvider>>,
     /// Authorize provider — `Some` only when `Capability::Authorize` granted.
     authorize_provider: Option<Arc<dyn crate::platform_capabilities::AuthorizeProvider>>,
     /// Local clock — ungated; every skill can read the wall clock.
@@ -314,6 +321,12 @@ struct StoreData {
     /// keyword-scorer dispatches and for `score()` invocations — the
     /// SDK's `ari::args()` helper returns an empty/None equivalent.
     args_json: Option<String>,
+    /// Per-call utterance as the user actually said it, before
+    /// `normalize_input` lowercased it and stripped punctuation. Read back
+    /// via the `ari::raw_input` host import. Skills that quote the user to
+    /// somebody else — a message body, a note — need this; the normalised
+    /// form turns "I'll be home soon" into "i will be home soon".
+    raw_input: Option<String>,
 }
 
 /// Bundle of (configured client, config) so the host import has everything it
@@ -421,6 +434,9 @@ pub struct WasmSkill {
     location_provider: Arc<dyn crate::platform_capabilities::LocationProvider>,
     /// Platform media services capability. Same pattern as `tasks_provider`.
     media_services_provider: Arc<dyn crate::platform_capabilities::MediaServicesProvider>,
+    contacts_provider: Arc<dyn crate::platform_capabilities::ContactsProvider>,
+    live_conversations_provider:
+        Arc<dyn crate::platform_capabilities::LiveConversationsProvider>,
     /// Browser round-trip capability (`ari::authorize`). Always present
     /// (possibly Null); gated into the store only when `Capability::Authorize`
     /// is granted. Same pattern as `tasks_provider`.
@@ -627,6 +643,8 @@ impl WasmSkill {
         let calendar_provider = options.calendar_provider.clone();
         let location_provider = options.location_provider.clone();
         let media_services_provider = options.media_services_provider.clone();
+        let contacts_provider = options.contacts_provider.clone();
+        let live_conversations_provider = options.live_conversations_provider.clone();
         let authorize_provider = options.authorize_provider.clone();
         let local_clock = options.local_clock.clone();
         let config_store = options.config_store.clone();
@@ -727,6 +745,8 @@ impl WasmSkill {
             calendar_provider,
             location_provider,
             media_services_provider,
+            contacts_provider,
+            live_conversations_provider,
             authorize_provider,
             local_clock,
             config_store,
@@ -801,6 +821,19 @@ impl WasmSkill {
                 } else {
                     None
                 },
+                contacts_provider: if self.granted_capabilities.contains(&Capability::Contacts) {
+                    Some(self.contacts_provider.clone())
+                } else {
+                    None
+                },
+                live_conversations_provider: if self
+                    .granted_capabilities
+                    .contains(&Capability::Reply)
+                {
+                    Some(self.live_conversations_provider.clone())
+                } else {
+                    None
+                },
                 media_services_provider: if self.granted_capabilities.contains(&Capability::MediaServices) {
                     Some(self.media_services_provider.clone())
                 } else {
@@ -817,6 +850,7 @@ impl WasmSkill {
                 locale_provider: self.locale_provider.clone(),
                 localized_strings: self.localized_strings.clone(),
                 args_json: None,
+                raw_input: None,
             },
         );
         store.limiter(|data| &mut data.limits);
@@ -1089,6 +1123,43 @@ impl WasmSkill {
                 .map_err(|e| WasmError::Compile(e.to_string()))?;
         }
 
+        // Live conversations — gated on the Reply capability. Names only;
+        // notifications never leave the frontend.
+        if self.granted_capabilities.contains(&Capability::Reply) {
+            linker
+                .func_wrap(
+                    "ari",
+                    "live_conversations",
+                    |mut caller: Caller<'_, StoreData>| -> i64 {
+                        live_conversations_impl(&mut caller)
+                    },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
+        }
+
+        // Contacts host imports — gated on the Contacts capability.
+        if self.granted_capabilities.contains(&Capability::Contacts) {
+            linker
+                .func_wrap(
+                    "ari",
+                    "contacts_permission_granted",
+                    |mut caller: Caller<'_, StoreData>| -> i32 {
+                        contacts_permission_granted_impl(&mut caller)
+                    },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
+
+            linker
+                .func_wrap(
+                    "ari",
+                    "contacts_lookup",
+                    |mut caller: Caller<'_, StoreData>, ptr: i32, len: i32| -> i64 {
+                        contacts_lookup_impl(&mut caller, ptr, len)
+                    },
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
+        }
+
         // Authorize — gated on `Capability::Authorize`. A dumb browser
         // round-trip the host implements; carries no OAuth knowledge.
         if self.granted_capabilities.contains(&Capability::Authorize) {
@@ -1184,6 +1255,16 @@ impl WasmSkill {
                 "args",
                 |mut caller: Caller<'_, StoreData>| -> i64 {
                     args_impl(&mut caller)
+                },
+            )
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
+
+        linker
+            .func_wrap(
+                "ari",
+                "raw_input",
+                |mut caller: Caller<'_, StoreData>| -> i64 {
+                    raw_input_impl(&mut caller)
                 },
             )
             .map_err(|e| WasmError::Compile(e.to_string()))?;
@@ -2141,6 +2222,80 @@ fn args_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
     write_response(caller, memory, &args)
 }
 
+fn raw_input_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    // Absent/empty → 0 so the SDK helper exposes it as None. `score()` runs
+    // without it, matching the normalised-text-only matching contract.
+    let raw = match caller.data().raw_input.as_deref() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return 0,
+    };
+    write_response(caller, memory, &raw)
+}
+
+fn contacts_permission_granted_impl(caller: &mut Caller<'_, StoreData>) -> i32 {
+    match caller.data().contacts_provider.clone() {
+        Some(p) => p.has_permission() as i32,
+        None => 0,
+    }
+}
+
+fn contacts_lookup_impl(
+    caller: &mut Caller<'_, StoreData>,
+    query_ptr: i32,
+    query_len: i32,
+) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let query = match read_utf8(&memory, &*caller, query_ptr, query_len) {
+        Some(q) => q,
+        None => return 0,
+    };
+    // An empty query would be an enumeration request in disguise. Refuse it
+    // here rather than trusting every host impl to remember.
+    if query.trim().is_empty() {
+        return 0;
+    }
+    let provider = match caller.data().contacts_provider.clone() {
+        Some(p) => p,
+        None => return 0,
+    };
+    let json = serde_json::json!(
+        provider
+            .lookup(query.trim())
+            .iter()
+            .map(|c| serde_json::json!({
+                "display_name": c.display_name,
+                "channels": c
+                    .channels
+                    .iter()
+                    .map(|ch| serde_json::json!({ "service": ch.service, "id": ch.id }))
+                    .collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>()
+    )
+    .to_string();
+    write_response(caller, memory, &json)
+}
+
+fn live_conversations_impl(caller: &mut Caller<'_, StoreData>) -> i64 {
+    let memory = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 0,
+    };
+    let provider = match caller.data().live_conversations_provider.clone() {
+        Some(p) => p,
+        None => return 0,
+    };
+    let json = serde_json::json!(provider.names()).to_string();
+    write_response(caller, memory, &json)
+}
+
 fn setting_get_impl(caller: &mut Caller<'_, StoreData>, key_ptr: i32, key_len: i32) -> i64 {
     let memory = match caller.get_export("memory") {
         Some(wasmtime::Extern::Memory(m)) => m,
@@ -2591,8 +2746,8 @@ impl Skill for WasmSkill {
         )
     }
 
-    fn execute(&self, input: &str, _ctx: &SkillContext) -> Response {
-        self.execute_inner(input, None)
+    fn execute(&self, input: &str, ctx: &SkillContext) -> Response {
+        self.execute_inner(input, None, raw_of(ctx))
     }
 
     fn settings_query(&self, field: &str, values_json: &str) -> ari_core::SettingsQueryResult {
@@ -2611,7 +2766,7 @@ impl Skill for WasmSkill {
         &self,
         input: &str,
         args_json: &str,
-        _ctx: &SkillContext,
+        ctx: &SkillContext,
     ) -> Response {
         // Stash a non-empty args JSON for the duration of this call;
         // the `ari::args` host import reads it back from StoreData.
@@ -2623,12 +2778,23 @@ impl Skill for WasmSkill {
         } else {
             Some(args_json.to_string())
         };
-        self.execute_inner(input, args)
+        self.execute_inner(input, args, raw_of(ctx))
     }
 }
 
+/// The utterance as spoken, or `None` when the engine didn't supply one
+/// (scoring, tests, hosts on an older engine). Empty is the same as absent.
+fn raw_of(ctx: &SkillContext) -> Option<String> {
+    Some(ctx.raw_input.clone()).filter(|s| !s.is_empty())
+}
+
 impl WasmSkill {
-    fn execute_inner(&self, input: &str, args_json: Option<String>) -> Response {
+    fn execute_inner(
+        &self,
+        input: &str,
+        args_json: Option<String>,
+        raw_input: Option<String>,
+    ) -> Response {
         let fallback = || Response::Text("(skill error)".to_string());
         let log_sink = self.log_sink.clone();
         let skill_id = self.id.clone();
@@ -2642,6 +2808,7 @@ impl WasmSkill {
                 // by the `fresh_store` cycle since the store is
                 // dropped post-`with_instance`.
                 store.data_mut().args_json = args_json.clone();
+                store.data_mut().raw_input = raw_input.clone();
 
                 let Some((memory, ptr, len)) = WasmSkill::write_input(store, instance, input) else {
                     warn("execute: write_input failed");
@@ -2936,6 +3103,10 @@ mod tests {
             calendar_provider: Arc::new(crate::NullCalendarProvider),
             location_provider: Arc::new(crate::platform_capabilities::NullLocationProvider),
             media_services_provider: Arc::new(crate::platform_capabilities::NullMediaServicesProvider),
+            contacts_provider: Arc::new(crate::platform_capabilities::NullContactsProvider),
+            live_conversations_provider: Arc::new(
+                crate::platform_capabilities::NullLiveConversationsProvider,
+            ),
             local_clock: Arc::new(crate::UtcLocalClock),
             config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
             locale_provider: Arc::new(crate::EnglishLocaleProvider),
@@ -3977,6 +4148,10 @@ mod tests {
                 calendar_provider: Arc::new(crate::NullCalendarProvider),
                 location_provider: Arc::new(crate::platform_capabilities::NullLocationProvider),
                 media_services_provider: Arc::new(crate::platform_capabilities::NullMediaServicesProvider),
+            contacts_provider: Arc::new(crate::platform_capabilities::NullContactsProvider),
+            live_conversations_provider: Arc::new(
+                crate::platform_capabilities::NullLiveConversationsProvider,
+            ),
                 local_clock: Arc::new(crate::UtcLocalClock),
                 config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
                 locale_provider: Arc::new(crate::EnglishLocaleProvider),
@@ -4092,6 +4267,10 @@ mod tests {
                 calendar_provider: Arc::new(crate::NullCalendarProvider),
                 location_provider: Arc::new(crate::platform_capabilities::NullLocationProvider),
                 media_services_provider: Arc::new(crate::platform_capabilities::NullMediaServicesProvider),
+            contacts_provider: Arc::new(crate::platform_capabilities::NullContactsProvider),
+            live_conversations_provider: Arc::new(
+                crate::platform_capabilities::NullLiveConversationsProvider,
+            ),
                 local_clock: Arc::new(crate::UtcLocalClock),
                 config_store: Arc::new(crate::assistant::MemoryConfigStore::new()),
                 locale_provider: Arc::new(crate::EnglishLocaleProvider),

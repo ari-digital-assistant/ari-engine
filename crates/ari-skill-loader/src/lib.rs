@@ -23,7 +23,7 @@ pub use models::{ModelCatalog, ModelCatalogError, TierModel};
 pub use bundle::{install_from_bytes, sha256_hex, BundleError, InstalledBundle};
 pub use declarative::{AdapterError, DeclarativeSkill};
 pub use signature::{SignatureError, TrustRoot, VERIFYING_KEY_LENGTH};
-pub use host_capabilities::{capability_name, parse_capability, HostCapabilities};
+pub use host_capabilities::{ALL_CAPABILITIES, capability_name, parse_capability, HostCapabilities};
 pub use http_config::HttpConfig;
 pub use loader::{
     load_single_skill_dir, load_single_skill_dir_with, load_skill_directory,
@@ -48,10 +48,13 @@ pub use localized_strings::{
 };
 pub use platform_capabilities::{
     AuthorizeInput, AuthorizeOutput, AuthorizeProvider, Calendar, CalendarEventRow,
-    CalendarProvider, EnglishLocaleProvider, InsertCalendarEventParams, InsertTaskParams,
-    LocalClock, LocalTimeComponents, LocaleProvider, LocationProvider, LocationResult,
+    CalendarProvider, Contact, ContactChannel, ContactsProvider, EnglishLocaleProvider,
+    InsertCalendarEventParams, InsertTaskParams,
+    LiveConversationsProvider, LocalClock, LocalTimeComponents, LocaleProvider,
+    LocationProvider, LocationResult,
     LocationStatus, MediaServicesProvider, NullAuthorizeProvider, NullCalendarProvider,
-    NullLocationProvider, NullMediaServicesProvider, NullSettingWriter, NullTasksProvider,
+    NullContactsProvider, NullLiveConversationsProvider, NullLocationProvider, NullMediaServicesProvider, NullSettingWriter,
+    NullTasksProvider,
     SettingWriter, TaskList, TaskRow, TasksProvider, UtcLocalClock,
 };
 pub use storage_config::StorageConfig;

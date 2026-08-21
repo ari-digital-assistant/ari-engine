@@ -173,6 +173,16 @@ pub struct SkillContext {
     /// (Linux, headless) or before the first push, which preserves the legacy
     /// "any target is an app" behaviour in `open`'s scoring.
     pub installed_apps: Vec<AppEntry>,
+    /// The utterance as the user said it, before `normalize_input` lowercased
+    /// it, expanded contractions and stripped punctuation. For skills that
+    /// quote the user back to somebody else — a message body, a note — the
+    /// normalised text is unusable: "I'll be home soon" becomes "i will be
+    /// home soon", and that is what the other person reads.
+    ///
+    /// Populated for `execute` only. Scoring and matching run against
+    /// normalised text by design, so it is empty during `score` and callers
+    /// must not reach for it there.
+    pub raw_input: String,
 }
 
 impl Default for SkillContext {
@@ -180,6 +190,7 @@ impl Default for SkillContext {
         Self {
             locale: "en".to_string(),
             installed_apps: Vec::new(),
+            raw_input: String::new(),
         }
     }
 }
@@ -566,9 +577,11 @@ pub fn replace_number_words(input: &str) -> String {
 /// blanking it turned both into two separate numbers.
 ///
 /// Per-locale dispatch:
-/// - `"en"` — expand English contractions (`"don't"` → `"do not"`,
-///   `"what's"` → `"what is"`), fold dotted meridiems (`"p.m."` → `"pm"`)
-///   and replace English number words (`"five"` → `"5"`).
+/// - `"en"` — expand English contractions, both the irregular whole words
+///   (`"don't"` → `"do not"`, `"what's"` → `"what is"`) and the suffixes that
+///   attach to any stem (`"I'll"` → `"i will"`, `"they've"` → `"they have"`);
+///   fold dotted meridiems (`"p.m."` → `"pm"`) and replace English number
+///   words (`"five"` → `"5"`).
 /// - `"it"` — strip Italian apostrophe-elisions (`"l'ora"` → `"l ora"`,
 ///   `"c'è"` → `"c è"`). No contraction expansion or number words yet
 ///   (Italian number words are a Phase-7 polish item, alongside the
@@ -636,24 +649,121 @@ fn is_between_digits(chars: &[char], i: usize) -> bool {
         && chars.get(i + 1).is_some_and(|c| c.is_ascii_digit())
 }
 
+const CONTRACTIONS: &[(&str, &str)] = &[
+    ("what's", "what is"),
+    ("whats", "what is"),
+    ("it's", "it is"),
+    ("i'm", "i am"),
+    ("don't", "do not"),
+    ("doesn't", "does not"),
+    ("can't", "cannot"),
+    ("won't", "will not"),
+    ("isn't", "is not"),
+    ("aren't", "are not"),
+    ("didn't", "did not"),
+    ("there's", "there is"),
+    ("here's", "here is"),
+    ("that's", "that is"),
+    ("let's", "let us"),
+];
+
+/// Contraction suffixes that attach to any stem, expanded wherever they close
+/// a word.
+///
+/// These are listed as suffixes rather than whole words because the stem is
+/// open-ended: "they'll", "that'll" and "mario'll" are one rule, and a table
+/// of whole words would only ever cover the pronouns somebody thought of.
+///
+/// `'d` is the ambiguous one — it stands for "would" ("I'd like a reminder")
+/// and for "had" ("I'd forgotten"), and telling them apart needs a parser we
+/// do not have. Leaving it alone was worse: "i d" is wrong under both
+/// readings. What an assistant is told is overwhelmingly the "would" sense,
+/// so that is the guess, pinned by `apostrophe_d_always_reads_as_would`.
+///
+/// `'s` is deliberately absent: it is a possessive at least as often as it is
+/// "is", and the whole words above already cover the ones worth guessing at.
+const CONTRACTION_SUFFIXES: &[(&str, &str)] = &[
+    ("'ll", " will"),
+    ("'ve", " have"),
+    ("'re", " are"),
+    ("'d", " would"),
+];
+
+/// Whole words first, then the open-ended suffixes — the irregulars ("won't",
+/// "can't") do not end in a suffix, so the two passes never fight over the
+/// same word.
+///
+/// Every needle below is spelled with a plain apostrophe, and phone and
+/// desktop keyboards autocorrect one into a typographic `\u{2019}`. Folding
+/// that first is what makes the rules fire on text somebody typed rather than
+/// spoke; without it "don\u{2019}t" fell through to the punctuation strip and
+/// reached the skills as "don t".
 fn expand_english_contractions(lower: &str) -> String {
-    lower
-        .replace("what's", "what is")
-        .replace("whats", "what is")
-        .replace("it's", "it is")
-        .replace("i'm", "i am")
-        .replace("don't", "do not")
-        .replace("doesn't", "does not")
-        .replace("can't", "cannot")
-        .replace("won't", "will not")
-        .replace("isn't", "is not")
-        .replace("aren't", "are not")
-        .replace("didn't", "did not")
-        .replace("there's", "there is")
-        .replace("here's", "here is")
-        .replace("that's", "that is")
-        .replace("let's", "let us")
-        .replace("we're", "we are")
+    let mut out = lower.replace('\u{2019}', "'");
+    for (from, to) in CONTRACTIONS {
+        out = replace_whole_word(&out, from, to);
+    }
+    for (suffix, expansion) in CONTRACTION_SUFFIXES {
+        out = expand_suffix(&out, suffix, expansion);
+    }
+    out
+}
+
+/// Expand a suffix wherever it closes a word: `"they'll"` → `"they will"`.
+///
+/// Two guards, and both earn their keep. The suffix needs an alphanumeric
+/// stem, so a stray `"'d"` on its own is left alone. It also has to *end* the
+/// word, or the `'d` rule cuts "o'donnell" down to "o would onnell" — and a
+/// skill that messages people meets those names.
+fn expand_suffix(hay: &str, suffix: &str, replacement: &str) -> String {
+    let is_word = |c: char| c.is_alphanumeric() || c == '\'';
+    let mut out = String::with_capacity(hay.len());
+    let mut from = 0usize;
+    while let Some(rel) = hay[from..].find(suffix) {
+        let at = from + rel;
+        let end = at + suffix.len();
+        let has_stem = hay[..at]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
+        let ends_word = hay[end..].chars().next().is_none_or(|c| !is_word(c));
+        out.push_str(&hay[from..at]);
+        if has_stem && ends_word {
+            out.push_str(replacement);
+        } else {
+            out.push_str(suffix);
+        }
+        from = end;
+    }
+    out.push_str(&hay[from..]);
+    out
+}
+
+/// Replace `needle` only where it stands as a whole word.
+///
+/// A plain `str::replace` here corrupts any word that merely *contains* a
+/// contraction: the `whats` rule turned "whatsapp" into "what isapp", so every
+/// utterance naming WhatsApp reached the skills mangled. Boundaries are
+/// alphanumeric-or-apostrophe, so "what's" is one word rather than three.
+fn replace_whole_word(hay: &str, needle: &str, replacement: &str) -> String {
+    let is_word = |c: char| c.is_alphanumeric() || c == '\'';
+    let mut out = String::with_capacity(hay.len());
+    let mut from = 0usize;
+    while let Some(rel) = hay[from..].find(needle) {
+        let at = from + rel;
+        let end = at + needle.len();
+        let before_ok = hay[..at].chars().next_back().is_none_or(|c| !is_word(c));
+        let after_ok = hay[end..].chars().next().is_none_or(|c| !is_word(c));
+        out.push_str(&hay[from..at]);
+        if before_ok && after_ok {
+            out.push_str(replacement);
+        } else {
+            out.push_str(needle);
+        }
+        from = end;
+    }
+    out.push_str(&hay[from..]);
+    out
 }
 
 /// Replace any apostrophe (or unicode right-single-quote) that's
@@ -783,8 +893,65 @@ mod tests {
     }
 
     #[test]
+    fn contraction_rules_only_fire_on_whole_words() {
+        // "whats" → "what is" as a plain substring replace turned "whatsapp"
+        // into "what isapp", so every utterance naming WhatsApp reached the
+        // skills corrupted — and the message skill could never see which
+        // service the user asked for.
+        assert_eq!(
+            normalize_input("tell mario hello on WhatsApp", "en"),
+            "tell mario hello on whatsapp",
+        );
+        assert_eq!(normalize_input("whatsapp mario", "en"), "whatsapp mario");
+    }
+
+    #[test]
+    fn whole_word_guard_does_not_break_real_contractions() {
+        assert_eq!(normalize_input("whats the time", "en"), "what is the time");
+        assert_eq!(normalize_input("what's the time", "en"), "what is the time");
+        // Trailing punctuation is not a word character, so the rule still fires.
+        assert_eq!(normalize_input("what's up?", "en"), "what is up");
+    }
+
+    #[test]
     fn normalize_expands_were_contraction() {
         assert_eq!(normalize_input("we're done", "en"), "we are done");
+    }
+
+    #[test]
+    fn normalize_expands_contraction_suffixes() {
+        assert_eq!(normalize_input("i'll be home soon", "en"), "i will be home soon");
+        assert_eq!(normalize_input("they'll wait", "en"), "they will wait");
+        assert_eq!(normalize_input("that'll do", "en"), "that will do");
+        assert_eq!(normalize_input("i've eaten", "en"), "i have eaten");
+        assert_eq!(normalize_input("should've asked", "en"), "should have asked");
+        assert_eq!(normalize_input("you're late", "en"), "you are late");
+        assert_eq!(normalize_input("they're here", "en"), "they are here");
+    }
+
+    #[test]
+    fn suffix_rules_need_a_stem_that_ends_there() {
+        // "o'donnell" contains "'d", and expanding it mid-word would hand the
+        // message skill "o would onnell" as somebody's name.
+        assert_eq!(normalize_input("message o'donnell", "en"), "message o donnell");
+        assert_eq!(normalize_input("call o'brien", "en"), "call o brien");
+        // No stem: nothing to expand, and the punctuation strip takes it.
+        assert_eq!(normalize_input("'ll", "en"), "ll");
+    }
+
+    #[test]
+    fn apostrophe_d_always_reads_as_would() {
+        assert_eq!(normalize_input("i'd like a reminder", "en"), "i would like a reminder");
+        // The "had" sense is expanded wrongly and knowingly: telling the two
+        // apart needs a parser, and "i d forgotten" was wrong either way.
+        assert_eq!(normalize_input("i'd forgotten", "en"), "i would forgotten");
+    }
+
+    #[test]
+    fn typographic_apostrophes_expand_too() {
+        // What a phone keyboard produces when somebody types instead of speaks.
+        assert_eq!(normalize_input("I\u{2019}ll be home soon", "en"), "i will be home soon");
+        assert_eq!(normalize_input("don\u{2019}t", "en"), "do not");
     }
 
     #[test]

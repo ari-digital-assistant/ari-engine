@@ -1,7 +1,7 @@
 use ari_engine::Engine;
 use ari_skill_loader::{
-    load_single_skill_dir_with, load_skill_directory_with, parse_capability, HostCapabilities,
-    LoadOptions, StorageConfig,
+    capability_name, load_single_skill_dir_with, load_skill_directory_with, parse_capability,
+    HostCapabilities, LoadOptions, StorageConfig, ALL_CAPABILITIES,
 };
 use ari_skills::{CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill};
 use std::io::{self, BufRead};
@@ -147,7 +147,6 @@ struct ParsedArgs {
     extra_skill_dirs: Vec<PathBuf>,
     utterance: String,
     host_capabilities: HostCapabilities,
-    host_capabilities_explicit: Vec<String>,
     storage_dir: Option<PathBuf>,
     skill_store: Option<PathBuf>,
     #[cfg(feature = "llm")]
@@ -161,7 +160,6 @@ impl Default for ParsedArgs {
             extra_skill_dirs: Vec::new(),
             utterance: String::new(),
             host_capabilities: HostCapabilities::pure_frontend(),
-            host_capabilities_explicit: Vec::new(),
             storage_dir: None,
             skill_store: None,
             #[cfg(feature = "llm")]
@@ -171,15 +169,17 @@ impl Default for ParsedArgs {
 }
 
 impl ParsedArgs {
-    fn host_capabilities_summary(&self) -> Vec<&str> {
-        if !self.host_capabilities_explicit.is_empty() {
-            self.host_capabilities_explicit
-                .iter()
-                .map(String::as_str)
-                .collect()
-        } else {
-            vec!["notifications", "launch_app", "clipboard", "tts (default: pure_frontend)"]
-        }
+    /// The capability names the loader will actually be given.
+    ///
+    /// Read off the set itself rather than a parallel `Vec<String>` built
+    /// during parsing: the two could disagree, and the hand-written default
+    /// branch did — it named four of the eleven `pure_frontend()` grants.
+    fn host_capabilities_summary(&self) -> Vec<&'static str> {
+        self.host_capabilities
+            .granted()
+            .into_iter()
+            .map(capability_name)
+            .collect()
     }
 }
 
@@ -212,19 +212,14 @@ fn parse_args(args: Vec<String>) -> Result<ParsedArgs, String> {
                 let value = iter.next().ok_or_else(|| {
                     "--host-capabilities requires a comma-separated list".to_string()
                 })?;
-                let (caps, names) = parse_caps_csv(&value)?;
-                explicit_host_caps = Some(caps);
-                parsed.host_capabilities_explicit = names;
+                explicit_host_caps = Some(parse_caps_csv(&value)?);
             }
             other if other.starts_with("--host-capabilities=") => {
                 let value = &other["--host-capabilities=".len()..];
-                let (caps, names) = parse_caps_csv(value)?;
-                explicit_host_caps = Some(caps);
-                parsed.host_capabilities_explicit = names;
+                explicit_host_caps = Some(parse_caps_csv(value)?);
             }
             "--no-host-capabilities" => {
                 explicit_host_caps = Some(HostCapabilities::none());
-                parsed.host_capabilities_explicit = vec!["(none)".to_string()];
             }
             "--storage-dir" => {
                 let value = iter
@@ -280,12 +275,38 @@ fn parse_args(args: Vec<String>) -> Result<ParsedArgs, String> {
     Ok(parsed)
 }
 
-fn parse_caps_csv(value: &str) -> Result<(HostCapabilities, Vec<String>), String> {
-    if value.trim().is_empty() {
-        return Ok((HostCapabilities::none(), vec!["(none)".to_string()]));
+/// Column the wrapped capability lists in `--help` start at, and how much room
+/// they have before an 80-column terminal wraps them itself.
+const HELP_LIST_INDENT: &str = "                                     ";
+const HELP_LIST_WIDTH: usize = 41;
+
+/// Break `items` into comma-separated lines of at most `width` characters.
+///
+/// The capability lists in `--help` are derived from the enum, so they have no
+/// fixed length — without this, adding a capability quietly pushes a help line
+/// off the edge of the terminal. An item longer than `width` gets its own line
+/// rather than being cut.
+fn wrap_list(items: &[&str], width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let piece = if i + 1 == items.len() {
+            format!("{item}.")
+        } else {
+            format!("{item},")
+        };
+        match lines.last_mut() {
+            Some(line) if line.len() + 1 + piece.len() <= width => {
+                line.push(' ');
+                line.push_str(&piece);
+            }
+            _ => lines.push(piece),
+        }
     }
+    lines
+}
+
+fn parse_caps_csv(value: &str) -> Result<HostCapabilities, String> {
     let mut caps = HostCapabilities::none();
-    let mut names: Vec<String> = Vec::new();
     for raw in value.split(',') {
         let name = raw.trim();
         if name.is_empty() {
@@ -294,9 +315,8 @@ fn parse_caps_csv(value: &str) -> Result<(HostCapabilities, Vec<String>), String
         let cap = parse_capability(name)
             .ok_or_else(|| format!("unknown capability: {name:?}"))?;
         caps = caps.with(cap);
-        names.push(name.to_string());
     }
-    Ok((caps, names))
+    Ok(caps)
 }
 
 /// Does `path` look like a single skill directory rather than a registry root?
@@ -322,10 +342,17 @@ fn print_usage() {
     eprintln!("                                   as a registry root and loads every skill under it.");
     eprintln!("                                   may be passed multiple times.");
     eprintln!("  --host-capabilities <list>       override the host capability set with a");
-    eprintln!("                                   comma-separated list. Valid names: http,");
-    eprintln!("                                   location, notifications, launch_app, clipboard,");
-    eprintln!("                                   tts, storage_kv. Default: pure_frontend");
-    eprintln!("                                   (notifications, launch_app, clipboard, tts).");
+    eprintln!("                                   comma-separated list. Valid names:");
+    let all: Vec<&str> = ALL_CAPABILITIES.iter().copied().map(capability_name).collect();
+    for line in wrap_list(&all, HELP_LIST_WIDTH) {
+        eprintln!("{HELP_LIST_INDENT}{line}");
+    }
+    eprintln!("                                   Default: pure_frontend, which is");
+    let default = HostCapabilities::pure_frontend();
+    let default: Vec<&str> = default.granted().into_iter().map(capability_name).collect();
+    for line in wrap_list(&default, HELP_LIST_WIDTH) {
+        eprintln!("{HELP_LIST_INDENT}{line}");
+    }
     eprintln!("  --no-host-capabilities           grant the empty capability set; any skill with");
     eprintln!("                                   declared capabilities will be rejected at load.");
     eprintln!("  --llm-model <path>               load a GGUF model for the LLM fallback.");
@@ -369,5 +396,69 @@ fn print_response(response: &ari_core::Response) {
         ari_core::Response::Binary { mime, data } => {
             println!("[binary: {mime}, {} bytes]", data.len())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_list_packs_lines_up_to_the_width() {
+        assert_eq!(
+            wrap_list(&["http", "location", "tts"], 20),
+            vec!["http, location, tts.".to_string()],
+        );
+        assert_eq!(
+            wrap_list(&["http", "location", "tts"], 19),
+            vec!["http, location,".to_string(), "tts.".to_string()],
+        );
+    }
+
+    #[test]
+    fn wrap_list_gives_an_overlong_item_its_own_line() {
+        assert_eq!(
+            wrap_list(&["tts", "media_services"], 4),
+            vec!["tts,".to_string(), "media_services.".to_string()],
+        );
+    }
+
+    #[test]
+    fn wrap_list_handles_one_item_and_none() {
+        assert_eq!(wrap_list(&["tts"], 41), vec!["tts.".to_string()]);
+        assert!(wrap_list(&[], 41).is_empty());
+    }
+
+    #[test]
+    fn every_capability_fits_the_help_column() {
+        for cap in ALL_CAPABILITIES {
+            let name = capability_name(*cap);
+            // Every name renders with one trailing comma or full stop.
+            let rendered = name.len() + 1;
+            assert!(
+                rendered <= HELP_LIST_WIDTH,
+                "{name} is too long for the --help capability column",
+            );
+        }
+    }
+
+    #[test]
+    fn summary_reports_the_set_that_will_be_granted() {
+        let parsed = parse_args(vec!["--host-capabilities".into(), "tts,http".into()]).unwrap();
+        // ALL_CAPABILITIES order, not the order they were typed.
+        assert_eq!(parsed.host_capabilities_summary(), vec!["http", "tts"]);
+
+        let none = parse_args(vec!["--no-host-capabilities".into()]).unwrap();
+        assert!(none.host_capabilities_summary().is_empty());
+
+        let default = parse_args(Vec::new()).unwrap();
+        assert_eq!(default.host_capabilities_summary().len(), 11);
+        assert!(default.host_capabilities_summary().contains(&"send_message"));
+    }
+
+    #[test]
+    fn unknown_capability_is_rejected() {
+        let err = parse_args(vec!["--host-capabilities".into(), "tts,telepathy".into()]).unwrap_err();
+        assert_eq!(err, "unknown capability: \"telepathy\"");
     }
 }

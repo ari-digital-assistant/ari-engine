@@ -21,6 +21,32 @@
 use crate::manifest::Capability;
 use std::collections::HashSet;
 
+/// Every capability that exists.
+///
+/// One list, so a new capability can't be added to the enum and forgotten
+/// somewhere else — a host that silently doesn't grant it rejects the skill
+/// at install with no obvious cause.
+pub const ALL_CAPABILITIES: &[Capability] = &[
+    Capability::Http,
+    Capability::Location,
+    Capability::Notifications,
+    Capability::LaunchApp,
+    Capability::Clipboard,
+    Capability::Tts,
+    Capability::StorageKv,
+    Capability::Calendar,
+    Capability::Tasks,
+    Capability::Authorize,
+    Capability::MediaControl,
+    Capability::MediaServices,
+    Capability::CriticalAlert,
+    Capability::Alarm,
+    Capability::Navigation,
+    Capability::SendMessage,
+    Capability::Contacts,
+    Capability::Reply,
+];
+
 /// The set of capabilities the host can satisfy.
 #[derive(Debug, Clone, Default)]
 pub struct HostCapabilities {
@@ -40,24 +66,8 @@ impl HostCapabilities {
     /// then fail at runtime when wasmtime can't resolve the import.
     pub fn all() -> Self {
         let mut s = Self::default();
-        for cap in [
-            Capability::Http,
-            Capability::Location,
-            Capability::Notifications,
-            Capability::LaunchApp,
-            Capability::Clipboard,
-            Capability::Tts,
-            Capability::StorageKv,
-            Capability::Calendar,
-            Capability::Tasks,
-            Capability::Authorize,
-            Capability::MediaControl,
-            Capability::MediaServices,
-            Capability::CriticalAlert,
-            Capability::Alarm,
-            Capability::Navigation,
-        ] {
-            s.granted.insert(cap);
+        for cap in ALL_CAPABILITIES {
+            s.granted.insert(*cap);
         }
         s
     }
@@ -83,6 +93,7 @@ impl HostCapabilities {
         s.granted.insert(Capability::CriticalAlert);
         s.granted.insert(Capability::Alarm);
         s.granted.insert(Capability::Navigation);
+        s.granted.insert(Capability::SendMessage);
         s
     }
 
@@ -101,6 +112,21 @@ impl HostCapabilities {
     /// Is the given capability granted by this host?
     pub fn provides(&self, cap: Capability) -> bool {
         self.granted.contains(&cap)
+    }
+
+    /// The granted capabilities, in [`ALL_CAPABILITIES`] order.
+    ///
+    /// Ordered rather than handed out as the raw set because the callers are
+    /// help text and diagnostics, where a `HashSet`'s iteration order would
+    /// reshuffle the output between runs. Deriving these lists from here is
+    /// also the only way they stay true: written out by hand, they went stale
+    /// the first time a capability was added.
+    pub fn granted(&self) -> Vec<Capability> {
+        ALL_CAPABILITIES
+            .iter()
+            .copied()
+            .filter(|c| self.granted.contains(c))
+            .collect()
     }
 
     /// Returns the capabilities the skill needs that this host does not
@@ -132,6 +158,9 @@ pub fn parse_capability(s: &str) -> Option<Capability> {
         "critical_alert" => Some(Capability::CriticalAlert),
         "alarm" => Some(Capability::Alarm),
         "navigation" => Some(Capability::Navigation),
+        "send_message" => Some(Capability::SendMessage),
+        "contacts" => Some(Capability::Contacts),
+        "reply" => Some(Capability::Reply),
         _ => None,
     }
 }
@@ -154,12 +183,59 @@ pub fn capability_name(cap: Capability) -> &'static str {
         Capability::CriticalAlert => "critical_alert",
         Capability::Alarm => "alarm",
         Capability::Navigation => "navigation",
+        Capability::SendMessage => "send_message",
+        Capability::Contacts => "contacts",
+        Capability::Reply => "reply",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn granted_lists_in_all_capabilities_order_not_hash_order() {
+        let h = HostCapabilities::none()
+            .with(Capability::Reply)
+            .with(Capability::Http)
+            .with(Capability::Tts);
+        // Declaration order in ALL_CAPABILITIES: Http, Tts, Reply.
+        assert_eq!(
+            h.granted(),
+            vec![Capability::Http, Capability::Tts, Capability::Reply],
+        );
+    }
+
+    #[test]
+    fn granted_reports_every_pure_frontend_capability() {
+        let names: Vec<&str> = HostCapabilities::pure_frontend()
+            .granted()
+            .into_iter()
+            .map(capability_name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "notifications",
+                "launch_app",
+                "clipboard",
+                "tts",
+                "calendar",
+                "tasks",
+                "media_control",
+                "critical_alert",
+                "alarm",
+                "navigation",
+                "send_message",
+            ],
+        );
+    }
+
+    #[test]
+    fn granted_on_all_matches_every_capability_that_exists() {
+        assert_eq!(HostCapabilities::all().granted(), ALL_CAPABILITIES.to_vec());
+        assert!(HostCapabilities::none().granted().is_empty());
+    }
 
     #[test]
     fn none_grants_nothing() {
@@ -282,6 +358,36 @@ mod tests {
         // import, so every frontend that honours actions provides it.
         assert!(HostCapabilities::pure_frontend().provides(Capability::CriticalAlert));
         assert!(HostCapabilities::all().provides(Capability::CriticalAlert));
+    }
+
+    #[test]
+    fn every_capability_has_a_name_that_round_trips() {
+        // Catches a variant added to the enum but not to the name tables,
+        // which would make it unparseable from a manifest.
+        for cap in ALL_CAPABILITIES {
+            assert_eq!(parse_capability(capability_name(*cap)), Some(*cap));
+        }
+    }
+
+    #[test]
+    fn contacts_is_a_host_import_not_pure_frontend() {
+        assert_eq!(parse_capability("contacts"), Some(Capability::Contacts));
+        assert_eq!(capability_name(Capability::Contacts), "contacts");
+        // Needs WASM imports wired, so a frontend must claim it explicitly
+        // rather than getting it for honouring action envelopes.
+        assert!(!HostCapabilities::pure_frontend().provides(Capability::Contacts));
+        assert!(HostCapabilities::all().provides(Capability::Contacts));
+    }
+
+    #[test]
+    fn send_message_roundtrips_and_is_pure_frontend() {
+        assert_eq!(parse_capability("send_message"), Some(Capability::SendMessage));
+        assert_eq!(capability_name(Capability::SendMessage), "send_message");
+        // Sending is a frontend-handled action — the skill never touches a
+        // messaging API itself, it emits a `message` slot and the frontend
+        // either sends it or opens a compose surface.
+        assert!(HostCapabilities::pure_frontend().provides(Capability::SendMessage));
+        assert!(HostCapabilities::all().provides(Capability::SendMessage));
     }
 
     #[test]
