@@ -651,9 +651,8 @@ impl WasmSkill {
         let setting_writer = options.setting_writer.clone();
         let locale_provider = options.locale_provider.clone();
 
-        let mut config = wasmtime::Config::new();
-        config.consume_fuel(true);
-        let engine = Engine::new(&config).map_err(|e| WasmError::Compile(e.to_string()))?;
+        let engine =
+            Engine::new(&engine_config()?).map_err(|e| WasmError::Compile(e.to_string()))?;
 
         let module = compile_module_cached(&engine, bytes, options.compile_cache_dir.as_deref())?;
 
@@ -1541,6 +1540,37 @@ fn wasm_cache_key(bytes: &[u8]) -> String {
     format!("{}.cwasm", crate::bundle::sha256_hex(bytes))
 }
 
+/// The wasmtime config every engine in this crate is built from.
+///
+/// On Android, cranelift is pointed at Pulley — wasmtime's portable bytecode
+/// target — instead of the host ISA. The compile step is the same; what
+/// changes is that the artifact is bytecode the runtime interprets rather than
+/// native code, so nothing a user downloads is ever mapped executable. That is
+/// the difference between "downloaded skills run in an interpreter" and
+/// "downloaded skills are JIT-compiled to native", and only the first sits
+/// inside Play's interpreted-code carve-out in the Device & Network Abuse
+/// policy. Desktop keeps the native backend: the policy doesn't apply there
+/// and the skills run faster for it.
+///
+/// The target is chosen by pointer width rather than hardcoded, because
+/// wasmtime refuses a pulley target whose width doesn't match the host and
+/// would take the whole skill loader down with it.
+fn engine_config() -> Result<wasmtime::Config, WasmError> {
+    let mut config = wasmtime::Config::new();
+    config.consume_fuel(true);
+    if cfg!(target_os = "android") {
+        let target = if cfg!(target_pointer_width = "64") {
+            "pulley64"
+        } else {
+            "pulley32"
+        };
+        config
+            .target(target)
+            .map_err(|e| WasmError::Compile(format!("wasmtime rejected target {target}: {e}")))?;
+    }
+    Ok(config)
+}
+
 /// Run the actual cranelift compile on a dedicated 8 MB-stack thread.
 ///
 /// **Why the thread:** `wasmtime::Module::new` runs cranelift synchronously
@@ -1551,6 +1581,10 @@ fn wasm_cache_key(bytes: &[u8]) -> String {
 /// a rw map". We hit this installing a WASM skill through the Android UI and
 /// it killed the app instantly. Rather than asking every caller to mind its
 /// stack, we always compile on a fresh thread sized to match desktop.
+///
+/// Targeting Pulley does not get us out of this: cranelift still runs, it just
+/// emits bytecode at the end instead of machine code. The stack cost is the IR
+/// pipeline, not the backend.
 fn compile_on_big_stack(engine: &Engine, bytes: &[u8]) -> Result<Module, WasmError> {
     let engine_clone = engine.clone();
     let bytes_vec = bytes.to_vec();
@@ -3116,13 +3150,12 @@ mod tests {
         }
     }
 
-    /// Engine config used by the compile-cache tests. Must match the config
-    /// `WasmSkill::from_parts` builds, otherwise a cwasm serialised here
-    /// wouldn't deserialise on the production path (and vice-versa).
+    /// Engine used by the compile-cache tests. Shares `engine_config` with
+    /// `WasmSkill::from_parts` because a cwasm is stamped with the config that
+    /// produced it — two configs that drift apart would make every cache entry
+    /// written here unreadable on the production path (and vice-versa).
     fn cache_test_engine() -> Engine {
-        let mut config = wasmtime::Config::new();
-        config.consume_fuel(true);
-        Engine::new(&config).unwrap()
+        Engine::new(&engine_config().unwrap()).unwrap()
     }
 
     fn unique_cache_dir() -> PathBuf {
@@ -3139,6 +3172,34 @@ mod tests {
 
     fn export_names(module: &Module) -> Vec<String> {
         module.exports().map(|e| e.name().to_string()).collect()
+    }
+
+    #[test]
+    fn the_pulley_interpreter_compiles_and_runs_a_module() {
+        // Android compiles skills to Pulley bytecode instead of native code,
+        // and that only works while the `pulley` cargo feature is on. Drop it
+        // from Cargo.toml and this build still compiles happily — every skill
+        // load on Android just starts failing, which no other test would
+        // notice. So exercise the interpreter directly, on whatever host runs
+        // the suite.
+        let mut config = engine_config().unwrap();
+        config.target("pulley64").unwrap();
+        let engine = Engine::new(&config).unwrap();
+
+        let bytes = wat::parse_str(
+            r#"(module (func (export "add") (param i32 i32) (result i32)
+                 (i32.add (local.get 0) (local.get 1))))"#,
+        )
+        .unwrap();
+        let module = Module::new(&engine, &bytes).unwrap();
+
+        let mut store = Store::new(&engine, ());
+        store.set_fuel(10_000).unwrap();
+        let instance = Linker::new(&engine).instantiate(&mut store, &module).unwrap();
+        let add = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "add")
+            .unwrap();
+        assert_eq!(add.call(&mut store, (2, 5)).unwrap(), 7);
     }
 
     #[test]

@@ -10,7 +10,7 @@ serde_json = { workspace = true }
 serde_yaml_ng = "0.10.0"
 thiserror = "2.0.18"
 regex = "1.12.3"
-wasmtime = { version = "43.0.0", default-features = false, features = ["cranelift", "runtime"] }
+wasmtime = { version = "43.0.0", default-features = false, features = ["cranelift", "runtime", "pulley"] }
 reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "rustls", "http2", "charset"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "1.0"
