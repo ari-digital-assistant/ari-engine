@@ -1009,6 +1009,18 @@ impl Engine {
         self.model_catalog = catalog;
     }
 
+    /// A loaded skill by id, as a handle that outlives the borrow.
+    ///
+    /// Exists so a caller can let go of whatever lock guards the engine before
+    /// invoking the skill. A settings action can wait on the user for minutes
+    /// — the Home Assistant sign-in asks for five — and the skill itself needs
+    /// no exclusivity: every invocation builds a fresh WASM store, and the
+    /// trait is Send + Sync so skills can be shared. Holding the Arc also
+    /// keeps this one alive if the skill set is replaced mid-call.
+    pub fn skill_by_id(&self, skill_id: &str) -> Option<Arc<dyn Skill>> {
+        self.skills.iter().find(|s| s.id() == skill_id).map(Arc::clone)
+    }
+
     /// Settings-time invocation: route to a loaded skill by id and run its
     /// `settings_query`. Returns an error result if the skill isn't loaded.
     pub fn query_skill_setting(

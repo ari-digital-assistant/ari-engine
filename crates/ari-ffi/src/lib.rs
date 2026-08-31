@@ -685,6 +685,18 @@ pub struct FfiSettingsQueryResult {
 /// Convert an engine-side [`ari_core::SettingsQueryResult`] into the
 /// UniFFI-exportable [`FfiSettingsQueryResult`]. The engine's
 /// `SettingsOption` only carries `value`/`label`; the richer
+/// The error result both settings entry points return for an id that isn't
+/// loaded. Was inline in the engine before the skill lookup moved out here.
+pub(crate) fn skill_not_loaded(skill_id: &str) -> ari_core::SettingsQueryResult {
+    ari_core::SettingsQueryResult {
+        ok: false,
+        error: Some(format!("skill not loaded: {skill_id}")),
+        options: Vec::new(),
+        message: None,
+        refresh: false,
+    }
+}
+
 /// `FfiSelectOption` download fields don't apply to query results, so
 /// they're `None`.
 pub(crate) fn map_settings_result(
@@ -1157,8 +1169,16 @@ impl AriEngine {
             }
         }
         let values_json = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".to_string());
-        let engine = self.inner.lock().expect("engine mutex poisoned");
-        map_settings_result(engine.query_skill_setting(&skill_id, &field, &values_json))
+        // Same reasoning as `settings_action` below — a dynamic_select does
+        // HTTP, so it can hang for a while too, just not for minutes.
+        let skill = {
+            let engine = self.inner.lock().expect("engine mutex poisoned");
+            engine.skill_by_id(&skill_id)
+        };
+        match skill {
+            Some(skill) => map_settings_result(skill.settings_query(&field, &values_json)),
+            None => map_settings_result(skill_not_loaded(&skill_id)),
+        }
     }
 
     /// Effectful settings-time skill invocation: run `skill_id`'s `settings_action`
@@ -1179,8 +1199,25 @@ impl AriEngine {
             }
         }
         let values_json = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".to_string());
-        let engine = self.inner.lock().expect("engine mutex poisoned");
-        map_settings_result(engine.settings_action(&skill_id, &action, &values_json))
+        // Resolve the skill under the lock, then let go of it before calling.
+        //
+        // This one waits on a human: the Home Assistant sign-in blocks on the
+        // OAuth callback for up to five minutes. Every entry point here shares
+        // this mutex, `process_input` among them, so holding it across the call
+        // left Ari deaf to everything for the duration — and reopening the app
+        // did not help, because the process and the held lock survived.
+        //
+        // Nothing about the call needs exclusivity. `Skill::settings_action`
+        // takes `&self`, each WASM invocation builds a fresh store, and holding
+        // the Arc keeps the skill alive even if the set is replaced mid-call.
+        let skill = {
+            let engine = self.inner.lock().expect("engine mutex poisoned");
+            engine.skill_by_id(&skill_id)
+        };
+        match skill {
+            Some(skill) => map_settings_result(skill.settings_action(&action, &values_json)),
+            None => map_settings_result(skill_not_loaded(&skill_id)),
+        }
     }
 
     pub fn process_input(&self, input: String) -> FfiResponse {
@@ -1638,6 +1675,106 @@ mod uniffi_twin_guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A skill whose settings action parks inside the call until released, so
+    /// a test can ask what the rest of the engine can do meanwhile.
+    struct BlockingSkill {
+        entered: std::sync::Arc<std::sync::Barrier>,
+        release: std::sync::Arc<std::sync::Barrier>,
+    }
+
+    impl ari_core::Skill for BlockingSkill {
+        fn id(&self) -> &str {
+            "test.blocking"
+        }
+        fn specificity(&self) -> ari_core::Specificity {
+            ari_core::Specificity::Low
+        }
+        fn score(&self, _input: &str, _ctx: &ari_core::SkillContext) -> f32 {
+            0.0
+        }
+        fn execute(&self, _input: &str, _ctx: &ari_core::SkillContext) -> ari_core::Response {
+            ari_core::Response::Text(String::new())
+        }
+        fn settings_action(&self, _action: &str, _values: &str) -> ari_core::SettingsQueryResult {
+            self.entered.wait();
+            self.release.wait();
+            ari_core::SettingsQueryResult {
+                ok: true,
+                error: None,
+                options: Vec::new(),
+                message: None,
+                refresh: false,
+            }
+        }
+    }
+
+    /// A settings action can wait on a person — the Home Assistant sign-in
+    /// blocks on an OAuth callback for up to five minutes. It used to do that
+    /// holding the engine mutex, which every entry point here takes, so Ari
+    /// went deaf to everything until it gave up.
+    ///
+    /// The wait is on another thread with a deadline rather than inline: a
+    /// regression should fail this test, not hang it.
+    #[test]
+    fn a_blocked_settings_action_does_not_stop_the_engine_answering() {
+        use std::sync::{mpsc, Arc, Barrier};
+        use std::time::Duration;
+
+        let engine = Arc::new(AriEngine::new());
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        {
+            let mut inner = engine.inner.lock().expect("engine mutex poisoned");
+            inner.replace_skills(vec![Box::new(BlockingSkill {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            })]);
+        }
+
+        let acting = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                engine.settings_action(
+                    "test.blocking".to_string(),
+                    "sign_in".to_string(),
+                    std::collections::HashMap::new(),
+                )
+            })
+        };
+        entered.wait();
+
+        let (tx, rx) = mpsc::channel();
+        {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                let _ = tx.send(engine.process_input("hello".to_string()));
+            });
+        }
+        let answered = rx.recv_timeout(Duration::from_secs(5));
+
+        release.wait();
+        let action = acting.join().expect("settings action thread panicked");
+
+        assert!(
+            answered.is_ok(),
+            "process_input blocked behind a settings action that was waiting on the user",
+        );
+        assert!(action.ok, "the settings action itself should still succeed");
+    }
+
+    #[test]
+    fn a_settings_action_for_an_unloaded_skill_still_reports_it() {
+        // The not-loaded branch moved out of the engine when the lookup did.
+        let engine = AriEngine::new();
+        let r = engine.settings_action(
+            "nobody.here".to_string(),
+            "sign_in".to_string(),
+            std::collections::HashMap::new(),
+        );
+        assert!(!r.ok);
+        assert_eq!(r.error.as_deref(), Some("skill not loaded: nobody.here"));
+    }
 
     struct OkWriter;
     impl FfiSettingWriter for OkWriter {
