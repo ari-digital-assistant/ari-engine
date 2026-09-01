@@ -651,7 +651,7 @@ pub enum FfiResponse {
     /// `dev.heyari.timer`), used by the frontend to resolve `asset:<path>`
     /// references back to the skill's bundle directory. Empty string if
     /// the engine couldn't attribute the response to a specific skill
-    /// (router-direct actions, fallbacks) — treat that as "no bundle,
+    /// (phrase-tier actions, fallbacks) — treat that as "no bundle,
     /// asset references will fail to resolve".
     /// `rearm` true means the engine is awaiting a spoken reply — the host
     /// should re-arm the mic without a wake word (see multi-turn design).
@@ -864,7 +864,7 @@ pub struct AriEngine {
 
 /// Build an [`Engine`] with the full set of built-in skills registered — the
 /// same catalogue used at runtime. Exposed so the `route-eval` binary can
-/// exercise the real router catalogue without duplicating the skill list.
+/// exercise the real skill catalogue without duplicating the skill list.
 /// The 6 built-in Rust skills, freshly constructed. Kept in one place so the
 /// initial engine build and every `reload_community_skills` register exactly
 /// the same set — a reload that forgot one would silently drop that skill.
@@ -1262,19 +1262,6 @@ impl AriEngine {
         }
     }
 
-    /// Run ONLY the on-device FunctionGemma router against `input` and return
-    /// a human-readable summary of its pick (skill + confidence, or NoMatch),
-    /// bypassing the keyword scorer and the assistant. Backs the `/router`
-    /// chat debug command — useful because a cloud-assistant user's normal
-    /// routing never reaches FunctionGemma, so there's otherwise no way to
-    /// see what the on-device router would have done.
-    pub fn debug_route(&self, input: String) -> String {
-        let locale = self.locale_provider.current_locale();
-        let mut engine = self.inner.lock().expect("engine mutex poisoned");
-        engine.set_locale(locale);
-        engine.debug_route(&input)
-    }
-
     /// Discard any pending question the engine is awaiting a reply to. Called
     /// by the host when the re-armed mic times out, the user dismisses, or a
     /// fresh wake word starts a new session. No-op when nothing is pending.
@@ -1294,21 +1281,6 @@ impl AriEngine {
             .lock()
             .expect("engine mutex poisoned")
             .set_conversation_active(active);
-    }
-
-    /// Set the confidence floor router picks must clear, from the INSTALLED
-    /// MODEL's manifest (`min_confidence` — derived per-model by CI's floor
-    /// sweep). `None` reverts to the compiled default, which is also the
-    /// right call for models whose manifest lacks the field. The floor
-    /// belongs to the model, not the device: call it whenever
-    /// `load_router_model` is called, with whatever the sidecar recorded.
-    /// Not `llm`-gated on purpose — the gate lives in engine core, and a
-    /// floor set with no router loaded is simply inert.
-    pub fn set_router_confidence_floor(&self, floor: Option<f32>) {
-        self.inner
-            .lock()
-            .expect("engine mutex poisoned")
-            .set_router_confidence_floor(floor);
     }
 
     /// Master switch for conversation memory (cross-turn context + "Let's
@@ -1407,7 +1379,7 @@ impl AriEngine {
         // Swap the skill set IN PLACE. We deliberately do NOT build a fresh
         // Engine: that discarded every other field — remembered facts (and the
         // first later "remember" then clobbered the on-disk list), the
-        // conversation-memory toggle, the on-device LLM, the router, the
+        // conversation-memory toggle, the on-device LLM, the
         // pending turn, let's-talk state and the conversation buffer — none of
         // which the frontend re-applies after a reload. `replace_skills`
         // touches only the skills; the engine's sinks/providers were installed
@@ -1470,29 +1442,6 @@ impl AriEngine {
         engine.set_llm_none();
     }
 
-    /// Set the FunctionGemma router model path. Like the LLM fallback,
-    /// the model loads lazily on first use and unloads after 60s idle.
-    /// `locale` is the language this model was trained for — the engine
-    /// only routes with it while that matches the active locale, so a
-    /// model left over from a language switch can't route the wrong
-    /// language. Returns `true` if the path exists, `false` otherwise.
-    pub fn load_router_model(&self, model_path: String, locale: String) -> bool {
-        let path = std::path::Path::new(&model_path);
-        if !path.is_file() {
-            return false;
-        }
-        let router = ari_llm::FunctionGemmaRouter::new(path);
-        let mut engine = self.inner.lock().expect("engine mutex poisoned");
-        engine.set_router(Some((Box::new(router), locale)));
-        true
-    }
-
-    /// Remove the FunctionGemma router. Keyword scoring still works;
-    /// unmatched queries go straight to the assistant.
-    pub fn unload_router_model(&self) {
-        let mut engine = self.inner.lock().expect("engine mutex poisoned");
-        engine.set_router(None);
-    }
 }
 
 /// Stubs for builds without the `llm` feature (e.g. the `keyword-hit`
@@ -1518,21 +1467,6 @@ impl AriEngine {
     /// it is dropped and the memory is freed.
     pub fn unload_llm_model(&self) {}
 
-    /// Set the FunctionGemma router model path. Like the LLM fallback,
-    /// the model loads lazily on first use and unloads after 60s idle.
-    /// `locale` is the language this model was trained for — the engine
-    /// only routes with it while that matches the active locale, so a
-    /// model left over from a language switch can't route the wrong
-    /// language. Returns `true` if the path exists, `false` otherwise.
-    pub fn load_router_model(&self, model_path: String, locale: String) -> bool {
-        let _ = model_path;
-        let _ = locale;
-        false
-    }
-
-    /// Remove the FunctionGemma router. Keyword scoring still works;
-    /// unmatched queries go straight to the assistant.
-    pub fn unload_router_model(&self) {}
 }
 
 /// Mechanical guard for the `llm` / `not(llm)` twin `impl` blocks above.
@@ -1557,15 +1491,10 @@ mod uniffi_twin_guard {
     const NO_LLM_MARKER: &str =
         "#[cfg(not(feature = \"llm\"))]\n#[uniffi::export]\nimpl AriEngine {";
 
-    /// The four methods that must exist in both twins. Hardcoded so deleting a
+    /// The methods that must exist in both twins. Hardcoded so deleting a
     /// method from BOTH blocks — which would keep them trivially equal while
     /// dropping an exported FFI symbol the frontend calls — still fails here.
-    const EXPECTED: [&str; 4] = [
-        "load_llm_model",
-        "unload_llm_model",
-        "load_router_model",
-        "unload_router_model",
-    ];
+    const EXPECTED: [&str; 2] = ["load_llm_model", "unload_llm_model"];
 
     /// Body of the `impl AriEngine` block introduced by `marker`, ending at
     /// the first column-0 `}`.

@@ -1,55 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-// ── Skill router ──────────────────────────────────────────────────────
-
-/// What the skill router decided. `confidence` on the skill variants
-/// is the mean per-token log-probability of the model's generated
-/// output — close to 0 = model was sure of every token; -3.0 or
-/// lower = distribution at each position was flat enough that the
-/// routing decision is shaky. The engine compares against
-/// [`MIN_ROUTER_CONFIDENCE`] and falls through to the LLM fallback /
-/// assistant when below threshold, so the user gets a useful answer
-/// instead of running a wrongly-picked skill.
-pub enum RouteResult {
-    /// Route to a registered skill by id, no args extracted.
-    Skill { id: String, confidence: f32 },
-    /// Route to a registered skill by id with typed arguments the
-    /// router extracted from the user's utterance. `args_json` is a
-    /// JSON object string matching the skill's `parameters_schema` —
-    /// e.g. `{"app_name":"Spotify"}` for the `open` skill, or
-    /// `{"title":"call mum","when":"tomorrow at 3pm"}` for reminder.
-    /// The engine threads this through to the skill so it can skip
-    /// its own grammar/regex parser. Empty `{}` carries the same
-    /// semantics as `Skill { id }` — no extracted slots.
-    SkillWithArgs {
-        id: String,
-        args_json: String,
-        confidence: f32,
-    },
-    /// Route to a system action (Android intent). The JSON value carries
-    /// the action type and parameters for the frontend to dispatch.
-    Action(serde_json::Value),
-    /// No match — fall through to the assistant.
-    NoMatch,
-}
-
-/// Confidence threshold below which the engine ignores the router's
-/// pick and falls through to the LLM fallback / assistant.
-///
-/// Retuned 2026-07-19 from the launch value of -3.0 (mean per-token
-/// probability ≈ 0.05 — effectively a do-nothing gate) using the first
-/// empirical sweep on the reference-scale models, then tightened to
-/// -0.06 (≈ 94% mean per-token certainty) on the post-surgery v3 models
-/// (2026-07-20): right and wrong answers sort themselves around that
-/// line — en's last wrong firing sat at -0.075 while its top correct
-/// routes all sat above -0.059, and at -0.06 BOTH locales cleared
-/// Gate v3 locally (en 100%/28%/100%, it 94%/38%/97%). Every route this
-/// gate declines falls through to the assistant tier — the user is
-/// still served, slower — so the threshold trades silent latency for
-/// not sending anyone to the wrong skill. Full sweep:
-/// .superpowers/sdd/morning-report-2026-07-20.md.
-pub const MIN_ROUTER_CONFIDENCE: f32 = -0.06;
-
 /// Appended to the assistant system prompt when prior conversation turns
 /// are supplied, instructing the model to self-classify the turn. The
 /// engine parses and strips the trailing marker (see `ContinuationFlag`).
@@ -76,35 +26,6 @@ pub fn remembered_facts_block(facts: &[String]) -> Option<String> {
         block.push_str(fact);
     }
     Some(block)
-}
-
-/// Trait for an LLM-based skill router that runs after the keyword
-/// matcher fails. The router sees the user input and the list of
-/// available skills, and either picks one, suggests a system action,
-/// or declines.
-///
-/// Each skill entry is `(id, description, parameters_schema_json)`.
-/// The schema is the same OpenAI-style JSON the skill declares via
-/// [`Skill::parameters_schema`] — the router embeds it in the
-/// inference prompt so the model can produce typed args matching
-/// the schema. Callers should pass the schema verbatim; the router
-/// trusts it as already-valid JSON.
-pub trait SkillRouter: Send + Sync {
-    fn route(
-        &self,
-        input: &str,
-        skills: &[(String, String, String)],
-    ) -> RouteResult;
-
-    /// Return the raw inference output from the most recent `route()`
-    /// call, if the router cares to expose one. Used by the engine for
-    /// diagnostic logging — letting us see what the underlying model
-    /// emitted before parsing kicked in (function name, args JSON,
-    /// stop tokens, hallucinations, etc.). Default returns `None` so
-    /// non-introspectable impls and test mocks need no override.
-    fn last_raw_output(&self) -> Option<String> {
-        None
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

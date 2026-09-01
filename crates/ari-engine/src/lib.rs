@@ -1,5 +1,5 @@
 use ari_core::{
-    normalize_input, AppEntry, Response, RouteResult, Skill, SkillContext, SkillRouter,
+    normalize_input, AppEntry, Response, Skill, SkillContext,
     Specificity,
 };
 use ari_skill_loader::assistant::{AssistantApiError, ConfigStore};
@@ -521,18 +521,6 @@ pub struct Engine {
     #[cfg(feature = "llm")]
     llm: Option<Arc<dyn ari_llm::Fallback>>,
     active_assistant: Option<ActiveAssistant>,
-    router: Option<Box<dyn SkillRouter>>,
-    /// The locale the loaded router's model was trained for. Always `Some`
-    /// while `router` is `Some` — see [`Engine::set_router`].
-    router_locale: Option<String>,
-    /// Per-model confidence floor, from the model's own manifest
-    /// (`min_confidence`, derived per-model by CI's floor sweep). `None`
-    /// falls back to the compiled [`ari_core::MIN_ROUTER_CONFIDENCE`] —
-    /// the pre-T5 behaviour, and the behaviour for manifests without the
-    /// field. Calibration is per-MODEL: two same-corpus retrains have
-    /// measured viable floors of -0.0233 and none-at-all, so a constant
-    /// tuned on one roll silently mis-gates the next.
-    router_confidence_floor: Option<f32>,
     /// Optional sink so engine-internal paths (currently Layer C) can
     /// surface diagnostics in the same channel skills use. `None` means
     /// those log calls are no-ops — no formatting cost either.
@@ -597,9 +585,6 @@ impl Engine {
             #[cfg(feature = "llm")]
             llm: None,
             active_assistant: None,
-            router: None,
-            router_locale: None,
-            router_confidence_floor: None,
             log_sink: None,
             envelope_sink: None,
             named_assistants: Vec::new(),
@@ -935,67 +920,6 @@ impl Engine {
         self.named_assistants = list;
     }
 
-    /// Set the skill router (e.g. FunctionGemma) together with the locale
-    /// its model was trained for. When set, the engine consults the router
-    /// after keyword scoring fails, before falling through to the
-    /// assistant — but only while that locale matches the active one, so a
-    /// model left over from a language switch can never route the wrong
-    /// language. Pass `None` to disable.
-    ///
-    /// Router and locale travel as one value deliberately: a router with no
-    /// locale would be unusable, and this makes that state unrepresentable.
-    pub fn set_router(&mut self, router: Option<(Box<dyn SkillRouter>, String)>) {
-        match router {
-            Some((router, locale)) => {
-                self.router = Some(router);
-                self.router_locale = Some(locale);
-            }
-            None => {
-                self.router = None;
-                self.router_locale = None;
-            }
-        }
-    }
-
-    /// Set the confidence floor the router's picks must clear, from the
-    /// installed model's manifest (`min_confidence`). `None` reverts to
-    /// the compiled [`ari_core::MIN_ROUTER_CONFIDENCE`] — correct for
-    /// models whose manifest predates per-model floors. Call alongside
-    /// [`Self::set_router`]: the floor belongs to the MODEL, not the
-    /// device, so it must change when the loaded model does.
-    pub fn set_router_confidence_floor(&mut self, floor: Option<f32>) {
-        self.router_confidence_floor = floor;
-    }
-
-    /// The on-device router, but only when the active language is English.
-    ///
-    /// FunctionGemma is English-only: at 270M it routes other languages
-    /// confidently but wrongly, so the engine never consults it outside `en`.
-    /// Non-English routing is the cloud LLM's job (see `uses_assistant_routing`).
-    /// The debug/eval entry points read `self.router` directly and are
-    /// deliberately exempt, so the eval harness can still score any model.
-    ///
-    /// The `router_locale == ctx.locale` check stays as a second guard: the
-    /// host swaps models asynchronously on a language switch, and routing one
-    /// language through another's model would be confident nonsense.
-    fn router_for_active_locale(&self) -> Option<&dyn SkillRouter> {
-        if self.ctx.locale != "en" {
-            return None;
-        }
-        let router = self.router.as_ref()?;
-        if self.router_locale.as_deref() != Some(self.ctx.locale.as_str()) {
-            return None;
-        }
-        Some(router.as_ref())
-    }
-
-    /// The effective floor: the loaded model's own, else the compiled
-    /// constant.
-    fn router_floor(&self) -> f32 {
-        self.router_confidence_floor
-            .unwrap_or(ari_core::MIN_ROUTER_CONFIDENCE)
-    }
-
     /// Install the config store used to read skill settings from
     /// engine-internal paths (the fallback tier(s)).
     pub fn set_config_store(&mut self, store: Option<Arc<dyn ConfigStore>>) {
@@ -1148,75 +1072,12 @@ impl Engine {
             .collect()
     }
 
-    /// Debug helper for the `/router` chat command: run ONLY the FunctionGemma
-    /// router against `input` and report its raw pick — bypassing the keyword
-    /// scorer, the assistant, and the confidence gate. Lets us inspect the
-    /// on-device router even when normal routing goes through a cloud
-    /// assistant (which skips FunctionGemma entirely).
-    pub fn debug_route(&self, input: &str) -> String {
-        let normalized = normalize_input(input.trim(), &self.ctx.locale);
-        if normalized.is_empty() {
-            return "empty input".to_string();
-        }
-        let Some(ref router) = self.router else {
-            return "router not loaded".to_string();
-        };
-        let catalog = self.router_catalog();
-        let result = router.route(&normalized, &catalog);
-        let raw = router.last_raw_output().unwrap_or_default();
-        let floor = self.router_floor();
-        let gate = |c: f32| {
-            if c < floor {
-                "below threshold → would fall through"
-            } else {
-                "above threshold → would dispatch"
-            }
-        };
-        let verdict = match &result {
-            RouteResult::Skill { id, confidence } => {
-                format!("skill={id} (confidence {confidence:.3}, {})", gate(*confidence))
-            }
-            RouteResult::SkillWithArgs { id, args_json, confidence } => format!(
-                "skill={id} args={args_json} (confidence {confidence:.3}, {})",
-                gate(*confidence)
-            ),
-            RouteResult::Action(a) => format!("action={a}"),
-            RouteResult::NoMatch => "NoMatch → falls through to assistant".to_string(),
-        };
-        format!("input: {normalized:?}\n{verdict}\nraw: {raw}")
-    }
-
-    /// Router-only routing decision, mirroring the router branch of
-    /// `process_input_traced`: run the router against the live catalogue and
-    /// apply the confidence gate. Returns the skill id that WOULD be
-    /// dispatched, or `None` for NoMatch / below-threshold (i.e. "falls
-    /// through to the assistant"). Backs the routing-eval promotion gate;
-    /// runs neither the keyword scorer nor the assistant.
-    ///
-    /// Deliberately NOT locale-gated, unlike production routing: this is an
-    /// explicit "run this model" primitive, and route-eval grades a candidate
-    /// model against a locale's eval bank by setting both to match. Gating
-    /// here would only ever mask a harness misconfiguration as an abstention.
-    pub fn route_decision(&self, input: &str) -> Option<String> {
-        let normalized = normalize_input(input.trim(), &self.ctx.locale);
-        if normalized.is_empty() {
-            return None;
-        }
-        let router = self.router.as_ref()?;
-        match router.route(&normalized, &self.router_catalog()) {
-            RouteResult::Skill { id, confidence }
-            | RouteResult::SkillWithArgs { id, confidence, .. } => {
-                (confidence >= self.router_floor()).then_some(id)
-            }
-            RouteResult::Action(_) | RouteResult::NoMatch => None,
-        }
-    }
-
     /// The keyword scorer's verdict for `input`: the skill the ranking rounds
     /// would execute, or `None` when no skill clears its threshold (in which
-    /// case production consults the router). Shares the exact ranking logic
-    /// `process_input_traced` uses — deliberately not a replica, because a
-    /// second copy would drift from the path it is supposed to describe.
+    /// case the phrase tier gets a go, then the assistant). Shares the exact
+    /// ranking logic `process_input_traced` uses — deliberately not a replica,
+    /// because a second copy would drift from the path it is supposed to
+    /// describe.
     pub fn keyword_decision(&self, input: &str) -> Option<String> {
         let normalized = normalize_input(input.trim(), &self.ctx.locale);
         if normalized.is_empty() {
@@ -1282,24 +1143,6 @@ impl Engine {
             }
         }
         None
-    }
-
-    /// Raw router emission for analysis: the function the router picked and its
-    /// confidence (mean per-token log-prob), BEFORE the confidence gate.
-    /// `None` when the router abstained (emitted no function call). Used by
-    /// route-eval's verbose mode to study whether misroutes sit at lower
-    /// confidence than correct routes.
-    pub fn route_raw(&self, input: &str) -> Option<(String, f32)> {
-        let normalized = normalize_input(input.trim(), &self.ctx.locale);
-        if normalized.is_empty() {
-            return None;
-        }
-        let router = self.router.as_ref()?;
-        match router.route(&normalized, &self.router_catalog()) {
-            RouteResult::Skill { id, confidence }
-            | RouteResult::SkillWithArgs { id, confidence, .. } => Some((id, confidence)),
-            RouteResult::Action(_) | RouteResult::NoMatch => None,
-        }
     }
 
     pub fn process_input_traced(&self, input: &str) -> (Response, Option<DebugTrace>) {
@@ -1548,9 +1391,6 @@ impl Engine {
         // signal than an explicit trigger and must never outrank one.
         let phrase_scores = self.phrase_scores(&normalized);
         if let Some((winner, round_idx)) = Self::rank(&phrase_scores) {
-            trace.winner = Some(format!("phrase:{}", winner.skill_id));
-            trace.round = Some(round_idx);
-
             let skill = self
                 .skills
                 .iter()
@@ -1559,114 +1399,30 @@ impl Engine {
                 .clone();
 
             let response = skill.execute(&normalized, &exec_ctx);
-            let response = self.maybe_intercept_consult(skill, &normalized, response);
-            return (response, Some(trace));
+            if Self::is_no_match_envelope(&response) {
+                self.log(
+                    LogLevel::Info,
+                    &format!(
+                        "phrase: skill={} declined (_ari_no_match); falling through",
+                        winner.skill_id
+                    ),
+                );
+            } else {
+                trace.winner = Some(format!("phrase:{}", winner.skill_id));
+                trace.round = Some(round_idx);
+                let response = self.maybe_intercept_consult(skill, &normalized, response);
+                return (response, Some(trace));
+            }
         }
 
-        // Still nothing. Two routing tiers, in this order:
-        //
-        // 1. The on-device router (FunctionGemma), but only for English — at
-        //    270M it routes other languages confidently but wrongly, so
-        //    `router_for_active_locale` gates it to `en`. Sub-second, offline,
-        //    free. It only speaks up when its confidence clears the floor its
-        //    own manifest shipped, so the phrasings it isn't sure about cost
-        //    nothing and fall to tier 2.
-        // 2. The assistant — cloud (one call that routes OR answers) or the
-        //    on-device LLM, which only answers. Slower and, for cloud, a
-        //    network round-trip, but it handles what tier 1 declined and
-        //    answers general questions.
+        // Still nothing. The assistant is the last tier — cloud (one call
+        // that routes OR answers) or the on-device LLM, which only answers.
+        // Slower and, for cloud, a network round-trip, but it handles what
+        // the phrase tier declined and answers general questions.
 
         let skill_catalog = self.router_catalog();
 
-        if let Some(router) = self.router_for_active_locale() {
-            let route_result = router.route(&normalized, &skill_catalog);
-
-            // Diagnostic: log the model's raw output so we can see what
-            // FunctionGemma actually emits — function name + args block +
-            // stop tokens. Useful for verifying whether the model is
-            // producing usable typed-args we can consume, or whether the
-            // training/inference prompt needs work before we plumb args
-            // through to skills.
-            if let Some(raw) = router.last_raw_output() {
-                self.log(
-                    LogLevel::Info,
-                    &format!("router: raw output ({} bytes): {raw:?}", raw.len()),
-                );
-            }
-
-            match route_result {
-                RouteResult::Skill { ref id, confidence } => {
-                    if confidence < self.router_floor() {
-                        self.log(
-                            LogLevel::Info,
-                            &format!(
-                                "router: skipping skill={id} — confidence {confidence:.3} \
-                                 below threshold {threshold:.3}; falling through to assistant",
-                                threshold = self.router_floor(),
-                            ),
-                        );
-                    } else if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
-                        self.log(
-                            LogLevel::Info,
-                            &format!("router: dispatching skill={id} (confidence {confidence:.3})"),
-                        );
-                        let response = skill.execute(&normalized, &exec_ctx);
-                        if Self::is_no_match_envelope(&response) {
-                            self.log(
-                                LogLevel::Info,
-                                &format!("router: skill={id} declined (_ari_no_match); falling through"),
-                            );
-                        } else {
-                            trace.winner = Some(format!("router:{id}"));
-                            let response = self.maybe_intercept_consult(skill, &normalized, response);
-                            return (response, Some(trace));
-                        }
-                    }
-                }
-                RouteResult::SkillWithArgs {
-                    ref id,
-                    ref args_json,
-                    confidence,
-                } => {
-                    if confidence < self.router_floor() {
-                        self.log(
-                            LogLevel::Info,
-                            &format!(
-                                "router: skipping skill={id} — confidence {confidence:.3} \
-                                 below threshold {threshold:.3}; falling through to assistant",
-                                threshold = self.router_floor(),
-                            ),
-                        );
-                    } else if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
-                        self.log(
-                            LogLevel::Info,
-                            &format!(
-                                "router: dispatching skill={id} with typed args ({} bytes, confidence {confidence:.3})",
-                                args_json.len()
-                            ),
-                        );
-                        let response = skill.execute_with_args(&normalized, args_json, &exec_ctx);
-                        if Self::is_no_match_envelope(&response) {
-                            self.log(
-                                LogLevel::Info,
-                                &format!("router: skill={id} declined (_ari_no_match); falling through"),
-                            );
-                        } else {
-                            trace.winner = Some(format!("router:{id}+args"));
-                            let response = self.maybe_intercept_consult(skill, &normalized, response);
-                            return (response, Some(trace));
-                        }
-                    }
-                }
-                RouteResult::Action(action) => {
-                    trace.winner = Some("router:action".to_string());
-                    return (Response::Action(action), Some(trace));
-                }
-                RouteResult::NoMatch => {}
-            }
-        }
-
-        // Tier 2. Whether the assistant is asked to ROUTE what tier 1 left
+        // Whether the assistant is asked to ROUTE what the earlier tiers left
         // behind (as opposed to only answering it) turns on ONE thing: is a
         // cloud assistant wired? Routing is cloud-only.
         //
@@ -1677,8 +1433,10 @@ impl Engine {
         //   a single call); other languages get the two-step routing prompt.
         // - No cloud assistant, any locale: ask nothing. The on-device LLM is
         //   far too slow at routing (the catalogue prefill dominates) and, at
-        //   its size, unreliable — so tier 1's verdict stands (English only)
-        //   and anything left goes to the answer path, answered directly.
+        //   its size, unreliable — so anything left goes to the answer path,
+        //   answered directly. On-device users are served by the keyword and
+        //   phrase tiers above; this one is where a cloud assistant earns its
+        //   keep on the really oblique phrasings.
         let has_cloud_assistant =
             matches!(&self.active_assistant, Some(ActiveAssistant::Api { .. }));
         let use_assistant_routing = uses_assistant_routing(has_cloud_assistant);
@@ -3047,7 +2805,7 @@ mod tests {
 
     #[test]
     fn remember_my_name_elicits_then_captures_en() {
-        let mut engine = Engine::new();
+        let engine = Engine::new();
         let (resp, _) = engine.process_input_traced("remember my name");
         assert!(matches!(resp, Response::Text(ref s) if s == name_prompt_for("en")),
             "bare request must ask for the name; got {resp:?}");
@@ -3076,7 +2834,7 @@ mod tests {
 
     #[test]
     fn name_reply_with_no_name_apologises_once() {
-        let mut engine = Engine::new();
+        let engine = Engine::new();
         let _ = engine.process_input_traced("remember my name");
         let (resp, _) = engine.process_input_traced("nope");
         assert!(matches!(resp, Response::Text(ref s) if s == name_not_caught_for("en")));
@@ -3086,7 +2844,7 @@ mod tests {
 
     #[test]
     fn cancel_during_name_capture_escapes() {
-        let mut engine = Engine::new();
+        let engine = Engine::new();
         let _ = engine.process_input_traced("remember my name");
         let (resp, _) = engine.process_input_traced("cancel");
         assert!(matches!(resp, Response::Text(ref s) if s == cancel_ack_for("en")));
@@ -3097,7 +2855,7 @@ mod tests {
     #[test]
     fn remember_my_name_with_name_stores_directly() {
         // Regression: the non-bare form must NOT elicit — it stores as-is.
-        let mut engine = Engine::new();
+        let engine = Engine::new();
         let (resp, _) = engine.process_input_traced("remember my name is Dave");
         assert!(matches!(resp, Response::Text(ref s) if s == fact_remembered_ack_for("en")));
         assert!(!engine.has_pending_turn());
@@ -3349,28 +3107,12 @@ mod tests {
         assert_eq!(turns[0].assistant, "Hi there.", "records the spoken response");
     }
 
-    // --- Router catalogue eligibility ---
-
-    /// A router that records the skill catalogue it was handed and then
-    /// declines to route, so the test can inspect exactly which skills the
-    /// engine offered the model.
-    struct CatalogCapturingRouter {
-        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    impl SkillRouter for CatalogCapturingRouter {
-        fn route(&self, _input: &str, skills: &[(String, String, String)]) -> RouteResult {
-            *self.seen.lock().unwrap() = skills.iter().map(|(id, _, _)| id.clone()).collect();
-            RouteResult::NoMatch
-        }
-    }
+    // --- Assistant catalogue eligibility ---
 
     #[test]
     fn router_ineligible_skill_is_excluded_from_catalogue() {
-        use std::sync::{Arc, Mutex};
-
         /// A keyword-only skill (like search): scores nothing here and opts
-        /// out of the router catalogue.
+        /// out of the catalogue offered to the assistant.
         struct KeywordOnlySkill;
         impl Skill for KeywordOnlySkill {
             fn id(&self) -> &str { "keyword_only" }
@@ -3383,246 +3125,57 @@ mod tests {
             }
         }
 
-        let seen = Arc::new(Mutex::new(Vec::new()));
         let mut engine = Engine::new();
         engine.register_skill(Box::new(KeywordOnlySkill));
         engine.register_skill(Box::new(MockSkill {
             id: "eligible", specificity: Specificity::Low, fixed_score: 0.0,
             response: "eligible", requires_setting: None,
         }));
-        engine.set_router(Some((Box::new(CatalogCapturingRouter { seen: seen.clone() }), "en".to_string())));
 
-        // Neither skill scores, so the router runs and we can inspect the
-        // catalogue it received.
-        let _ = engine.process_input_traced(
-            "what is the capital city of the united arab emirates",
-        );
-
-        let seen = seen.lock().unwrap();
+        let offered: Vec<String> = engine.router_catalog().into_iter().map(|(id, _, _)| id).collect();
         assert!(
-            seen.contains(&"eligible".to_string()),
-            "router-eligible skill must be offered to the router, got {seen:?}"
+            offered.contains(&"eligible".to_string()),
+            "eligible skill must be offered to the assistant, got {offered:?}"
         );
         assert!(
-            !seen.contains(&"keyword_only".to_string()),
-            "router-ineligible skill must be filtered out, got {seen:?}"
+            !offered.contains(&"keyword_only".to_string()),
+            "ineligible skill must be filtered out, got {offered:?}"
         );
     }
 
-    // --- Router/assistant dispatch must not leak the _ari_no_match sentinel ---
+    // --- Phrase-tier dispatch must not leak the _ari_no_match sentinel ---
 
     /// A skill that always declines via the `_ari_no_match` sentinel (like
     /// `open` does for a no-trigger utterance). Never scores at the keyword
-    /// tier, so only a router/assistant can dispatch it.
+    /// tier, so only the phrase tier can dispatch it.
     struct DeclineSkill;
     impl Skill for DeclineSkill {
         fn id(&self) -> &str { "decliner" }
         fn specificity(&self) -> Specificity { Specificity::Low }
         fn score(&self, _: &str, _: &SkillContext) -> f32 { 0.0 }
+        fn example_utterances(&self) -> &[ari_core::ExampleUtterance] {
+            const EXAMPLES: &[ari_core::ExampleUtterance] = &[ari_core::ExampleUtterance {
+                text: "show me the camera",
+                args: "{}",
+                weight: 0.95,
+            }];
+            EXAMPLES
+        }
         fn execute(&self, _: &str, _: &SkillContext) -> Response {
             Response::Action(serde_json::json!({ "v": 1, "_ari_no_match": true }))
         }
-        fn execute_with_args(&self, _: &str, _: &str, _: &SkillContext) -> Response {
-            Response::Action(serde_json::json!({ "v": 1, "_ari_no_match": true }))
-        }
-    }
-
-    /// Router that routes everything to `decliner`. `with_args` toggles which
-    /// `RouteResult` variant it emits, exercising both router dispatch sites.
-    struct AlwaysRouteTo { id: String, with_args: bool }
-    impl SkillRouter for AlwaysRouteTo {
-        fn route(&self, _input: &str, _skills: &[(String, String, String)]) -> RouteResult {
-            if self.with_args {
-                RouteResult::SkillWithArgs { id: self.id.clone(), args_json: "{}".to_string(), confidence: 1.0 }
-            } else {
-                RouteResult::Skill { id: self.id.clone(), confidence: 1.0 }
-            }
-        }
     }
 
     #[test]
-    fn router_skill_dispatch_does_not_leak_no_match_sentinel() {
+    fn phrase_dispatch_does_not_leak_no_match_sentinel() {
         let mut engine = Engine::new();
         engine.register_skill(Box::new(DeclineSkill));
-        engine.set_router(Some((Box::new(AlwaysRouteTo { id: "decliner".to_string(), with_args: false }), "en".to_string())));
-        // Keyword tier: decliner scores 0.0 → no winner → router routes to
-        // decliner → execute returns the sentinel → must be filtered, NOT
-        // returned to the user.
+        // Keyword tier: decliner scores 0.0 → no winner → its example phrase
+        // wins the phrase tier → execute returns the sentinel → must be
+        // filtered, NOT returned to the user.
         match engine.process_input("show me the camera") {
             Response::Text(t) => assert_eq!(t, fallback_response_for("en")),
             other => panic!("sentinel leaked instead of falling through: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn router_skill_with_args_dispatch_does_not_leak_no_match_sentinel() {
-        let mut engine = Engine::new();
-        engine.register_skill(Box::new(DeclineSkill));
-        engine.set_router(Some((Box::new(AlwaysRouteTo { id: "decliner".to_string(), with_args: true }), "en".to_string())));
-        match engine.process_input("show me the camera") {
-            Response::Text(t) => assert_eq!(t, fallback_response_for("en")),
-            other => panic!("sentinel leaked instead of falling through: {other:?}"),
-        }
-    }
-
-    // --- Router locale gating and precedence ---
-
-    /// A router that always claims `target` at maximum confidence, so a test
-    /// can prove the engine consulted it by observing the skill it dispatched.
-    struct AlwaysRoutesTo {
-        target: &'static str,
-    }
-
-    impl SkillRouter for AlwaysRoutesTo {
-        fn route(&self, _input: &str, _skills: &[(String, String, String)]) -> RouteResult {
-            RouteResult::Skill {
-                id: self.target.to_string(),
-                confidence: 0.0,
-            }
-        }
-    }
-
-    /// A skill that never scores, so only a router can dispatch it.
-    fn unreachable_by_keyword(id: &'static str, response: &'static str) -> MockSkill {
-        MockSkill {
-            id,
-            specificity: Specificity::Low,
-            fixed_score: 0.0,
-            response,
-            requires_setting: None,
-        }
-    }
-
-    /// A cloud assistant pointed at a closed port. Present so
-    /// `has_cloud_assistant` is true; any actual call fails immediately
-    /// rather than reaching the network.
-    fn unreachable_cloud_assistant() -> ActiveAssistant {
-        use ari_skill_loader::assistant::MemoryConfigStore;
-        use ari_skill_loader::manifest::{AuthScheme, LocalizedPrompt, RequestFormat};
-
-        ActiveAssistant::Api {
-            skill_id: "test.assistant".to_string(),
-            config: ApiConfig {
-                endpoint: Some("http://127.0.0.1:1/v1/chat".to_string()),
-                endpoint_config_key: None,
-                default_endpoint: None,
-                auth: AuthScheme::None,
-                auth_header: None,
-                auth_config_key: None,
-                model_config_key: None,
-                model_provider: None,
-                tier_config_key: None,
-                default_tier: None,
-                default_models: Default::default(),
-                default_model: "test-model".to_string(),
-                system_prompt: LocalizedPrompt::from_english("test".to_string()),
-                request_format: RequestFormat::Openai,
-                response_path: "choices.0.message.content".to_string(),
-                api_version: None,
-                api_version_header: None,
-                max_tokens: 64,
-                temperature: 0.0,
-            },
-            config_store: Arc::new(MemoryConfigStore::new()),
-        }
-    }
-
-    #[test]
-    fn router_is_english_only_even_with_a_matching_locale_model() {
-        use std::sync::{Arc, Mutex};
-
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = Engine::new();
-        engine.set_locale("it".to_string());
-        engine.register_skill(Box::new(unreachable_by_keyword("meteo", "Sole.")));
-        // An Italian-locale model is loaded and matches the active locale...
-        engine.set_router(Some((
-            Box::new(CatalogCapturingRouter { seen: seen.clone() }),
-            "it".to_string(),
-        )));
-
-        let (response, _) = engine.process_input_traced("che tempo fa");
-
-        // ...but FunctionGemma is English-only, so it is never consulted.
-        assert!(
-            seen.lock().unwrap().is_empty(),
-            "FunctionGemma must not be consulted for a non-English locale, got {:?}",
-            seen.lock().unwrap()
-        );
-        match response {
-            Response::Text(t) => assert_eq!(t, fallback_response_for("it")),
-            other => panic!("expected the Italian fallback, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn router_is_skipped_when_its_model_is_for_another_locale() {
-        use std::sync::{Arc, Mutex};
-
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = Engine::new();
-        engine.set_locale("it".to_string());
-        engine.register_skill(Box::new(unreachable_by_keyword("meteo", "Sole.")));
-        engine.set_router(Some((
-            Box::new(CatalogCapturingRouter { seen: seen.clone() }),
-            "en".to_string(),
-        )));
-
-        let (response, _) = engine.process_input_traced("che tempo fa");
-
-        let seen = seen.lock().unwrap();
-        assert!(
-            seen.is_empty(),
-            "an English model must never be asked to route Italian, got {seen:?}"
-        );
-        match response {
-            Response::Text(t) => assert_eq!(t, fallback_response_for("it")),
-            other => panic!("expected the Italian fallback, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn router_outranks_a_cloud_assistant_when_a_matching_model_is_loaded() {
-        let mut engine = Engine::new();
-        engine.register_skill(Box::new(unreachable_by_keyword("weather", "Sunny.")));
-        engine.set_active_assistant(Some(unreachable_cloud_assistant()));
-        engine.set_router(Some((
-            Box::new(AlwaysRoutesTo { target: "weather" }),
-            "en".to_string(),
-        )));
-
-        let (response, trace) = engine.process_input_traced("is it raining out there");
-
-        match response {
-            Response::Text(t) => assert_eq!(t, "Sunny."),
-            other => panic!("expected the routed skill's text, got {other:?}"),
-        }
-        assert_eq!(
-            trace.unwrap().winner,
-            Some("router:weather".to_string()),
-            "the on-device router must win before the cloud one-shot is called"
-        );
-    }
-
-    #[test]
-    fn unloading_the_router_clears_its_locale() {
-        let mut engine = Engine::new();
-        engine.register_skill(Box::new(unreachable_by_keyword("weather", "Sunny.")));
-        engine.set_router(Some((
-            Box::new(AlwaysRoutesTo { target: "weather" }),
-            "en".to_string(),
-        )));
-        engine.set_router(None);
-
-        let (response, _) = engine.process_input_traced("is it raining out there");
-
-        match response {
-            Response::Text(t) => assert_eq!(
-                t,
-                fallback_response_for("en"),
-                "no router loaded means nothing routes"
-            ),
-            other => panic!("expected the fallback, got {other:?}"),
         }
     }
 
