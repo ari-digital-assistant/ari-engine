@@ -2,20 +2,9 @@ use ari_core::{AppEntry, Response, Skill, SkillContext, Specificity};
 use ari_engine::Engine;
 use ari_skills::OpenSkill;
 
-// NOTE: the task brief for this test named the entry point
-// `Engine::route_decision`, describing it as returning "the KEYWORD-tier
-// winner's skill id". That description matches `Engine::keyword_decision`
-// (see its doc comment: "the skill the ranking rounds would execute" /
-// "shares the exact ranking logic process_input_traced uses"), not
-// `route_decision`, which is documented as "Router-only... runs neither the
-// keyword scorer nor the assistant" and short-circuits to `None` whenever no
-// FunctionGemma router is loaded (always true for a bare `Engine::new()` in
-// a unit test). Verified: with the brief's literal `route_decision` call,
-// both tests below fail with `None` for that reason alone, regardless of
-// Tasks 3-5's behaviour. Swapping to `keyword_decision` — the method whose
-// documented behaviour actually matches the brief's description — makes both
-// assertions pass, confirming Tasks 3-5's keyword-tier disambiguation is
-// correct. No production code was touched to reach this result.
+// These assert the KEYWORD tier's verdict specifically, so they call
+// `keyword_decision` rather than driving a whole turn: what matters here is
+// which skill the ranking rounds pick, not what the later tiers do with it.
 
 /// Stand-in for Home Assistant's keyword tier: medium specificity, scores 0.8
 /// when the utterance contains an open/close/lock/unlock verb — its real

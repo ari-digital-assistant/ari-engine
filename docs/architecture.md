@@ -23,11 +23,11 @@ User speaks
     │
     │ no match
     ▼
-5a. FunctionGemma — the on-device router. Runs whenever a model for the
-    │ language being spoken is loaded. Offline, sub-second, free.
+5a. Example phrases — the skills' own phrasings, matched directly.
+    │ Offline, instant, free. No model.
     │
-    ├─ confident pick ───────────► Skill executes. Done.
-    └─ abstains / below its floor ► step 5b
+    ├─ a phrase matches ─────────► Skill executes. Done.
+    └─ nothing matches ──────────► step 5b
     ▼
 5b. The assistant routes what's left
     │
@@ -139,44 +139,41 @@ and the response is returned to the user.
 This step is **fast, deterministic, and free** — no model inference, just
 string matching. It handles the majority of everyday utterances.
 
-### 5a. FunctionGemma — the on-device router
+### 5a. Example phrases
 
-Anything the keyword scorer didn't claim goes to the on-device router first,
-**whenever a model exists for the language being spoken**. There is one
-trained model per locale (`functiongemma-en-latest`, `functiongemma-it-latest`,
-…), not one multilingual model; the host downloads the one matching the active
-language and swaps it when the user switches.
+Anything the keyword scorer didn't claim is matched against the skills' own
+example phrases. Every skill declares them — built-ins in
+`example_utterances_for(locale)`, community skills in their manifest's
+`examples:` block — and they are the oblique phrasings the keyword patterns
+deliberately miss.
 
-FunctionGemma (270M parameters, ~253MB GGUF) sees the input plus the catalogue
-of registered skills — declared by **short alias** (the final id segment, e.g.
-`weather`, not `dev.heyari.weather`), because a 270M model can't reliably emit
-reverse-DNS ids; the engine resolves the alias back. It either picks a skill or
-abstains (`NoMatch`). It is trained on Ari's own skills plus a balanced set of
-"answer nothing" negatives, so it abstains on general-knowledge questions
-rather than force-routing them. Lazy lifecycle: loads on first use, unloads
-after 60s idle; sub-second inference on phone.
+A phrase is a template: literal words plus `{slot}` placeholders, each of
+which binds one or more words. `play {song}` matches "play hotel california"
+but not "play", and not "shall i play something" — the match is anchored at
+both ends, so a phrase claims the whole utterance or nothing.
 
-**The confidence floor is what makes going first safe.** Every published model
-ships a `min_confidence` in its manifest, derived from that specific model's
-measured precision/abstention curve, and the device enforces it. A pick below
-the floor is discarded and the query carries on to 5b. So the router only
-speaks up when it is sure, and being wrong costs a fall-through rather than a
-wrong answer.
+Each phrase carries a **weight** on the same 0..=1 scale as
+`matching.patterns`, reflecting how uniquely its wording points at one skill:
+"play {song}" is 0.95, "can we have some {artist}" is 0.55, because the latter
+could plausibly belong to several skills. Scoring then runs the *same* ranking
+rounds the keyword tier uses, so weight and specificity arbitrate exactly as
+they do there.
 
-**The locale must match.** The engine tracks which language the loaded model
-was trained for (`Engine::set_router` takes both) and refuses to route with a
-mismatched one. The host swaps models asynchronously on a language change, so
-without this check there is a window where an English model would confidently
-route Italian.
+**It runs second, deliberately.** A `{slot}` phrase is a looser signal than an
+explicit trigger, so it must never outrank one — an utterance a keyword
+pattern claims never reaches this tier. A skill that wins here and then
+declines (the `_ari_no_match` sentinel) falls through like any other tier.
 
-If no model is installed for the active language, this step is skipped
-entirely.
+Phrases are matched against normalised input, so they are stored normalised
+too: `normalize_phrase` expands contractions in the literals while leaving
+`{slot}` intact, since plain normalisation strips the braces. Manifest phrases
+go through it at load; the built-in banks are static and stored pre-normalised,
+with a test guarding that they stay that way. An un-normalised phrase is not an
+error anywhere — it simply never matches.
 
-> The training pipeline (`ari-tools/functiongemma`) deliberately omits Google's
-> mobile-actions demo dataset and scales negatives to the skill count; a
-> **promotion gate** (`route-eval`) scores precision and abstention on a
-> generated eval bank at the model's own derived floor, and blocks any
-> retrained model that regresses before it can ship.
+> This tier replaced a fine-tuned on-device routing model in September 2026,
+> and inherited its training corpus as the phrase banks. The post-mortem in
+> `docs/postmortems/` covers why the model went.
 
 ### 5b. The assistant routes what's left
 
@@ -188,13 +185,14 @@ folding route+answer into one call avoids a second round-trip. (See
 **Non-English.** The engine asks the *active assistant* (cloud or on-device
 LLM) to pick a skill id from the catalogue, or answer.
 
-**English with no cloud assistant.** Nothing else routes. The on-device LLM
-takes ~22s to route because the catalogue prefill dominates, so the router's
-verdict stands and the query goes straight to step 6 to be answered.
+**No cloud assistant, any language.** Nothing else routes. The on-device LLM
+takes ~22s to route because the catalogue prefill dominates, so the keyword and
+phrase tiers' verdict stands and the query goes straight to step 6 to be
+answered.
 
 ### 6. Answer the leftover
 
-If routing produced no skill (FunctionGemma abstained, or the assistant said
+If routing produced no skill (no phrase matched, or the assistant said
 "none"), the active assistant answers the question directly:
 
 - **Builtin** — on-device GGUF model (Gemma 3 1B default). One-sentence
@@ -247,7 +245,7 @@ understand that." and returns to listening for the wake word.
 | STT | `ari-android/.../stt/SpeechRecognizer.kt` (sherpa-onnx) |
 | Input normalisation | `ari-engine/crates/ari-core/src/lib.rs` |
 | Keyword scoring | `ari-engine/crates/ari-skills/src/*.rs` (built-in), `ari-skill-loader` (community) |
-| FunctionGemma router | `ari-engine/crates/ari-llm/src/lib.rs` (`FunctionGemmaRouter`) |
+| Phrase matching | `ari-engine/crates/ari-core/src/lib.rs` (`phrase_matches`), `ari-skill-loader/src/scoring.rs` |
 | Assistant fallback | `ari-engine/crates/ari-llm/src/lib.rs` (builtin LLM), `ari-skill-loader/src/assistant.rs` (API adapter) |
 | STT retry | `ari-android/.../voice/VoiceSession.kt` |
 | Engine orchestration | `ari-engine/crates/ari-engine/src/lib.rs` (`process_input_traced`) |
@@ -258,7 +256,7 @@ understand that." and returns to listening for the wake word.
 | Layer | Catches | Example |
 |-------|---------|---------|
 | Keyword scorer (always first) | Exact keyword/regex matches | "what time is it" → CurrentTime |
-| FunctionGemma (on-device, per-locale, second) | Paraphrases the keywords missed, in whatever language has a model; abstains on general knowledge and on anything below its floor | "is it morning yet" → CurrentTime; "che ore sono ormai" → CurrentTime; "capital of France" → abstain |
-| Cloud one-shot | Routes *or* answers in a single call, for what the router declined | "remind me at 5" → Reminder; "capital of France" → answered |
+| Example phrases (on-device, second) | Oblique phrasings the keyword patterns deliberately miss, in every language a skill declares phrases for | "is it morning yet" → CurrentTime; "che ore sono ormai" → CurrentTime |
+| Cloud one-shot | Routes *or* answers in a single call, for what the phrase tier declined | "remind me at 5" → Reminder; "capital of France" → answered |
 | Assistant | Answers the general-knowledge questions routing left behind | "what's the capital of France" → "Paris." |
 | STT retry | Misheard transcripts | "wheat time" (misheard) → retried → "what time" → CurrentTime |

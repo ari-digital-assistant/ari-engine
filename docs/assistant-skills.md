@@ -411,10 +411,11 @@ to (the assistant now participates in *routing*, not just answering — see
 `architecture.md` for the full picture):
 
 ```
-keyword ranking rounds fail → route the leftover:
+keyword ranking rounds fail → example phrases match → skill executes
+phrases fail too → route the leftover:
   • cloud assistant   → ONE-SHOT: routes to a skill OR answers directly
-  • on-device / none, English → FunctionGemma routes; abstain → assistant answers
   • non-English       → assistant routes; none → assistant answers
+  • on-device / none  → nothing routes; the assistant answers
 → no assistant → FALLBACK_RESPONSE
 ```
 
@@ -436,9 +437,9 @@ enum ActiveAssistant {
 }
 ```
 
-When `active_assistant` is `Some(Builtin { .. })`, the on-device LLM answers the leftover via `self.llm.try_answer()` (FunctionGemma did the routing first). The `tier` field (Small/Medium/Large) gates **Layer C** — the multi-turn deferred-commit consult where a skill calls back to the assistant mid-turn (skill → LLM → skill, e.g. to clarify): Small is rejected (too small for structured output), Medium and Large invoke `Fallback::run_prompt`. When it's `Some(Api(..))`, the engine builds the HTTP request from the `ApiConfig`, resolves config values (model, endpoint, API key) from the `ConfigStore`, makes the call, and extracts the response via `response_path`.
+When `active_assistant` is `Some(Builtin { .. })`, the on-device LLM answers the leftover via `self.llm.try_answer()` — it only ever answers, never routes. The `tier` field (Small/Medium/Large) gates **Layer C** — the multi-turn deferred-commit consult where a skill calls back to the assistant mid-turn (skill → LLM → skill, e.g. to clarify): Small is rejected (too small for structured output), Medium and Large invoke `Fallback::run_prompt`. When it's `Some(Api(..))`, the engine builds the HTTP request from the `ApiConfig`, resolves config values (model, endpoint, API key) from the `ConfigStore`, makes the call, and extracts the response via `response_path`.
 
-> Since the FunctionGemma rehabilitation, a **cloud** assistant is also the *router*: for English, `Engine::route_or_answer` makes a single call that either returns `SKILL: <id>` (dispatch that skill) or a direct answer — folding the old route-then-answer two-step into one round-trip. FunctionGemma is bypassed for cloud users; it's the on-device English router.
+> A **cloud** assistant is also the *router*: for English, `Engine::route_or_answer` makes a single call that either returns `SKILL: <id>` (dispatch that skill) or a direct answer — folding the old route-then-answer two-step into one round-trip. It sees only what the keyword and phrase tiers declined.
 
 When `active_assistant` is `None`, the engine returns `FALLBACK_RESPONSE` immediately. No LLM, no API call.
 
