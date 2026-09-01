@@ -323,7 +323,7 @@ impl Skill for OpenSkill {
         }
     }
 
-    /// Typed-args path. The FunctionGemma router extracts the
+    /// Typed-args path, for a dispatch that carries the
     /// `app_name` slot directly so we skip `extract_target`'s trigger-
     /// word scan and use the model's value verbatim. Falls back to
     /// `execute` when the args JSON is missing the field or the model

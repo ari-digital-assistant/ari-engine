@@ -359,7 +359,7 @@ struct StorageCtx {
     lock: Mutex<()>,
 }
 
-/// Derive a FunctionGemma parameter schema from a skill's example args. The
+/// Derive a parameter schema from a skill's example args. The
 /// manifest carries no explicit schema, so we infer string properties from the
 /// union of arg keys across the examples (every key required) — the same
 /// derivation generate-dataset.py does, so the runtime declaration matches what
@@ -391,7 +391,7 @@ fn derive_parameters_schema(examples: &[crate::manifest::SkillExample]) -> Strin
 pub struct WasmSkill {
     id: String,
     description: String,
-    /// Parameter schema for the FunctionGemma router, derived at load time
+    /// Parameter schema shown to a routing assistant, derived at load time
     /// from the manifest's example args (the manifest carries no explicit
     /// schema). Mirrors generate-dataset.py so training and runtime agree.
     parameters_schema: String,
@@ -1262,7 +1262,7 @@ impl WasmSkill {
             .map_err(|e| WasmError::Compile(e.to_string()))?;
 
         // Typed args — ungated; every skill can read whatever JSON the
-        // FunctionGemma router extracted for this call. Returns 0 (the
+        // engine extracted for this call. Returns 0 (the
         // empty-pack sentinel) when the skill was invoked via the
         // keyword scorer or with no extracted args, so the SDK helper
         // surfaces it as `None` to the skill.

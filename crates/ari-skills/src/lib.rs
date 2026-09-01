@@ -5,7 +5,7 @@
 //! 1. Create a new module here (e.g. `weather.rs`).
 //! 2. Implement the [`ari_core::Skill`] trait. Required: `id()`,
 //!    `specificity()`, `score()`, `execute()`. Strongly recommended for
-//!    the FunctionGemma router: `description()`, `example_utterances()`,
+//!    matching beyond keywords: `description()`, `example_utterances()`,
 //!    and `parameters_schema()` if your skill takes args.
 //! 3. Add the module declaration and `pub use` below.
 //! 4. Add the skill to `bin/export_utterances.rs` so it appears in the

@@ -1,11 +1,13 @@
-//! Batch keyword-scorer oracle for the FunctionGemma training pipeline.
+//! Batch keyword-scorer oracle: does the keyword tier already claim this
+//! utterance?
 //!
 //! Reads utterances on stdin (one per line) and writes `true` or `false` per
 //! line: `true` means the keyword scorer already claims that utterance, so the
-//! router never sees it in production and training on it is wasted capacity.
+//! phrase tier never sees it in production.
 //!
-//! This exists because the router is the FALLBACK tier. `route-eval` enforces
-//! the same rule on the eval sets; this enforces it on the training corpus.
+//! This exists because phrase matching is the FALLBACK tier — an example
+//! phrase some skill's keywords already win is one that can never fire. The
+//! poaching test in this file enforces exactly that across the catalogue.
 //!
 //! Usage: `keyword-hit [--locale <xx>] [--skills-dir <path>] < utterances.txt`
 //!
@@ -13,8 +15,8 @@
 //! `skills/` root of an `ari-skills` checkout). Without it the oracle knows
 //! only the six built-ins, so a community skill's examples can never be
 //! recognised as keyword-hits even when that skill's own `matching.patterns`
-//! win them outright in production — and they stay in the corpus as waste.
-//! Omitting the flag preserves the builtin-only behaviour exactly.
+//! win them outright in production. Omitting the flag preserves the
+//! builtin-only behaviour exactly.
 
 use ari_ffi::register_community_skills;
 use std::path::{Path, PathBuf};

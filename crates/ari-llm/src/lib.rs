@@ -133,10 +133,10 @@ const IDLE_TIMEOUT_SECS: u64 = 60;
 /// Process-wide shared `LlamaBackend`. llama.cpp's backend is a global
 /// singleton — calling `LlamaBackend::init()` more than once fails
 /// with `BackendAlreadyInitialized`, which previously broke any path
-/// that loaded a second model after the FunctionGemma router (e.g.
-/// the QA fallback's first invocation, since the router loads at
-/// startup). Shared access via `OnceLock` ensures every loader sees
-/// the same already-initialized backend.
+/// that loaded a second model after the first (e.g. the QA fallback's
+/// first invocation when another model was already resident). Shared
+/// access via `OnceLock` ensures every loader sees the same
+/// already-initialized backend.
 static SHARED_BACKEND: std::sync::OnceLock<LlamaBackend> = std::sync::OnceLock::new();
 
 fn shared_backend() -> Result<&'static LlamaBackend, LlmError> {

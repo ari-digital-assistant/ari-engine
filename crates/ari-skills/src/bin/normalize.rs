@@ -1,5 +1,5 @@
 //! Expose the engine's own `normalize_input` over stdin/stdout so the
-//! FunctionGemma training pipeline can normalise its corpus through the
+//! tooling outside this repo can normalise text through the
 //! SAME function the router is served at inference — rather than a Python
 //! replica, which would drift and would defeat the point of train/serve parity.
 //!

@@ -544,7 +544,7 @@ pub struct AriExtension {
     pub behaviour: Option<Behaviour>,
     /// Present only for assistant skills (`skill_type == Assistant`).
     pub assistant: Option<AssistantManifest>,
-    /// Example utterances for FunctionGemma training. Required for
+    /// Example utterances the phrase tier matches. Required for
     /// regular skills (minimum 5), optional for assistant skills.
     pub examples: Vec<SkillExample>,
     /// User-configurable fields for this skill, rendered as a settings

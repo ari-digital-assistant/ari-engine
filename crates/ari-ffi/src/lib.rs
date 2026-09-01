@@ -863,8 +863,8 @@ pub struct AriEngine {
 }
 
 /// Build an [`Engine`] with the full set of built-in skills registered — the
-/// same catalogue used at runtime. Exposed so the `route-eval` binary can
-/// exercise the real skill catalogue without duplicating the skill list.
+/// same catalogue used at runtime. Exposed so tooling can exercise the real
+/// skill catalogue without duplicating the skill list.
 /// The 6 built-in Rust skills, freshly constructed. Kept in one place so the
 /// initial engine build and every `reload_community_skills` register exactly
 /// the same set — a reload that forgot one would silently drop that skill.
@@ -890,12 +890,10 @@ pub fn build_engine_with_builtins() -> Engine {
 /// Load every skill under `root` and register it alongside the built-ins,
 /// returning the number registered.
 ///
-/// Shared by the `keyword-hit` oracle (which decides what leaves the training
-/// corpus) and the `route-eval` promotion gate (which decides what may be
-/// measured). Both answer the same question — "does the keyword scorer already
-/// claim this utterance?" — so they must answer it against the same skill
-/// catalogue. Two copies of this logic could drift, and a drifted gate reports
-/// a silently inflated score.
+/// Shared by the `keyword-hit` oracle and its poaching test, which both ask
+/// "does the keyword scorer already claim this utterance?" and so must ask it
+/// against the same skill catalogue. Two copies of this logic could drift, and
+/// a drifted gate reports a silently inflated score.
 ///
 /// Grants [`HostCapabilities::all`] deliberately. Both callers only ever read
 /// `matching.patterns` and `specificity` through `Skill::score` /

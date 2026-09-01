@@ -1053,10 +1053,10 @@ impl Engine {
             .unwrap_or(false)
     }
 
-    /// The skill catalogue handed to the semantic routers (FunctionGemma and
-    /// the assistant-routing path). Excludes unready gated skills and
-    /// keyword-only skills (`router_eligible() == false`) so neither router
-    /// can claim a query that belongs to the keyword scorer or the assistant.
+    /// The skill catalogue handed to the assistant when it routes. Excludes
+    /// unready gated skills and keyword-only skills
+    /// (`router_eligible() == false`) so nothing guessing at intent can claim
+    /// a query that belongs to the keyword scorer.
     fn router_catalog(&self) -> Vec<(String, String, String)> {
         self.skills
             .iter()
@@ -1384,11 +1384,11 @@ impl Engine {
         }
 
         // No keyword pattern claimed it. Before reaching for a model, try the
-        // skills' own example phrases — the corpus that used to train
-        // FunctionGemma, matched directly against the utterance. Same ranking
-        // rounds, so weights and specificity arbitrate exactly as they do for
-        // keywords; it just runs second, because a `{slot}` phrase is a looser
-        // signal than an explicit trigger and must never outrank one.
+        // skills' own example phrases, matched directly against the utterance.
+        // Same ranking rounds, so weights and specificity arbitrate exactly as
+        // they do for keywords; it just runs second, because a `{slot}` phrase
+        // is a looser signal than an explicit trigger and must never outrank
+        // one.
         let phrase_scores = self.phrase_scores(&normalized);
         if let Some((winner, round_idx)) = Self::rank(&phrase_scores) {
             let skill = self
@@ -1496,7 +1496,7 @@ impl Engine {
             // Unknown id / call failed — fall through to the fallback /
             // assistant-answer path below.
         } else if use_assistant_routing {
-            // Non-English: translated two-step routing prompt (FunctionGemma is
+            // Non-English: translated two-step routing prompt (the one-shot is
             // English-only). A general question falls through to the
             // assistant-answer path below.
             let picked = match self.try_assistant_route(&normalized, &skill_catalog) {
@@ -1998,7 +1998,7 @@ fn assistant_display_name(skill_id: &str) -> String {
 /// Gemma cannot (it's ~22s to route, catalogue prefill dominates, and at its
 /// size the picks aren't reliable), so when there's no cloud assistant nothing
 /// is asked to route: the request falls to the answer path and is answered
-/// directly. English still gets FunctionGemma as its offline routing tier;
+/// directly. Every language still gets the offline keyword and phrase tiers;
 /// other languages get keyword matching and direct answers offline.
 fn uses_assistant_routing(has_cloud_assistant: bool) -> bool {
     has_cloud_assistant
@@ -2128,7 +2128,7 @@ fn build_assistant_routing_prompt(
 /// Returns `None` for "NONE" responses, empty responses, or when no
 /// line matches a known skill id. The engine treats `None` as
 /// "fall through to the assistant-answer path" — the same behaviour
-/// FunctionGemma's `RouteResult::NoMatch` produces for English.
+/// an unmatched utterance produces.
 fn parse_assistant_routing_response(
     response: &str,
     skills: &[(String, String, String)],

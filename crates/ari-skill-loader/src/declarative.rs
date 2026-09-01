@@ -49,7 +49,7 @@ pub enum AdapterError {
 /// load time and live on the parent [`DeclarativeSkill`] directly.
 #[derive(Debug)]
 struct LocalizedDeclarative {
-    /// Description used for skill-browser display. (FunctionGemma
+    /// Description used for skill-browser display. (An assistant
     /// routing only ever sees the canonical-English description, so
     /// the per-locale variant matters mainly for UI surfaces.)
     description: String,
@@ -304,7 +304,7 @@ impl Skill for DeclarativeSkill {
     }
 
     fn description(&self) -> &str {
-        // FunctionGemma routes on English description; the skill
+        // An assistant routes on the English description; the skill
         // browser uses ctx-aware paths instead. Default to canonical
         // for callers that don't have a context (router training data
         // export, etc.).
