@@ -67,7 +67,6 @@ const OPEN_EXAMPLES_EN: &[ExampleUtterance] = &[
     ExampleUtterance { text: "would you mind opening {app}", args: r#"{"app_name": "{app}"}"#, weight: 0.95 },
     ExampleUtterance { text: "can we open {app}", args: r#"{"app_name": "{app}"}"#, weight: 0.95 },
     ExampleUtterance { text: "where s the {app} app", args: r#"{"app_name": "{app}"}"#, weight: 0.95 },
-    ExampleUtterance { text: "find the {app} app and open it", args: r#"{"app_name": "{app}"}"#, weight: 0.95 },
     ExampleUtterance { text: "open the app called {app}", args: r#"{"app_name": "{app}"}"#, weight: 0.95 },
     ExampleUtterance { text: "launch the app called {app}", args: r#"{"app_name": "{app}"}"#, weight: 0.95 },
     ExampleUtterance { text: "bring the {app} app to the front", args: r#"{"app_name": "{app}"}"#, weight: 0.95 },

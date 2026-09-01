@@ -26,6 +26,7 @@ const TRIGGER_PHRASES: &[&[&str]] = &[
 // (Whether the generator should normalise these to match inference is the
 // parity spike's question — not this file's.)
 const DATE_EXAMPLES_EN: &[ExampleUtterance] = &[
+    ExampleUtterance { text: "is it the start of the month", args: "{}", weight: 0.75 },
     ExampleUtterance { text: "what is the date for today", args: "{}", weight: 0.95 },
     ExampleUtterance { text: "what is todays date then", args: "{}", weight: 0.95 },
     ExampleUtterance { text: "what day is it today", args: "{}", weight: 0.75 },

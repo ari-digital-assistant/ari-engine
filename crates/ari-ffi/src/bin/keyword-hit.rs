@@ -369,6 +369,34 @@ mod tests {
         pairs
     }
 
+    /// Stand-in for the launchable-app list the host pushes at startup. The
+    /// labels are the ones the `open` examples name, so the skill resolves
+    /// them exactly as it would on a device with those apps installed.
+    fn sample_app_inventory() -> Vec<ari_core::AppEntry> {
+        [
+            ("Spotify", "com.spotify.music"),
+            ("Camera", "com.android.camera"),
+            ("Chrome", "com.android.chrome"),
+            ("YouTube", "com.google.android.youtube"),
+            ("Settings", "com.android.settings"),
+            ("Maps", "com.google.android.apps.maps"),
+            ("Calculator", "com.android.calculator2"),
+            ("Clock", "com.android.deskclock"),
+            ("Files", "com.android.documentsui"),
+            ("Gallery", "com.android.gallery3d"),
+            ("Email", "com.android.email"),
+            ("Phone", "com.android.dialer"),
+            ("Messages", "com.android.messaging"),
+            ("Notes", "com.android.notes"),
+        ]
+        .into_iter()
+        .map(|(label, package)| ari_core::AppEntry {
+            label: label.to_string(),
+            package: package.to_string(),
+        })
+        .collect()
+    }
+
     /// A router example must reach its OWN skill at the keyword tier, or
     /// nobody at all. One that another skill's patterns win is an example the
     /// router never sees in production: it teaches the model the opposite of
@@ -390,6 +418,11 @@ mod tests {
         for locale in ["en", "it"] {
             let mut engine = ari_ffi::build_engine_with_builtins();
             engine.set_locale(locale.to_string());
+            // The host pushes this during engine construction, before any
+            // input is processed. Without it `open` falls back to "any target
+            // is an app" and claims every "open the garage door" in the
+            // catalogue — collisions that cannot happen in a running Ari.
+            engine.set_installed_apps(sample_app_inventory());
             register_community_skills(&mut engine, &root).unwrap();
 
             for (owner, text) in router_examples(locale, &root) {
