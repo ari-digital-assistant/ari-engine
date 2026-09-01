@@ -526,6 +526,8 @@ pub fn replace_number_words(input: &str) -> String {
 ///   attach to any stem (`"I'll"` → `"i will"`, `"they've"` → `"they have"`);
 ///   fold dotted meridiems (`"p.m."` → `"pm"`) and replace English number
 ///   words (`"five"` → `"5"`).
+/// - Every locale — drop a trailing `.` from each token, so a transcript's
+///   sentence stop never reaches a skill as part of the last word.
 /// - `"it"` — strip Italian apostrophe-elisions (`"l'ora"` → `"l ora"`,
 ///   `"c'è"` → `"c è"`). No contraction expansion or number words yet
 ///   (Italian number words are a Phase-7 polish item, alongside the
@@ -561,10 +563,35 @@ pub fn normalize_input(input: &str, locale: &str) -> String {
         .collect::<Vec<&str>>()
         .join(" ");
 
+    let cleaned = match locale {
+        "en" => collapse_meridiem(&cleaned),
+        _ => cleaned,
+    };
+    let cleaned = strip_sentence_stops(&cleaned);
+
     match locale {
-        "en" => replace_number_words(&collapse_meridiem(&cleaned)),
+        "en" => replace_number_words(&cleaned),
         _ => cleaned,
     }
+}
+
+/// Drop a trailing `.` from each token.
+///
+/// The punctuation strip keeps `.` so decimals and arithmetic survive, but
+/// speech recognition punctuates what it transcribes, and the stop then rode
+/// all the way into the skills: "add bananas to family shopping." reached the
+/// reminder skill with the stop attached, so its list lookup compared "family
+/// shopping." against the user's real "Family Shopping", missed, and filed the
+/// item in the default list. Runs after [`collapse_meridiem`], which has
+/// already folded "p.m." to "pm"; only a TRAILING dot goes, so "3.5" is
+/// untouched.
+fn strip_sentence_stops(cleaned: &str) -> String {
+    cleaned
+        .split_whitespace()
+        .map(|w| w.trim_end_matches('.'))
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<&str>>()
+        .join(" ")
 }
 
 /// Fold dotted meridiem tokens onto their bare forms: `"p.m."` → `"pm"`.
@@ -1119,8 +1146,28 @@ mod tests {
         assert_eq!(normalize_input("at 4 pm", "en"), "at 4 pm");
         assert_eq!(normalize_input("yes i am", "en"), "yes i am");
         assert_eq!(normalize_input("what is 3.5 times 2", "en"), "what is 3.5 times 2");
-        // English-only dispatch — Italian keeps whatever it was given.
-        assert_eq!(normalize_input("alle 4 p.m.", "it"), "alle 4 p.m.");
+        // English-only dispatch — Italian doesn't get the meridiem fold, so
+        // the dots stay put apart from the trailing stop every locale loses.
+        assert_eq!(normalize_input("alle 4 p.m.", "it"), "alle 4 p.m");
+    }
+
+    #[test]
+    fn normalize_drops_the_sentence_stop() {
+        // What broke: STT punctuates, and "family shopping." then failed to
+        // match the user's list called "Family Shopping".
+        assert_eq!(
+            normalize_input("add bananas to family shopping.", "en"),
+            "add bananas to family shopping"
+        );
+        assert_eq!(
+            normalize_input("aggiungi banane alla spesa.", "it"),
+            "aggiungi banane alla spesa"
+        );
+        assert_eq!(normalize_input("Open Spotify.", "en"), "open spotify");
+        assert_eq!(normalize_input("well...", "en"), "well");
+        // Decimals and arithmetic keep the dots that are doing work.
+        assert_eq!(normalize_input("what is 3.5 times 2.", "en"), "what is 3.5 times 2");
+        assert_eq!(normalize_input("3.14159", "en"), "3.14159");
     }
 
     #[test]

@@ -3649,10 +3649,10 @@ mod tests {
         let (resp, trace) = engine.process_input_traced("!!??");
         assert!(matches!(resp, Response::Text(ref s) if s == FALLBACK_RESPONSE));
         assert!(trace.is_none());
-        // "..." normalises to "..." (dots preserved for decimal math), gets trace but no winner
+        // "..." normalises to "" too — a dot only survives inside a number
         let (resp2, trace2) = engine.process_input_traced("...");
         assert!(matches!(resp2, Response::Text(ref s) if s == FALLBACK_RESPONSE));
-        assert!(trace2.is_some());
+        assert!(trace2.is_none());
     }
 
     #[test]
