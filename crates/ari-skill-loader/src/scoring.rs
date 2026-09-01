@@ -6,7 +6,7 @@
 //! normalised) input. The highest matching weight wins.
 
 use crate::manifest::{MatchPattern, Matching, SkillExample};
-use ari_core::{best_phrase_weight, normalize_input, normalize_phrase};
+use ari_core::{best_phrase_weight, normalize_input, normalize_phrase, SkillContext};
 use regex::Regex;
 use thiserror::Error;
 
@@ -109,9 +109,9 @@ impl PatternScorer {
     /// [`score_normalised`](Self::score_normalised) because the engine runs
     /// phrases as a later tier — they catch what no pattern claimed, and must
     /// not outrank an explicit trigger.
-    pub fn phrase_score_normalised(&self, normalised: &str) -> f32 {
+    pub fn phrase_score_normalised(&self, normalised: &str, ctx: &SkillContext) -> f32 {
         let phrases = self.phrases.iter().map(|(p, w)| (p.as_str(), *w));
-        best_phrase_weight(phrases, normalised)
+        best_phrase_weight(phrases, normalised, ctx)
     }
 }
 

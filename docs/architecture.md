@@ -164,6 +164,19 @@ explicit trigger, so it must never outrank one — an utterance a keyword
 pattern claims never reaches this tier. A skill that wins here and then
 declines (the `_ari_no_match` sentinel) falls through like any other tier.
 
+**Runtime vocabularies.** A slot written `{list:tasks.lists}` binds only text
+naming a member of a word list the frontend pushed via
+`Engine::set_vocabulary` — the user's task lists today, their rooms or
+contacts later. Some commands are unrecognisable without it: "add bananas to
+family shopping" is a list add and "add cream to the coffee" is not, and the
+only thing separating them is that one names a list this user has. It is also
+what lets a phrase be loose in wording and still precise, which no keyword
+pattern can be. A vocabulary nobody pushed admits nothing, so a constrained
+phrase fails closed rather than degrading into a greedy one; `SkillContext`
+carries them, and `phrase_matches_in` tries every split of the input rather
+than the leftmost, since a constrained slot can reject a split its neighbour
+would have taken.
+
 Phrases are matched against normalised input, so they are stored normalised
 too: `normalize_phrase` expands contractions in the literals while leaving
 `{slot}` intact, since plain normalisation strips the braces. Manifest phrases

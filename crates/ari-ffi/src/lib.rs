@@ -1312,6 +1312,17 @@ impl AriEngine {
             .set_installed_apps(apps.into_iter().map(Into::into).collect());
     }
 
+    /// Replace one runtime vocabulary a skill's `{slot:name}` phrases can bind
+    /// against — the user's task lists, rooms, contacts. The frontend re-pushes
+    /// whenever the underlying set changes. Push an empty `values` when the
+    /// user has none — phrases naming that vocabulary then match nothing.
+    pub fn set_vocabulary(&self, name: String, values: Vec<String>) {
+        self.inner
+            .lock()
+            .expect("engine mutex poisoned")
+            .set_vocabulary(name, values);
+    }
+
     /// Snapshot of the engine's durable personal facts (oldest first). The
     /// frontend reads this after a turn that signalled `facts_changed` and
     /// persists the result.

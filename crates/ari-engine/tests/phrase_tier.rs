@@ -1,4 +1,4 @@
-use ari_core::{normalize_input, normalize_phrase, Skill};
+use ari_core::{normalize_input, normalize_phrase, Skill, SkillContext};
 use ari_engine::Engine;
 use ari_skills::{
     CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill,
@@ -51,12 +51,13 @@ fn every_builtin_phrase_matches_its_own_text() {
             continue;
         }
         for locale in ["en", "it"] {
+            let ctx = SkillContext { locale: locale.to_string(), ..Default::default() };
             for e in skill.example_utterances_for(locale) {
                 if e.text.contains('{') {
                     continue;
                 }
                 assert!(
-                    skill.phrase_score(&normalize_input(e.text, locale), locale) >= e.weight,
+                    skill.phrase_score(&normalize_input(e.text, locale), &ctx) >= e.weight,
                     "[{locale}] {}: {:?} does not match itself",
                     skill.id(),
                     e.text

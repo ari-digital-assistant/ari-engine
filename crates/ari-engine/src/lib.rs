@@ -850,6 +850,18 @@ impl Engine {
         self.ctx.installed_apps = apps;
     }
 
+    /// Replace one runtime vocabulary — the names a `{slot:name}` in an
+    /// example phrase may bind. The frontend owns these: it is the only part
+    /// of the stack that can see the user's task lists, rooms or contacts,
+    /// and it re-pushes whenever they change.
+    ///
+    /// Pushing an empty list is how a frontend says "the user has none of
+    /// these"; phrases constraining a slot to that name then match nothing,
+    /// which for an empty set is the right answer.
+    pub fn set_vocabulary(&mut self, name: String, values: Vec<String>) {
+        self.ctx.vocabularies.insert(name, values);
+    }
+
     /// Install an envelope sink so the engine can push phase-2 Layer C
     /// envelopes (produced asynchronously after the assistant replies)
     /// back to the host. When `None`, the `consult_assistant` directive
@@ -1118,7 +1130,7 @@ impl Engine {
             .map(|s| SkillScore {
                 skill_id: s.id().to_string(),
                 specificity: s.specificity(),
-                score: s.phrase_score(normalized, &self.ctx.locale),
+                score: s.phrase_score(normalized, &self.ctx),
             })
             .collect()
     }
@@ -2882,6 +2894,50 @@ mod tests {
                 requires_setting: Some(k.to_string()),
             })
         }
+    }
+
+    use ari_core::ExampleUtterance;
+
+    /// A skill reachable only through one vocabulary-constrained phrase.
+    struct ListAddSkill;
+
+    impl Skill for ListAddSkill {
+        fn id(&self) -> &str { "list-add" }
+        fn specificity(&self) -> Specificity { Specificity::High }
+        fn score(&self, _input: &str, _ctx: &SkillContext) -> f32 { 0.0 }
+        fn example_utterances(&self) -> &[ExampleUtterance] {
+            const PHRASES: &[ExampleUtterance] = &[ExampleUtterance {
+                text: "add {item} to {list:tasks.lists}",
+                args: "{}",
+                weight: 0.9,
+            }];
+            PHRASES
+        }
+        fn execute(&self, _input: &str, _ctx: &SkillContext) -> Response {
+            Response::Text("added".to_string())
+        }
+    }
+
+    #[test]
+    fn a_pushed_vocabulary_lets_a_constrained_phrase_route() {
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(ListAddSkill));
+
+        // Nothing pushed: the constraint admits nothing, so no winner.
+        let (_, trace) = engine.process_input_traced("add bananas to family shopping");
+        assert_eq!(trace.and_then(|t| t.winner), None);
+
+        engine.set_vocabulary(
+            "tasks.lists".to_string(),
+            vec!["Family Shopping".to_string()],
+        );
+        let (resp, trace) = engine.process_input_traced("add bananas to family shopping");
+        assert!(matches!(resp, Response::Text(ref s) if s == "added"));
+        assert_eq!(trace.unwrap().winner.as_deref(), Some("phrase:list-add"));
+
+        // A tail that names no list of theirs stays unclaimed.
+        let (_, trace) = engine.process_input_traced("add cream to the coffee");
+        assert_eq!(trace.and_then(|t| t.winner), None);
     }
 
     // --- Reload state preservation (P0) ---

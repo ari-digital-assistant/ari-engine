@@ -2767,8 +2767,9 @@ impl Skill for WasmSkill {
     /// Manifest example phrases always come from the native scorer, even for
     /// a `custom_score` module — that export replaces the keyword tier, not
     /// the phrases the manifest declares.
-    fn phrase_score(&self, normalized: &str, locale: &str) -> f32 {
-        self.scorer_for(locale).phrase_score_normalised(normalized)
+    fn phrase_score(&self, normalized: &str, ctx: &SkillContext) -> f32 {
+        self.scorer_for(&ctx.locale)
+            .phrase_score_normalised(normalized, ctx)
     }
 
     fn score(&self, input: &str, ctx: &SkillContext) -> f32 {

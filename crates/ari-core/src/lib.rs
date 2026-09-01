@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Appended to the assistant system prompt when prior conversation turns
 /// are supplied, instructing the model to self-classify the turn. The
@@ -94,6 +95,18 @@ pub struct SkillContext {
     /// (Linux, headless) or before the first push, which preserves the legacy
     /// "any target is an app" behaviour in `open`'s scoring.
     pub installed_apps: Vec<AppEntry>,
+    /// Word lists that only the frontend can see — the user's task lists,
+    /// their smart-home rooms, their contacts — pushed via
+    /// `Engine::set_vocabulary` and keyed by the name a skill's phrases refer
+    /// to. An example phrase constrains a slot to one by writing
+    /// `{list:tasks.lists}`, which lets "add bananas to family shopping"
+    /// route on-device without the word "list" in it, while "add cream to
+    /// the coffee" stays unmatched.
+    ///
+    /// A name nobody pushed admits nothing, so a constrained phrase matches
+    /// nothing rather than everything — see
+    /// [`vocabulary_admits`](SkillContext::vocabulary_admits).
+    pub vocabularies: BTreeMap<String, Vec<String>>,
     /// The utterance as the user said it, before `normalize_input` lowercased
     /// it, expanded contractions and stripped punctuation. For skills that
     /// quote the user back to somebody else — a message body, a note — the
@@ -106,11 +119,32 @@ pub struct SkillContext {
     pub raw_input: String,
 }
 
+impl SkillContext {
+    /// Whether `value` — a slot's captured text, already normalised — names a
+    /// member of the vocabulary called `name`.
+    ///
+    /// An unknown or empty vocabulary admits nothing. A skill author writes
+    /// `{list:tasks.lists}` precisely to mean "only a real list", and a
+    /// constraint that quietly falls open would turn their careful phrase
+    /// into a greedy one on exactly the platforms least able to cope. The
+    /// skill keeps its unconstrained phrases and its keyword patterns.
+    pub fn vocabulary_admits(&self, name: &str, value: &str) -> bool {
+        let value = value.trim();
+        match self.vocabularies.get(name) {
+            Some(values) => values
+                .iter()
+                .any(|v| normalize_input(v, &self.locale) == value),
+            None => false,
+        }
+    }
+}
+
 impl Default for SkillContext {
     fn default() -> Self {
         Self {
             locale: "en".to_string(),
             installed_apps: Vec::new(),
+            vocabularies: BTreeMap::new(),
             raw_input: String::new(),
         }
     }
@@ -283,15 +317,15 @@ pub trait Skill: Send + Sync {
     /// which covers the built-in skills. Declarative and WASM skills override
     /// it to read the phrases from their manifest. Skills that opted out of
     /// semantic routing keep their explicit triggers as the only way in.
-    fn phrase_score(&self, normalized: &str, locale: &str) -> f32 {
+    fn phrase_score(&self, normalized: &str, ctx: &SkillContext) -> f32 {
         if !self.router_eligible() {
             return 0.0;
         }
         let phrases = self
-            .example_utterances_for(locale)
+            .example_utterances_for(&ctx.locale)
             .iter()
             .map(|e| (e.text, e.weight));
-        best_phrase_weight(phrases, normalized)
+        best_phrase_weight(phrases, normalized, ctx)
     }
 
     /// JSON schema describing this skill's parameters in OpenAI tool
@@ -775,6 +809,21 @@ fn literal_parts(phrase: &str) -> Vec<&str> {
     parts
 }
 
+/// The vocabulary each `{slot}` is constrained to, in phrase order. `None`
+/// where the slot named none. `{list:tasks.lists}` yields `Some("tasks.lists")`,
+/// plain `{list}` yields `None`.
+fn slot_vocabularies(phrase: &str) -> Vec<Option<&str>> {
+    let mut out = Vec::new();
+    let mut rest = phrase;
+    while let Some(open) = rest.find('{') {
+        let Some(close) = rest[open..].find('}') else { break };
+        let body = &rest[open + 1..open + close];
+        out.push(body.split_once(':').map(|(_, vocab)| vocab.trim()));
+        rest = &rest[open + close + 1..];
+    }
+    out
+}
+
 /// Whether `slot` swallowed something real — a slot must bind at least one
 /// whole word, so `play {song}` does not match a bare "play".
 fn slot_is_filled(slot: &str) -> bool {
@@ -833,48 +882,73 @@ pub fn normalize_phrase(phrase: &str, locale: &str) -> String {
 /// each `{slot}` binds one or more words. `play {song}` matches
 /// "play hotel california" but neither "play" nor "shall i play something".
 /// Phrases with no slots match the whole input exactly.
+///
+/// Slots are unconstrained here. Use [`phrase_matches_in`] to honour a
+/// `{slot:vocabulary}` qualifier against what the frontend pushed.
 pub fn phrase_matches(phrase: &str, normalised: &str) -> bool {
-    let parts = literal_parts(phrase);
-    let (first, rest) = match parts.split_first() {
+    phrase_matches_in(phrase, normalised, &SkillContext::default())
+}
+
+/// [`phrase_matches`], with any `{slot:vocabulary}` qualifier checked against
+/// `ctx`. A slot so qualified binds only text naming a member of that
+/// vocabulary, which is how a phrase can require a real list name where an
+/// unqualified slot would swallow any words at all.
+pub fn phrase_matches_in(phrase: &str, normalised: &str, ctx: &SkillContext) -> bool {
+    let literals = literal_parts(phrase);
+    let (first, rest) = match literals.split_first() {
         Some(pair) => pair,
         None => return false,
     };
     if rest.is_empty() {
         return normalised == *first;
     }
-    let mut cur = match normalised.strip_prefix(first) {
-        Some(tail) => tail,
-        None => return false,
+    match normalised.strip_prefix(first) {
+        Some(tail) => match_slots(tail, rest, &slot_vocabularies(phrase), ctx),
+        None => false,
+    }
+}
+
+/// Consume `{slot} literal` pairs left to right. `literals` holds the ones
+/// still to come — one per remaining slot — and `vocabs` their qualifiers.
+///
+/// Every split is tried rather than only the leftmost, because a constrained
+/// slot can reject a split its unconstrained neighbour would have taken:
+/// "add milk to the tesco run to family shopping" needs the SECOND " to " to
+/// leave a real list name behind.
+fn match_slots(
+    input: &str,
+    literals: &[&str],
+    vocabs: &[Option<&str>],
+    ctx: &SkillContext,
+) -> bool {
+    let (next, rest) = match literals.split_first() {
+        Some(pair) => pair,
+        None => return true,
     };
-    let (last, mids) = rest.split_last().expect("rest is non-empty");
-    for mid in mids {
-        // Search past the first byte so the preceding slot cannot bind empty.
-        let found = match cur.match_indices(*mid).find(|(i, _)| slot_is_filled(&cur[..*i])) {
-            Some((i, _)) => i,
-            None => return false,
-        };
-        cur = &cur[found + mid.len()..];
-    }
-    if last.is_empty() {
-        slot_is_filled(cur)
-    } else {
-        match cur.strip_suffix(last) {
-            Some(slot) => slot_is_filled(slot),
+    let admitted = |slot: &str| {
+        slot_is_filled(slot) && vocabs[0].is_none_or(|v| ctx.vocabulary_admits(v, slot.trim()))
+    };
+    if rest.is_empty() {
+        return match input.strip_suffix(next) {
+            Some(slot) => admitted(slot),
             None => false,
-        }
+        };
     }
+    input
+        .match_indices(next)
+        .any(|(i, _)| admitted(&input[..i]) && match_slots(&input[i + next.len()..], rest, &vocabs[1..], ctx))
 }
 
 /// Highest weight among the example phrases matching `normalised`, or `0.0`.
 /// Callers pass `(phrase, weight)` pairs so both the static built-in tables
 /// and a manifest's owned strings can share one matcher.
-pub fn best_phrase_weight<'a, I>(examples: I, normalised: &str) -> f32
+pub fn best_phrase_weight<'a, I>(examples: I, normalised: &str, ctx: &SkillContext) -> f32
 where
     I: IntoIterator<Item = (&'a str, f32)>,
 {
     examples
         .into_iter()
-        .filter(|(phrase, _)| phrase_matches(phrase, normalised))
+        .filter(|(phrase, _)| phrase_matches_in(phrase, normalised, ctx))
         .map(|(_, weight)| weight)
         .fold(0.0_f32, f32::max)
 }
@@ -941,11 +1015,70 @@ mod tests {
         assert!(!phrase_matches("{app} please open", "please open"));
     }
 
+    fn ctx_with_lists(lists: &[&str]) -> SkillContext {
+        let mut ctx = SkillContext::default();
+        ctx.vocabularies.insert(
+            "tasks.lists".to_string(),
+            lists.iter().map(|l| l.to_string()).collect(),
+        );
+        ctx
+    }
+
+    #[test]
+    fn constrained_slot_binds_only_a_vocabulary_member() {
+        let phrase = "add {item} to {list:tasks.lists}";
+        let ctx = ctx_with_lists(&["Family Shopping", "Work"]);
+        assert!(phrase_matches_in(phrase, "add bananas to family shopping", &ctx));
+        assert!(phrase_matches_in(phrase, "add a report to work", &ctx));
+        // "the coffee" is not a list the user has, so this is not a list add.
+        assert!(!phrase_matches_in(phrase, "add cream to the coffee", &ctx));
+        assert!(!phrase_matches_in(phrase, "add milk to family", &ctx));
+    }
+
+    #[test]
+    fn a_vocabulary_nobody_pushed_admits_nothing() {
+        let phrase = "add {item} to {list:tasks.lists}";
+        // A constrained slot means "only a real one" — with no lists to check
+        // against, the phrase matches nothing rather than everything.
+        assert!(!phrase_matches_in(phrase, "add bananas to family shopping", &SkillContext::default()));
+        assert!(!phrase_matches_in(phrase, "add cream to the coffee", &ctx_with_lists(&[])));
+    }
+
+    #[test]
+    fn vocabulary_membership_ignores_case_and_punctuation() {
+        let ctx = ctx_with_lists(&["Family Shopping (Weekly)"]);
+        assert!(phrase_matches_in(
+            "add {item} to {list:tasks.lists}",
+            "add bananas to family shopping weekly",
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn a_constrained_slot_backtracks_past_an_earlier_split() {
+        // The leftmost " to " leaves "the tesco run to family shopping",
+        // which is no list; the matcher must try the next one.
+        let ctx = ctx_with_lists(&["Family Shopping"]);
+        assert!(phrase_matches_in(
+            "add {item} to {list:tasks.lists}",
+            "add milk to the tesco run to family shopping",
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn slot_vocabularies_reads_the_qualifier_off_each_slot() {
+        assert_eq!(slot_vocabularies("add {item} to {list:tasks.lists}"), vec![None, Some("tasks.lists")]);
+        assert_eq!(slot_vocabularies("play {song}"), vec![None]);
+        assert!(slot_vocabularies("what time is it").is_empty());
+    }
+
     #[test]
     fn best_phrase_weight_returns_the_highest_match_and_zero_for_none() {
+        let ctx = SkillContext::default();
         let examples = [("play {song}", 0.95_f32), ("play {artist}", 0.6_f32)];
-        assert_eq!(best_phrase_weight(examples, "play thriller"), 0.95);
-        assert_eq!(best_phrase_weight(examples, "what time is it"), 0.0);
+        assert_eq!(best_phrase_weight(examples, "play thriller", &ctx), 0.95);
+        assert_eq!(best_phrase_weight(examples, "what time is it", &ctx), 0.0);
     }
 
     // --- SkillContext / AppEntry ---
