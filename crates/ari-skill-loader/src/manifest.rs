@@ -336,14 +336,21 @@ pub struct SelectOption {
     pub download_bytes: Option<u64>,
 }
 
-// ── Skill examples (for FunctionGemma training) ──────────────────────
+// ── Skill examples ───────────────────────────────────────────────────
 
-/// One example utterance in a SKILL.md manifest. Used as training data
-/// for the FunctionGemma skill router.
+/// One example utterance in a SKILL.md manifest. The phrase may carry
+/// `{slot}` placeholders, each standing for a run of words the scorer
+/// binds to the named argument — `play {song}` matches "play hotel
+/// california" and yields `song = "hotel california"`.
+///
+/// `weight` is the score a full match contributes, on the same 0..=1
+/// scale as `matching.patterns`. Oblique phrasings that could plausibly
+/// belong to another skill should sit lower than explicit ones.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkillExample {
     pub text: String,
     pub args: Option<serde_json::Value>,
+    pub weight: f32,
 }
 
 const MIN_EXAMPLES: usize = 5;
@@ -895,6 +902,7 @@ impl AriExtension {
                 Ok(SkillExample {
                     text,
                     args: e.args.clone(),
+                    weight: e.weight.unwrap_or(1.0),
                 })
             })
             .collect::<Result<Vec<_>, ManifestError>>()?;
@@ -1509,6 +1517,7 @@ struct RawExample {
     text: Option<String>,
     #[serde(default)]
     args: Option<serde_json::Value>,
+    weight: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]

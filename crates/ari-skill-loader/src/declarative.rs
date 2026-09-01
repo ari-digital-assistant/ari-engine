@@ -105,7 +105,7 @@ impl DeclarativeSkill {
         let ari = sf.ari_extension.as_ref().ok_or(AdapterError::NotAnAriSkill)?;
         let id = ari.id.clone();
         let specificity = ari.specificity.as_core();
-        let entry = compile_locale_entry(&sf.description, ari)?;
+        let entry = compile_locale_entry(&sf.description, ari, CANONICAL_LOCALE)?;
         let mut by_locale = BTreeMap::new();
         by_locale.insert(CANONICAL_LOCALE.to_string(), entry);
         Ok(DeclarativeSkill {
@@ -144,7 +144,7 @@ impl DeclarativeSkill {
             let Some(ari) = sf.ari_extension.as_ref() else {
                 continue;
             };
-            let entry = compile_locale_entry(&sf.description, ari)?;
+            let entry = compile_locale_entry(&sf.description, ari, locale)?;
             by_locale.insert(locale.clone(), entry);
         }
 
@@ -203,6 +203,7 @@ impl DeclarativeSkill {
 fn compile_locale_entry(
     description: &str,
     ari: &AriExtension,
+    locale: &str,
 ) -> Result<LocalizedDeclarative, AdapterError> {
     let decl = match &ari.behaviour {
         Some(Behaviour::Declarative(d)) => d,
@@ -210,7 +211,7 @@ fn compile_locale_entry(
         None => return Err(AdapterError::NotDeclarative),
     };
     let matching = ari.matching.as_ref().ok_or(AdapterError::NotDeclarative)?;
-    let scorer = PatternScorer::compile(matching)?;
+    let scorer = PatternScorer::compile(matching, &ari.examples, locale)?;
     Ok(LocalizedDeclarative {
         description: description.to_string(),
         scorer,
@@ -322,6 +323,10 @@ impl Skill for DeclarativeSkill {
 
     fn score(&self, input: &str, ctx: &SkillContext) -> f32 {
         self.entry_for_locale(&ctx.locale).scorer.score(input, &ctx.locale)
+    }
+
+    fn phrase_score(&self, normalized: &str, locale: &str) -> f32 {
+        self.entry_for_locale(locale).scorer.phrase_score_normalised(normalized)
     }
 
     fn execute(&self, _input: &str, ctx: &SkillContext) -> Response {

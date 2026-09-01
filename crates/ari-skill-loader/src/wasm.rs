@@ -479,6 +479,15 @@ impl std::fmt::Debug for WasmSkill {
 }
 
 impl WasmSkill {
+
+    /// Scorer for `locale`, falling back to the canonical English one.
+    fn scorer_for(&self, locale: &str) -> &PatternScorer {
+        self.scorers.get(locale).unwrap_or_else(|| {
+            self.scorers
+                .get(crate::localized_manifest::CANONICAL_LOCALE)
+                .expect("canonical scorer guaranteed by from_parts")
+        })
+    }
     /// Build a WASM skill from a parsed `SKILL.md` and the directory the
     /// manifest lives in (used to resolve the relative `wasm.module` path).
     /// `host_caps` is the set of capabilities the host provides; the skill's
@@ -501,7 +510,12 @@ impl WasmSkill {
         if let Some(matching) = ari.matching.as_ref() {
             scorers.insert(
                 crate::localized_manifest::CANONICAL_LOCALE.to_string(),
-                PatternScorer::compile(matching).map_err(|e| WasmError::Compile(e.to_string()))?,
+                PatternScorer::compile(
+                    matching,
+                    &ari.examples,
+                    crate::localized_manifest::CANONICAL_LOCALE,
+                )
+                .map_err(|e| WasmError::Compile(e.to_string()))?,
             );
         }
         Self::build(ari, &sf.description, wasm, skill_dir, options, scorers)
@@ -541,8 +555,8 @@ impl WasmSkill {
             let Some(matching) = ari.matching.as_ref() else {
                 continue;
             };
-            let scorer =
-                PatternScorer::compile(matching).map_err(|e| WasmError::Compile(e.to_string()))?;
+            let scorer = PatternScorer::compile(matching, &ari.examples, locale)
+                .map_err(|e| WasmError::Compile(e.to_string()))?;
             scorers.insert(locale.clone(), scorer);
         }
         Self::build(canonical_ari, &canonical.description, wasm, skill_dir, options, scorers)
@@ -617,7 +631,11 @@ impl WasmSkill {
         if let Some(matching) = ari.matching.as_ref() {
             scorers.insert(
                 crate::localized_manifest::CANONICAL_LOCALE.to_string(),
-                PatternScorer::compile(matching)?,
+                PatternScorer::compile(
+                    matching,
+                    &ari.examples,
+                    crate::localized_manifest::CANONICAL_LOCALE,
+                )?,
             );
         }
         Self::from_parts(ari, description, wasm, bytes, options, localized_strings, scorers)
@@ -2746,6 +2764,13 @@ impl Skill for WasmSkill {
         self.specificity
     }
 
+    /// Manifest example phrases always come from the native scorer, even for
+    /// a `custom_score` module — that export replaces the keyword tier, not
+    /// the phrases the manifest declares.
+    fn phrase_score(&self, normalized: &str, locale: &str) -> f32 {
+        self.scorer_for(locale).phrase_score_normalised(normalized)
+    }
+
     fn score(&self, input: &str, ctx: &SkillContext) -> f32 {
         // Default path: same native pattern scorer the declarative adapter
         // uses, applied to the manifest's `metadata.ari.matching` block. The
@@ -2756,12 +2781,7 @@ impl Skill for WasmSkill {
         // module its own `score()` export, called for every input. Documented
         // as a power-user feature with a perf warning.
         if !self.custom_score {
-            let scorer = self.scorers.get(&ctx.locale).unwrap_or_else(|| {
-                self.scorers
-                    .get(crate::localized_manifest::CANONICAL_LOCALE)
-                    .expect("canonical scorer guaranteed by from_parts")
-            });
-            return scorer.score(input, &ctx.locale);
+            return self.scorer_for(&ctx.locale).score(input, &ctx.locale);
         }
 
         self.with_instance(
@@ -3027,10 +3047,12 @@ mod tests {
             SkillExample {
                 text: "x".into(),
                 args: Some(serde_json::json!({"location": "", "when": "now"})),
+                weight: 1.0,
             },
             SkillExample {
                 text: "y".into(),
                 args: Some(serde_json::json!({"location": "tokyo", "when": "today"})),
+                weight: 1.0,
             },
         ];
         let v: serde_json::Value =

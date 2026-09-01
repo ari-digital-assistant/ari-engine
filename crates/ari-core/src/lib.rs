@@ -209,10 +209,14 @@ impl Default for SkillContext {
 /// `"{}"` for parameterless skills, or `r#"{"app_name": "Spotify"}"#` for
 /// parameterised ones. The args literal must be valid JSON; the export
 /// pipeline parses it directly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExampleUtterance {
     pub text: &'static str,
     pub args: &'static str,
+    /// Score a full match contributes, on the same 0..=1 scale as a
+    /// declarative skill's `matching.patterns`. Oblique phrasings that
+    /// could plausibly belong to another skill sit lower than explicit ones.
+    pub weight: f32,
 }
 
 /// A skill's opt-in declaration that it acts as a fallback NLU tier: when the
@@ -348,6 +352,26 @@ pub trait Skill: Send + Sync {
     /// skill that has not localised its router examples keeps working (English).
     fn example_utterances_for(&self, _locale: &str) -> &[ExampleUtterance] {
         self.example_utterances()
+    }
+
+    /// Score from this skill's example phrases against already-normalised
+    /// input, on the same 0..=1 scale as `score()`. The engine consults this
+    /// only after the keyword tier found no winner, so a phrase never
+    /// outranks an explicit trigger.
+    ///
+    /// The default matches [`example_utterances_for`](Skill::example_utterances_for),
+    /// which covers the built-in skills. Declarative and WASM skills override
+    /// it to read the phrases from their manifest. Skills that opted out of
+    /// semantic routing keep their explicit triggers as the only way in.
+    fn phrase_score(&self, normalized: &str, locale: &str) -> f32 {
+        if !self.router_eligible() {
+            return 0.0;
+        }
+        let phrases = self
+            .example_utterances_for(locale)
+            .iter()
+            .map(|e| (e.text, e.weight));
+        best_phrase_weight(phrases, normalized)
     }
 
     /// JSON schema describing this skill's parameters in OpenAI tool
@@ -790,9 +814,192 @@ fn strip_italian_elisions(lower: &str) -> String {
     out
 }
 
+/// Split a `{slot}`-templated phrase into its literal parts. `n` slots yield
+/// `n + 1` literals, any of which may be empty.
+fn literal_parts(phrase: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut rest = phrase;
+    while let Some(open) = rest.find('{') {
+        let Some(close) = rest[open..].find('}') else { break };
+        parts.push(&rest[..open]);
+        rest = &rest[open + close + 1..];
+    }
+    parts.push(rest);
+    parts
+}
+
+/// Whether `slot` swallowed something real — a slot must bind at least one
+/// whole word, so `play {song}` does not match a bare "play".
+fn slot_is_filled(slot: &str) -> bool {
+    !slot.trim().is_empty()
+}
+
+/// Normalise an example phrase the way [`normalize_input`] normalises user
+/// input, but leaving `{slot}` placeholders intact — plain normalisation
+/// strips the braces, which would turn every slot into a literal word.
+///
+/// Phrases must be stored in this form for [`phrase_matches`] to fire:
+/// the input it is matched against has already been through
+/// `normalize_input`, so an unnormalised "whats the time" could never
+/// meet the normalised "what is the time".
+pub fn normalize_phrase(phrase: &str, locale: &str) -> String {
+    let mut out = String::with_capacity(phrase.len());
+    let mut rest = phrase;
+    loop {
+        let (literal, slot, tail) = match rest.find('{') {
+            Some(open) => match rest[open..].find('}') {
+                Some(close) => (
+                    &rest[..open],
+                    Some(&rest[open..open + close + 1]),
+                    &rest[open + close + 1..],
+                ),
+                None => (rest, None, ""),
+            },
+            None => (rest, None, ""),
+        };
+        // Normalising drops the boundary spaces that separate a literal from
+        // its neighbouring slot, so put them back.
+        let lead = literal.starts_with(char::is_whitespace);
+        let trail = literal.ends_with(char::is_whitespace);
+        let body = normalize_input(literal, locale);
+        if lead && !body.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&body);
+        if trail && !body.is_empty() {
+            out.push(' ');
+        } else if trail && body.is_empty() && !out.ends_with(' ') && !out.is_empty() {
+            out.push(' ');
+        }
+        match slot {
+            Some(s) => out.push_str(s),
+            None => break,
+        }
+        rest = tail;
+    }
+    out
+}
+
+/// Match a `{slot}`-templated example phrase against already-normalised input.
+///
+/// Literals must appear in order and the match is anchored at both ends;
+/// each `{slot}` binds one or more words. `play {song}` matches
+/// "play hotel california" but neither "play" nor "shall i play something".
+/// Phrases with no slots match the whole input exactly.
+pub fn phrase_matches(phrase: &str, normalised: &str) -> bool {
+    let parts = literal_parts(phrase);
+    let (first, rest) = match parts.split_first() {
+        Some(pair) => pair,
+        None => return false,
+    };
+    if rest.is_empty() {
+        return normalised == *first;
+    }
+    let mut cur = match normalised.strip_prefix(first) {
+        Some(tail) => tail,
+        None => return false,
+    };
+    let (last, mids) = rest.split_last().expect("rest is non-empty");
+    for mid in mids {
+        // Search past the first byte so the preceding slot cannot bind empty.
+        let found = match cur.match_indices(*mid).find(|(i, _)| slot_is_filled(&cur[..*i])) {
+            Some((i, _)) => i,
+            None => return false,
+        };
+        cur = &cur[found + mid.len()..];
+    }
+    if last.is_empty() {
+        slot_is_filled(cur)
+    } else {
+        match cur.strip_suffix(last) {
+            Some(slot) => slot_is_filled(slot),
+            None => false,
+        }
+    }
+}
+
+/// Highest weight among the example phrases matching `normalised`, or `0.0`.
+/// Callers pass `(phrase, weight)` pairs so both the static built-in tables
+/// and a manifest's owned strings can share one matcher.
+pub fn best_phrase_weight<'a, I>(examples: I, normalised: &str) -> f32
+where
+    I: IntoIterator<Item = (&'a str, f32)>,
+{
+    examples
+        .into_iter()
+        .filter(|(phrase, _)| phrase_matches(phrase, normalised))
+        .map(|(_, weight)| weight)
+        .fold(0.0_f32, f32::max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_phrase_expands_literals_and_keeps_slots() {
+        assert_eq!(normalize_phrase("play {song}", "en"), "play {song}");
+        assert_eq!(
+            normalize_phrase("whats it saying on the clock", "en"),
+            "what is it saying on the clock"
+        );
+        assert_eq!(
+            normalize_phrase("i'd like {artist} on {service}", "en"),
+            "i would like {artist} on {service}"
+        );
+        assert_eq!(normalize_phrase("{app} please", "en"), "{app} please");
+    }
+
+    #[test]
+    fn normalized_phrase_matches_normalized_input() {
+        let phrase = normalize_phrase("whats playing on {service}", "en");
+        let input = normalize_input("What's playing on Spotify", "en");
+        assert!(phrase_matches(&phrase, &input));
+    }
+
+    #[test]
+    fn phrase_without_slots_matches_only_the_exact_input() {
+        assert!(phrase_matches("pause the music", "pause the music"));
+        assert!(!phrase_matches("pause the music", "pause the music now"));
+        assert!(!phrase_matches("pause the music", "pause"));
+    }
+
+    #[test]
+    fn trailing_slot_binds_one_or_more_words() {
+        assert!(phrase_matches("play {song}", "play hotel california"));
+        assert!(phrase_matches("play {song}", "play thriller"));
+        assert!(!phrase_matches("play {song}", "play"));
+        assert!(!phrase_matches("play {song}", "play "));
+    }
+
+    #[test]
+    fn phrase_is_anchored_at_both_ends() {
+        assert!(!phrase_matches("play {song}", "can you play thriller"));
+        assert!(phrase_matches("can you play {song}", "can you play thriller"));
+    }
+
+    #[test]
+    fn interior_slots_bind_between_literals() {
+        assert!(phrase_matches(
+            "play {song} on {service}",
+            "play abbey road on spotify"
+        ));
+        assert!(!phrase_matches("play {song} on {service}", "play abbey road on"));
+        assert!(!phrase_matches("play {song} on {service}", "play on spotify"));
+    }
+
+    #[test]
+    fn leading_slot_binds_before_a_literal() {
+        assert!(phrase_matches("{app} please open", "spotify please open"));
+        assert!(!phrase_matches("{app} please open", "please open"));
+    }
+
+    #[test]
+    fn best_phrase_weight_returns_the_highest_match_and_zero_for_none() {
+        let examples = [("play {song}", 0.95_f32), ("play {artist}", 0.6_f32)];
+        assert_eq!(best_phrase_weight(examples, "play thriller"), 0.95);
+        assert_eq!(best_phrase_weight(examples, "what time is it"), 0.0);
+    }
 
     // --- SkillContext / AppEntry ---
 

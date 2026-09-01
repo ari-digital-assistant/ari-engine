@@ -5,8 +5,8 @@
 //! as whole words, regex patterns require a match anywhere in the (already
 //! normalised) input. The highest matching weight wins.
 
-use crate::manifest::{MatchPattern, Matching};
-use ari_core::normalize_input;
+use crate::manifest::{MatchPattern, Matching, SkillExample};
+use ari_core::{best_phrase_weight, normalize_input, normalize_phrase};
 use regex::Regex;
 use thiserror::Error;
 
@@ -47,20 +47,34 @@ impl CompiledPattern {
     }
 }
 
-/// A compiled pattern set, ready to score inputs.
+/// A compiled pattern set plus the skill's example phrases, ready to score
+/// inputs. Phrases are normalised at compile time so they meet
+/// [`normalize_input`]'s output on equal terms.
 #[derive(Debug)]
 pub struct PatternScorer {
     patterns: Vec<CompiledPattern>,
+    phrases: Vec<(String, f32)>,
 }
 
 impl PatternScorer {
-    pub fn compile(matching: &Matching) -> Result<Self, ScorerError> {
+    pub fn compile(
+        matching: &Matching,
+        examples: &[SkillExample],
+        locale: &str,
+    ) -> Result<Self, ScorerError> {
         let patterns = matching
             .patterns
             .iter()
             .map(compile_pattern)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(PatternScorer { patterns })
+        // Normalised here rather than trusted from the manifest: a skill
+        // author writes "what's the time", and the input this is matched
+        // against has already been through `normalize_input`.
+        let phrases = examples
+            .iter()
+            .map(|e| (normalize_phrase(&e.text, locale), e.weight))
+            .collect();
+        Ok(PatternScorer { patterns, phrases })
     }
 
     /// Score a raw (un-normalised) input string. Returns the highest matching
@@ -89,6 +103,15 @@ impl PatternScorer {
             }
         }
         best
+    }
+
+    /// Best matching example phrase, or `0.0`. Kept apart from
+    /// [`score_normalised`](Self::score_normalised) because the engine runs
+    /// phrases as a later tier — they catch what no pattern claimed, and must
+    /// not outrank an explicit trigger.
+    pub fn phrase_score_normalised(&self, normalised: &str) -> f32 {
+        let phrases = self.phrases.iter().map(|(p, w)| (p.as_str(), *w));
+        best_phrase_weight(phrases, normalised)
     }
 }
 
@@ -136,7 +159,7 @@ mod tests {
             words: vec!["flip".to_string(), "coin".to_string()],
             weight: 0.95,
         }]);
-        let s = PatternScorer::compile(&m).unwrap();
+        let s = PatternScorer::compile(&m, &[], "en").unwrap();
         assert_eq!(s.score("flip a coin", "en"), 0.95);
         assert_eq!(s.score("toss a coin", "en"), 0.0);
         assert_eq!(s.score("flipping a coin", "en"), 0.0);
@@ -155,7 +178,7 @@ mod tests {
                 weight: 0.9,
             },
         ]);
-        let s = PatternScorer::compile(&m).unwrap();
+        let s = PatternScorer::compile(&m, &[], "en").unwrap();
         assert_eq!(s.score("just foo", "en"), 0.5);
         assert_eq!(s.score("foo bar", "en"), 0.9);
     }
@@ -166,7 +189,7 @@ mod tests {
             pattern: "what.*weather".to_string(),
             weight: 0.85,
         }]);
-        let s = PatternScorer::compile(&m).unwrap();
+        let s = PatternScorer::compile(&m, &[], "en").unwrap();
         // normalize_input lowercases and expands contractions
         assert_eq!(s.score("What's the weather like?", "en"), 0.85);
         assert_eq!(s.score("the weather is nice", "en"), 0.0);
@@ -178,7 +201,7 @@ mod tests {
             pattern: "[unclosed".to_string(),
             weight: 0.9,
         }]);
-        let err = PatternScorer::compile(&m).unwrap_err();
+        let err = PatternScorer::compile(&m, &[], "en").unwrap_err();
         match err {
             ScorerError::BadRegex { pattern, .. } => assert_eq!(pattern, "[unclosed"),
         }
@@ -187,7 +210,7 @@ mod tests {
     #[test]
     fn no_patterns_means_zero_score() {
         let m = matching(vec![]);
-        let s = PatternScorer::compile(&m).unwrap();
+        let s = PatternScorer::compile(&m, &[], "en").unwrap();
         assert_eq!(s.score("anything at all", "en"), 0.0);
     }
 }

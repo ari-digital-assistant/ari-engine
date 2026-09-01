@@ -136,42 +136,31 @@ mod tests {
         let examples = |id: &str| pick(&v, id);
         let examples_en = |id: &str| pick(&en_v, id);
 
-        // All five router-eligible built-ins lead with their canonical
-        // Italian phrasing. Count parity with English was a Plan-2
-        // authoring convention, not an invariant: Task 3 added four
-        // Italian-only polite-conditional `current_time` examples, so
-        // that one no longer matches English's count (29).
-        assert_eq!(examples("current_time").len(), 33);
-        assert_eq!(examples("current_time")[0]["text"], "che ora è");
-        assert_eq!(examples("current_time")[0]["args"], json!({}));
-        assert_eq!(examples("current_date").len(), 30);
-        assert_eq!(examples("current_date")[0]["text"], "che giorno è oggi");
-        assert_eq!(examples("greeting").len(), 30);
-        assert_eq!(examples("greeting")[0]["text"], "ciao");
-        // `open` is the first localised skill carrying args: the Italian
-        // text is translated but the app_name value stays canonical
-        // English, because it feeds app resolution rather than display.
-        assert_eq!(examples("open").len(), 40);
-        assert_eq!(examples("open")[0]["text"], "apri spotify");
-        assert_eq!(examples("open")[0]["args"], json!({"app_name": "Spotify"}));
-        assert_eq!(examples("open")[1]["text"], "apri la fotocamera");
-        assert_eq!(examples("open")[1]["args"], json!({"app_name": "Camera"}));
-        // `calculator` carries args whose value is canonical evaluator
-        // syntax: the utterance is Italian, the expression is not, because
-        // the evaluator has no locale.
-        assert_eq!(examples("calculator").len(), 40);
-        assert_eq!(examples("calculator")[0]["text"], "quanto fa 5 più 3");
+        // Every router-eligible built-in exports its own Italian phrases.
+        // Neither counts nor ordering are asserted: the phrase banks are
+        // authored corpora that grow, and the export preserves declaration
+        // order, so pinning either turns every corpus edit into a test edit.
+        let has = |id: &str, text: &str| {
+            examples(id).iter().any(|e| e["text"] == text)
+        };
+        assert!(has("current_time", "che ora è"));
+        assert!(has("current_date", "che giorno è oggi"));
+        assert!(has("greeting", "ciao"));
+
+        // `open` and `calculator` carry args. The utterance is Italian but
+        // the value is not: app_name feeds app resolution and expression
+        // feeds the evaluator, and neither has a locale.
+        let arg_for = |id: &str, text: &str| {
+            examples(id)
+                .iter()
+                .find(|e| e["text"] == text)
+                .map(|e| e["args"].clone())
+                .unwrap_or(json!(null))
+        };
+        assert_eq!(arg_for("open", "apri la posta"), json!({"app_name": "Email"}));
         assert_eq!(
-            examples("calculator")[0]["args"],
-            json!({"expression": "5 + 3"})
-        );
-        assert_eq!(
-            examples("calculator")[2]["text"],
-            "quanto fa il quindici percento di duecento"
-        );
-        assert_eq!(
-            examples("calculator")[2]["args"],
-            json!({"expression": "15% of 200"})
+            arg_for("calculator", "quanto fa {n1} più {n2}"),
+            json!({"expression": "{n1} + {n2}"})
         );
 
         // `search` is router_eligible=false and is deliberately never

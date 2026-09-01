@@ -1246,6 +1246,22 @@ impl Engine {
             .collect()
     }
 
+    /// Per-skill example-phrase scores, for the tier that runs when no
+    /// keyword pattern claimed the utterance. Deliberately separate from
+    /// [`keyword_scores`]: a phrase is a looser signal than an explicit
+    /// trigger, so it must never outrank one.
+    fn phrase_scores(&self, normalized: &str) -> Vec<SkillScore> {
+        self.skills
+            .iter()
+            .filter(|s| self.skill_is_ready(s.as_ref()))
+            .map(|s| SkillScore {
+                skill_id: s.id().to_string(),
+                specificity: s.specificity(),
+                score: s.phrase_score(normalized, &self.ctx.locale),
+            })
+            .collect()
+    }
+
     /// Run the ranking rounds over pre-computed scores. Returns the winner and
     /// its round index.
     fn rank(scores: &[SkillScore]) -> Option<(&SkillScore, usize)> {
@@ -1524,7 +1540,30 @@ impl Engine {
             return (response, Some(trace));
         }
 
-        // No keyword match. Two routing tiers, in this order:
+        // No keyword pattern claimed it. Before reaching for a model, try the
+        // skills' own example phrases — the corpus that used to train
+        // FunctionGemma, matched directly against the utterance. Same ranking
+        // rounds, so weights and specificity arbitrate exactly as they do for
+        // keywords; it just runs second, because a `{slot}` phrase is a looser
+        // signal than an explicit trigger and must never outrank one.
+        let phrase_scores = self.phrase_scores(&normalized);
+        if let Some((winner, round_idx)) = Self::rank(&phrase_scores) {
+            trace.winner = Some(format!("phrase:{}", winner.skill_id));
+            trace.round = Some(round_idx);
+
+            let skill = self
+                .skills
+                .iter()
+                .find(|s| s.id() == winner.skill_id)
+                .unwrap()
+                .clone();
+
+            let response = skill.execute(&normalized, &exec_ctx);
+            let response = self.maybe_intercept_consult(skill, &normalized, response);
+            return (response, Some(trace));
+        }
+
+        // Still nothing. Two routing tiers, in this order:
         //
         // 1. The on-device router (FunctionGemma), but only for English — at
         //    270M it routes other languages confidently but wrongly, so
