@@ -3097,6 +3097,7 @@ mod tests {
             depends_on: vec![],
             help_text: None,
             collapsed_group: None,
+            keyboard: None,
         };
         let fields = vec![
             mk("token", ConfigFieldType::Secret),
