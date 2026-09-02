@@ -81,6 +81,18 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
 
 uniffi::setup_scaffolding!();
 
+/// The engine version a frontend should quote in a bug report.
+///
+/// This is `ari-ffi`'s own crate version, and that is deliberate: the engine's
+/// crates are not versioned in lockstep, so there is no single number that
+/// describes "the engine". What every frontend actually links is this crate,
+/// so its version is the one that identifies the boundary a bug was reported
+/// against. Bump it when the FFI surface changes.
+#[uniffi::export]
+pub fn engine_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 /// WASM-skill log level, mirrored from [`ari_skill_loader::LogLevel`] for
 /// the UniFFI boundary. The engine's own `LogLevel` isn't exportable
 /// directly because UniFFI types can't derive outside the FFI crate.
