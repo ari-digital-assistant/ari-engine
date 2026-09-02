@@ -110,6 +110,10 @@ pub struct FfiConfigField {
     /// rendered collapsed under one expander carrying this label. Null =
     /// always shown at top level.
     pub collapsed_group: Option<String>,
+    /// Optional soft-keyboard hint for text entry — currently only `"url"`.
+    /// Null means an ordinary text keyboard. A frontend that doesn't know a
+    /// value here must fall back to plain text rather than hide the field.
+    pub keyboard: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -331,6 +335,7 @@ impl AssistantRegistry {
                     validate: field.validate,
                     help_text: field.help_text.clone(),
                     collapsed_group: field.collapsed_group.clone(),
+                    keyboard: field.keyboard.map(|k| k.as_str().to_string()),
                 }
             })
             .collect()

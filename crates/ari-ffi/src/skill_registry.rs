@@ -738,6 +738,7 @@ impl SkillRegistry {
                     validate: field.validate,
                     help_text: field.help_text.clone(),
                     collapsed_group: field.collapsed_group.clone(),
+                    keyboard: field.keyboard.map(|k| k.as_str().to_string()),
                 }
             })
             .collect())

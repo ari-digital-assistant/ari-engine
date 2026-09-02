@@ -286,6 +286,41 @@ pub struct ConfigField {
     /// rendered collapsed under one expander carrying this label. `None` =
     /// always shown at top level.
     pub collapsed_group: Option<String>,
+    /// Optional soft-keyboard hint for text entry. `None` = ordinary text.
+    pub keyboard: Option<KeyboardHint>,
+}
+
+/// How a text field should be typed on a soft keyboard.
+///
+/// Deliberately *not* a new [`ConfigFieldType`]. A frontend skips a field
+/// whose type it doesn't recognise, so retyping the Home Assistant URL as
+/// `type: url` would make the box vanish on any client older than the
+/// change — for a required field, that bricks the skill's setup. An
+/// unrecognised `keyboard:` is ignored instead, and the field still renders
+/// as plain text, so skills can adopt this without waiting for every
+/// install to catch up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardHint {
+    /// A URL. Suppresses the auto-capitalisation and the space-after-a-dot
+    /// that a prose keyboard inserts into a hostname.
+    Url,
+}
+
+impl KeyboardHint {
+    fn parse(raw: Option<&str>) -> Option<Self> {
+        // Unknown values fall back to `None` rather than erroring: a
+        // manifest written for a newer schema must still load here.
+        match raw?.trim() {
+            "url" => Some(Self::Url),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Url => "url",
+        }
+    }
 }
 
 /// Declarative visibility gate on a [`ConfigField`]. The frontend
@@ -1340,6 +1375,7 @@ impl ConfigField {
             depends_on: raw.depends_on.clone(),
             help_text: raw.help_text.clone(),
             collapsed_group: raw.collapsed_group.clone(),
+            keyboard: KeyboardHint::parse(raw.keyboard.as_deref()),
         })
     }
 }
@@ -1604,6 +1640,8 @@ struct RawConfigField {
     help_text: Option<String>,
     #[serde(default)]
     collapsed_group: Option<String>,
+    #[serde(default)]
+    keyboard: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1700,6 +1738,57 @@ body
         );
         assert_eq!(action.help_text, None);
         assert_eq!(action.collapsed_group, None);
+    }
+
+    /// A `keyboard:` hint rides alongside `type: text` rather than replacing
+    /// it, so the field keeps rendering on clients that predate the hint.
+    #[test]
+    fn keyboard_hint_parses_and_tolerates_unknown_values() {
+        fn field_with(keyboard_line: &str) -> ConfigField {
+            let md = format!(
+                r#"---
+name: t
+description: Test skill for keyboard hint parsing. Use when testing the keyboard hint.
+metadata:
+  ari:
+    id: ai.example.keyboard-test
+    version: "0.1.0"
+    engine: ">=0.3"
+    matching:
+      patterns:
+        - keywords: [turn, on]
+          weight: 0.9
+    settings:
+      - key: base_url
+        label: "Server URL"
+        type: text
+{keyboard_line}
+    declarative:
+      response_pick: ["ok"]
+---
+body
+"#
+            );
+            let sf = Skillfile::parse(&md, None).expect("parse");
+            sf.ari_extension
+                .expect("ari extension required")
+                .settings
+                .into_iter()
+                .find(|f| f.key == "base_url")
+                .expect("base_url field")
+        }
+
+        let url = field_with("        keyboard: url");
+        assert_eq!(url.keyboard, Some(KeyboardHint::Url));
+        // Still an ordinary text field — the hint is presentation only, and
+        // must not change how the value is stored or validated.
+        assert_eq!(url.field_type, ConfigFieldType::Text);
+
+        // A value from a newer schema degrades to plain text instead of
+        // failing the whole manifest and taking the skill down with it.
+        assert_eq!(field_with("        keyboard: telephone").keyboard, None);
+
+        assert_eq!(field_with("        required: false").keyboard, None);
     }
 
     fn coin_flip_source() -> &'static str {
