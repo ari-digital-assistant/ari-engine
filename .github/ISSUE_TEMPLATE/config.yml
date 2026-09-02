@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Something wrong with a skill
+    url: https://github.com/ari-digital-assistant/ari-skills/issues/new/choose
+    about: Skills live in their own repository, along with their own bug tracker.
+  - name: Something wrong in the Android app
+    url: https://github.com/ari-digital-assistant/ari-android/issues/new/choose
+    about: Anything about the app's UI, permissions, notifications or wake word.
+  - name: Questions and ideas
+    url: https://github.com/orgs/ari-digital-assistant/discussions
+    about: For anything that isn't a bug.

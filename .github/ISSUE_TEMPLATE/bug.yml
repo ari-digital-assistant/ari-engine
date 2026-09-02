@@ -1,0 +1,92 @@
+name: Bug report
+description: Something in the engine doesn't work
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The engine is the part that decides what Ari does with what you said.
+        If the problem is with how something *looks* on Android, file it on
+        ari-android instead — the frontends own their own UI.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you asked Ari, what you expected, and what it did.
+    validations:
+      required: true
+
+  - type: input
+    id: utterance
+    attributes:
+      label: What did you say to Ari?
+      description: The exact wording, if routing went somewhere unexpected.
+      placeholder: "is it beer o'clock yet"
+
+  - type: input
+    id: version
+    attributes:
+      label: Engine version
+      placeholder: "0.7.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: frontend
+    attributes:
+      label: Which frontend?
+      options:
+        - Android
+        - Linux desktop
+        - Calling the engine directly
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of the engine?
+      options:
+        - Skill routing — it picked the wrong skill, or none
+        - Skill loading or manifests
+        - The assistant (cloud or on-device model)
+        - Storage or settings
+        - The FFI layer
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: skill
+    attributes:
+      label: Which skill, and which version?
+      placeholder: "home-assistant 0.4.1"
+
+  - type: input
+    id: locale
+    attributes:
+      label: Language
+      description: Routing is trained per language, so a bug can be real in one and absent in another.
+      placeholder: "en"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or debug output
+      description: >-
+        `--debug` output is very welcome. Check it over first — it can contain
+        hostnames and keys.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched the existing issues
+          required: true
+        - label: I removed anything private from what I pasted above
+          required: true
