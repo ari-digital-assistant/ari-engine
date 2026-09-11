@@ -467,7 +467,7 @@ pub fn call_assistant_api(
 ) -> Result<String, AssistantApiError>
 ```
 
-Builds the request body based on `request_format`, sets auth headers, POSTs, extracts response text via `response_path`. Timeout: 30 seconds (hardcoded, not configurable — antislop rule 13). Error type carries enough info for a user-facing message: timeout, auth failure, network error, unexpected response shape.
+Builds the request body based on `request_format`, sets auth headers, POSTs, extracts response text via `response_path`. Timeout: 30 seconds (hardcoded, not configurable — antislop rule 16). Error type carries enough info for a user-facing message: timeout, auth failure, network error, unexpected response shape.
 
 ### Response path extraction
 
