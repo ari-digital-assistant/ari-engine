@@ -1,5 +1,10 @@
 # Assistant Skills — Design Document
 
+This is the design as built. It shipped in 2026 and the engine, FFI and
+Android sections below describe code that now exists. For writing an
+assistant skill rather than understanding the design, read
+[ari-skills/docs/assistant-skills.md](https://github.com/ari-digital-assistant/ari-skills/blob/main/docs/assistant-skills.md).
+
 ## Problem
 
 Ari's on-device LLM fallback is hardwired into the engine. It works, but it's a closed system — there's no way for a developer or user to swap in an alternative (ChatGPT, Claude, Ollama, a different local model framework) without modifying the engine source. The LLM settings page is bespoke Android code that only knows about the three bundled Gemma tiers.
@@ -14,7 +19,7 @@ A new skill type: **assistant**. An assistant skill doesn't compete in the ranki
 
 - It is **not** a regular skill. It never enters the three-round ranking pipeline.
 - It is **not** a replacement for the engine's `Skill` trait. Regular skills (built-in, declarative, WASM) are unchanged.
-- It is **not** a conversation engine. It answers one question at a time. Multi-turn context is a future enhancement.
+- It is **not** a conversation engine of its own. The engine holds the conversation buffer and replays recent exchanges into the request; the skill just describes the API.
 
 ## Manifest format
 
@@ -606,8 +611,6 @@ Assistant skills don't have WASM modules or pattern matching, so they're always 
 
 ## Future extensions (not in scope now)
 
-- **Multi-turn conversation.** The `messages` array in the API request grows from 2 entries to N. The engine holds a conversation buffer scoped to the active assistant. Additive change — no manifest schema change needed.
 - **Streaming responses.** Server-sent events for cloud providers, token-by-token for local LLM. Requires FFI callback mechanism.
 - **Custom system prompt.** A user-facing config field that overrides the manifest's `system_prompt`. Already achievable by adding a `system_prompt` config key of type `text` — no engine change needed.
 - **WASM assistant provider.** For APIs with genuinely incompatible request/response shapes. A WASM module that implements an `assistant_execute(input) -> string` export instead of the regular skill ABI. Only build this if a real provider can't be served by the declarative format.
-- **First-run wizard.** The wtf.md already tracks this. The assistant selection would be a step in the wizard: "How should Ari answer general questions?" with the installed options.

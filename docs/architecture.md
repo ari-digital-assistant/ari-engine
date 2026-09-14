@@ -184,9 +184,13 @@ go through it at load; the built-in banks are static and stored pre-normalised,
 with a test guarding that they stay that way. An un-normalised phrase is not an
 error anywhere — it simply never matches.
 
-> This tier replaced a fine-tuned on-device routing model in September 2026,
-> and inherited its training corpus as the phrase banks. The post-mortem in
-> `docs/postmortems/` covers why the model went.
+> This tier replaced a fine-tuned 270M on-device routing model in September
+> 2026, and inherited its training corpus as the phrase banks. The model was
+> never good: on the hand-written spine it was right 50% of the time (en) and
+> 38% (it) when it emitted a route at all, and its confidence could not tell
+> right from wrong — correct and incorrect routes sat 0.005 apart, which is
+> noise. There was no threshold to find, which is why the promotion gate had
+> rejected every build for three weeks before it was removed.
 
 ### 5b. The assistant routes what's left
 
@@ -248,6 +252,38 @@ transcript.
 
 If all retries also return `NotUnderstood`, Ari says "Sorry, I didn't
 understand that." and returns to listening for the wake word.
+
+## Across turns
+
+The pipeline above answers one utterance. Four pieces of state survive between
+them, all held in `ari-engine` and all owned by the frontend, which persists
+them and pushes them back in on start.
+
+**The mic reopening.** An assistant answer carries a trailing `[continuation]`
+or `[new]` marker, stripped before the user ever sees it. `[continuation]`
+tells the frontend to reopen the mic without the wake word, so a follow-up
+needs no "hey Ari". An absent or unrecognised marker is read as
+`[continuation]` — keeping context is the safer default when the model has
+failed to say.
+
+**The conversation buffer.** The last 5 exchanges are replayed to the assistant
+so a follow-up can say "and tomorrow?". It is dropped after 90 seconds of
+inactivity, and is not kept at all when the user turns conversation memory off.
+
+**"Let's talk" mode.** Entered by phrase ("let us have a conversation"), left by
+phrase ("goodbye", "that is all"). While active, the mic stays open across turns
+and skill turns are recorded into the buffer alongside assistant ones. It
+requires conversation memory; entry is refused without it.
+
+**Remembered facts.** Explicit "remember that …" captures, up to 50, injected
+into the assistant prompt as a recall block. The user can list them back or
+forget them, individually or all at once. The engine holds the canonical copy;
+the frontend writes them to disk when the engine flags a change.
+
+Separately, a skill that asks the user a question parks a **pending turn** — the
+next utterance is handed straight back to that skill rather than re-entering the
+pipeline. It expires after 60 seconds, a safety net for a frontend that crashed
+before it could cancel.
 
 ## Component locations
 
