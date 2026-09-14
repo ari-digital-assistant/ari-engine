@@ -1,2 +1,6 @@
 /target
 *.jsonl
+
+# Local toolchain paths. Cargo cannot expand ~ or $HOME in [env], so this file
+# is necessarily machine-specific. Copy .cargo/config.toml.example and edit.
+.cargo/config.toml
