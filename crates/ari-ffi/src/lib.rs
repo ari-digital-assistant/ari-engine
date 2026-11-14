@@ -1,7 +1,7 @@
 #![allow(clippy::new_without_default)]
 
 use ari_core::Skill;
-use ari_engine::{fallback_response_for, Engine, EnvelopeSink, FALLBACK_RESPONSE};
+use ari_engine::{fallback_response_for, ConversationLength, Engine, EnvelopeSink, FALLBACK_RESPONSE};
 use ari_skill_loader::assistant::{ConfigStore, MemoryConfigStore};
 use ari_skill_loader::{
     load_skill_directory_with, AuthorizeInput, AuthorizeOutput, AuthorizeProvider, Calendar,
@@ -247,6 +247,24 @@ pub struct FfiCalendarEventRow {
     pub end_ms: i64,
     pub all_day: bool,
     pub calendar_id: u64,
+}
+
+/// The user's conversation-length setting; see [`ConversationLength`].
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FfiConversationLength {
+    Short,
+    Medium,
+    Long,
+}
+
+impl From<FfiConversationLength> for ConversationLength {
+    fn from(length: FfiConversationLength) -> Self {
+        match length {
+            FfiConversationLength::Short => ConversationLength::Short,
+            FfiConversationLength::Medium => ConversationLength::Medium,
+            FfiConversationLength::Long => ConversationLength::Long,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, uniffi::Enum)]
@@ -1303,6 +1321,26 @@ impl AriEngine {
             .lock()
             .expect("engine mutex poisoned")
             .set_conversation_memory_enabled(enabled);
+    }
+
+    /// How much conversation the engine keeps, and for how long. Mirrors
+    /// the Android `conversationLength` setting; hydrated at engine build and
+    /// written through when the user changes it.
+    pub fn set_conversation_length(&self, length: FfiConversationLength) {
+        self.inner
+            .lock()
+            .expect("engine mutex poisoned")
+            .set_conversation_length(length.into());
+    }
+
+    /// How assistant answers should sound, in the user's words; blank for
+    /// Ari's own voice. Mirrors the Android `personality` setting; hydrated
+    /// at engine build and written through when the user edits it.
+    pub fn set_personality(&self, personality: String) {
+        self.inner
+            .lock()
+            .expect("engine mutex poisoned")
+            .set_personality(&personality);
     }
 
     /// Replace the engine's durable personal facts. Mirrors the Android

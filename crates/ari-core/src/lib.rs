@@ -14,6 +14,35 @@ context to answer. At the very end of your reply, append a single space and then
 [continuation] if this message continues the earlier conversation, or [new] if it begins \
 a new, unrelated topic. Keep the marker on the same line as your answer.";
 
+/// Longest personality Ari keeps. A few sentences set a tone, and every
+/// character rides along in every assistant prompt, where the on-device
+/// model has room for about 2,000 tokens all told.
+pub const MAX_PERSONALITY_CHARS: usize = 500;
+
+/// The personality the user gave Ari, as a system-prompt block, or `None`
+/// when they left it blank. It sits after Ari's own instructions. A polite
+/// "let it shape your tone" was ignored by Gemma 4 (ari-android#31), so it
+/// asks for full character, and says the on-device prompt's few-shot
+/// examples set content, not style: Gemma copied "The sky is blue." verbatim
+/// otherwise. It also holds the model to Ari's rules, so a personality can't
+/// talk it into claiming abilities it lacks or out of a requested format.
+/// Internal directive, English source, not localized (like
+/// [`CONTINUATION_INSTRUCTION`]).
+pub fn personality_block(personality: &str) -> Option<String> {
+    let text = personality.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Your personality, chosen by the user: {text}\n\
+         Stay fully in character in every reply: your word choice, tone and phrasing should \
+         all show it. Any example replies above show what to say, not how to say it. Being \
+         in character never changes what you can do: when the rules above say you can't do \
+         something, say so, in character, and never pretend to have done it or invent \
+         information. Keep to any reply format you are asked for."
+    ))
+}
+
 /// A compact block of durable user facts for injection into an assistant
 /// system prompt. `None` when there are no facts so callers emit nothing.
 /// Format is fixed (see the plan Global Constraints): a header line then one
@@ -1112,6 +1141,22 @@ mod tests {
     #[test]
     fn remembered_facts_block_empty_is_none() {
         assert_eq!(crate::remembered_facts_block(&[]), None);
+    }
+
+    // --- personality_block ---
+
+    #[test]
+    fn personality_block_asks_for_character_within_the_rules() {
+        let block = crate::personality_block("  Cheerful and chatty.  ").unwrap();
+        assert!(block.starts_with("Your personality, chosen by the user: Cheerful and chatty.\n"));
+        assert!(block.contains("Stay fully in character"));
+        assert!(block.contains("never pretend to have done it"));
+    }
+
+    #[test]
+    fn blank_personality_is_none() {
+        assert_eq!(crate::personality_block(""), None);
+        assert_eq!(crate::personality_block("   \n"), None);
     }
 
     // --- settings_query ---

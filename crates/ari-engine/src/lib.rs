@@ -104,11 +104,44 @@ pub fn fallback_response_for(locale: &str) -> &'static str {
 /// is treated as abandoned. Safety net only — the frontend cancels eagerly.
 const PENDING_TURN_TTL: Duration = Duration::from_secs(60);
 
-/// Inactivity window after which a conversation's context is dropped and
-/// the next assistant turn starts fresh.
-const CONVERSATION_TTL: Duration = Duration::from_secs(90);
-/// Most recent exchanges retained (10 role/content entries).
-const MAX_CONVERSATION_TURNS: usize = 5;
+/// How much of a conversation Ari keeps for follow-up questions, and how
+/// long a silence it waits out before forgetting it. The user's choice;
+/// the two grow together, since someone who wants a longer conversation
+/// also takes longer between turns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConversationLength {
+    /// Five exchanges, forgotten after 90 seconds of quiet: quick
+    /// follow-ups ("and what about tomorrow?").
+    #[default]
+    Short,
+    /// Ten exchanges, forgotten after 5 minutes: time to read an answer
+    /// or step away briefly.
+    Medium,
+    /// Twenty exchanges, forgotten after 15 minutes: a proper chat with
+    /// pauses in it.
+    Long,
+}
+
+impl ConversationLength {
+    /// Most recent exchanges kept (a question and its answer each).
+    pub fn turns(self) -> usize {
+        match self {
+            Self::Short => 5,
+            Self::Medium => 10,
+            Self::Long => 20,
+        }
+    }
+
+    /// Inactivity after which the conversation is dropped and the next
+    /// assistant turn starts fresh.
+    pub fn idle_timeout(self) -> Duration {
+        match self {
+            Self::Short => Duration::from_secs(90),
+            Self::Medium => Duration::from_secs(5 * 60),
+            Self::Long => Duration::from_secs(15 * 60),
+        }
+    }
+}
 
 /// Upper bound on stored personal facts. Bounds the recall block injected
 /// into the assistant prompt; a capture at the cap evicts the oldest.
@@ -583,6 +616,11 @@ pub struct Engine {
     // the frontend to re-read and persist.
     remembered_facts: Mutex<Vec<String>>,
     facts_changed: AtomicBool,
+    // How the user wants assistant answers to sound; empty for Ari's own
+    // voice. Owned by the frontend (set via set_personality).
+    personality: Mutex<String>,
+    // Owned by the frontend (set via set_conversation_length).
+    conversation_length: Mutex<ConversationLength>,
 }
 
 impl Engine {
@@ -607,6 +645,8 @@ impl Engine {
             conversation_memory_enabled: AtomicBool::new(true),
             remembered_facts: Mutex::new(Vec::new()),
             facts_changed: AtomicBool::new(false),
+            personality: Mutex::new(String::new()),
+            conversation_length: Mutex::new(ConversationLength::default()),
         }
     }
 
@@ -679,6 +719,32 @@ impl Engine {
 
     fn is_conversation_memory_enabled(&self) -> bool {
         self.conversation_memory_enabled.load(Ordering::SeqCst)
+    }
+
+    /// How much conversation to keep and for how long. A shorter setting
+    /// takes effect on the conversation in progress straight away.
+    pub fn set_conversation_length(&self, length: ConversationLength) {
+        *self.conversation_length.lock().expect("conversation_length poisoned") = length;
+        if let Some(buf) = self.conversation.lock().expect("conversation poisoned").as_mut() {
+            let excess = buf.turns.len().saturating_sub(length.turns());
+            buf.turns.drain(0..excess);
+        }
+    }
+
+    pub fn conversation_length(&self) -> ConversationLength {
+        *self.conversation_length.lock().expect("conversation_length poisoned")
+    }
+
+    /// How assistant answers should sound, in the user's words. Blank
+    /// restores Ari's own voice; anything past
+    /// [`ari_core::MAX_PERSONALITY_CHARS`] is cut.
+    pub fn set_personality(&self, personality: &str) {
+        let text: String = personality.trim().chars().take(ari_core::MAX_PERSONALITY_CHARS).collect();
+        *self.personality.lock().expect("personality poisoned") = text;
+    }
+
+    pub fn personality(&self) -> String {
+        self.personality.lock().expect("personality poisoned").clone()
     }
 
     /// Replace the stored facts wholesale (frontend hydration + settings-screen
@@ -771,7 +837,7 @@ impl Engine {
         }
         let mut guard = self.conversation.lock().expect("conversation poisoned");
         match guard.as_mut() {
-            Some(buf) if buf.last_activity.elapsed() < CONVERSATION_TTL => {
+            Some(buf) if buf.last_activity.elapsed() < self.conversation_length().idle_timeout() => {
                 buf.last_activity = Instant::now();
                 buf.turns.clone()
             }
@@ -786,7 +852,7 @@ impl Engine {
     /// Record an assistant answer (marker already stripped) as the latest
     /// turn. `New` starts a fresh conversation seeded with just this turn;
     /// `Continuation` appends and trims to the most recent
-    /// `MAX_CONVERSATION_TURNS`.
+    /// [`ConversationLength::turns`].
     pub(crate) fn record_assistant_turn(&self, user: &str, assistant: &str, flag: ContinuationFlag) {
         if !self.is_conversation_memory_enabled() {
             return;
@@ -796,10 +862,8 @@ impl Engine {
         match (flag, guard.as_mut()) {
             (ContinuationFlag::Continuation, Some(buf)) => {
                 buf.turns.push(turn);
-                let len = buf.turns.len();
-                if len > MAX_CONVERSATION_TURNS {
-                    buf.turns.drain(0..len - MAX_CONVERSATION_TURNS);
-                }
+                let excess = buf.turns.len().saturating_sub(self.conversation_length().turns());
+                buf.turns.drain(0..excess);
                 buf.last_activity = Instant::now();
             }
             // `New`, or first turn of a fresh buffer: seed with this turn.
@@ -1292,6 +1356,9 @@ impl Engine {
         // assistant by name or not. Skill-serving calls (routing, layer-C)
         // pass &[] — facts are user-answer context only.
         let facts = self.remembered_facts();
+        // The personality shapes the same answers the facts inform, and
+        // likewise stays out of skill-serving calls.
+        let personality = self.personality();
 
         // Multi-turn: if a skill is awaiting a reply, this utterance belongs
         // to it — bypass all routing (scoring, router, assistant).
@@ -1362,7 +1429,7 @@ impl Engine {
                     m.remainder.len()
                 ),
             );
-            let outcome = dispatch_named_assistant(m.binding, &m.remainder, &self.ctx.locale, &history, &facts, self.model_catalog.as_deref(), |level, msg| {
+            let outcome = dispatch_named_assistant(m.binding, &m.remainder, &self.ctx.locale, &history, &facts, &personality, self.model_catalog.as_deref(), |level, msg| {
                 self.log(level, msg)
             });
             // The prompt actually sent is the remainder ("what is the capital
@@ -1467,7 +1534,7 @@ impl Engine {
             // call that either routes to a skill or answers directly, instead
             // of route-then-separate-answer. The combined prompt is English
             // only, so non-English keeps the translated two-step below.
-            match self.route_or_answer(&normalized, &history, &facts) {
+            match self.route_or_answer(&normalized, &history, &facts, &personality) {
                 Ok(RouteOrAnswer::Skill(id)) => {
                     if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
                         self.log(
@@ -1621,7 +1688,7 @@ impl Engine {
                             normalized.len()
                         ),
                     );
-                    let result = llm.try_answer(&normalized, &catalog, &self.ctx.locale, &history, &facts);
+                    let result = llm.try_answer(&normalized, &catalog, &self.ctx.locale, &history, &facts, &personality);
                     match result {
                         Some(ari_llm::FallbackResult::DirectAnswer { text }) => {
                             let (clean, flag) = assistant_answer(&text);
@@ -1670,6 +1737,7 @@ impl Engine {
                     &self.ctx.locale,
                     &history,
                     &facts,
+                    &personality,
                     self.model_catalog.as_deref(),
                 ) {
                     Ok(text) if !text.is_empty() => {
@@ -1720,7 +1788,7 @@ impl Engine {
         skill_catalog: &[(String, String, String)],
     ) -> Result<Option<String>, AssistantCallError> {
         let prompt = build_assistant_routing_prompt(input, skill_catalog, &self.ctx.locale);
-        let response = match self.call_active_assistant(&prompt, &[], &[]) {
+        let response = match self.call_active_assistant(&prompt, &[], &[], "") {
             Ok(response) => response,
             Err(e @ AssistantCallError::Terminal(_)) => return Err(e),
             Err(AssistantCallError::Transient(_)) => return Ok(None),
@@ -1745,7 +1813,13 @@ impl Engine {
     /// which of those the caller must surface rather than fall through.
     /// Shared by the routing prompt, the one-shot route-or-answer, and the
     /// debug commands.
-    fn call_active_assistant(&self, prompt: &str, history: &[(String, String)], facts: &[String]) -> Result<String, AssistantCallError> {
+    fn call_active_assistant(
+        &self,
+        prompt: &str,
+        history: &[(String, String)],
+        facts: &[String],
+        personality: &str,
+    ) -> Result<String, AssistantCallError> {
         let fail = |reason: String| -> Result<String, AssistantCallError> {
             self.log(LogLevel::Warn, &format!("assistant: {reason}"));
             Err(AssistantCallError::Transient(reason))
@@ -1767,6 +1841,7 @@ impl Engine {
                 &self.ctx.locale,
                 history,
                 facts,
+                personality,
                 self.model_catalog.as_deref(),
             ) {
                 Ok(text) => text,
@@ -1819,10 +1894,16 @@ impl Engine {
     /// be normalised. `None` when no assistant is configured or the call
     /// failed. English-instruction prompt for now; non-English callers should
     /// keep the translated two-step until a localised combined prompt exists.
-    fn route_or_answer(&self, input: &str, history: &[(String, String)], facts: &[String]) -> Result<RouteOrAnswer, AssistantCallError> {
+    fn route_or_answer(
+        &self,
+        input: &str,
+        history: &[(String, String)],
+        facts: &[String],
+        personality: &str,
+    ) -> Result<RouteOrAnswer, AssistantCallError> {
         let catalog = self.router_catalog();
         let prompt = build_combined_route_or_answer_prompt(input, &catalog);
-        let response = self.call_active_assistant(&prompt, history, facts)?;
+        let response = self.call_active_assistant(&prompt, history, facts, personality)?;
         Ok(parse_combined_response(&response, &catalog))
     }
 
@@ -2198,6 +2279,7 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
     locale: &str,
     history: &[(String, String)],
     facts: &[String],
+    personality: &str,
     catalog: Option<&ari_skill_loader::ModelCatalog>,
     log: F,
 ) -> NamedAssistantOutcome {
@@ -2210,6 +2292,7 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
         locale,
         history,
         facts,
+        personality,
         catalog,
     ) {
         Ok(text) if !text.is_empty() => NamedAssistantOutcome::Answer(text),
@@ -2614,6 +2697,7 @@ fn call_assistant_for_consult(
                 locale,
                 &[],
                 &[],
+                "",
                 catalog,
             )
             .map_err(|e| e.to_string())?;
@@ -2680,6 +2764,7 @@ fn call_assistant_for_consult(
                 locale,
                 &[],
                 &[],
+                "",
                 catalog,
             )
             .map_err(|e| e.to_string())?;
@@ -3582,6 +3667,18 @@ mod tests {
             "addressing an assistant by name is still a user answer, so durable \
              facts belong in its prompt; got {system:?}"
         );
+    }
+
+    #[test]
+    fn named_assistant_receives_the_personality() {
+        let stub = StubAssistant::start(vec!["Arr, Valletta."]);
+        let engine = engine_with_named_assistant(&stub);
+        engine.set_personality("Talk like a pirate.");
+
+        engine.process_input_traced("ask chatgpt where should i go for lunch");
+
+        let (_, system) = stub.messages(0)[0].clone();
+        assert!(system.contains("Talk like a pirate."), "got {system:?}");
     }
 
     #[test]
@@ -4876,6 +4973,69 @@ mod tests {
     }
 
     #[test]
+    fn longer_conversations_keep_more_exchanges() {
+        let engine = Engine::new();
+        engine.set_conversation_length(ConversationLength::Long);
+        for i in 0..25 {
+            engine.record_assistant_turn(&format!("q{i}"), &format!("a{i}"), ContinuationFlag::Continuation);
+        }
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 20);
+        assert_eq!(turns[0].user, "q5");
+    }
+
+    #[test]
+    fn shortening_the_setting_trims_the_conversation_in_progress() {
+        let engine = Engine::new();
+        engine.set_conversation_length(ConversationLength::Medium);
+        for i in 0..8 {
+            engine.record_assistant_turn(&format!("q{i}"), &format!("a{i}"), ContinuationFlag::Continuation);
+        }
+        engine.set_conversation_length(ConversationLength::Short);
+        let turns = engine.conversation_context();
+        assert_eq!(turns.len(), 5);
+        assert_eq!(turns[0].user, "q3");
+    }
+
+    #[test]
+    fn longer_conversations_survive_longer_silences() {
+        use std::time::{Duration, Instant};
+        let age = |engine: &Engine, secs: u64| {
+            let mut g = engine.conversation.lock().unwrap();
+            g.as_mut().unwrap().last_activity = Instant::now().checked_sub(Duration::from_secs(secs)).unwrap();
+        };
+        let engine = Engine::new();
+        engine.set_conversation_length(ConversationLength::Medium);
+        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        age(&engine, 4 * 60);
+        assert_eq!(engine.conversation_context().len(), 1, "4 minutes is inside Medium's 5");
+        age(&engine, 6 * 60);
+        assert!(engine.conversation_context().is_empty(), "6 minutes is past Medium's 5");
+
+        engine.set_conversation_length(ConversationLength::Long);
+        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        age(&engine, 14 * 60);
+        assert_eq!(engine.conversation_context().len(), 1, "14 minutes is inside Long's 15");
+    }
+
+    #[test]
+    fn short_is_the_default_and_keeps_todays_limits() {
+        let length = ConversationLength::default();
+        assert_eq!(length, ConversationLength::Short);
+        assert_eq!(length.turns(), 5);
+        assert_eq!(length.idle_timeout(), std::time::Duration::from_secs(90));
+    }
+
+    #[test]
+    fn personality_is_trimmed_and_capped() {
+        let engine = Engine::new();
+        engine.set_personality("  Dry and witty.  ");
+        assert_eq!(engine.personality(), "Dry and witty.");
+        engine.set_personality(&"x".repeat(ari_core::MAX_PERSONALITY_CHARS + 50));
+        assert_eq!(engine.personality().chars().count(), ari_core::MAX_PERSONALITY_CHARS);
+    }
+
+    #[test]
     fn conversation_context_empty_when_no_buffer() {
         let engine = Engine::new();
         assert!(engine.conversation_context().is_empty());
@@ -4954,6 +5114,7 @@ mod tests {
     struct RecordingFallback {
         last_history: std::sync::Mutex<Vec<(String, String)>>,
         last_facts: std::sync::Mutex<Vec<String>>,
+        last_personality: std::sync::Mutex<String>,
         reply: &'static str,
     }
 
@@ -4966,9 +5127,11 @@ mod tests {
             _locale: &str,
             history: &[(String, String)],
             facts: &[String],
+            personality: &str,
         ) -> Option<ari_llm::FallbackResult> {
             *self.last_history.lock().unwrap() = history.to_vec();
             *self.last_facts.lock().unwrap() = facts.to_vec();
+            *self.last_personality.lock().unwrap() = personality.to_string();
             Some(ari_llm::FallbackResult::DirectAnswer { text: self.reply.to_string() })
         }
     }
@@ -4980,6 +5143,7 @@ mod tests {
         let fb = std::sync::Arc::new(RecordingFallback {
             last_history: std::sync::Mutex::new(Vec::new()),
             last_facts: std::sync::Mutex::new(Vec::new()),
+            last_personality: std::sync::Mutex::new(String::new()),
             reply: "Paris. [continuation]",
         });
         engine.set_llm(fb.clone());
@@ -5007,6 +5171,7 @@ mod tests {
         let fb = std::sync::Arc::new(RecordingFallback {
             last_history: std::sync::Mutex::new(Vec::new()),
             last_facts: std::sync::Mutex::new(Vec::new()),
+            last_personality: std::sync::Mutex::new(String::new()),
             reply: "ok. [continuation]",
         });
         engine.set_llm(fb.clone());
@@ -5023,11 +5188,30 @@ mod tests {
 
     #[cfg(feature = "llm")]
     #[test]
+    fn assistant_answer_receives_personality() {
+        let mut engine = Engine::new();
+        let fb = std::sync::Arc::new(RecordingFallback {
+            last_history: std::sync::Mutex::new(Vec::new()),
+            last_facts: std::sync::Mutex::new(Vec::new()),
+            last_personality: std::sync::Mutex::new(String::new()),
+            reply: "ok. [continuation]",
+        });
+        engine.set_llm(fb.clone());
+        engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
+        engine.set_personality("Talk like a pirate.");
+
+        let _ = engine.process_input_traced("tell me a joke");
+        assert_eq!(*fb.last_personality.lock().unwrap(), "Talk like a pirate.");
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
     fn new_flag_reseeds_conversation() {
         let mut engine = Engine::new();
         let fb = std::sync::Arc::new(RecordingFallback {
             last_history: std::sync::Mutex::new(Vec::new()),
             last_facts: std::sync::Mutex::new(Vec::new()),
+            last_personality: std::sync::Mutex::new(String::new()),
             reply: "81. [new]",
         });
         engine.set_llm(fb.clone());
@@ -5086,6 +5270,7 @@ mod tests {
         let fb = std::sync::Arc::new(RecordingFallback {
             last_history: std::sync::Mutex::new(Vec::new()),
             last_facts: std::sync::Mutex::new(Vec::new()),
+            last_personality: std::sync::Mutex::new(String::new()),
             reply: "Fresh answer. [continuation]",
         });
         engine.set_llm(fb.clone());

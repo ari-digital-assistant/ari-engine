@@ -51,6 +51,7 @@ pub trait Fallback: Send + Sync {
         locale: &str,
         history: &[(String, String)],
         facts: &[String],
+        personality: &str,
     ) -> Option<FallbackResult>;
 
     /// Run an arbitrary prompt and return the raw stripped output. Used
@@ -128,6 +129,11 @@ struct LoadedModel {
 /// Generous enough to fit Gemma 4's optional thinking mode preamble
 /// plus the structured JSON output Layer C asks for.
 const MAX_GENERATION_TOKENS: usize = 1024;
+
+/// Context window the on-device model runs with: prompt, conversation and
+/// answer together. A conversation that outgrows it loses its oldest turns
+/// (see [`fit_history`]).
+const CONTEXT_TOKENS: usize = 2048;
 
 /// Most tokens an on-device answer may run to: a five-item list with a
 /// line on each fits, and it matches the cloud assistants' default
@@ -229,13 +235,17 @@ impl LoadedModel {
             .map_err(|e| format!("template: {jinja_err}; matcher: {e}"))
     }
 
+    fn token_count(&self, prompt: &str) -> usize {
+        self.model.vocab().tokenize(prompt.as_bytes(), true, true).len()
+    }
+
     /// Generate until the model ends its turn or [`max_tokens`] run out.
     /// `stop_on_newline` also ends it at the first complete line, for a
     /// prompt sent without the model's chat template: left to run on, a
     /// model writes the next "User:" turn itself.
     fn run_inference(&self, prompt: &str, max_tokens: usize, stop_on_newline: bool) -> Result<Generation, LlmError> {
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(std::num::NonZeroU32::new(2048));
+            .with_n_ctx(std::num::NonZeroU32::new(CONTEXT_TOKENS as u32));
 
         let mut ctx = self
             .model
@@ -465,6 +475,7 @@ impl Fallback for LazyLlmFallback {
         locale: &str,
         history: &[(String, String)],
         facts: &[String],
+        personality: &str,
     ) -> Option<FallbackResult> {
         self.clear_error();
         let mut state = match self.inner.lock() {
@@ -500,14 +511,19 @@ impl Fallback for LazyLlmFallback {
         let now = Instant::now();
         state.last_used = Some(now);
 
-        let system_prompt = build_system_prompt(skills, locale, !history.is_empty(), facts);
         let user_prompt = build_user_prompt(input);
-
         let model = state.loaded.as_ref().unwrap();
-        let (prompt, template_err) = match model.build_chat_prompt(&system_prompt, history, &user_prompt) {
-            Ok(p) => (p, None),
-            Err(e) => (format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "), Some(e)),
+        let wrap = |history: &[(String, String)]| {
+            let system_prompt = build_system_prompt(skills, locale, !history.is_empty(), facts, personality);
+            match model.build_chat_prompt(&system_prompt, history, &user_prompt) {
+                Ok(p) => (p, None),
+                Err(e) => (format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "), Some(e)),
+            }
         };
+        let history = fit_history(history, |h| {
+            model.token_count(&wrap(h).0) + ANSWER_MAX_TOKENS <= CONTEXT_TOKENS
+        });
+        let (prompt, template_err) = wrap(history);
 
         let output = match model.run_inference(&prompt, ANSWER_MAX_TOKENS, template_err.is_some()) {
             Ok(generation) => answer_text(&generation),
@@ -621,11 +637,12 @@ impl Fallback for LlmFallback {
         // injects `_facts` into the system prompt. Passing `&[]` below is a
         // deliberate no-op for facts recall in the harness, not a parity bug.
         _facts: &[String],
+        _personality: &str,
     ) -> Option<FallbackResult> {
         let _guard = self.inference_lock.lock().ok()?;
 
         // `&[]`: facts recall is a no-op in this dev-harness impl (see `_facts`).
-        let system_prompt = build_system_prompt(skills, locale, false, &[]);
+        let system_prompt = build_system_prompt(skills, locale, false, &[], "");
         let user_prompt = build_user_prompt(input);
 
         let (prompt, templated) = match self.build_chat_prompt(&system_prompt, &[], &user_prompt) {
@@ -734,7 +751,13 @@ const PROMPT_IT_SYSTEM: &str = include_str!("../prompts/it/system.md");
 /// for small models (Gemma 4 E2B occasionally bleeds in non-target-
 /// language tokens like `不` for "no" when the prompt isn't language-
 /// scoped).
-fn build_system_prompt(_skills: &[SkillInfo], locale: &str, has_history: bool, facts: &[String]) -> String {
+fn build_system_prompt(
+    _skills: &[SkillInfo],
+    locale: &str,
+    has_history: bool,
+    facts: &[String],
+    personality: &str,
+) -> String {
     let template = match locale {
         "en" => PROMPT_EN_SYSTEM,
         "it" => PROMPT_IT_SYSTEM,
@@ -751,6 +774,10 @@ fn build_system_prompt(_skills: &[SkillInfo], locale: &str, has_history: bool, f
         prompt.push_str("\n\n");
         prompt.push_str(ari_core::CONTINUATION_INSTRUCTION);
     }
+    if let Some(block) = ari_core::personality_block(personality) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&block);
+    }
     if let Some(block) = ari_core::remembered_facts_block(facts) {
         prompt.push_str("\n\n");
         prompt.push_str(&block);
@@ -760,6 +787,21 @@ fn build_system_prompt(_skills: &[SkillInfo], locale: &str, has_history: bool, f
 
 fn build_user_prompt(input: &str) -> String {
     input.to_string()
+}
+
+/// The most recent part of `history` that `fits`, dropping the oldest
+/// exchange (a user message and its reply) at a time. Long answers, or a
+/// long conversation setting, can outgrow the on-device context, and a
+/// prompt that overflows it fails outright.
+fn fit_history<'a>(
+    history: &'a [(String, String)],
+    fits: impl Fn(&[(String, String)]) -> bool,
+) -> &'a [(String, String)] {
+    let mut history = history;
+    while !history.is_empty() && !fits(history) {
+        history = &history[history.len().min(2)..];
+    }
+    history
 }
 
 /// The user-facing text of an answer: reasoning stripped and, when the
@@ -820,7 +862,7 @@ mod tests {
 
     #[test]
     fn system_prompt_english_is_concise_and_locale_fenced() {
-        let prompt = build_system_prompt(&test_skills(), "en", false, &[]);
+        let prompt = build_system_prompt(&test_skills(), "en", false, &[], "");
         assert!(prompt.contains("Ari"));
         // Locale fence — the explicit "English" word matters for
         // small models that occasionally bleed in non-English tokens.
@@ -833,19 +875,51 @@ mod tests {
     #[test]
     fn build_system_prompt_injects_facts_block() {
         let facts = vec!["i live in valletta".to_string()];
-        let prompt = build_system_prompt(&[], "en", false, &facts);
+        let prompt = build_system_prompt(&[], "en", false, &facts, "");
         assert!(prompt.contains("Things you know about the user:\n- i live in valletta"));
     }
 
     #[test]
+    fn personality_comes_after_the_rules_and_before_the_facts() {
+        let facts = vec!["i live in valletta".to_string()];
+        let prompt = build_system_prompt(&[], "en", true, &facts, "Dry and witty.");
+        let rules = prompt.find("You cannot access live information").unwrap();
+        let personality = prompt.find("Dry and witty.").unwrap();
+        let known = prompt.find("Things you know about the user").unwrap();
+        assert!(rules < personality && personality < known, "{prompt}");
+    }
+
+    #[test]
+    fn no_personality_block_when_blank() {
+        assert!(!build_system_prompt(&[], "en", false, &[], " ").contains("personality"));
+    }
+
+    #[test]
+    fn history_loses_whole_exchanges_oldest_first_until_it_fits() {
+        let turn = |role: &str, text: &str| (role.to_string(), text.to_string());
+        let history = vec![
+            turn("user", "one"),
+            turn("assistant", "1"),
+            turn("user", "two"),
+            turn("assistant", "2"),
+            turn("user", "three"),
+            turn("assistant", "3"),
+        ];
+        let kept = fit_history(&history, |h| h.len() <= 3);
+        assert_eq!(kept, &history[4..]);
+        assert_eq!(fit_history(&history, |_| true), &history[..]);
+        assert!(fit_history(&history, |_| false).is_empty());
+    }
+
+    #[test]
     fn build_system_prompt_no_facts_block_when_empty() {
-        let prompt = build_system_prompt(&[], "en", false, &[]);
+        let prompt = build_system_prompt(&[], "en", false, &[], "");
         assert!(!prompt.contains("Things you know about the user"));
     }
 
     #[test]
     fn system_prompt_forbids_bluffing_about_live_data_and_devices() {
-        let p = build_system_prompt(&[], "en", false, &[]);
+        let p = build_system_prompt(&[], "en", false, &[], "");
         assert!(
             p.contains("You cannot access live information"),
             "capability-honesty line missing from EN system prompt: {p}"
@@ -863,7 +937,7 @@ mod tests {
             "few-shot answerable example missing from EN system prompt: {p}"
         );
 
-        let it = build_system_prompt(&[], "it", false, &[]);
+        let it = build_system_prompt(&[], "it", false, &[], "");
         assert!(
             it.contains("Non puoi accedere a informazioni in tempo reale"),
             "capability-honesty line missing from IT system prompt: {it}"
@@ -897,7 +971,7 @@ mod tests {
 
     #[test]
     fn system_prompt_italian_is_localized() {
-        let prompt = build_system_prompt(&test_skills(), "it", false, &[]);
+        let prompt = build_system_prompt(&test_skills(), "it", false, &[], "");
         assert!(prompt.contains("Ari"));
         assert!(prompt.contains("italiano"));
         assert!(prompt.contains("frase breve"));
@@ -908,7 +982,7 @@ mod tests {
 
     #[test]
     fn system_prompt_unknown_locale_falls_back_to_english() {
-        let prompt = build_system_prompt(&test_skills(), "ja", false, &[]);
+        let prompt = build_system_prompt(&test_skills(), "ja", false, &[], "");
         // "Ja" isn't shipped — should silently get the en template.
         assert!(prompt.contains("Ari"));
         assert!(prompt.contains("English"));
@@ -1101,7 +1175,7 @@ mod tests {
         eprintln!("Model loaded.");
 
         let skills = test_skills();
-        let system = build_system_prompt(&skills, "en", false, &[]);
+        let system = build_system_prompt(&skills, "en", false, &[], "");
         let user = build_user_prompt("what is the capital of australia");
 
         eprintln!("--- System prompt ---");
