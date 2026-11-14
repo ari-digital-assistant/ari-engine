@@ -18,6 +18,8 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
+use llama_cpp_2::vocab::LlamaVocab;
 
 // ── Public types ────────────────────────────────────────────────────────
 
@@ -171,21 +173,47 @@ impl LoadedModel {
         Ok(LoadedModel { model })
     }
 
-    fn build_chat_prompt(&self, system: &str, history: &[(String, String)], user: &str) -> Option<String> {
-        let tmpl = self.model.chat_template(None).ok()?;
-        let mut messages = Vec::with_capacity(history.len() + 2);
+    /// Wrap the conversation in the model's own chat template, rendered with
+    /// minijinja. llama.cpp's built-in matcher only knows a fixed list of
+    /// formats and Gemma 4 (Medium, Large) isn't on it: left to the matcher,
+    /// those tiers get an unwrapped prompt and answer with nothing. The
+    /// matcher stays as a second try for templates minijinja can't render.
+    /// The error names both failures so a caller can log why it fell back.
+    fn build_chat_prompt(&self, system: &str, history: &[(String, String)], user: &str) -> Result<String, String> {
+        let tmpl = self.model.chat_template(None).map_err(|e| format!("no chat template: {e}"))?;
+        let mut turns: Vec<(&str, &str)> = Vec::with_capacity(history.len() + 2);
         // Some Gemma chat templates raise on the system role outright
         // ("System role not supported") — drop the system message when
-        // it's empty so apply_chat_template doesn't fall through to the
-        // None branch and leave us sending an unwrapped prompt.
+        // it's empty so the template doesn't reject the whole prompt.
         if !system.is_empty() {
-            messages.push(LlamaChatMessage::new("system".to_string(), system.to_string()).ok()?);
+            turns.push(("system", system));
         }
-        for (role, content) in history {
-            messages.push(LlamaChatMessage::new(role.clone(), content.clone()).ok()?);
-        }
-        messages.push(LlamaChatMessage::new("user".to_string(), user.to_string()).ok()?);
-        self.model.apply_chat_template(&tmpl, &messages, true).ok()
+        turns.extend(history.iter().map(|(role, content)| (role.as_str(), content.as_str())));
+        turns.push(("user", user));
+
+        let vocab = self.model.vocab();
+        let bos = token_text(&vocab, vocab.bos());
+        let rendered = tmpl.to_str().map_err(|e| e.to_string()).and_then(|source| {
+            render_chat_template(source, &turns, &bos, &token_text(&vocab, vocab.eos()))
+        });
+        let jinja_err = match rendered {
+            // run_inference's tokenizer adds BOS when the model wants one, so a
+            // template that prints it too would double it.
+            Ok(prompt) if vocab.should_add_bos() => {
+                return Ok(prompt.strip_prefix(bos.as_str()).map(str::to_string).unwrap_or(prompt))
+            }
+            Ok(prompt) => return Ok(prompt),
+            Err(e) => e,
+        };
+
+        let messages = turns
+            .iter()
+            .map(|(role, content)| LlamaChatMessage::new(role.to_string(), content.to_string()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("template: {jinja_err}; matcher: {e}"))?;
+        self.model
+            .apply_chat_template(&tmpl, &messages, true)
+            .map_err(|e| format!("template: {jinja_err}; matcher: {e}"))
     }
 
     fn run_inference(&self, prompt: &str, stop_on_newline: bool) -> Result<String, LlmError> {
@@ -359,21 +387,15 @@ impl Fallback for LazyLlmFallback {
         state.last_used = Some(now);
 
         let model = state.loaded.as_ref().unwrap();
-        let wrapping;
-        let wrapped = match model.build_chat_prompt("", &[], prompt) {
-            Some(p) => {
-                wrapping = "native";
-                p
-            }
-            None => {
-                // llama-cpp-2 couldn't apply the GGUF's embedded chat
-                // template (Gemma 4's Jinja can be too rich for minja).
-                // All three tiers we ship are Gemma, so fall back to the
-                // well-known Gemma turn-marker format manually. <bos> is
-                // already prepended by AddBos::Always in str_to_token.
-                wrapping = "manual_gemma";
-                format!(
-                    "<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
+        let (wrapped, wrapping) = match model.build_chat_prompt("", &[], prompt) {
+            Ok(p) => (p, "native".to_string()),
+            Err(e) => {
+                // Neither minijinja nor llama.cpp's matcher could apply the
+                // GGUF's chat template. Last resort: Gemma 3's turn markers,
+                // the format of the Small tier. The tokenizer adds <bos>.
+                (
+                    format!("<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"),
+                    format!("manual_gemma ({e})"),
                 )
             }
         };
@@ -462,9 +484,9 @@ impl Fallback for LazyLlmFallback {
         let user_prompt = build_user_prompt(input);
 
         let model = state.loaded.as_ref().unwrap();
-        let prompt = match model.build_chat_prompt(&system_prompt, history, &user_prompt) {
-            Some(p) => p,
-            None => format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "),
+        let (prompt, template_err) = match model.build_chat_prompt(&system_prompt, history, &user_prompt) {
+            Ok(p) => (p, None),
+            Err(e) => (format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "), Some(e)),
         };
 
         let output = match model.run_inference(&prompt, true) {
@@ -480,8 +502,11 @@ impl Fallback for LazyLlmFallback {
             // model's response. Common reasons: empty / "NONE" /
             // ≤10 chars after first-line trim.
             let preview: String = output.chars().take(120).collect();
+            let template = template_err
+                .map(|e| format!("; chat template failed, prompt sent unwrapped: {e}"))
+                .unwrap_or_default();
             self.record_error(format!(
-                "parse_output rejected response (output_len={}, first_120={preview:?})",
+                "parse_output rejected response (output_len={}, first_120={preview:?}){template}",
                 output.len()
             ));
         }
@@ -542,7 +567,7 @@ impl LlmFallback {
         })
     }
 
-    fn build_chat_prompt(&self, system: &str, history: &[(String, String)], user: &str) -> Option<String> {
+    fn build_chat_prompt(&self, system: &str, history: &[(String, String)], user: &str) -> Result<String, String> {
         self.loaded.build_chat_prompt(system, history, user)
     }
 
@@ -558,10 +583,9 @@ impl Fallback for LlmFallback {
             .lock()
             .map_err(|_| LlmError::Backend("inference mutex poisoned".into()))?;
 
-        let wrapped = match self.build_chat_prompt("", &[], prompt) {
-            Some(p) => p,
-            None => prompt.to_string(),
-        };
+        let wrapped = self
+            .build_chat_prompt("", &[], prompt)
+            .unwrap_or_else(|_| prompt.to_string());
 
         self.run_inference(&wrapped, false)
     }
@@ -584,10 +608,9 @@ impl Fallback for LlmFallback {
         let system_prompt = build_system_prompt(skills, locale, false, &[]);
         let user_prompt = build_user_prompt(input);
 
-        let prompt = match self.build_chat_prompt(&system_prompt, &[], &user_prompt) {
-            Some(p) => p,
-            None => format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "),
-        };
+        let prompt = self
+            .build_chat_prompt(&system_prompt, &[], &user_prompt)
+            .unwrap_or_else(|_| format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "));
 
         let output = match self.run_inference(&prompt, true) {
             Ok(text) => strip_thinking(&text),
@@ -600,22 +623,81 @@ impl Fallback for LlmFallback {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-/// Remove `<think>…</think>` blocks from a model's raw output. Gemma 4
-/// can emit a reasoning preamble before its real answer; the QA path
-/// always strips, but Layer C calls this explicitly so it can also log
-/// the raw output for diagnostics.
+/// Remove reasoning from a model's raw output, leaving only what the user
+/// should hear: `<think>…</think>` blocks, and Gemma 4's
+/// `<|channel>thought…<channel|>`. The QA path always strips, but Layer C
+/// calls this explicitly so it can also log the raw output for diagnostics.
 pub fn strip_thinking(raw: &str) -> String {
-    let mut result = raw.to_string();
-    while let Some(start) = result.find("<think>") {
-        if let Some(end) = result.find("</think>") {
-            let block_end = end + "</think>".len();
-            result = format!("{}{}", &result[..start], &result[block_end..]);
-        } else {
-            result = result[..start].to_string();
-            break;
-        }
+    let result = strip_reasoning(raw, "<|channel>", "<channel|>");
+    strip_reasoning(&result, "<think>", "</think>").trim().to_string()
+}
+
+/// Strip `open…close` blocks from `text`. A closer with no opener before it
+/// means the prompt opened the block (LFM3's template ends the generation
+/// prompt in `<think>`, or `<think></think>` with reasoning off, and the
+/// model still writes a draft answer, a stray `</think>`, then the answer
+/// again), so everything before it goes. An opener that never closes is
+/// reasoning still in progress, or cut off, so everything after it goes.
+fn strip_reasoning(text: &str, open: &str, close: &str) -> String {
+    let mut out = text.to_string();
+    while let Some(close_at) = out.find(close) {
+        let start = out[..close_at].rfind(open).unwrap_or(0);
+        out.replace_range(start..close_at + close.len(), "");
     }
-    result.trim().to_string()
+    if let Some(open_at) = out.find(open) {
+        out.truncate(open_at);
+    }
+    out
+}
+
+/// A special token's text, for templates that print `bos_token` or
+/// `eos_token` themselves.
+fn token_text(vocab: &LlamaVocab<'_>, token: LlamaToken) -> String {
+    String::from_utf8_lossy(&vocab.token_to_piece(token, true, None)).into_owned()
+}
+
+/// Render a GGUF's Hugging Face chat template the way `transformers` does
+/// (trim_blocks, lstrip_blocks, Python string and dict methods), ending in
+/// the generation prompt with reasoning switched off. An on-device answer
+/// is one spoken sentence: hidden reasoning costs seconds per answer and
+/// adds nothing the user hears.
+fn render_chat_template(source: &str, turns: &[(&str, &str)], bos: &str, eos: &str) -> Result<String, String> {
+    let mut env = minijinja::Environment::new();
+    env.set_syntax(
+        minijinja::syntax::SyntaxConfig::builder()
+            .trim_blocks(true)
+            .lstrip_blocks(true)
+            .build()
+            .map_err(|e| e.to_string())?,
+    );
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env.add_function("raise_exception", |msg: String| -> Result<minijinja::Value, minijinja::Error> {
+        Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
+    });
+    // `{% generation %}…{% endgeneration %}` is a transformers extension that
+    // marks assistant text for training loss masks and renders nothing of its
+    // own; LFM3's template uses it and minijinja has no such tag. An
+    // always-true block keeps the tags' whitespace control.
+    static GENERATION_TAG: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\{%(-?)\s*(end)?generation\s*(-?)%\}").unwrap());
+    let source = GENERATION_TAG.replace_all(source, |caps: &regex::Captures| {
+        let tag = if caps.get(2).is_some() { "endif" } else { "if true" };
+        format!("{{%{} {tag} {}%}}", &caps[1], &caps[3])
+    });
+    let template = env.template_from_str(&source).map_err(|e| e.to_string())?;
+    let messages: Vec<minijinja::Value> = turns
+        .iter()
+        .map(|(role, content)| minijinja::context! { role => *role, content => *content })
+        .collect();
+    template
+        .render(minijinja::context! {
+            messages => messages,
+            add_generation_prompt => true,
+            enable_thinking => false,
+            bos_token => bos,
+            eos_token => eos,
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Per-locale system prompt baked into the binary at compile time
@@ -843,6 +925,109 @@ mod tests {
     }
 
     #[test]
+    fn strip_thinking_removes_think_blocks() {
+        assert_eq!(
+            strip_thinking("<think>They want a city.</think>Canberra is the capital."),
+            "Canberra is the capital."
+        );
+    }
+
+    #[test]
+    fn strip_thinking_drops_the_draft_before_a_stray_closer() {
+        // LFM3 with reasoning off: the prompt already ends in
+        // <think></think>, yet the model writes the answer, a stray closer,
+        // then the answer again. Seen in 11 of 20 answers on 2026-11-14.
+        assert_eq!(
+            strip_thinking("The Berlin Wall fell in 1989.</think>The Berlin Wall fell in 1989."),
+            "The Berlin Wall fell in 1989."
+        );
+    }
+
+    #[test]
+    fn strip_thinking_cuts_reasoning_that_never_closes() {
+        assert_eq!(strip_thinking("Sure.\n<think>still working"), "Sure.");
+        assert_eq!(strip_thinking("<think>never finished"), "");
+    }
+
+    #[test]
+    fn strip_thinking_removes_gemma4_thought_channel() {
+        assert_eq!(
+            strip_thinking("<|channel>thought\nThey ask about colour.<channel|>The sky is blue because of Rayleigh scattering."),
+            "The sky is blue because of Rayleigh scattering."
+        );
+        assert_eq!(strip_thinking("<|channel>thought\nstill thinking"), "");
+    }
+
+    #[test]
+    fn strip_thinking_leaves_plain_answers_alone() {
+        assert_eq!(strip_thinking("  Jane Austen wrote it.  "), "Jane Austen wrote it.");
+    }
+
+    #[test]
+    fn chat_template_renders_generation_prompt_with_reasoning_off() {
+        // The generation-prompt end of LFM3's template, cut down to what a
+        // regression would break: the thinking switch and bos_token.
+        let template = "{{- bos_token -}}\
+            {%- for message in messages -%}\
+            {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' -}}\
+            {%- endfor -%}\
+            {%- if add_generation_prompt -%}{{- '<|im_start|>assistant\\n' -}}\
+            {%- if enable_thinking -%}{{- '<think>' -}}{%- else -%}{{- '<think></think>' -}}{%- endif -%}\
+            {%- endif -%}";
+        let out = render_chat_template(template, &[("system", "Be brief."), ("user", "Hi")], "<s>", "</s>").unwrap();
+        assert_eq!(
+            out,
+            "<s><|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think></think>"
+        );
+    }
+
+    #[test]
+    fn chat_template_trims_block_lines_like_transformers() {
+        // Hugging Face templates are written for trim_blocks + lstrip_blocks:
+        // lines holding only block tags must vanish entirely.
+        let template = "{% for message in messages %}\n  {% if message.role == 'user' %}\n[{{ message.content }}]\n  {% endif %}\n{% endfor %}\n";
+        let out = render_chat_template(template, &[("system", "S"), ("user", "Hi")], "", "").unwrap();
+        assert_eq!(out, "[Hi]\n");
+    }
+
+    #[test]
+    fn chat_template_supports_python_methods() {
+        // Gemma 4's template calls dict.get and str.split, which plain
+        // minijinja doesn't provide.
+        let template = "{%- for message in messages -%}\
+            {{- '<|turn>' + message['role'] + '\\n' + (message.get('content', '').split('<channel|>')[-1] | trim) + '<turn|>\\n' -}}\
+            {%- endfor -%}\
+            {%- if add_generation_prompt -%}{{- '<|turn>model\\n' -}}{%- endif -%}";
+        let out = render_chat_template(
+            template,
+            &[("assistant", "<|channel>x<channel|>Old answer"), ("user", "Hi")],
+            "",
+            "",
+        )
+        .unwrap();
+        assert_eq!(out, "<|turn>assistant\nOld answer<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n");
+    }
+
+    #[test]
+    fn chat_template_accepts_transformers_generation_tag() {
+        // LFM3's template wraps assistant turns in {% generation %}; without
+        // handling, the whole template fails and reasoning can't be switched off.
+        let template = "{%- for message in messages -%}\
+            {%- if message.role == 'assistant' -%}{%- generation -%}{{- '[' + message.content + ']' -}}{%- endgeneration -%}\
+            {%- else -%}{{- message.content -}}{%- endif -%}\
+            {%- endfor -%}";
+        let out = render_chat_template(template, &[("user", "Hi"), ("assistant", "Hello")], "", "").unwrap();
+        assert_eq!(out, "Hi[Hello]");
+    }
+
+    #[test]
+    fn chat_template_raise_exception_becomes_an_error() {
+        let err = render_chat_template("{{ raise_exception('System role not supported') }}", &[("user", "Hi")], "", "")
+            .unwrap_err();
+        assert!(err.contains("System role not supported"), "{err}");
+    }
+
+    #[test]
     #[ignore]
     fn real_model_debug_output() {
         let model_path = std::env::var("LLM_TEST_MODEL")
@@ -867,13 +1052,13 @@ mod tests {
         eprintln!("{user}");
 
         let prompt = match fallback.build_chat_prompt(&system, &[], &user) {
-            Some(p) => {
+            Ok(p) => {
                 eprintln!("--- Chat template applied ---");
                 eprintln!("{p}");
                 p
             }
-            None => {
-                eprintln!("--- No chat template, using raw ---");
+            Err(e) => {
+                eprintln!("--- No chat template ({e}), using raw ---");
                 let raw = format!("{system}\n\nUser: {user}\n\nResponse: ");
                 eprintln!("{raw}");
                 raw
