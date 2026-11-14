@@ -129,6 +129,19 @@ struct LoadedModel {
 /// plus the structured JSON output Layer C asks for.
 const MAX_GENERATION_TOKENS: usize = 1024;
 
+/// Most tokens an on-device answer may run to: a five-item list with a
+/// line on each fits, and it matches the cloud assistants' default
+/// `max_tokens`. An answer is spoken, so a runaway one costs the user
+/// time twice, once generating and once listening.
+const ANSWER_MAX_TOKENS: usize = 256;
+
+/// What a generation produced, and whether it ran out of tokens before
+/// the model ended its turn.
+struct Generation {
+    text: String,
+    cut_off: bool,
+}
+
 /// How long the model stays loaded after the last query.
 const IDLE_TIMEOUT_SECS: u64 = 60;
 
@@ -216,7 +229,11 @@ impl LoadedModel {
             .map_err(|e| format!("template: {jinja_err}; matcher: {e}"))
     }
 
-    fn run_inference(&self, prompt: &str, stop_on_newline: bool) -> Result<String, LlmError> {
+    /// Generate until the model ends its turn or [`max_tokens`] run out.
+    /// `stop_on_newline` also ends it at the first complete line, for a
+    /// prompt sent without the model's chat template: left to run on, a
+    /// model writes the next "User:" turn itself.
+    fn run_inference(&self, prompt: &str, max_tokens: usize, stop_on_newline: bool) -> Result<Generation, LlmError> {
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(2048));
 
@@ -230,7 +247,7 @@ impl LoadedModel {
             .vocab()
             .tokenize(prompt.as_bytes(), true, true);
 
-        let mut batch = LlamaBatch::new(tokens.len() + MAX_GENERATION_TOKENS, 1);
+        let mut batch = LlamaBatch::new(tokens.len() + max_tokens, 1);
         for (i, &token) in tokens.iter().enumerate() {
             let is_last = i == tokens.len() - 1;
             batch
@@ -248,12 +265,14 @@ impl LoadedModel {
 
         let mut output = String::new();
         let mut n_cur = tokens.len() as i32;
+        let mut cut_off = true;
 
-        for _ in 0..MAX_GENERATION_TOKENS {
+        for _ in 0..max_tokens {
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
             sampler.accept(token);
 
             if self.model.vocab().is_eog(token) {
+                cut_off = false;
                 break;
             }
 
@@ -267,6 +286,7 @@ impl LoadedModel {
             if stop_on_newline {
                 let cleaned = strip_thinking(&output);
                 if !cleaned.is_empty() && cleaned.contains('\n') {
+                    cut_off = false;
                     break;
                 }
             }
@@ -283,7 +303,7 @@ impl LoadedModel {
 
         // Return raw output — callers strip thinking blocks themselves
         // so Layer C can log both raw and stripped for diagnostics.
-        Ok(output)
+        Ok(Generation { text: output, cut_off })
     }
 }
 
@@ -400,7 +420,7 @@ impl Fallback for LazyLlmFallback {
             }
         };
 
-        let output = model.run_inference(&wrapped, false)?;
+        let output = model.run_inference(&wrapped, MAX_GENERATION_TOKENS, false)?.text;
 
         // Surface a diagnostic when the model produces zero tokens.
         // Fold in whether the chat template applied and a head sample of
@@ -489,8 +509,8 @@ impl Fallback for LazyLlmFallback {
             Err(e) => (format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "), Some(e)),
         };
 
-        let output = match model.run_inference(&prompt, true) {
-            Ok(text) => strip_thinking(&text),
+        let output = match model.run_inference(&prompt, ANSWER_MAX_TOKENS, template_err.is_some()) {
+            Ok(generation) => answer_text(&generation),
             Err(e) => {
                 self.record_error(format!("run_inference failed: {e}"));
                 return None;
@@ -500,7 +520,7 @@ impl Fallback for LazyLlmFallback {
         if parse_output(&output, skills).is_none() {
             // Record diagnostic about why parse_output rejected the
             // model's response. Common reasons: empty / "NONE" /
-            // ≤10 chars after first-line trim.
+            // ≤10 chars after trimming.
             let preview: String = output.chars().take(120).collect();
             let template = template_err
                 .map(|e| format!("; chat template failed, prompt sent unwrapped: {e}"))
@@ -571,8 +591,8 @@ impl LlmFallback {
         self.loaded.build_chat_prompt(system, history, user)
     }
 
-    fn run_inference(&self, prompt: &str, stop_on_newline: bool) -> Result<String, LlmError> {
-        self.loaded.run_inference(prompt, stop_on_newline)
+    fn run_inference(&self, prompt: &str, max_tokens: usize, stop_on_newline: bool) -> Result<Generation, LlmError> {
+        self.loaded.run_inference(prompt, max_tokens, stop_on_newline)
     }
 }
 
@@ -587,7 +607,7 @@ impl Fallback for LlmFallback {
             .build_chat_prompt("", &[], prompt)
             .unwrap_or_else(|_| prompt.to_string());
 
-        self.run_inference(&wrapped, false)
+        self.run_inference(&wrapped, MAX_GENERATION_TOKENS, false).map(|g| g.text)
     }
 
     fn try_answer(
@@ -608,12 +628,13 @@ impl Fallback for LlmFallback {
         let system_prompt = build_system_prompt(skills, locale, false, &[]);
         let user_prompt = build_user_prompt(input);
 
-        let prompt = self
-            .build_chat_prompt(&system_prompt, &[], &user_prompt)
-            .unwrap_or_else(|_| format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "));
+        let (prompt, templated) = match self.build_chat_prompt(&system_prompt, &[], &user_prompt) {
+            Ok(p) => (p, true),
+            Err(_) => (format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "), false),
+        };
 
-        let output = match self.run_inference(&prompt, true) {
-            Ok(text) => strip_thinking(&text),
+        let output = match self.run_inference(&prompt, ANSWER_MAX_TOKENS, !templated) {
+            Ok(generation) => answer_text(&generation),
             Err(_) => return None,
         };
 
@@ -741,14 +762,37 @@ fn build_user_prompt(input: &str) -> String {
     input.to_string()
 }
 
-fn parse_output(output: &str, _skills: &[SkillInfo]) -> Option<FallbackResult> {
-    let line = output.lines().next()?.trim();
-
-    if line.is_empty() || line == "NONE" {
-        return None;
+/// The user-facing text of an answer: reasoning stripped and, when the
+/// token cap cut it off, the unfinished tail dropped.
+fn answer_text(generation: &Generation) -> String {
+    let text = strip_thinking(&generation.text);
+    if generation.cut_off {
+        drop_unfinished_tail(&text).to_string()
+    } else {
+        text
     }
+}
 
-    let text = line.strip_prefix("ANSWER:").unwrap_or(line).trim();
+/// Cut a truncated answer back to its last complete line, or failing
+/// that its last complete sentence, so a list loses its half-written
+/// last item rather than ending mid-word. Text with neither is kept whole.
+fn drop_unfinished_tail(text: &str) -> &str {
+    let text = text.trim_end();
+    if let Some(at) = text.rfind('\n') {
+        return text[..at].trim_end();
+    }
+    match text.rfind(['.', '!', '?']) {
+        Some(at) => &text[..=at],
+        None => text,
+    }
+}
+
+/// The whole answer, every line of it: a list is a heading line and then
+/// its items, so keeping only the first line kept only the heading
+/// (ari-android#30).
+fn parse_output(output: &str, _skills: &[SkillInfo]) -> Option<FallbackResult> {
+    let output = output.trim();
+    let text = output.strip_prefix("ANSWER:").unwrap_or(output).trim();
 
     if text.is_empty() || text == "NONE" || text.len() <= 10 {
         return None;
@@ -911,17 +955,31 @@ mod tests {
     }
 
     #[test]
-    fn takes_first_line_only() {
-        let result = parse_output(
-            "ANSWER:The answer.\nSome extra garbage the model spat out.",
-            &test_skills(),
-        );
-        match result {
-            Some(FallbackResult::DirectAnswer { text }) => {
-                assert_eq!(text, "The answer.");
-            }
-            _ => panic!("expected DirectAnswer from first line"),
+    fn keeps_every_line_of_a_list() {
+        // ari-android#30: keeping the first line kept only the heading.
+        let list = "Here are the top 5 fastest animals:\n1. Peregrine falcon\n2. Cheetah";
+        match parse_output(list, &test_skills()) {
+            Some(FallbackResult::DirectAnswer { text }) => assert_eq!(text, list),
+            _ => panic!("expected DirectAnswer"),
         }
+    }
+
+    #[test]
+    fn a_finished_answer_is_kept_whole() {
+        let generation = Generation { text: "Heading:\n1. One\n2. Two".into(), cut_off: false };
+        assert_eq!(answer_text(&generation), "Heading:\n1. One\n2. Two");
+    }
+
+    #[test]
+    fn a_cut_off_list_loses_its_unfinished_item() {
+        let generation = Generation { text: "Heading:\n1. One\n2. Two\n3. Th".into(), cut_off: true };
+        assert_eq!(answer_text(&generation), "Heading:\n1. One\n2. Two");
+    }
+
+    #[test]
+    fn a_cut_off_paragraph_ends_at_its_last_full_sentence() {
+        assert_eq!(drop_unfinished_tail("It is blue. Light scatt"), "It is blue.");
+        assert_eq!(drop_unfinished_tail("no sentence end at all"), "no sentence end at all");
     }
 
     #[test]
@@ -1066,9 +1124,12 @@ mod tests {
         };
 
         eprintln!("--- Running inference ---");
-        let output = fallback.run_inference(&prompt, true).expect("inference failed");
-        eprintln!("--- Raw output ---");
-        eprintln!("[{output}]");
+        let generation = fallback
+            .run_inference(&prompt, ANSWER_MAX_TOKENS, false)
+            .expect("inference failed");
+        eprintln!("--- Raw output (cut off: {}) ---", generation.cut_off);
+        eprintln!("[{}]", generation.text);
+        let output = answer_text(&generation);
 
         let result = parse_output(&output, &skills);
         eprintln!("--- Parsed result ---");
