@@ -536,7 +536,7 @@ impl Fallback for LazyLlmFallback {
         if parse_output(&output, skills).is_none() {
             // Record diagnostic about why parse_output rejected the
             // model's response. Common reasons: empty / "NONE" /
-            // ≤10 chars after trimming.
+            // nothing but punctuation after trimming.
             let preview: String = output.chars().take(120).collect();
             let template = template_err
                 .map(|e| format!("; chat template failed, prompt sent unwrapped: {e}"))
@@ -832,11 +832,16 @@ fn drop_unfinished_tail(text: &str) -> &str {
 /// The whole answer, every line of it: a list is a heading line and then
 /// its items, so keeping only the first line kept only the heading
 /// (ari-android#30).
+///
+/// Any answer with a word or number in it counts, however short. A
+/// minimum of 11 characters, left from an older answer format, threw away
+/// "Paris.", "1945." and "12." and told the user it hadn't understood
+/// (ari-android#32).
 fn parse_output(output: &str, _skills: &[SkillInfo]) -> Option<FallbackResult> {
     let output = output.trim();
     let text = output.strip_prefix("ANSWER:").unwrap_or(output).trim();
 
-    if text.is_empty() || text == "NONE" || text.len() <= 10 {
+    if text == "NONE" || !text.chars().any(char::is_alphanumeric) {
         return None;
     }
 
@@ -1022,10 +1027,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_short_output() {
-        assert!(parse_output("lol what", &test_skills()).is_none());
+    fn keeps_short_answers() {
+        for answer in ["Paris.", "1945.", "12.", "Yes.", "Tokyo"] {
+            match parse_output(answer, &test_skills()) {
+                Some(FallbackResult::DirectAnswer { text }) => assert_eq!(text, answer),
+                _ => panic!("{answer:?} is a whole answer"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_output_with_no_words() {
         assert!(parse_output("", &test_skills()).is_none());
-        assert!(parse_output("ok", &test_skills()).is_none());
+        assert!(parse_output("  \n ", &test_skills()).is_none());
+        assert!(parse_output("...", &test_skills()).is_none());
     }
 
     #[test]

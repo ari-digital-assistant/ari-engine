@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A conversation too long for the on-device model's context drops its oldest exchanges
   instead of failing the answer.
+- Short on-device answers such as "Paris." or "1945." reach the user instead of being
+  discarded as too short ([ari-android#32](https://github.com/ari-digital-assistant/ari-android/issues/32)).
 
 - On-device answers keep every line, so a list is no longer cut down to its opening
   line ([ari-android#30](https://github.com/ari-digital-assistant/ari-android/issues/30)).
