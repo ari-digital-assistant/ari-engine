@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub mod named_assistant;
+mod plain_text;
 pub use named_assistant::NamedAssistantBinding;
 
 /// Pseudo skill-id used for engine-emitted log lines so they surface in
@@ -74,6 +75,14 @@ pub(crate) fn parse_continuation_flag(raw: &str) -> (String, ContinuationFlag) {
         }
     }
     (trimmed.to_string(), ContinuationFlag::Continuation)
+}
+
+/// An assistant's reply as the user gets it: markdown reduced to plain
+/// text, since Ari neither renders it nor should read it aloud, then the
+/// continuation marker split off. Markdown goes first so a marker the
+/// model wrapped in bold is still found.
+pub(crate) fn assistant_answer(raw: &str) -> (String, ContinuationFlag) {
+    parse_continuation_flag(&plain_text::plain_text(raw))
 }
 
 /// The locale-appropriate version of [`FALLBACK_RESPONSE`]. Used when
@@ -1361,7 +1370,7 @@ impl Engine {
             // the transcript.
             let response = match outcome {
                 NamedAssistantOutcome::Answer(text) => {
-                    let (clean, flag) = parse_continuation_flag(&text);
+                    let (clean, flag) = assistant_answer(&text);
                     self.record_assistant_turn(&m.remainder, &clean, flag);
                     Response::Text(clean)
                 }
@@ -1479,7 +1488,7 @@ impl Engine {
                     }
                 }
                 Ok(RouteOrAnswer::Answer(text)) => {
-                    let (clean, flag) = parse_continuation_flag(&text);
+                    let (clean, flag) = assistant_answer(&text);
                     self.record_assistant_turn(&normalized, &clean, flag);
                     let label = match &self.active_assistant {
                         Some(ActiveAssistant::Api { skill_id, .. }) => format!("assistant:{skill_id}"),
@@ -1615,7 +1624,7 @@ impl Engine {
                     let result = llm.try_answer(&normalized, &catalog, &self.ctx.locale, &history, &facts);
                     match result {
                         Some(ari_llm::FallbackResult::DirectAnswer { text }) => {
-                            let (clean, flag) = parse_continuation_flag(&text);
+                            let (clean, flag) = assistant_answer(&text);
                             self.record_assistant_turn(&normalized, &clean, flag);
                             let preview: String = clean.chars().take(160).collect();
                             self.log(
@@ -1664,7 +1673,7 @@ impl Engine {
                     self.model_catalog.as_deref(),
                 ) {
                     Ok(text) if !text.is_empty() => {
-                        let (clean, flag) = parse_continuation_flag(&text);
+                        let (clean, flag) = assistant_answer(&text);
                         self.record_assistant_turn(&normalized, &clean, flag);
                         trace.winner = Some(format!("assistant:{skill_id}"));
                         return (Response::Text(clean), Some(trace));
