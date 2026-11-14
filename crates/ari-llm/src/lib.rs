@@ -199,8 +199,8 @@ impl LoadedModel {
 
         let tokens = self
             .model
-            .str_to_token(prompt, llama_cpp_2::model::AddBos::Always)
-            .map_err(|e| LlmError::Context(e.to_string()))?;
+            .vocab()
+            .tokenize(prompt.as_bytes(), true, true);
 
         let mut batch = LlamaBatch::new(tokens.len() + MAX_GENERATION_TOKENS, 1);
         for (i, &token) in tokens.iter().enumerate() {
@@ -225,14 +225,14 @@ impl LoadedModel {
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
             sampler.accept(token);
 
-            if self.model.is_eog_token(token) {
+            if self.model.vocab().is_eog(token) {
                 break;
             }
 
             let bytes = self
                 .model
-                .token_to_piece_bytes(token, 128, false, None)
-                .unwrap_or_default();
+                .vocab()
+                .token_to_piece(token, false, None);
             let piece = String::from_utf8_lossy(&bytes);
             output.push_str(&piece);
 
