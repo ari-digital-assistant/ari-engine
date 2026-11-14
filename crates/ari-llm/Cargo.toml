@@ -12,3 +12,10 @@ minijinja = { version = "3.1.0", features = ["loop_controls"] }
 minijinja-contrib = { version = "3.1.0", features = ["pycompat"] }
 regex = "1"
 serde_json = { workspace = true }
+
+# Android arm64 only: llama.cpp's CPU code as one library per ARM
+# generation, the best loaded at startup (see src/cpu_build.rs). The app
+# packages the libraries next to libari_ffi.so.
+[target.'cfg(all(target_os = "android", target_arch = "aarch64"))'.dependencies]
+llama-cpp-2 = { version = "0.1.161", features = ["dynamic-backends"] }
+llama-cpp-sys-2 = "0.1.161"

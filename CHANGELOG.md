@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old fixed limits), Medium ten for 5 minutes, Long twenty for 15 minutes
   ([ari-android#31](https://github.com/ari-digital-assistant/ari-android/issues/31)).
 
+### Changed
+
+- On Android arm64, llama.cpp's CPU code ships in three builds, ARMv8.0, ARMv8.2 (dot
+  product) and ARMv8.6 (int8 matrix multiply), and the on-device assistant loads the
+  best one the phone supports. On a Pixel 10 Pro Fold the Medium model answers in
+  3.1 s instead of 8.1 s ([ari-android#32](https://github.com/ari-digital-assistant/ari-android/issues/32)).
+- `on_device_cpu_info()` reports which build loaded and the CPU's features.
+
 ### Fixed
 
 - A conversation too long for the on-device model's context drops its oldest exchanges

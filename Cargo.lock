@@ -114,6 +114,7 @@ version = "0.1.0"
 dependencies = [
  "ari-core",
  "llama-cpp-2",
+ "llama-cpp-sys-2",
  "minijinja",
  "minijinja-contrib",
  "regex",

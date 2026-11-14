@@ -8,6 +8,9 @@
 //! actually misses all skills, loads on demand (~1-2 s cold start), then
 //! unloads after 60 seconds of idle to free RAM.
 
+mod cpu_build;
+pub use cpu_build::{cpu_build, cpu_features, CpuBuild};
+
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -175,6 +178,10 @@ fn shared_backend() -> Result<&'static LlamaBackend, LlmError> {
         .map_err(|_| LlmError::Backend("backend init mutex poisoned".into()))?;
     if let Some(b) = SHARED_BACKEND.get() {
         return Ok(b);
+    }
+    // The CPU backend first: without one, llama.cpp has nothing to run on.
+    if cpu_build::ensure_loaded().is_none() {
+        return Err(LlmError::Backend("no llama.cpp CPU build would load on this device".into()));
     }
     let backend = LlamaBackend::init().map_err(|e| LlmError::Backend(e.to_string()))?;
     let _ = SHARED_BACKEND.set(backend);

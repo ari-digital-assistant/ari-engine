@@ -93,6 +93,40 @@ pub fn engine_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// The on-device assistant's CPU code and the CPU it runs on, for bug
+/// reports and the debug screen.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCpuInfo {
+    /// Which build of llama.cpp's CPU code is loaded: "ARMv8.6", "ARMv8.2",
+    /// "ARMv8.0", or "built in" off Android arm64. Null when none would load,
+    /// or in a build without the on-device assistant.
+    pub build: Option<String>,
+    /// What that build uses, in words.
+    pub build_description: Option<String>,
+    /// The CPU features this device reports that llama.cpp can use.
+    pub features: Vec<String>,
+}
+
+/// Which llama.cpp CPU build the on-device assistant runs on, loading it if
+/// no model has yet (a few MB, once per process), and this CPU's features
+/// (ari-android#32).
+#[uniffi::export]
+pub fn on_device_cpu_info() -> FfiCpuInfo {
+    #[cfg(feature = "llm")]
+    {
+        let build = ari_llm::cpu_build();
+        FfiCpuInfo {
+            build: build.as_ref().map(|b| b.name.clone()),
+            build_description: build.map(|b| b.description),
+            features: ari_llm::cpu_features(),
+        }
+    }
+    #[cfg(not(feature = "llm"))]
+    {
+        FfiCpuInfo { build: None, build_description: None, features: Vec::new() }
+    }
+}
+
 /// WASM-skill log level, mirrored from [`ari_skill_loader::LogLevel`] for
 /// the UniFFI boundary. The engine's own `LogLevel` isn't exportable
 /// directly because UniFFI types can't derive outside the FFI crate.
