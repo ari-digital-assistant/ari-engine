@@ -48,6 +48,8 @@ pub trait Fallback: Send + Sync {
     /// non-target-language tokens into the answer. Returns `None`
     /// if the model declined to answer or the call failed.
     ///
+    /// `tier` picks the system prompt: Small keeps its own.
+    ///
     /// `on_text` sees the raw output so far, reasoning included, after
     /// every generated token, so the engine can speak finished sentences
     /// while the model writes the rest (ari-android#37).
@@ -57,6 +59,7 @@ pub trait Fallback: Send + Sync {
         input: &str,
         skills: &[SkillInfo],
         locale: &str,
+        tier: BuiltinTier,
         history: &[(String, String)],
         facts: &[String],
         personality: &str,
@@ -494,6 +497,7 @@ impl Fallback for LazyLlmFallback {
         input: &str,
         skills: &[SkillInfo],
         locale: &str,
+        tier: BuiltinTier,
         history: &[(String, String)],
         facts: &[String],
         personality: &str,
@@ -536,7 +540,7 @@ impl Fallback for LazyLlmFallback {
         let user_prompt = build_user_prompt(input);
         let model = state.loaded.as_ref().unwrap();
         let wrap = |history: &[(String, String)]| {
-            let system_prompt = build_system_prompt(skills, locale, !history.is_empty(), facts, personality);
+            let system_prompt = build_system_prompt(skills, locale, tier, !history.is_empty(), facts, personality);
             match model.build_chat_prompt(&system_prompt, history, &user_prompt) {
                 Ok(p) => (p, None),
                 Err(e) => (format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "), Some(e)),
@@ -659,6 +663,7 @@ impl Fallback for LlmFallback {
         input: &str,
         skills: &[SkillInfo],
         locale: &str,
+        tier: BuiltinTier,
         _history: &[(String, String)],
         // Intentionally dropped here: this eager `LlmFallback` is only the
         // ari-cli dev-harness path. Production uses `LazyLlmFallback`, which
@@ -671,7 +676,7 @@ impl Fallback for LlmFallback {
         let _guard = self.inference_lock.lock().ok()?;
 
         // `&[]`: facts recall is a no-op in this dev-harness impl (see `_facts`).
-        let system_prompt = build_system_prompt(skills, locale, false, &[], "");
+        let system_prompt = build_system_prompt(skills, locale, tier, false, &[], "");
         let user_prompt = build_user_prompt(input);
 
         let (prompt, templated) = match self.build_chat_prompt(&system_prompt, &[], &user_prompt) {
@@ -773,30 +778,38 @@ fn render_chat_template(source: &str, turns: &[(&str, &str)], bos: &str, eos: &s
 const PROMPT_EN_SYSTEM: &str = include_str!("../prompts/en/system.md");
 const PROMPT_IT_SYSTEM: &str = include_str!("../prompts/it/system.md");
 
+/// The Small tier's prompt: one short sentence, and no word about answering
+/// "best" questions from what it knows. Gemma 3 1B answered worse with the
+/// Medium and Large prompt (Sydney for Australia's capital, "Response:"
+/// read out before an answer), so it keeps this one (ari-android#37).
+const PROMPT_EN_SYSTEM_SMALL: &str = include_str!("../prompts/en/system-small.md");
+const PROMPT_IT_SYSTEM_SMALL: &str = include_str!("../prompts/it/system-small.md");
+
 /// The QA-style system prompt for the on-device LLM fallback. Picks
-/// the locale-specific template and trims trailing whitespace from
-/// the file. Unknown locales fall back to English with a warn-log
-/// (engine catches it via the LogSink). The locale fence is critical
-/// for small models (Gemma 4 E2B occasionally bleeds in non-target-
-/// language tokens like `不` for "no" when the prompt isn't language-
-/// scoped).
+/// the locale-specific template for the model's tier and trims trailing
+/// whitespace from the file. Unknown locales fall back to English with a
+/// warn-log (engine catches it via the LogSink). The locale fence is
+/// critical for small models (Gemma 4 E2B occasionally bleeds in
+/// non-target-language tokens like `不` for "no" when the prompt isn't
+/// language-scoped).
 fn build_system_prompt(
     _skills: &[SkillInfo],
     locale: &str,
+    tier: BuiltinTier,
     has_history: bool,
     facts: &[String],
     personality: &str,
 ) -> String {
-    let template = match locale {
-        "en" => PROMPT_EN_SYSTEM,
-        "it" => PROMPT_IT_SYSTEM,
-        _ => {
-            // No template for this locale — silently fall through to
-            // English. Engine-level logging tracks the active locale
-            // so the dev can see this is happening; we don't surface
-            // it as a model error.
-            PROMPT_EN_SYSTEM
-        }
+    let small = tier == BuiltinTier::Small;
+    let template = match (locale, small) {
+        ("it", true) => PROMPT_IT_SYSTEM_SMALL,
+        ("it", false) => PROMPT_IT_SYSTEM,
+        // No template for other locales — silently fall through to
+        // English. Engine-level logging tracks the active locale
+        // so the dev can see this is happening; we don't surface
+        // it as a model error.
+        (_, true) => PROMPT_EN_SYSTEM_SMALL,
+        (_, false) => PROMPT_EN_SYSTEM,
     };
     let mut prompt = template.trim().to_string();
     if has_history {
@@ -896,27 +909,38 @@ mod tests {
 
     #[test]
     fn system_prompt_english_is_concise_and_locale_fenced() {
-        let prompt = build_system_prompt(&test_skills(), "en", false, &[], "");
+        let prompt = build_system_prompt(&test_skills(), "en", BuiltinTier::Medium, false, &[], "");
         assert!(prompt.contains("Ari"));
         // Locale fence — the explicit "English" word matters for
         // small models that occasionally bleed in non-English tokens.
         assert!(prompt.contains("English"));
-        // Brevity hint stays loud.
-        assert!(prompt.contains("one short"));
-        assert!(prompt.contains("sentence"));
+        // Brevity hint stays loud, with room for a list when one is asked for.
+        assert!(prompt.contains("briefly"));
+        assert!(prompt.contains("one or two sentences, or a short list"));
+    }
+
+    #[test]
+    fn small_tier_keeps_its_one_sentence_prompt() {
+        for (locale, brevity) in [("en", "one short English sentence"), ("it", "una sola frase breve")] {
+            let small = build_system_prompt(&[], locale, BuiltinTier::Small, false, &[], "");
+            assert!(small.contains(brevity), "{small}");
+            let medium = build_system_prompt(&[], locale, BuiltinTier::Medium, false, &[], "");
+            assert!(!medium.contains(brevity), "{medium}");
+            assert_eq!(medium, build_system_prompt(&[], locale, BuiltinTier::Large, false, &[], ""));
+        }
     }
 
     #[test]
     fn build_system_prompt_injects_facts_block() {
         let facts = vec!["i live in valletta".to_string()];
-        let prompt = build_system_prompt(&[], "en", false, &facts, "");
+        let prompt = build_system_prompt(&[], "en", BuiltinTier::Medium, false, &facts, "");
         assert!(prompt.contains("Things you know about the user:\n- i live in valletta"));
     }
 
     #[test]
     fn personality_comes_after_the_rules_and_before_the_facts() {
         let facts = vec!["i live in valletta".to_string()];
-        let prompt = build_system_prompt(&[], "en", true, &facts, "Dry and witty.");
+        let prompt = build_system_prompt(&[], "en", BuiltinTier::Medium, true, &facts, "Dry and witty.");
         let rules = prompt.find("You cannot access live information").unwrap();
         let personality = prompt.find("Dry and witty.").unwrap();
         let known = prompt.find("Things you know about the user").unwrap();
@@ -925,7 +949,7 @@ mod tests {
 
     #[test]
     fn no_personality_block_when_blank() {
-        assert!(!build_system_prompt(&[], "en", false, &[], " ").contains("personality"));
+        assert!(!build_system_prompt(&[], "en", BuiltinTier::Medium, false, &[], " ").contains("personality"));
     }
 
     #[test]
@@ -947,68 +971,70 @@ mod tests {
 
     #[test]
     fn build_system_prompt_no_facts_block_when_empty() {
-        let prompt = build_system_prompt(&[], "en", false, &[], "");
+        let prompt = build_system_prompt(&[], "en", BuiltinTier::Medium, false, &[], "");
         assert!(!prompt.contains("Things you know about the user"));
     }
 
     #[test]
     fn system_prompt_forbids_bluffing_about_live_data_and_devices() {
-        let p = build_system_prompt(&[], "en", false, &[], "");
-        assert!(
-            p.contains("You cannot access live information"),
-            "capability-honesty line missing from EN system prompt: {p}"
-        );
-        // A rule alone doesn't bind a small on-device Gemma (device
-        // evidence: it still hallucinated a Rome temperature with the
-        // rule-only copy) — the few-shot refusal + answerable pair is
-        // the actual fix, so pin both examples down.
-        assert!(
-            p.contains("Response: I don't have a skill installed that can do that"),
-            "few-shot refusal example missing from EN system prompt: {p}"
-        );
-        assert!(
-            p.contains("Response: The sky is blue."),
-            "few-shot answerable example missing from EN system prompt: {p}"
-        );
+        for tier in [BuiltinTier::Small, BuiltinTier::Medium] {
+            let p = build_system_prompt(&[], "en", tier, false, &[], "");
+            assert!(
+                p.contains("You cannot access live information"),
+                "capability-honesty line missing from EN system prompt: {p}"
+            );
+            // A rule alone doesn't bind a small on-device Gemma (device
+            // evidence: it still hallucinated a Rome temperature with the
+            // rule-only copy) — the few-shot refusal + answerable pair is
+            // the actual fix, so pin both examples down.
+            assert!(
+                p.contains("Response: I don't have a skill installed that can do that"),
+                "few-shot refusal example missing from EN system prompt: {p}"
+            );
+            assert!(
+                p.contains("Response: The sky is blue."),
+                "few-shot answerable example missing from EN system prompt: {p}"
+            );
 
-        let it = build_system_prompt(&[], "it", false, &[], "");
-        assert!(
-            it.contains("Non puoi accedere a informazioni in tempo reale"),
-            "capability-honesty line missing from IT system prompt: {it}"
-        );
-        // A single memorised refusal example didn't generalise on-device
-        // (gemma3-1b-q4 still hallucinated for a differently-phrased
-        // weather question) — two refusal examples across different
-        // domains (weather, device control) are needed to demonstrate
-        // the REFUSAL PATTERN rather than one fixed sentence to match.
-        // The weather example uses the apostrophe-free phrasing the
-        // engine's normaliser actually feeds the model ("com e il tempo",
-        // not "com'è il tempo").
-        assert_eq!(
-            it.matches("Response: Non ho una skill installata per farlo").count(),
-            2,
-            "expected two refusal examples (weather + device control) in IT system prompt: {it}"
-        );
-        assert!(
-            it.contains("User: com e il tempo a Roma?"),
-            "normalised-phrasing weather refusal example missing from IT system prompt: {it}"
-        );
-        assert!(
-            it.contains("User: accendi le luci del soggiorno"),
-            "device-control refusal example missing from IT system prompt: {it}"
-        );
-        assert!(
-            it.contains("Response: Il cielo è blu."),
-            "few-shot answerable example missing from IT system prompt: {it}"
-        );
+            let it = build_system_prompt(&[], "it", tier, false, &[], "");
+            assert!(
+                it.contains("Non puoi accedere a informazioni in tempo reale"),
+                "capability-honesty line missing from IT system prompt: {it}"
+            );
+            // A single memorised refusal example didn't generalise on-device
+            // (gemma3-1b-q4 still hallucinated for a differently-phrased
+            // weather question) — two refusal examples across different
+            // domains (weather, device control) are needed to demonstrate
+            // the REFUSAL PATTERN rather than one fixed sentence to match.
+            // The weather example uses the apostrophe-free phrasing the
+            // engine's normaliser actually feeds the model ("com e il tempo",
+            // not "com'è il tempo").
+            assert_eq!(
+                it.matches("Response: Non ho una skill installata per farlo").count(),
+                2,
+                "expected two refusal examples (weather + device control) in IT system prompt: {it}"
+            );
+            assert!(
+                it.contains("User: com e il tempo a Roma?"),
+                "normalised-phrasing weather refusal example missing from IT system prompt: {it}"
+            );
+            assert!(
+                it.contains("User: accendi le luci del soggiorno"),
+                "device-control refusal example missing from IT system prompt: {it}"
+            );
+            assert!(
+                it.contains("Response: Il cielo è blu."),
+                "few-shot answerable example missing from IT system prompt: {it}"
+            );
+        }
     }
 
     #[test]
     fn system_prompt_italian_is_localized() {
-        let prompt = build_system_prompt(&test_skills(), "it", false, &[], "");
+        let prompt = build_system_prompt(&test_skills(), "it", BuiltinTier::Medium, false, &[], "");
         assert!(prompt.contains("Ari"));
         assert!(prompt.contains("italiano"));
-        assert!(prompt.contains("frase breve"));
+        assert!(prompt.contains("una o due frasi, oppure un breve elenco"));
         // Italian template must NOT carry the English fence — that
         // would confuse the model into mixing languages.
         assert!(!prompt.contains("English"));
@@ -1016,7 +1042,7 @@ mod tests {
 
     #[test]
     fn system_prompt_unknown_locale_falls_back_to_english() {
-        let prompt = build_system_prompt(&test_skills(), "ja", false, &[], "");
+        let prompt = build_system_prompt(&test_skills(), "ja", BuiltinTier::Medium, false, &[], "");
         // "Ja" isn't shipped — should silently get the en template.
         assert!(prompt.contains("Ari"));
         assert!(prompt.contains("English"));
@@ -1219,7 +1245,7 @@ mod tests {
         eprintln!("Model loaded.");
 
         let skills = test_skills();
-        let system = build_system_prompt(&skills, "en", false, &[], "");
+        let system = build_system_prompt(&skills, "en", BuiltinTier::Small, false, &[], "");
         let user = build_user_prompt("what is the capital of australia");
 
         eprintln!("--- System prompt ---");

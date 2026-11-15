@@ -1699,7 +1699,7 @@ impl Engine {
         // No skill matched. Delegate to the active assistant, if any.
         match &self.active_assistant {
             #[cfg(feature = "llm")]
-            Some(ActiveAssistant::Builtin { .. }) => {
+            Some(ActiveAssistant::Builtin { tier }) => {
                 #[cfg(feature = "llm")]
                 if let Some(ref llm) = self.llm {
                     let catalog: Vec<ari_llm::SkillInfo> = self
@@ -1726,6 +1726,7 @@ impl Engine {
                         &normalized,
                         &catalog,
                         &self.ctx.locale,
+                        *tier,
                         &history,
                         &facts,
                         &personality,
@@ -5174,6 +5175,7 @@ mod tests {
             _input: &str,
             _skills: &[ari_llm::SkillInfo],
             _locale: &str,
+            _tier: ari_llm::BuiltinTier,
             history: &[(String, String)],
             facts: &[String],
             personality: &str,
