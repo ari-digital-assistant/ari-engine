@@ -47,6 +47,11 @@ pub trait Fallback: Send + Sync {
     /// "respond in <language>" fence so the model doesn't bleed
     /// non-target-language tokens into the answer. Returns `None`
     /// if the model declined to answer or the call failed.
+    ///
+    /// `on_text` sees the raw output so far, reasoning included, after
+    /// every generated token, so the engine can speak finished sentences
+    /// while the model writes the rest (ari-android#37).
+    #[allow(clippy::too_many_arguments)]
     fn try_answer(
         &self,
         input: &str,
@@ -55,6 +60,7 @@ pub trait Fallback: Send + Sync {
         history: &[(String, String)],
         facts: &[String],
         personality: &str,
+        on_text: &mut dyn FnMut(&str),
     ) -> Option<FallbackResult>;
 
     /// Run an arbitrary prompt and return the raw stripped output. Used
@@ -246,11 +252,18 @@ impl LoadedModel {
         self.model.vocab().tokenize(prompt.as_bytes(), true, true).len()
     }
 
-    /// Generate until the model ends its turn or [`max_tokens`] run out.
+    /// Generate until the model ends its turn or [`max_tokens`] run out,
+    /// showing `on_text` the output so far after every token.
     /// `stop_on_newline` also ends it at the first complete line, for a
     /// prompt sent without the model's chat template: left to run on, a
     /// model writes the next "User:" turn itself.
-    fn run_inference(&self, prompt: &str, max_tokens: usize, stop_on_newline: bool) -> Result<Generation, LlmError> {
+    fn run_inference(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        stop_on_newline: bool,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Generation, LlmError> {
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(CONTEXT_TOKENS as u32));
 
@@ -299,6 +312,7 @@ impl LoadedModel {
                 .token_to_piece(token, false, None);
             let piece = String::from_utf8_lossy(&bytes);
             output.push_str(&piece);
+            on_text(&output);
 
             if stop_on_newline {
                 let cleaned = strip_thinking(&output);
@@ -437,7 +451,7 @@ impl Fallback for LazyLlmFallback {
             }
         };
 
-        let output = model.run_inference(&wrapped, MAX_GENERATION_TOKENS, false)?.text;
+        let output = model.run_inference(&wrapped, MAX_GENERATION_TOKENS, false, &mut |_| {})?.text;
 
         // Surface a diagnostic when the model produces zero tokens.
         // Fold in whether the chat template applied and a head sample of
@@ -483,6 +497,7 @@ impl Fallback for LazyLlmFallback {
         history: &[(String, String)],
         facts: &[String],
         personality: &str,
+        on_text: &mut dyn FnMut(&str),
     ) -> Option<FallbackResult> {
         self.clear_error();
         let mut state = match self.inner.lock() {
@@ -532,7 +547,7 @@ impl Fallback for LazyLlmFallback {
         });
         let (prompt, template_err) = wrap(history);
 
-        let output = match model.run_inference(&prompt, ANSWER_MAX_TOKENS, template_err.is_some()) {
+        let output = match model.run_inference(&prompt, ANSWER_MAX_TOKENS, template_err.is_some(), on_text) {
             Ok(generation) => answer_text(&generation),
             Err(e) => {
                 self.record_error(format!("run_inference failed: {e}"));
@@ -614,8 +629,14 @@ impl LlmFallback {
         self.loaded.build_chat_prompt(system, history, user)
     }
 
-    fn run_inference(&self, prompt: &str, max_tokens: usize, stop_on_newline: bool) -> Result<Generation, LlmError> {
-        self.loaded.run_inference(prompt, max_tokens, stop_on_newline)
+    fn run_inference(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        stop_on_newline: bool,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Generation, LlmError> {
+        self.loaded.run_inference(prompt, max_tokens, stop_on_newline, on_text)
     }
 }
 
@@ -630,7 +651,7 @@ impl Fallback for LlmFallback {
             .build_chat_prompt("", &[], prompt)
             .unwrap_or_else(|_| prompt.to_string());
 
-        self.run_inference(&wrapped, MAX_GENERATION_TOKENS, false).map(|g| g.text)
+        self.run_inference(&wrapped, MAX_GENERATION_TOKENS, false, &mut |_| {}).map(|g| g.text)
     }
 
     fn try_answer(
@@ -645,6 +666,7 @@ impl Fallback for LlmFallback {
         // deliberate no-op for facts recall in the harness, not a parity bug.
         _facts: &[String],
         _personality: &str,
+        on_text: &mut dyn FnMut(&str),
     ) -> Option<FallbackResult> {
         let _guard = self.inference_lock.lock().ok()?;
 
@@ -657,7 +679,7 @@ impl Fallback for LlmFallback {
             Err(_) => (format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "), false),
         };
 
-        let output = match self.run_inference(&prompt, ANSWER_MAX_TOKENS, !templated) {
+        let output = match self.run_inference(&prompt, ANSWER_MAX_TOKENS, !templated, on_text) {
             Ok(generation) => answer_text(&generation),
             Err(_) => return None,
         };
@@ -1221,7 +1243,7 @@ mod tests {
 
         eprintln!("--- Running inference ---");
         let generation = fallback
-            .run_inference(&prompt, ANSWER_MAX_TOKENS, false)
+            .run_inference(&prompt, ANSWER_MAX_TOKENS, false, &mut |_| {})
             .expect("inference failed");
         eprintln!("--- Raw output (cut off: {}) ---", generation.cut_off);
         eprintln!("[{}]", generation.text);

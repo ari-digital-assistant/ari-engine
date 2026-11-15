@@ -2,6 +2,8 @@
 
 use ari_core::Skill;
 use ari_engine::{fallback_response_for, ConversationLength, Engine, EnvelopeSink, FALLBACK_RESPONSE};
+#[cfg(feature = "llm")]
+use ari_engine::SentenceSink;
 use ari_skill_loader::assistant::{ConfigStore, MemoryConfigStore};
 use ari_skill_loader::{
     load_skill_directory_with, AuthorizeInput, AuthorizeOutput, AuthorizeProvider, Calendar,
@@ -200,6 +202,28 @@ impl EnvelopeSink for ForeignEnvelopeSinkAdapter {
     fn push(&self, envelope_json: &str, skill_id: Option<&str>) {
         self.0
             .push(envelope_json.to_string(), skill_id.map(|s| s.to_string()));
+    }
+}
+
+/// Callback interface the host implements to hear an on-device assistant
+/// answer a sentence at a time while the model is still writing it, via
+/// [`AriEngine::process_input_streaming`]. Same contract as the engine's
+/// [`ari_engine::SentenceSink`]: a host that gets any sentence gets the whole answer
+/// this way, so it speaks the sentences instead of the response text.
+#[uniffi::export(with_foreign)]
+pub trait FfiSentenceSink: Send + Sync {
+    fn sentence(&self, text: String);
+}
+
+/// Wraps a foreign [`FfiSentenceSink`] so it satisfies the engine's
+/// [`SentenceSink`]. Same `&str`→`String` copy as the other adapters.
+#[cfg(feature = "llm")]
+struct ForeignSentenceSinkAdapter(Arc<dyn FfiSentenceSink>);
+
+#[cfg(feature = "llm")]
+impl SentenceSink for ForeignSentenceSinkAdapter {
+    fn sentence(&self, text: &str) {
+        self.0.sentence(text.to_string());
     }
 }
 
@@ -1283,45 +1307,16 @@ impl AriEngine {
     }
 
     pub fn process_input(&self, input: String) -> FfiResponse {
-        // Refresh the engine's locale on every call so per-locale
-        // skill scorers and responses pick up live changes from the
-        // frontend's settings store. The locale provider's read is a
-        // synchronous AtomicReference lookup on Android (see
-        // AriFfiLocaleProvider), so this is essentially free.
-        let locale = self.locale_provider.current_locale();
-        let mut engine = self.inner.lock().expect("engine mutex poisoned");
-        engine.set_locale(locale.clone());
-        let (response, skill_id) = engine.process_input_with_skill(&input);
-        let rearm = engine.has_pending_turn();
-        let enter_conversation = engine.take_enter_signal();
-        let exit_conversation = engine.take_exit_signal();
-        let facts_changed = engine.take_facts_changed_signal();
-        match response {
-            ari_core::Response::Text(s) => {
-                // The engine's fallback text is locale-specific
-                // (Phase 5 step 2). Compare against the locale-
-                // appropriate version so the Android NotUnderstood
-                // retry path fires for Italian / French / etc.
-                // users too — not just English.
-                let is_fallback =
-                    s == fallback_response_for(&locale) || s == FALLBACK_RESPONSE;
-                if is_fallback {
-                    // A fallback never re-arms.
-                    FfiResponse::NotUnderstood { body: s }
-                } else {
-                    FfiResponse::Text { body: s, rearm, enter_conversation, exit_conversation, facts_changed }
-                }
-            }
-            ari_core::Response::Action(v) => FfiResponse::Action {
-                json: serde_json::to_string(&v).unwrap_or_default(),
-                skill_id: skill_id.unwrap_or_default(),
-                rearm,
-                enter_conversation,
-                exit_conversation,
-                facts_changed,
-            },
-            ari_core::Response::Binary { mime, data } => FfiResponse::Binary { mime, data },
-        }
+        self.respond(input, None)
+    }
+
+    /// [`Self::process_input`], handing each sentence of an on-device
+    /// assistant answer to `sink` while the model is still writing the
+    /// rest, so the host can start speaking it (ari-android#37). The sink
+    /// is called on this thread, under the engine lock, so it must not
+    /// call back into the engine.
+    pub fn process_input_streaming(&self, input: String, sink: Arc<dyn FfiSentenceSink>) -> FfiResponse {
+        self.respond(input, Some(sink))
     }
 
     /// Discard any pending question the engine is awaiting a reply to. Called
@@ -1484,6 +1479,61 @@ impl AriEngine {
             .expect("engine mutex poisoned")
             .replace_skills(skills);
         loaded
+    }
+}
+
+impl AriEngine {
+    /// The body of [`Self::process_input`], with sentences of an on-device
+    /// answer going to `sentences` when there is one.
+    fn respond(&self, input: String, sentences: Option<Arc<dyn FfiSentenceSink>>) -> FfiResponse {
+        // Refresh the engine's locale on every call so per-locale
+        // skill scorers and responses pick up live changes from the
+        // frontend's settings store. The locale provider's read is a
+        // synchronous AtomicReference lookup on Android (see
+        // AriFfiLocaleProvider), so this is essentially free.
+        let locale = self.locale_provider.current_locale();
+        let mut engine = self.inner.lock().expect("engine mutex poisoned");
+        engine.set_locale(locale.clone());
+        #[cfg(feature = "llm")]
+        engine.set_sentence_sink(
+            sentences.map(|s| Arc::new(ForeignSentenceSinkAdapter(s)) as Arc<dyn SentenceSink>),
+        );
+        // Without the on-device assistant there are no answers to stream.
+        #[cfg(not(feature = "llm"))]
+        drop(sentences);
+        let (response, skill_id) = engine.process_input_with_skill(&input);
+        #[cfg(feature = "llm")]
+        engine.set_sentence_sink(None);
+        let rearm = engine.has_pending_turn();
+        let enter_conversation = engine.take_enter_signal();
+        let exit_conversation = engine.take_exit_signal();
+        let facts_changed = engine.take_facts_changed_signal();
+        match response {
+            ari_core::Response::Text(s) => {
+                // The engine's fallback text is locale-specific
+                // (Phase 5 step 2). Compare against the locale-
+                // appropriate version so the Android NotUnderstood
+                // retry path fires for Italian / French / etc.
+                // users too — not just English.
+                let is_fallback =
+                    s == fallback_response_for(&locale) || s == FALLBACK_RESPONSE;
+                if is_fallback {
+                    // A fallback never re-arms.
+                    FfiResponse::NotUnderstood { body: s }
+                } else {
+                    FfiResponse::Text { body: s, rearm, enter_conversation, exit_conversation, facts_changed }
+                }
+            }
+            ari_core::Response::Action(v) => FfiResponse::Action {
+                json: serde_json::to_string(&v).unwrap_or_default(),
+                skill_id: skill_id.unwrap_or_default(),
+                rearm,
+                enter_conversation,
+                exit_conversation,
+                facts_changed,
+            },
+            ari_core::Response::Binary { mime, data } => FfiResponse::Binary { mime, data },
+        }
     }
 }
 

@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A conversation length setting: Short keeps five exchanges for 90 seconds of quiet (the
   old fixed limits), Medium ten for 5 minutes, Long twenty for 15 minutes
   ([ari-android#31](https://github.com/ari-digital-assistant/ari-android/issues/31)).
+- `process_input_streaming(input, sink)` hands an on-device assistant answer to the sink
+  a sentence at a time while the model is still writing the rest, so the host can start
+  speaking it. Sentences are released only once finished and cleaned like the whole
+  answer; an answer with nothing to release early is returned as before
+  ([ari-android#37](https://github.com/ari-digital-assistant/ari-android/issues/37)).
 
 ### Changed
 

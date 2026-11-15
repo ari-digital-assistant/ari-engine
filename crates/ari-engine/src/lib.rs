@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 pub mod named_assistant;
 mod plain_text;
+#[cfg(feature = "llm")]
+mod sentence_stream;
 pub use named_assistant::NamedAssistantBinding;
 
 /// Pseudo skill-id used for engine-emitted log lines so they surface in
@@ -33,6 +35,21 @@ pub trait EnvelopeSink: Send + Sync {
     /// the frontend can resolve `asset:` references in it). Skill id
     /// matches the value [`Engine::process_input_with_skill`] returns.
     fn push(&self, envelope_json: &str, skill_id: Option<&str>);
+}
+
+/// Host-implemented sink for the sentences of an on-device assistant
+/// answer, handed over while the model is still writing the rest so the
+/// host can start speaking (ari-android#37). Called on the thread running
+/// `process_input`, before it returns.
+///
+/// A host that gets any sentence gets the whole answer this way, the last
+/// of it just before `process_input` returns, so it speaks the sentences
+/// rather than the response text. An answer with nothing to send early (a
+/// single sentence, say) sends nothing, and the response is spoken as usual.
+/// Each sentence keeps the space or line break before it, so joined end to
+/// end they read as the answer.
+pub trait SentenceSink: Send + Sync {
+    fn sentence(&self, text: &str);
 }
 
 /// The text the engine returns when no skill matches the input. Exposed
@@ -572,6 +589,10 @@ pub struct Engine {
     /// `consult_assistant` directive is inert (skill's first envelope
     /// is returned unchanged).
     envelope_sink: Option<Arc<dyn EnvelopeSink>>,
+    /// Where the sentences of an on-device answer go while it's being
+    /// written. Set by the host around a single `process_input` call.
+    #[cfg(feature = "llm")]
+    sentence_sink: Option<Arc<dyn SentenceSink>>,
     /// Named cloud assistants addressable as "ask <alias> ...". Pushed
     /// by [`AriEngine::AssistantRegistry::apply_to_engine`] from the
     /// installed skill set. Empty when no community assistants are
@@ -634,6 +655,8 @@ impl Engine {
             active_assistant: None,
             log_sink: None,
             envelope_sink: None,
+            #[cfg(feature = "llm")]
+            sentence_sink: None,
             named_assistants: Vec::new(),
             model_catalog: None,
             config_store: None,
@@ -943,6 +966,13 @@ impl Engine {
     /// `process_input` call.
     pub fn set_envelope_sink(&mut self, sink: Option<Arc<dyn EnvelopeSink>>) {
         self.envelope_sink = sink;
+    }
+
+    /// Install the sink the next on-device answer's sentences go to, or
+    /// `None` to keep answers whole. See [`SentenceSink`].
+    #[cfg(feature = "llm")]
+    pub fn set_sentence_sink(&mut self, sink: Option<Arc<dyn SentenceSink>>) {
+        self.sentence_sink = sink;
     }
 
     fn log(&self, level: LogLevel, message: &str) {
@@ -1688,10 +1718,29 @@ impl Engine {
                             normalized.len()
                         ),
                     );
-                    let result = llm.try_answer(&normalized, &catalog, &self.ctx.locale, &history, &facts, &personality);
+                    let mut sentences = self
+                        .sentence_sink
+                        .as_deref()
+                        .map(sentence_stream::SentenceStream::new);
+                    let result = llm.try_answer(
+                        &normalized,
+                        &catalog,
+                        &self.ctx.locale,
+                        &history,
+                        &facts,
+                        &personality,
+                        &mut |raw| {
+                            if let Some(sentences) = sentences.as_mut() {
+                                sentences.feed(raw);
+                            }
+                        },
+                    );
                     match result {
                         Some(ari_llm::FallbackResult::DirectAnswer { text }) => {
                             let (clean, flag) = assistant_answer(&text);
+                            if let Some(sentences) = &sentences {
+                                sentences.finish(&clean);
+                            }
                             self.record_assistant_turn(&normalized, &clean, flag);
                             let preview: String = clean.chars().take(160).collect();
                             self.log(
@@ -5128,11 +5177,53 @@ mod tests {
             history: &[(String, String)],
             facts: &[String],
             personality: &str,
+            on_text: &mut dyn FnMut(&str),
         ) -> Option<ari_llm::FallbackResult> {
             *self.last_history.lock().unwrap() = history.to_vec();
             *self.last_facts.lock().unwrap() = facts.to_vec();
             *self.last_personality.lock().unwrap() = personality.to_string();
+            for (at, c) in self.reply.char_indices() {
+                on_text(&self.reply[..at + c.len_utf8()]);
+            }
             Some(ari_llm::FallbackResult::DirectAnswer { text: self.reply.to_string() })
+        }
+    }
+
+    #[cfg(feature = "llm")]
+    #[derive(Default)]
+    struct RecordingSentences(std::sync::Mutex<Vec<String>>);
+
+    #[cfg(feature = "llm")]
+    impl SentenceSink for RecordingSentences {
+        fn sentence(&self, text: &str) {
+            self.0.lock().unwrap().push(text.to_string());
+        }
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn assistant_answer_reaches_the_sentence_sink_as_it_is_written() {
+        let mut engine = Engine::new();
+        engine.set_llm(std::sync::Arc::new(RecordingFallback {
+            last_history: std::sync::Mutex::new(Vec::new()),
+            last_facts: std::sync::Mutex::new(Vec::new()),
+            last_personality: std::sync::Mutex::new(String::new()),
+            reply: "Top two:\n* **Lionel Messi**: Argentina.\n* **Cristiano Ronaldo**: Portugal. [continuation]",
+        }));
+        engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
+        let sentences = std::sync::Arc::new(RecordingSentences::default());
+        engine.set_sentence_sink(Some(sentences.clone()));
+
+        let (resp, _) = engine.process_input_traced("top two footballers");
+        assert_eq!(
+            *sentences.0.lock().unwrap(),
+            ["Top two:", "\n• Lionel Messi: Argentina.", "\n• Cristiano Ronaldo: Portugal."]
+        );
+        match resp {
+            Response::Text(t) => {
+                assert_eq!(t, "Top two:\n• Lionel Messi: Argentina.\n• Cristiano Ronaldo: Portugal.")
+            }
+            o => panic!("{o:?}"),
         }
     }
 
