@@ -25,9 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The Medium and Large on-device models answer from what they know when asked about the
   best or most famous people and things, instead of calling it live information they
-  can't reach, and may answer in two sentences or a short list. Small keeps its
-  one-sentence prompt, which it answers better with
-  ([ari-android#37](https://github.com/ari-digital-assistant/ari-android/issues/37)).
+  can't reach, and answer a question about several things with a short list that covers
+  every one of them. Small keeps its one-sentence prompt, which it answers better with
+  ([ari-android#37](https://github.com/ari-digital-assistant/ari-android/issues/37),
+  [ari-android#38](https://github.com/ari-digital-assistant/ari-android/issues/38)).
 - On Android arm64, llama.cpp's CPU code ships in three builds, ARMv8.0, ARMv8.2 (dot
   product) and ARMv8.6 (int8 matrix multiply), and the on-device assistant loads the
   best one the phone supports. On a Pixel 10 Pro Fold the Medium model answers in

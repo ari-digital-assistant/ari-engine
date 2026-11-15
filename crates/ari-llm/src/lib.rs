@@ -914,9 +914,9 @@ mod tests {
         // Locale fence — the explicit "English" word matters for
         // small models that occasionally bleed in non-English tokens.
         assert!(prompt.contains("English"));
-        // Brevity hint stays loud, with room for a list when one is asked for.
+        // Brevity hint stays loud, with a list covering everything asked about.
         assert!(prompt.contains("briefly"));
-        assert!(prompt.contains("one or two sentences, or a short list"));
+        assert!(prompt.contains("a short list that covers every one of them"));
     }
 
     #[test]
@@ -1034,7 +1034,7 @@ mod tests {
         let prompt = build_system_prompt(&test_skills(), "it", BuiltinTier::Medium, false, &[], "");
         assert!(prompt.contains("Ari"));
         assert!(prompt.contains("italiano"));
-        assert!(prompt.contains("una o due frasi, oppure un breve elenco"));
+        assert!(prompt.contains("un breve elenco che le copra tutte"));
         // Italian template must NOT carry the English fence — that
         // would confuse the model into mixing languages.
         assert!(!prompt.contains("English"));
