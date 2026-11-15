@@ -3,7 +3,7 @@
 use ari_core::Skill;
 use ari_engine::{fallback_response_for, ConversationLength, Engine, EnvelopeSink, FALLBACK_RESPONSE};
 #[cfg(feature = "llm")]
-use ari_engine::SentenceSink;
+use ari_engine::AnswerSink;
 use ari_skill_loader::assistant::{ConfigStore, MemoryConfigStore};
 use ari_skill_loader::{
     load_skill_directory_with, AuthorizeInput, AuthorizeOutput, AuthorizeProvider, Calendar,
@@ -205,23 +205,30 @@ impl EnvelopeSink for ForeignEnvelopeSinkAdapter {
     }
 }
 
-/// Callback interface the host implements to hear an on-device assistant
-/// answer a sentence at a time while the model is still writing it, via
-/// [`AriEngine::process_input_streaming`]. Same contract as the engine's
-/// [`ari_engine::SentenceSink`]: a host that gets any sentence gets the whole answer
-/// this way, so it speaks the sentences instead of the response text.
+/// Callback interface the host implements to get an on-device assistant
+/// answer while the model is still writing it, via
+/// [`AriEngine::process_input_streaming`]: the words so far to show, and each
+/// finished sentence to speak. Same contract as the engine's
+/// [`ari_engine::AnswerSink`]: a host that gets any sentence gets the whole
+/// answer as sentences, so it speaks those instead of the response text.
 #[uniffi::export(with_foreign)]
-pub trait FfiSentenceSink: Send + Sync {
+pub trait FfiAnswerSink: Send + Sync {
+    /// The answer so far, in whole words. Each call replaces the last.
+    fn text(&self, so_far: String);
+    /// The next finished sentence.
     fn sentence(&self, text: String);
 }
 
-/// Wraps a foreign [`FfiSentenceSink`] so it satisfies the engine's
-/// [`SentenceSink`]. Same `&str`→`String` copy as the other adapters.
+/// Wraps a foreign [`FfiAnswerSink`] so it satisfies the engine's
+/// [`AnswerSink`]. Same `&str`→`String` copy as the other adapters.
 #[cfg(feature = "llm")]
-struct ForeignSentenceSinkAdapter(Arc<dyn FfiSentenceSink>);
+struct ForeignAnswerSinkAdapter(Arc<dyn FfiAnswerSink>);
 
 #[cfg(feature = "llm")]
-impl SentenceSink for ForeignSentenceSinkAdapter {
+impl AnswerSink for ForeignAnswerSinkAdapter {
+    fn text(&self, so_far: &str) {
+        self.0.text(so_far.to_string());
+    }
     fn sentence(&self, text: &str) {
         self.0.sentence(text.to_string());
     }
@@ -1310,12 +1317,12 @@ impl AriEngine {
         self.respond(input, None)
     }
 
-    /// [`Self::process_input`], handing each sentence of an on-device
-    /// assistant answer to `sink` while the model is still writing the
-    /// rest, so the host can start speaking it (ari-android#37). The sink
-    /// is called on this thread, under the engine lock, so it must not
-    /// call back into the engine.
-    pub fn process_input_streaming(&self, input: String, sink: Arc<dyn FfiSentenceSink>) -> FfiResponse {
+    /// [`Self::process_input`], handing an on-device assistant answer to
+    /// `sink` while the model is still writing it: the words so far to show,
+    /// and each finished sentence so the host can start speaking
+    /// (ari-android#37). The sink is called on this thread, under the engine
+    /// lock, so it must not call back into the engine.
+    pub fn process_input_streaming(&self, input: String, sink: Arc<dyn FfiAnswerSink>) -> FfiResponse {
         self.respond(input, Some(sink))
     }
 
@@ -1483,9 +1490,9 @@ impl AriEngine {
 }
 
 impl AriEngine {
-    /// The body of [`Self::process_input`], with sentences of an on-device
-    /// answer going to `sentences` when there is one.
-    fn respond(&self, input: String, sentences: Option<Arc<dyn FfiSentenceSink>>) -> FfiResponse {
+    /// The body of [`Self::process_input`], with an on-device answer going to
+    /// `answer` while it's written, when there is one.
+    fn respond(&self, input: String, answer: Option<Arc<dyn FfiAnswerSink>>) -> FfiResponse {
         // Refresh the engine's locale on every call so per-locale
         // skill scorers and responses pick up live changes from the
         // frontend's settings store. The locale provider's read is a
@@ -1495,15 +1502,15 @@ impl AriEngine {
         let mut engine = self.inner.lock().expect("engine mutex poisoned");
         engine.set_locale(locale.clone());
         #[cfg(feature = "llm")]
-        engine.set_sentence_sink(
-            sentences.map(|s| Arc::new(ForeignSentenceSinkAdapter(s)) as Arc<dyn SentenceSink>),
+        engine.set_answer_sink(
+            answer.map(|s| Arc::new(ForeignAnswerSinkAdapter(s)) as Arc<dyn AnswerSink>),
         );
         // Without the on-device assistant there are no answers to stream.
         #[cfg(not(feature = "llm"))]
-        drop(sentences);
+        drop(answer);
         let (response, skill_id) = engine.process_input_with_skill(&input);
         #[cfg(feature = "llm")]
-        engine.set_sentence_sink(None);
+        engine.set_answer_sink(None);
         let rearm = engine.has_pending_turn();
         let enter_conversation = engine.take_enter_signal();
         let exit_conversation = engine.take_exit_signal();

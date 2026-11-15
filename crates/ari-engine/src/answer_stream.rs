@@ -1,17 +1,21 @@
-//! The sentences of an on-device assistant answer, released while the model
-//! is still writing the rest, so Ari starts speaking sooner (ari-android#37).
+//! An on-device assistant answer, handed over while the model is still
+//! writing it (ari-android#37): the words so far, for the host to show, and
+//! each finished sentence, for it to speak.
 //!
-//! Only text that can't change any more goes out: up to the last newline, or
-//! the last sentence end once the next sentence has begun. It gets the same
-//! cleanup as the finished answer (reasoning removed, markdown reduced to
-//! plain text, continuation marker split off), so a sentence spoken early
-//! reads exactly as it does in the whole answer.
+//! Words go out whole, never inside emphasis, a code span or a link, so no
+//! markdown flickers onto the screen. A sentence goes out once it can't
+//! change any more: up to the last newline, or the last sentence end once the
+//! next sentence has begun. Both get the same cleanup as the finished answer
+//! (reasoning removed, markdown reduced to plain text, continuation marker
+//! split off), so what is shown and spoken early reads as the whole answer.
 
-use crate::{assistant_answer, SentenceSink};
+use crate::{assistant_answer, AnswerSink};
 
-/// One answer's sentences on their way to a [`SentenceSink`].
-pub(crate) struct SentenceStream<'a> {
-    sink: &'a dyn SentenceSink,
+/// One answer on its way to an [`AnswerSink`].
+pub(crate) struct AnswerStream<'a> {
+    sink: &'a dyn AnswerSink,
+    /// The words last shown.
+    shown: String,
     /// The cleaned answer up to the end of the last sentence released.
     released: String,
     /// The cleaned text stopped starting with what was already released,
@@ -20,14 +24,19 @@ pub(crate) struct SentenceStream<'a> {
     diverged: bool,
 }
 
-impl<'a> SentenceStream<'a> {
-    pub(crate) fn new(sink: &'a dyn SentenceSink) -> Self {
-        Self { sink, released: String::new(), diverged: false }
+impl<'a> AnswerStream<'a> {
+    pub(crate) fn new(sink: &'a dyn AnswerSink) -> Self {
+        Self { sink, shown: String::new(), released: String::new(), diverged: false }
     }
 
-    /// Release any sentences the model has finished, given its raw output
-    /// so far.
+    /// Show the words and release any sentences the model has finished,
+    /// given its raw output so far.
     pub(crate) fn feed(&mut self, raw: &str) {
+        let (words, _) = assistant_answer(&ari_llm::strip_thinking(&raw[..shown_len(raw)]));
+        if words != self.shown && words.chars().any(char::is_alphanumeric) {
+            self.sink.text(&words);
+            self.shown = words;
+        }
         if self.diverged {
             return;
         }
@@ -61,7 +70,7 @@ impl<'a> SentenceStream<'a> {
 /// Hand `text` to the sink if it has any words in it, with the space or
 /// line break before it, so the sentences joined end to end read as the
 /// answer does.
-fn release(sink: &dyn SentenceSink, text: &str) -> bool {
+fn release(sink: &dyn AnswerSink, text: &str) -> bool {
     if !text.chars().any(char::is_alphanumeric) {
         return false;
     }
@@ -83,6 +92,22 @@ fn after_spoken<'s>(answer: &'s str, spoken: &str) -> &'s str {
         }
     }
     ""
+}
+
+/// Byte length of the part of `text` that can be shown: whole words, with no
+/// emphasis, code span or link left open.
+fn shown_len(text: &str) -> usize {
+    let mut shown = 0;
+    let mut line_start = 0;
+    for (at, c) in text.char_indices() {
+        if c.is_whitespace() && balanced(&text[line_start..at]) {
+            shown = at;
+        }
+        if c == '\n' {
+            line_start = at + 1;
+        }
+    }
+    shown
 }
 
 /// Byte length of the part of `text` that is finished: up to the last
@@ -125,7 +150,8 @@ fn sentence_end(chars: &[(usize, char)], line_start: usize, i: usize) -> Option<
     if c == '.' && (chars[next].1.is_lowercase() || is_abbreviation(chars, line_start, i)) {
         return None;
     }
-    if !balanced(&chars[line_start..end]) {
+    let line: String = chars[line_start..end].iter().map(|&(_, c)| c).collect();
+    if !balanced(&line) {
         return None;
     }
     Some(chars[end].0)
@@ -149,9 +175,8 @@ fn is_abbreviation(chars: &[(usize, char)], line_start: usize, dot: usize) -> bo
 /// Whether a line cut here leaves no emphasis, code span or link half
 /// open: cut inside one, the markdown cleanup reads the two halves
 /// differently from the whole. A leading `* ` bullet doesn't count.
-fn balanced(line: &[(usize, char)]) -> bool {
-    let text: String = line.iter().map(|&(_, c)| c).collect();
-    let body = text.trim_start();
+fn balanced(line: &str) -> bool {
+    let body = line.trim_start();
     let body = body.strip_prefix("* ").unwrap_or(body);
     // Runs, not characters: `**` opens bold just as `*` opens italics.
     let runs = |mark: char| {
@@ -174,29 +199,76 @@ mod tests {
     use std::sync::Mutex;
 
     #[derive(Default)]
-    struct Recorder(Mutex<Vec<String>>);
+    struct Recorder {
+        shown: Mutex<Vec<String>>,
+        sentences: Mutex<Vec<String>>,
+    }
 
-    impl SentenceSink for Recorder {
+    impl AnswerSink for Recorder {
+        fn text(&self, so_far: &str) {
+            self.shown.lock().unwrap().push(so_far.to_string());
+        }
         fn sentence(&self, text: &str) {
-            self.0.lock().unwrap().push(text.to_string());
+            self.sentences.lock().unwrap().push(text.to_string());
         }
     }
 
     /// Feed `raw` the way the model writes it, a character at a time, then
-    /// finish with the cleaned whole, and return every sentence released.
-    fn stream(raw: &str) -> Vec<String> {
+    /// finish with the cleaned whole, and return everything shown and every
+    /// sentence released.
+    fn stream_all(raw: &str) -> (Vec<String>, Vec<String>) {
         let sink = Recorder::default();
-        let mut stream = SentenceStream::new(&sink);
+        let mut stream = AnswerStream::new(&sink);
         for (at, c) in raw.char_indices() {
             stream.feed(&raw[..at + c.len_utf8()]);
         }
         let (answer, _) = assistant_answer(&ari_llm::strip_thinking(raw));
         stream.finish(&answer);
-        sink.0.into_inner().unwrap()
+        (sink.shown.into_inner().unwrap(), sink.sentences.into_inner().unwrap())
+    }
+
+    fn stream(raw: &str) -> Vec<String> {
+        stream_all(raw).1
+    }
+
+    fn shown(raw: &str) -> Vec<String> {
+        stream_all(raw).0
     }
 
     fn settled(text: &str) -> &str {
         &text[..settled_len(text)]
+    }
+
+    #[test]
+    fn words_show_whole_and_outside_open_markdown() {
+        assert_eq!(&"Paris is the cap"[..shown_len("Paris is the cap")], "Paris is the");
+        assert_eq!(&"Paris is **the big"[..shown_len("Paris is **the big")], "Paris is");
+        assert_eq!(&"See [the map"[..shown_len("See [the map")], "See");
+    }
+
+    #[test]
+    fn a_one_sentence_answer_shows_its_words_as_they_come() {
+        assert_eq!(
+            shown("Some often named are Lionel Messi and Cristiano Ronaldo. [continuation]"),
+            [
+                "Some",
+                "Some often",
+                "Some often named",
+                "Some often named are",
+                "Some often named are Lionel",
+                "Some often named are Lionel Messi",
+                "Some often named are Lionel Messi and",
+                "Some often named are Lionel Messi and Cristiano",
+                "Some often named are Lionel Messi and Cristiano Ronaldo.",
+            ]
+        );
+    }
+
+    #[test]
+    fn shown_words_never_carry_markdown_or_the_marker() {
+        for words in shown("Top two:\n* **Lionel Messi**: Argentina.\n* **Cristiano Ronaldo**: Portugal. [new]") {
+            assert!(!words.contains(['*', '[']), "{words:?}");
+        }
     }
 
     #[test]
