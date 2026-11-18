@@ -1339,7 +1339,7 @@ impl Engine {
         // normalisation is lossy in one direction only. Built once per turn and
         // handed to `execute`; scoring deliberately keeps the stored ctx, whose
         // `raw_input` stays empty.
-        let exec_ctx = SkillContext {
+        let mut exec_ctx = SkillContext {
             raw_input: input.trim().to_string(),
             ..self.ctx.clone()
         };
@@ -1465,6 +1465,7 @@ impl Engine {
         // wins are transparent (refresh, never record).
         let conversation = self.conversation_context();
         let history = history_messages(&conversation);
+        exec_ctx.last_question = conversation.last().map(|t| t.user.clone()).unwrap_or_default();
         // Personal memory: the durable facts snapshot handed to the assistant
         // for THIS turn's free-text answer, whether the user addressed an
         // assistant by name or not. Skill-serving calls (routing, layer-C)
@@ -5352,6 +5353,18 @@ mod tests {
         assert_eq!(turns.len(), 1, "skill turn must NOT record into the buffer");
         let elapsed = engine.conversation.lock().unwrap().as_ref().unwrap().last_activity.elapsed();
         assert!(elapsed < Duration::from_secs(5), "skill turn must refresh the timer");
+    }
+
+    #[test]
+    fn search_for_it_searches_for_the_question_ari_remembers() {
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(ari_skills::SearchSkill::new()));
+        engine.record_assistant_turn("are not they extinct in libya", "I don't have live information.");
+
+        match engine.process_input_traced("search for it").0 {
+            Response::Action(v) => assert_eq!(v["search"], "are not they extinct in libya"),
+            other => panic!("expected a search, got {other:?}"),
+        }
     }
 
     #[test]

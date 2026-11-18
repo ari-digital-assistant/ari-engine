@@ -51,6 +51,14 @@ const BRIDGES: &[&[&str]] = &[
 /// After the query: "google that for me", "search for cats please".
 const TAILS: &[&[&str]] = &[&["please"], &["for", "me"], &["per", "favore"]];
 
+/// A whole query that stands for what the user was just asking about:
+/// "search for it" searched for the word "it".
+const REFERENCES: &[&str] = &[
+    "it", "that", "this", "them", "those", "these",
+    // Italian: questo/questa (this), quello/quella (that)
+    "questo", "questa", "quello", "quella",
+];
+
 fn strip_leading<'a>(mut words: &'a [&'a str], phrases: &[&[&str]]) -> &'a [&'a str] {
     'again: loop {
         for phrase in phrases {
@@ -175,21 +183,42 @@ impl Skill for SearchSkill {
         }
     }
 
-    fn execute(&self, input: &str, _ctx: &SkillContext) -> Response {
-        // Reached without a command only when something else routed here;
-        // then the whole input is the query.
+    fn execute(&self, input: &str, ctx: &SkillContext) -> Response {
+        // The answer to "What should I search for?" below.
+        if let Some(text) = serde_json::from_str::<serde_json::Value>(input)
+            .ok()
+            .and_then(|v| v["_ari_reply"]["text"].as_str().map(str::to_string))
+        {
+            return search(text);
+        }
         let query = match command_query(input) {
-            Some(query) if !query.is_empty() => query,
-            _ => input.to_string(),
+            Some(query) if REFERENCES.contains(&query.as_str()) => ctx.last_question.clone(),
+            Some(query) => query,
+            // Reached without a command only when something else routed here;
+            // then the whole input is the query.
+            None => input.to_string(),
         };
-
-        // `speak` omitted deliberately — the frontend produces the
-        // platform-appropriate "Searching for X." phrase itself.
-        Response::Action(serde_json::json!({
-            "v": 1,
-            "search": query,
-        }))
+        if query.is_empty() {
+            return Response::Action(serde_json::json!({
+                "v": 1,
+                "speak": match ctx.locale.as_str() {
+                    "it" => "Cosa devo cercare?",
+                    _ => "What should I search for?",
+                },
+                "await_reply": { "context": "query" },
+            }));
+        }
+        search(query)
     }
+}
+
+fn search(query: String) -> Response {
+    // `speak` omitted deliberately — the frontend produces the
+    // platform-appropriate "Searching for X." phrase itself.
+    Response::Action(serde_json::json!({
+        "v": 1,
+        "search": query,
+    }))
 }
 
 #[cfg(test)]
@@ -334,6 +363,42 @@ mod tests {
         let skill = SearchSkill::new();
         match skill.execute("google cats", &ctx()) {
             Response::Action(v) => assert_eq!(v["search"], "cats"),
+            other => panic!("expected Action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_for_it_searches_for_the_question_before() {
+        let skill = SearchSkill::new();
+        let ctx = SkillContext {
+            last_question: "are not they locally extinct in libya and egypt".to_string(),
+            ..ctx()
+        };
+        for input in ["search for it", "google that for me", "cerca questo"] {
+            match skill.execute(input, &ctx) {
+                Response::Action(v) => {
+                    assert_eq!(v["search"], "are not they locally extinct in libya and egypt", "{input}")
+                }
+                other => panic!("expected Action for {input:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_to_search_for_asks_and_searches_the_answer() {
+        let skill = SearchSkill::new();
+        for input in ["search for it", "search for"] {
+            match skill.execute(input, &ctx()) {
+                Response::Action(v) => {
+                    assert_eq!(v["speak"], "What should I search for?", "{input}");
+                    assert_eq!(v["await_reply"]["context"], "query");
+                    assert!(v.get("search").is_none());
+                }
+                other => panic!("expected Action for {input:?}, got {other:?}"),
+            }
+        }
+        match skill.execute_reply("query", "cheetahs in libya", &ctx()) {
+            Response::Action(v) => assert_eq!(v["search"], "cheetahs in libya"),
             other => panic!("expected Action, got {other:?}"),
         }
     }

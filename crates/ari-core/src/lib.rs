@@ -146,6 +146,12 @@ pub struct SkillContext {
     /// normalised text by design, so it is empty during `score` and callers
     /// must not reach for it there.
     pub raw_input: String,
+    /// The user's latest question in the conversation Ari still remembers,
+    /// normalised, or empty when there is none. For a skill told to act on
+    /// "it" or "that": "search for it" straight after a question searches
+    /// for that question, not for the word "it". Populated for `execute`
+    /// only, like [`raw_input`](SkillContext::raw_input).
+    pub last_question: String,
 }
 
 impl SkillContext {
@@ -175,6 +181,7 @@ impl Default for SkillContext {
             installed_apps: Vec::new(),
             vocabularies: BTreeMap::new(),
             raw_input: String::new(),
+            last_question: String::new(),
         }
     }
 }
