@@ -1,7 +1,9 @@
 #![allow(clippy::new_without_default)]
 
 use ari_core::Skill;
-use ari_engine::{fallback_response_for, ConversationLength, Engine, EnvelopeSink, FALLBACK_RESPONSE};
+use ari_engine::{
+    fallback_response_for, ConversationLength, ConversationMemory, Engine, EnvelopeSink, FALLBACK_RESPONSE,
+};
 #[cfg(feature = "llm")]
 use ari_engine::AnswerSink;
 use ari_skill_loader::assistant::{ConfigStore, MemoryConfigStore};
@@ -312,6 +314,26 @@ pub struct FfiCalendarEventRow {
     pub end_ms: i64,
     pub all_day: bool,
     pub calendar_id: u64,
+}
+
+/// Whether Ari still remembers the conversation; see [`ConversationMemory`].
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FfiConversationMemory {
+    None,
+    Live { forgotten_in_ms: u64 },
+    Lapsed,
+}
+
+impl From<ConversationMemory> for FfiConversationMemory {
+    fn from(memory: ConversationMemory) -> Self {
+        match memory {
+            ConversationMemory::None => FfiConversationMemory::None,
+            ConversationMemory::Live(left) => FfiConversationMemory::Live {
+                forgotten_in_ms: left.as_millis() as u64,
+            },
+            ConversationMemory::Lapsed => FfiConversationMemory::Lapsed,
+        }
+    }
 }
 
 /// The user's conversation-length setting; see [`ConversationLength`].
@@ -1381,6 +1403,17 @@ impl AriEngine {
             .lock()
             .expect("engine mutex poisoned")
             .clear_conversation();
+    }
+
+    /// Whether Ari still remembers the conversation, and for how much longer,
+    /// so the chat can say when it has been forgotten (ari-android#51).
+    /// Reading it doesn't keep the conversation alive.
+    pub fn conversation_memory(&self) -> FfiConversationMemory {
+        self.inner
+            .lock()
+            .expect("engine mutex poisoned")
+            .conversation_memory()
+            .into()
     }
 
     /// How much conversation the engine keeps, and for how long. Mirrors

@@ -120,6 +120,18 @@ impl ConversationLength {
     }
 }
 
+/// Whether Ari holds a conversation to answer follow-ups from: what a host
+/// needs to show the user when it has been forgotten (ari-android#51).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConversationMemory {
+    /// Nothing to forget: no conversation yet, cleared, or memory off.
+    None,
+    /// A conversation Ari forgets after this much more quiet.
+    Live(Duration),
+    /// The conversation went quiet for too long; the next turn starts fresh.
+    Lapsed,
+}
+
 /// Upper bound on stored personal facts. Bounds the recall block injected
 /// into the assistant prompt; a capture at the cap evicts the oldest.
 const MAX_REMEMBERED_FACTS: usize = 50;
@@ -894,6 +906,23 @@ impl Engine {
     pub fn clear_conversation(&self) {
         *self.conversation.lock().expect("conversation poisoned") = None;
         self.clear_pending_turn();
+    }
+
+    /// Whether Ari still remembers the conversation, and for how long. Unlike
+    /// [`Self::conversation_context`], this only reads: asking doesn't keep
+    /// the conversation alive.
+    pub fn conversation_memory(&self) -> ConversationMemory {
+        if !self.is_conversation_memory_enabled() {
+            return ConversationMemory::None;
+        }
+        let guard = self.conversation.lock().expect("conversation poisoned");
+        let Some(buf) = guard.as_ref() else {
+            return ConversationMemory::None;
+        };
+        match self.conversation_length().idle_timeout().checked_sub(buf.last_activity.elapsed()) {
+            Some(left) if !left.is_zero() => ConversationMemory::Live(left),
+            _ => ConversationMemory::Lapsed,
+        }
     }
 
     /// Recent assistant turns if the buffer is within its inactivity TTL,
@@ -5106,6 +5135,37 @@ mod tests {
         assert_eq!(engine.personality(), "Dry and witty.");
         engine.set_personality(&"x".repeat(ari_core::MAX_PERSONALITY_CHARS + 50));
         assert_eq!(engine.personality().chars().count(), ari_core::MAX_PERSONALITY_CHARS);
+    }
+
+    #[test]
+    fn conversation_memory_says_how_long_until_ari_forgets() {
+        use std::time::{Duration, Instant};
+        let engine = Engine::new();
+        assert_eq!(engine.conversation_memory(), ConversationMemory::None);
+
+        engine.record_assistant_turn("q1", "a1");
+        match engine.conversation_memory() {
+            ConversationMemory::Live(left) => {
+                assert!(left > Duration::from_secs(85) && left <= Duration::from_secs(90), "{left:?}")
+            }
+            other => panic!("expected Live, got {other:?}"),
+        }
+
+        let aged = Instant::now().checked_sub(Duration::from_secs(91)).unwrap();
+        engine.conversation.lock().unwrap().as_mut().unwrap().last_activity = aged;
+        assert_eq!(engine.conversation_memory(), ConversationMemory::Lapsed);
+        assert_eq!(
+            engine.conversation.lock().unwrap().as_ref().unwrap().last_activity,
+            aged,
+            "asking must not keep the conversation alive"
+        );
+
+        engine.clear_conversation();
+        assert_eq!(engine.conversation_memory(), ConversationMemory::None);
+
+        engine.record_assistant_turn("q2", "a2");
+        engine.set_conversation_memory_enabled(false);
+        assert_eq!(engine.conversation_memory(), ConversationMemory::None);
     }
 
     #[test]
