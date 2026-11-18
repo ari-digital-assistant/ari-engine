@@ -12,8 +12,8 @@ mod cpu_build;
 pub use cpu_build::{cpu_build, cpu_features, CpuBuild};
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -85,6 +85,12 @@ pub trait Fallback: Send + Sync {
     fn last_error(&self) -> Option<String> {
         None
     }
+
+    /// Drop the model's weights from memory but stay ready: the next
+    /// question loads them again. For the phone running short of memory,
+    /// where removing the fallback would switch the assistant off.
+    /// Default does nothing, for impls that hold no model.
+    fn release_memory(&self) {}
 }
 
 /// Size classification of the loaded built-in model. Layer C uses this to
@@ -349,7 +355,8 @@ impl LoadedModel {
 /// freed. The next miss reloads it (cold start ~1-2 s on phone).
 pub struct LazyLlmFallback {
     model_path: PathBuf,
-    inner: Mutex<LazyState>,
+    /// Shared with the idle-eviction timers, which hold it weakly.
+    inner: Arc<Mutex<LazyState>>,
     /// Last error from a `try_answer` or `run_prompt` failure, surfaced
     /// via [`Fallback::last_error`] so the engine can log model-load /
     /// inference failures that the trait's `Option<FallbackResult>`
@@ -366,6 +373,9 @@ struct LazyState {
 // loaded. All access is serialised through the Mutex.
 unsafe impl Send for LazyLlmFallback {}
 unsafe impl Sync for LazyLlmFallback {}
+// SAFETY: as above. The eviction timer moves a handle to the state to its
+// own thread, and only ever touches it with the Mutex held.
+unsafe impl Send for LazyState {}
 
 impl LazyLlmFallback {
     /// Create a lazy fallback that will load from `model_path` on first use.
@@ -373,10 +383,10 @@ impl LazyLlmFallback {
     pub fn new(model_path: &Path) -> Self {
         LazyLlmFallback {
             model_path: model_path.to_path_buf(),
-            inner: Mutex::new(LazyState {
+            inner: Arc::new(Mutex::new(LazyState {
                 loaded: None,
                 last_used: None,
-            }),
+            })),
             last_error: Mutex::new(None),
         }
     }
@@ -409,6 +419,23 @@ impl LazyLlmFallback {
             .unwrap_or(false)
     }
 
+    /// Drops the model `after` the use at `used_at` ([`IDLE_TIMEOUT_SECS`]
+    /// in production), unless it was used again in the meantime. The timer holds the state weakly: once
+    /// this fallback is gone (another model picked, or the assistant
+    /// removed), it ends without touching anything. It used to hold a raw
+    /// pointer, which a fallback dropped within the minute left dangling.
+    fn schedule_eviction(&self, used_at: Instant, after: Duration) -> std::thread::JoinHandle<()> {
+        let state = Arc::downgrade(&self.inner);
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            let Some(shared) = state.upgrade() else { return };
+            let Ok(mut state) = shared.lock() else { return };
+            if state.last_used == Some(used_at) {
+                state.loaded = None;
+                state.last_used = None;
+            }
+        })
+    }
 }
 
 impl Fallback for LazyLlmFallback {
@@ -469,25 +496,8 @@ impl Fallback for LazyLlmFallback {
 
         let last_used_at = Instant::now();
         state.last_used = Some(last_used_at);
-
-        let idle_timeout = std::time::Duration::from_secs(IDLE_TIMEOUT_SECS);
         drop(state);
-
-        let inner = &self.inner as *const Mutex<LazyState> as usize;
-        std::thread::spawn(move || {
-            std::thread::sleep(idle_timeout);
-            // SAFETY: same as try_answer's eviction thread — the
-            // LazyLlmFallback outlives any spawned timer.
-            let mutex = unsafe { &*(inner as *const Mutex<LazyState>) };
-            if let Ok(mut state) = mutex.lock() {
-                if let Some(last) = state.last_used {
-                    if last == last_used_at {
-                        state.loaded = None;
-                        state.last_used = None;
-                    }
-                }
-            }
-        });
+        self.schedule_eviction(last_used_at, Duration::from_secs(IDLE_TIMEOUT_SECS));
 
         Ok(output)
     }
@@ -573,39 +583,22 @@ impl Fallback for LazyLlmFallback {
             ));
         }
 
-        // Update last_used after inference (could have taken a while).
+        // Update last_used after inference (could have taken a while), then
+        // schedule idle eviction with the lock released.
         let last_used_at = Instant::now();
         state.last_used = Some(last_used_at);
-
-        // Schedule idle eviction.
-        let idle_timeout = std::time::Duration::from_secs(IDLE_TIMEOUT_SECS);
-
-        // Drop the lock before spawning the eviction thread.
         drop(state);
-
-        let inner = &self.inner as *const Mutex<LazyState> as usize;
-        std::thread::spawn(move || {
-            std::thread::sleep(idle_timeout);
-            // SAFETY: the LazyLlmFallback (and thus the Mutex) lives as long as
-            // the engine, which outlives any eviction thread. The pointer is
-            // only used to re-acquire the lock.
-            let mutex = unsafe { &*(inner as *const Mutex<LazyState>) };
-            if let Ok(mut state) = mutex.lock() {
-                if let Some(last) = state.last_used {
-                    if last == last_used_at {
-                        // No query since we started the timer — evict.
-                        state.loaded = None;
-                        state.last_used = None;
-                    }
-                }
-            }
-        });
+        self.schedule_eviction(last_used_at, Duration::from_secs(IDLE_TIMEOUT_SECS));
 
         parse_output(&output, skills)
     }
 
     fn last_error(&self) -> Option<String> {
         self.last_error.lock().ok().and_then(|g| g.clone())
+    }
+
+    fn release_memory(&self) {
+        self.unload();
     }
 }
 
@@ -1227,6 +1220,70 @@ mod tests {
         let err = render_chat_template("{{ raise_exception('System role not supported') }}", &[("user", "Hi")], "", "")
             .unwrap_err();
         assert!(err.contains("System role not supported"), "{err}");
+    }
+
+    fn lazy_marked_used() -> (LazyLlmFallback, Instant) {
+        let lazy = LazyLlmFallback::new(Path::new("/nonexistent/model.gguf"));
+        let used_at = Instant::now();
+        lazy.inner.lock().unwrap().last_used = Some(used_at);
+        (lazy, used_at)
+    }
+
+    #[test]
+    fn eviction_timer_clears_an_unused_model() {
+        let (lazy, used_at) = lazy_marked_used();
+        lazy.schedule_eviction(used_at, Duration::from_millis(10)).join().unwrap();
+        assert_eq!(lazy.inner.lock().unwrap().last_used, None);
+    }
+
+    #[test]
+    fn eviction_timer_spares_a_model_used_since() {
+        let (lazy, used_at) = lazy_marked_used();
+        let timer = lazy.schedule_eviction(used_at, Duration::from_millis(10));
+        let again = Instant::now();
+        lazy.inner.lock().unwrap().last_used = Some(again);
+        timer.join().unwrap();
+        assert_eq!(lazy.inner.lock().unwrap().last_used, Some(again));
+    }
+
+    #[test]
+    fn eviction_timer_outlives_a_dropped_fallback() {
+        // The timer used to hold a raw pointer to the state, so dropping the
+        // fallback inside the minute (switching models) left it dangling.
+        let (lazy, used_at) = lazy_marked_used();
+        let timer = lazy.schedule_eviction(used_at, Duration::from_millis(10));
+        drop(lazy);
+        timer.join().unwrap();
+    }
+
+    #[test]
+    fn release_memory_with_nothing_loaded_is_harmless() {
+        // Answering again after a release is covered, with a real model, by
+        // real_model_release_memory_then_answer_again.
+        let (lazy, _) = lazy_marked_used();
+        lazy.release_memory();
+        assert!(!lazy.is_loaded());
+        assert_eq!(lazy.inner.lock().unwrap().last_used, None);
+    }
+
+    #[test]
+    #[ignore]
+    fn real_model_release_memory_then_answer_again() {
+        let model_path = std::env::var("LLM_TEST_MODEL")
+            .unwrap_or_else(|_| "/tmp/gemma3-1b-q4.gguf".to_string());
+        let path = std::path::Path::new(&model_path);
+        if !path.exists() {
+            eprintln!("Model not found at {model_path}, skipping");
+            return;
+        }
+        let lazy = LazyLlmFallback::new(path);
+        let ask = || lazy.try_answer("What's the capital of France?", &[], "en", BuiltinTier::Small, &[], &[], "", &mut |_| {});
+        assert!(ask().is_some(), "{:?}", lazy.last_error());
+        assert!(lazy.is_loaded());
+        lazy.release_memory();
+        assert!(!lazy.is_loaded());
+        assert!(ask().is_some(), "{:?}", lazy.last_error());
+        assert!(lazy.is_loaded());
     }
 
     #[test]

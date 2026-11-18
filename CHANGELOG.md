@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its chat too. `clear_conversation()` does the same for a host that clears the chat
   another way. Before this, the phrases went to the assistant, which said it couldn't
   ([ari-android#40](https://github.com/ari-digital-assistant/ari-android/issues/40)).
+- `release_llm_memory()` frees the on-device model's memory but keeps it set, so the next
+  question loads it again. `unload_llm_model()` removes it, and the assistant stops
+  answering until a model is set again
+  ([ari-android#42](https://github.com/ari-digital-assistant/ari-android/issues/42)).
 
 ### Changed
 
@@ -43,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The on-device model's one-minute idle timer held a raw pointer to the model's state.
+  Removing or switching the model within a minute of an answer left the timer touching
+  freed memory. It now holds a weak reference and stops if the model is gone
+  ([ari-android#42](https://github.com/ari-digital-assistant/ari-android/issues/42)).
 - A conversation too long for the on-device model's context drops its oldest exchanges
   instead of failing the answer.
 - Short on-device answers such as "Paris." or "1945." reach the user instead of being

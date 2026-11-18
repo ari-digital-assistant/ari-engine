@@ -1087,6 +1087,16 @@ impl Engine {
         self.llm = None;
     }
 
+    /// Free the LLM's memory but keep it as the fallback, so the next
+    /// question loads it again. Unlike [`Self::set_llm_none`], the
+    /// assistant keeps working.
+    #[cfg(feature = "llm")]
+    pub fn release_llm_memory(&self) {
+        if let Some(llm) = &self.llm {
+            llm.release_memory();
+        }
+    }
+
     /// Set the active assistant provider.
     pub fn set_active_assistant(&mut self, assistant: Option<ActiveAssistant>) {
         self.active_assistant = assistant;

@@ -1608,10 +1608,21 @@ impl AriEngine {
     }
 
     /// Remove the LLM fallback. If a model is currently loaded in RAM,
-    /// it is dropped and the memory is freed.
+    /// it is dropped and the memory is freed. The on-device assistant
+    /// stops answering until [`Self::load_llm_model`] is called again, so
+    /// this is for switching or deleting models: to free memory, use
+    /// [`Self::release_llm_memory`].
     pub fn unload_llm_model(&self) {
         let mut engine = self.inner.lock().expect("engine mutex poisoned");
         engine.set_llm_none();
+    }
+
+    /// Free the loaded model's memory but keep it set, so the next question
+    /// loads it again. Blocks until any answer in progress finishes, so
+    /// don't call it on the main thread.
+    pub fn release_llm_memory(&self) {
+        let engine = self.inner.lock().expect("engine mutex poisoned");
+        engine.release_llm_memory();
     }
 
 }
@@ -1636,8 +1647,16 @@ impl AriEngine {
     }
 
     /// Remove the LLM fallback. If a model is currently loaded in RAM,
-    /// it is dropped and the memory is freed.
+    /// it is dropped and the memory is freed. The on-device assistant
+    /// stops answering until [`Self::load_llm_model`] is called again, so
+    /// this is for switching or deleting models: to free memory, use
+    /// [`Self::release_llm_memory`].
     pub fn unload_llm_model(&self) {}
+
+    /// Free the loaded model's memory but keep it set, so the next question
+    /// loads it again. Blocks until any answer in progress finishes, so
+    /// don't call it on the main thread.
+    pub fn release_llm_memory(&self) {}
 
 }
 
@@ -1666,7 +1685,7 @@ mod uniffi_twin_guard {
     /// The methods that must exist in both twins. Hardcoded so deleting a
     /// method from BOTH blocks — which would keep them trivially equal while
     /// dropping an exported FFI symbol the frontend calls — still fails here.
-    const EXPECTED: [&str; 2] = ["load_llm_model", "unload_llm_model"];
+    const EXPECTED: [&str; 3] = ["load_llm_model", "unload_llm_model", "release_llm_memory"];
 
     /// Body of the `impl AriEngine` block introduced by `marker`, ending at
     /// the first column-0 `}`.
