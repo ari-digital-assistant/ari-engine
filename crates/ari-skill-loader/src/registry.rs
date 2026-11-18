@@ -224,48 +224,12 @@ pub struct IndexEntry {
     /// this map directly — it implements the cross-platform fallback.
     #[serde(default)]
     pub screenshots: std::collections::BTreeMap<String, Vec<String>>,
-    /// The skill's trigger patterns per locale, the same ones its manifest
-    /// declares, so Ari can suggest a skill that isn't installed when what
-    /// the user said matches it (ari-android#44). Empty in indexes
-    /// published before the field existed.
+    /// Per locale, the phrases that clearly need this skill, from its
+    /// manifest's opt-in `suggest:` list, so Ari can suggest it to someone
+    /// who hasn't installed it (ari-android#44). Empty for skills that
+    /// don't opt in, and in indexes published before the field existed.
     #[serde(default)]
-    pub matching: std::collections::BTreeMap<String, Vec<IndexPattern>>,
-}
-
-/// One trigger pattern as `index.json` carries it: `keywords` or `regex`,
-/// and the weight a match scores.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct IndexPattern {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keywords: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub regex: Option<String>,
-    /// 1.0 when absent, as in a manifest.
-    #[serde(default = "default_pattern_weight")]
-    pub weight: f32,
-}
-
-fn default_pattern_weight() -> f32 {
-    1.0
-}
-
-impl IndexPattern {
-    /// As a manifest pattern, or `None` unless it has exactly one of
-    /// non-empty `keywords` or `regex`, the rule manifests are held to.
-    pub fn to_match_pattern(&self) -> Option<crate::manifest::MatchPattern> {
-        use crate::manifest::MatchPattern;
-        match (&self.keywords, &self.regex) {
-            (Some(words), None) if !words.is_empty() => Some(MatchPattern::Keywords {
-                words: words.clone(),
-                weight: self.weight,
-            }),
-            (None, Some(pattern)) => Some(MatchPattern::Regex {
-                pattern: pattern.clone(),
-                weight: self.weight,
-            }),
-            _ => None,
-        }
-    }
+    pub suggest: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// One locale's worth of display strings for a skill — the parts the
@@ -959,7 +923,7 @@ metadata:
                     manifest: None,
                     localizations: Default::default(),
                     screenshots: Default::default(),
-                    matching: Default::default(),
+                    suggest: Default::default(),
                 },
                 IndexEntry {
                     id: "dev.heyari.counter".into(),
@@ -978,7 +942,7 @@ metadata:
                     manifest: None,
                     localizations: Default::default(),
                     screenshots: Default::default(),
-                    matching: Default::default(),
+                    suggest: Default::default(),
                 },
             ],
         };
@@ -1027,7 +991,7 @@ metadata:
             manifest: None,
             localizations: Default::default(),
             screenshots: Default::default(),
-            matching: Default::default(),
+            suggest: Default::default(),
         };
         let mut index = Index {
             index_version: 1,
@@ -1446,7 +1410,7 @@ metadata:
             manifest: Some("manifests/dev.heyari.coinflip-0.3.0.md".into()),
             localizations: Default::default(),
             screenshots: Default::default(),
-            matching: Default::default(),
+            suggest: Default::default(),
         };
         let got = client.fetch_manifest(&entry).unwrap();
         assert_eq!(got, md, "fetched sidecar must be byte-identical to served");
@@ -1472,7 +1436,7 @@ metadata:
             manifest: None,
             localizations: Default::default(),
             screenshots: Default::default(),
-            matching: Default::default(),
+            suggest: Default::default(),
         };
         let err = client.fetch_manifest(&entry).unwrap_err();
         match err {
@@ -1531,7 +1495,7 @@ metadata:
                     )
                 })
                 .collect(),
-            matching: Default::default(),
+            suggest: Default::default(),
         }
     }
 

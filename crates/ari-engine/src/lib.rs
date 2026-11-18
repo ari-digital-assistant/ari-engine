@@ -1160,9 +1160,10 @@ impl Engine {
     }
 
     /// The store skill to offer for `normalized`, if one that isn't
-    /// installed matches it strongly in the user's language.
+    /// installed lists a suggest phrase matching all of it in the user's
+    /// language.
     fn suggest_store_skill(&self, normalized: &str) -> Option<ari_skill_loader::suggest::SkillSuggestion> {
-        self.skill_suggester.as_ref()?.suggest(normalized, &self.ctx.locale, |id| {
+        self.skill_suggester.as_ref()?.suggest(normalized, &self.ctx, |id| {
             self.skills.iter().any(|s| s.id() == id)
         })
     }
@@ -1664,8 +1665,9 @@ impl Engine {
         }
 
         // Nothing installed claims it. Before the assistant, which can only
-        // say it can't, offer a store skill whose strong patterns match
-        // (ari-android#44): "remind me to call Mum" with no reminder skill.
+        // say it can't, offer a store skill that lists this as a phrase that
+        // needs it (ari-android#44): "remind me to call Mum" with no
+        // reminder skill.
         if let Some(suggestion) = self.suggest_store_skill(&normalized) {
             self.log(LogLevel::Info, &format!("suggest: store skill={}", suggestion.id));
             trace.winner = Some(format!("suggest:{}", suggestion.id));
@@ -5739,7 +5741,7 @@ mod tests {
             r#"{"index_version": 1, "generated_at": "now", "skills": [{
                 "id": "dev.heyari.reminder", "version": "0.5.0", "name": "reminder",
                 "description": "", "type": "skill", "bundle": "b", "signature": "s", "sha256": "h",
-                "matching": {"en": [{"regex": "\\bremind me\\b", "weight": 0.95}]}
+                "suggest": {"en": ["remind me", "remind me to {text}"]}
             }]}"#,
         )
         .unwrap();

@@ -26,15 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its chat too. `clear_conversation()` does the same for a host that clears the chat
   another way. Before this, the phrases went to the assistant, which said it couldn't
   ([ari-android#40](https://github.com/ari-digital-assistant/ari-android/issues/40)).
-- Store skill suggestions: when nothing installed handles what the user said and a store
-  skill's strong trigger pattern (weight 0.85 or more) matches it in their language,
-  Ari offers that skill, before the assistant, as an action with `speak` and
-  `suggest_skill: {id, name}`. Assistants and installed skills are never suggested.
-  `SkillRegistry` keeps a copy of the index each time it fetches it
-  (`index_cache_path()`), and `set_skill_suggestions_path()` points the engine at it;
-  the engine reads it again whenever it changes. `ari-skill-validate --format=json`
-  emits each skill's patterns per language as `matching`, and `IndexEntry` reads them
-  ([ari-android#44](https://github.com/ari-digital-assistant/ari-android/issues/44)).
+- Store skill suggestions: when nothing installed handles what the user said and it
+  matches one of a store skill's suggest phrases in their language, Ari offers that
+  skill, before the assistant, as an action with `speak` and `suggest_skill: {id, name}`.
+  Opt-in: a skill lists the phrases that clearly need it under `metadata.ari.suggest`
+  (`{slot}` templates matched against the whole utterance, each needing a word of its
+  own), and skills without a list, assistants and installed skills are never suggested.
+  Matching patterns aren't used, because an uninstalled skill can't decline what its
+  broad patterns catch. `ari-skill-validate --format=json` emits the lists per language
+  as `suggest`, `IndexEntry` reads them, `SkillRegistry` keeps a copy of each index it
+  fetches (`index_cache_path()`), and `set_skill_suggestions_path()` points the engine
+  at it ([ari-android#44](https://github.com/ari-digital-assistant/ari-android/issues/44)).
 - `release_llm_memory()` frees the on-device model's memory but keeps it set, so the next
   question loads it again. `unload_llm_model()` removes it, and the assistant stops
   answering until a model is set again

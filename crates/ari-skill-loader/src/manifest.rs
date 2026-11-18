@@ -448,6 +448,9 @@ pub enum ManifestError {
     #[error("`keywords` list must not be empty")]
     EmptyKeywords,
 
+    #[error("suggest phrase {phrase:?} needs at least one word outside its {{slots}}")]
+    SuggestPhraseWithoutWords { phrase: String },
+
     #[error(
         "exactly one of `metadata.ari.declarative` or `metadata.ari.wasm` must be present \
          (found {found})"
@@ -582,6 +585,13 @@ pub struct AriExtension {
     /// Example utterances the phrase tier matches. Required for
     /// regular skills (minimum 5), optional for assistant skills.
     pub examples: Vec<SkillExample>,
+    /// Phrases that clearly need this skill, so Ari can suggest it to
+    /// someone who hasn't installed it (ari-android#44). Same `{slot}`
+    /// templates as examples, matched against the whole utterance. Opt-in:
+    /// a skill without any is never suggested. Kept narrow on purpose,
+    /// because an uninstalled skill can't decline a request the way an
+    /// installed one can, so these must not catch anything else.
+    pub suggest: Vec<String>,
     /// User-configurable fields for this skill, rendered as a settings
     /// panel in the frontend. Any skill type may declare these —
     /// WASM skills read current values at runtime via the `storage_kv`
@@ -942,6 +952,13 @@ impl AriExtension {
             })
             .collect::<Result<Vec<_>, ManifestError>>()?;
 
+        // A phrase that's all slots would match anything said, so each
+        // needs at least one word of its own.
+        let suggest: Vec<String> = raw.suggest.iter().map(|p| p.trim().to_string()).collect();
+        if let Some(bad) = suggest.iter().find(|p| !phrase_has_words(p)) {
+            return Err(ManifestError::SuggestPhraseWithoutWords { phrase: bad.clone() });
+        }
+
         Ok(AriExtension {
             id,
             version,
@@ -957,12 +974,29 @@ impl AriExtension {
             behaviour,
             assistant,
             examples,
+            suggest,
             settings,
             fallback: raw.fallback.as_ref().map(|f| ari_core::FallbackTier {
                 requires_setting: f.requires_setting.clone(),
             }),
         })
     }
+}
+
+/// Whether `phrase` has a letter or digit outside its `{slots}`.
+fn phrase_has_words(phrase: &str) -> bool {
+    let mut depth = 0u32;
+    phrase.chars().any(|c| match c {
+        '{' => {
+            depth += 1;
+            false
+        }
+        '}' => {
+            depth = depth.saturating_sub(1);
+            false
+        }
+        c => depth == 0 && c.is_alphanumeric(),
+    })
 }
 
 impl Matching {
@@ -1533,6 +1567,8 @@ struct RawAriExtension {
     assistant: Option<RawAssistant>,
     #[serde(default)]
     examples: Vec<RawExample>,
+    #[serde(default)]
+    suggest: Vec<String>,
     /// Top-level user-configurable fields. Replaces the legacy
     /// `metadata.ari.assistant.config` location (which still parses
     /// for back-compat — see [`AriExtension::from_raw`]).
@@ -1789,6 +1825,47 @@ body
         assert_eq!(field_with("        keyboard: telephone").keyboard, None);
 
         assert_eq!(field_with("        required: false").keyboard, None);
+    }
+
+    fn parse_with_suggest(suggest_block: &str) -> Result<AriExtension, String> {
+        let md = format!(
+            r#"---
+name: t
+description: Test skill for suggest parsing. Use when testing suggest phrases.
+metadata:
+  ari:
+    id: ai.example.suggest-test
+    version: "0.1.0"
+    engine: ">=0.3"
+    matching:
+      patterns:
+        - keywords: [remind]
+{suggest_block}
+    declarative:
+      response_pick: ["ok"]
+---
+body
+"#
+        );
+        Skillfile::parse(&md, None)
+            .map(|sf| sf.ari_extension.expect("ari extension required"))
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn suggest_phrases_parse_trimmed_and_default_to_none() {
+        let ari = parse_with_suggest("    suggest:\n      - \" remind me \"\n      - \"remind me to {text}\"").unwrap();
+        assert_eq!(ari.suggest, vec!["remind me", "remind me to {text}"]);
+        assert!(parse_with_suggest("").unwrap().suggest.is_empty());
+    }
+
+    #[test]
+    fn a_suggest_phrase_of_only_slots_is_refused() {
+        // It would match anything anyone said.
+        let err = parse_with_suggest("    suggest:\n      - \"{anything}\"").unwrap_err();
+        assert!(err.contains("needs at least one word"), "{err}");
+        assert!(parse_with_suggest("    suggest:\n      - \"{a} {b}\"").is_err());
+        assert!(parse_with_suggest("    suggest:\n      - \"\"").is_err());
     }
 
     fn coin_flip_source() -> &'static str {

@@ -3371,6 +3371,7 @@ mod tests {
             })),
             assistant: None,
             examples: Vec::new(),
+            suggest: Vec::new(),
             settings: Vec::new(),
             fallback: None,
         }
