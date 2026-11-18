@@ -71,31 +71,56 @@ pub(crate) enum ContinuationFlag {
     New,
 }
 
-/// Split a trailing `[continuation]` / `[new]` marker off an assistant
-/// answer. Matched case-insensitively, tolerant of surrounding quotes,
-/// and only when it is the final bracketed token. Returns the cleaned
-/// answer (trailing whitespace trimmed) and the flag; a missing or
-/// unrecognised marker defaults to `Continuation` so context is kept.
+/// Take the `[continuation]` / `[new]` marker out of an assistant answer.
+/// It is asked for at the very end, but Gemma 4 E2B sometimes writes it
+/// mid-reply, before the full stop, or where a name would go ("Hello
+/// [new]!", ari-android#46), so every one comes out, with the space before
+/// it and a comma it would leave dangling; the last one sets the flag.
+/// Matched case-insensitively, tolerant of quotes inside the brackets.
+/// Returns the cleaned answer (trailing whitespace trimmed) and the flag;
+/// a missing marker defaults to `Continuation` so context is kept.
 pub(crate) fn parse_continuation_flag(raw: &str) -> (String, ContinuationFlag) {
-    let trimmed = raw.trim_end();
-    if let Some(open) = trimmed.rfind('[') {
-        let inner = trimmed[open..]
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .trim()
-            .trim_matches(|c| c == '\'' || c == '"')
-            .trim()
-            .to_ascii_lowercase();
-        let flag = match inner.as_str() {
-            "new" => Some(ContinuationFlag::New),
-            "continuation" => Some(ContinuationFlag::Continuation),
-            _ => None,
+    let mut text = String::with_capacity(raw.len());
+    let mut flag = ContinuationFlag::Continuation;
+    let mut rest = raw;
+    while let Some(open) = rest.find('[') {
+        let Some(close) = rest[open..].find(']').map(|at| open + at + 1) else {
+            break;
         };
-        if let Some(flag) = flag {
-            return (trimmed[..open].trim_end().to_string(), flag);
+        text.push_str(&rest[..open]);
+        let Some(found) = marker_flag(&rest[open..close]) else {
+            text.push_str(&rest[open..close]);
+            rest = &rest[close..];
+            continue;
+        };
+        flag = found;
+        text.truncate(text.trim_end_matches([' ', '\t']).len());
+        rest = &rest[close..];
+        if text.is_empty() || text.ends_with('\n') {
+            rest = rest.trim_start_matches([' ', '\t']);
+        }
+        if text.ends_with(',') && rest.starts_with(['.', '!', '?', ',', ';', ':']) {
+            text.pop();
         }
     }
-    (trimmed.to_string(), ContinuationFlag::Continuation)
+    text.push_str(rest);
+    (text.trim_end().to_string(), flag)
+}
+
+/// The flag a bracketed `token` stands for, if it is a continuation marker.
+fn marker_flag(token: &str) -> Option<ContinuationFlag> {
+    let inner = token
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim()
+        .trim_matches(|c| c == '\'' || c == '"')
+        .trim()
+        .to_ascii_lowercase();
+    match inner.as_str() {
+        "new" => Some(ContinuationFlag::New),
+        "continuation" => Some(ContinuationFlag::Continuation),
+        _ => None,
+    }
 }
 
 /// An assistant's reply as the user gets it: markdown reduced to plain
@@ -5125,6 +5150,42 @@ mod tests {
     fn parse_flag_strips_trailing_newline_before_marker() {
         let (text, flag) = parse_continuation_flag("Paris.\n[new]");
         assert_eq!(text, "Paris.");
+        assert_eq!(flag, ContinuationFlag::New);
+    }
+
+    #[test]
+    fn parse_flag_strips_a_marker_written_where_a_name_goes() {
+        let (text, flag) = parse_continuation_flag("Hello [new]! How can I help you today?");
+        assert_eq!(text, "Hello! How can I help you today?");
+        assert_eq!(flag, ContinuationFlag::New);
+        let (text, flag) = parse_continuation_flag("Nice to meet you, [new].");
+        assert_eq!(text, "Nice to meet you.");
+        assert_eq!(flag, ContinuationFlag::New);
+        let (text, _) = parse_continuation_flag("Hi [new], what can I do?");
+        assert_eq!(text, "Hi, what can I do?");
+    }
+
+    #[test]
+    fn parse_flag_strips_a_marker_before_the_full_stop() {
+        let (text, flag) = parse_continuation_flag("It is 81 [new].");
+        assert_eq!(text, "It is 81.");
+        assert_eq!(flag, ContinuationFlag::New);
+    }
+
+    #[test]
+    fn parse_flag_strips_a_marker_at_the_start_of_a_line() {
+        let (text, flag) = parse_continuation_flag("[new] Paris.\n[new] It is big.");
+        assert_eq!(text, "Paris.\nIt is big.");
+        assert_eq!(flag, ContinuationFlag::New);
+    }
+
+    #[test]
+    fn parse_flag_takes_every_marker_out_and_the_last_one_wins() {
+        let (text, flag) = parse_continuation_flag("Hi [new]. It is 81. [continuation]");
+        assert_eq!(text, "Hi. It is 81.");
+        assert_eq!(flag, ContinuationFlag::Continuation);
+        let (text, flag) = parse_continuation_flag("Hi [continuation]. See item [3]. [new]");
+        assert_eq!(text, "Hi. See item [3].");
         assert_eq!(flag, ContinuationFlag::New);
     }
 

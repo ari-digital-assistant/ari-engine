@@ -272,6 +272,15 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_mid_reply_is_never_shown_or_spoken() {
+        let (shown, spoken) = stream_all("Hello [new]! How can I help you today? [new]");
+        for words in shown.iter().chain(&spoken) {
+            assert!(!words.contains('['), "{words:?}");
+        }
+        assert_eq!(spoken, ["Hello!", " How can I help you today?"]);
+    }
+
+    #[test]
     fn a_sentence_settles_once_the_next_begins() {
         assert_eq!(settled("Paris is the capital. It"), "Paris is the capital.");
         assert_eq!(settled("Paris is the capital. "), "");

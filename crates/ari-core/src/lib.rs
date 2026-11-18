@@ -3,11 +3,11 @@ use std::collections::BTreeMap;
 
 /// Appended to the assistant system prompt when prior conversation turns
 /// are supplied, instructing the model to self-classify the turn. The
-/// engine parses and strips the trailing marker (see `ContinuationFlag`).
+/// engine parses and strips the marker (see `ContinuationFlag`).
 /// Internal control directive — English source, NOT user-facing copy, so
 /// it is not localized. The marker is requested inline, a holdover from when
-/// the on-device path stopped at the first newline; the parser takes it off
-/// the end of the reply wherever the line breaks fall.
+/// the on-device path stopped at the first newline; the parser takes it out
+/// wherever in the reply it lands.
 pub const CONTINUATION_INSTRUCTION: &str = "You may be shown earlier turns of this \
 conversation as prior messages. If the user's latest message refers to them, use that \
 context to answer. At the very end of your reply, append a single space and then exactly \
