@@ -11,6 +11,7 @@ pub mod manifest;
 pub mod models;
 pub mod platform_capabilities;
 pub mod scoring;
+pub mod suggest;
 pub mod registry;
 pub mod signature;
 pub mod storage_config;

@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its chat too. `clear_conversation()` does the same for a host that clears the chat
   another way. Before this, the phrases went to the assistant, which said it couldn't
   ([ari-android#40](https://github.com/ari-digital-assistant/ari-android/issues/40)).
+- Store skill suggestions: when nothing installed handles what the user said and a store
+  skill's strong trigger pattern (weight 0.85 or more) matches it in their language,
+  Ari offers that skill, before the assistant, as an action with `speak` and
+  `suggest_skill: {id, name}`. Assistants and installed skills are never suggested.
+  `SkillRegistry` keeps a copy of the index each time it fetches it
+  (`index_cache_path()`), and `set_skill_suggestions_path()` points the engine at it;
+  the engine reads it again whenever it changes. `ari-skill-validate --format=json`
+  emits each skill's patterns per language as `matching`, and `IndexEntry` reads them
+  ([ari-android#44](https://github.com/ari-digital-assistant/ari-android/issues/44)).
 - `release_llm_memory()` frees the on-device model's memory but keeps it set, so the next
   question loads it again. `unload_llm_model()` removes it, and the assistant stops
   answering until a model is set again

@@ -1238,6 +1238,17 @@ impl AriEngine {
         }
     }
 
+    /// Where the store caches the registry index
+    /// ([`crate::skill_registry::SkillRegistry::index_cache_path`]). Ari then
+    /// offers a store skill that isn't installed, ahead of the assistant,
+    /// when what the user says matches one of its strong trigger patterns
+    /// (ari-android#44). The file is read again whenever it changes; until
+    /// it exists, nothing is suggested.
+    pub fn set_skill_suggestions_path(&self, path: String) {
+        let mut engine = self.inner.lock().expect("engine mutex poisoned");
+        engine.set_skill_suggestions_path(path);
+    }
+
     /// Settings-time skill invocation: run `skill_id`'s `settings_query` for
     /// `field`, passing the current `values` (the field's `depends_on`
     /// siblings). The host calls this from the settings UI to populate a

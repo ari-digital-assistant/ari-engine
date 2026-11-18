@@ -15,7 +15,7 @@
 
 use ari_skill_loader::manifest::ConfigFieldType;
 use ari_skill_loader::{
-    capability_name, check_updates, install_by_id, install_update, IndexEntry, ManifestError,
+    capability_name, check_updates, install_by_id, install_update, Index, IndexEntry, ManifestError,
     ModelCatalog, RegistryClient, RegistryError, Skillfile, SkillStore, StorageConfig, StoreError,
     TrustRoot, REGISTRY_TRUST_KEY,
 };
@@ -258,6 +258,26 @@ pub struct SkillRegistry {
     /// so per-skill settings written through either path land in the same
     /// HashMap and the engine's runtime API call path sees them.
     settings_store: Arc<SkillSettingsStore>,
+    /// Where each fetched index is kept, for the engine's skill
+    /// suggestions. See [`SkillRegistry::index_cache_path`].
+    index_cache: std::path::PathBuf,
+}
+
+impl SkillRegistry {
+    /// Fetch the registry index and keep a copy for the engine, which
+    /// suggests store skills from it (ari-android#44). Every path that
+    /// fetches the index goes through here, so Browse and the daily update
+    /// check both keep the copy fresh. Caching is best effort: a failed
+    /// write costs fresher suggestions, never the caller's operation.
+    fn fetch_index(&self, client: &RegistryClient) -> Result<Index, FfiRegistryError> {
+        let index = client.fetch_index().map_err(map_registry_error)?;
+        if let Ok(bytes) = serde_json::to_vec(&index) {
+            // Written aside and renamed, so the engine never reads half a file.
+            let tmp = self.index_cache.with_extension("json.tmp");
+            let _ = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &self.index_cache));
+        }
+        Ok(index)
+    }
 }
 
 #[uniffi::export]
@@ -283,11 +303,22 @@ impl SkillRegistry {
         .map_err(|e| FfiRegistryError::Store {
             message: e.to_string(),
         })?;
+        // Next to models.json; `SkillStore::rescan` only looks at
+        // directories, so the file is inert there.
+        let index_cache = store.root_path().join("index.json");
         Ok(Arc::new(Self {
             store: Mutex::new(store),
             storage_dir,
             settings_store,
+            index_cache,
         }))
+    }
+
+    /// Where the registry index is cached each time it's fetched. Hand it
+    /// to [`crate::AriEngine::set_skill_suggestions_path`] at startup, so
+    /// Ari can suggest store skills that aren't installed (ari-android#44).
+    pub fn index_cache_path(&self) -> String {
+        self.index_cache.to_string_lossy().into_owned()
     }
 
     /// Every skill currently installed in the store, sorted by id so the
@@ -317,7 +348,7 @@ impl SkillRegistry {
     /// Blocks on the network — callers must run this off the main thread.
     pub fn check_for_updates(&self) -> Result<Vec<FfiSkillUpdate>, FfiRegistryError> {
         let client = RegistryClient::new();
-        let index = client.fetch_index().map_err(map_registry_error)?;
+        let index = self.fetch_index(&client)?;
         let store = self.store.lock().expect("skill store mutex poisoned");
         let updates = check_updates(&store, &index);
         Ok(updates
@@ -345,7 +376,7 @@ impl SkillRegistry {
     /// Blocks on the network — callers must run this off the main thread.
     pub fn refresh_model_catalog(&self) -> Result<String, FfiRegistryError> {
         let client = RegistryClient::new();
-        let index = client.fetch_index().map_err(map_registry_error)?;
+        let index = self.fetch_index(&client)?;
         let trust = trust_root()?;
         let bytes = client
             .fetch_catalog_bytes(&index, &trust)
@@ -378,7 +409,7 @@ impl SkillRegistry {
         id: String,
     ) -> Result<FfiInstalledSkill, FfiRegistryError> {
         let client = RegistryClient::new();
-        let index = client.fetch_index().map_err(map_registry_error)?;
+        let index = self.fetch_index(&client)?;
         let entry = index
             .skills
             .iter()
@@ -408,7 +439,7 @@ impl SkillRegistry {
     /// Blocks on the network — callers must run this off the main thread.
     pub fn browse_registry(&self) -> Result<Vec<FfiBrowseEntry>, FfiRegistryError> {
         let client = RegistryClient::new();
-        let index = client.fetch_index().map_err(map_registry_error)?;
+        let index = self.fetch_index(&client)?;
         let store = self.store.lock().expect("skill store mutex poisoned");
         let mut out: Vec<FfiBrowseEntry> = index
             .skills
@@ -458,7 +489,7 @@ impl SkillRegistry {
         id: String,
     ) -> Result<FfiInstalledSkill, FfiRegistryError> {
         let client = RegistryClient::new();
-        let index = client.fetch_index().map_err(map_registry_error)?;
+        let index = self.fetch_index(&client)?;
         let trust = trust_root()?;
         let options = android_load_options(&self.storage_dir);
         let mut store = self.store.lock().expect("skill store mutex poisoned");
@@ -508,7 +539,7 @@ impl SkillRegistry {
         id: String,
     ) -> Result<FfiSkillManifest, FfiRegistryError> {
         let client = RegistryClient::new();
-        let index = client.fetch_index().map_err(map_registry_error)?;
+        let index = self.fetch_index(&client)?;
         let entry: IndexEntry = index
             .skills
             .into_iter()
@@ -571,7 +602,7 @@ impl SkillRegistry {
         platform: String,
     ) -> Result<Vec<String>, FfiRegistryError> {
         let client = RegistryClient::new();
-        let index = client.fetch_index().map_err(map_registry_error)?;
+        let index = self.fetch_index(&client)?;
         let entry: IndexEntry = index
             .skills
             .into_iter()

@@ -331,6 +331,27 @@ pub fn conversation_cleared_ack_for(locale: &str) -> &'static str {
     }
 }
 
+/// Offers a store skill that would handle what the user asked
+/// (ari-android#44): spoken and shown, with `suggest_skill` telling the
+/// frontend which skill to open when the user takes it up.
+fn skill_suggestion_response(suggestion: &ari_skill_loader::suggest::SkillSuggestion, locale: &str) -> Response {
+    // Index names are often the skill's slug ("reminder").
+    let mut chars = suggestion.name.chars();
+    let name: String = match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => suggestion.id.clone(),
+    };
+    let speak = match locale {
+        "it" => format!("Lo skill {name} può farlo. Vuoi aggiungerlo?"),
+        _ => format!("The {name} skill can do that. Want to add it?"),
+    };
+    Response::Action(serde_json::json!({
+        "v": 1,
+        "speak": speak,
+        "suggest_skill": { "id": suggestion.id, "name": name },
+    }))
+}
+
 // ---- Remembered Facts (personal memory) command recognition ----
 // All matching is against POST-normalize_input text (lowercase, contractions
 // expanded, punctuation collapsed to spaces). Capture/forget are prefix
@@ -649,6 +670,10 @@ pub struct Engine {
     /// skills fall back to the per-tier pins in their own manifests. Shared as
     /// an `Arc` because Layer C's consult thread needs its own handle.
     model_catalog: Option<Arc<ari_skill_loader::ModelCatalog>>,
+    /// Store skills to offer when nothing installed claims an utterance
+    /// (ari-android#44), read from the registry index the store caches.
+    /// `None` until the frontend says where that file lives.
+    skill_suggester: Option<Arc<ari_skill_loader::suggest::CachedSkillSuggester>>,
     /// Config store for reading skill settings from engine-internal paths
     /// (used by the fallback tier(s)' required-setting gate). `None` in
     /// bare/test engines that never wired one.
@@ -707,6 +732,7 @@ impl Engine {
             answer_sink: None,
             named_assistants: Vec::new(),
             model_catalog: None,
+            skill_suggester: None,
             config_store: None,
             pending_turn: Mutex::new(None),
             conversation: Mutex::new(None),
@@ -1121,6 +1147,24 @@ impl Engine {
     /// skills on the per-tier pins in their manifests.
     pub fn set_model_catalog(&mut self, catalog: Option<Arc<ari_skill_loader::ModelCatalog>>) {
         self.model_catalog = catalog;
+    }
+
+    /// Where the store caches the registry index, whose trigger patterns
+    /// let Ari suggest a skill that isn't installed (ari-android#44). The
+    /// file is read again whenever it changes; until it exists, nothing is
+    /// suggested.
+    pub fn set_skill_suggestions_path(&mut self, path: impl Into<std::path::PathBuf>) {
+        self.skill_suggester = Some(Arc::new(
+            ari_skill_loader::suggest::CachedSkillSuggester::new(path),
+        ));
+    }
+
+    /// The store skill to offer for `normalized`, if one that isn't
+    /// installed matches it strongly in the user's language.
+    fn suggest_store_skill(&self, normalized: &str) -> Option<ari_skill_loader::suggest::SkillSuggestion> {
+        self.skill_suggester.as_ref()?.suggest(normalized, &self.ctx.locale, |id| {
+            self.skills.iter().any(|s| s.id() == id)
+        })
     }
 
     /// A loaded skill by id, as a handle that outlives the borrow.
@@ -1617,6 +1661,15 @@ impl Engine {
                 let response = self.maybe_intercept_consult(skill, &normalized, response);
                 return (response, Some(trace));
             }
+        }
+
+        // Nothing installed claims it. Before the assistant, which can only
+        // say it can't, offer a store skill whose strong patterns match
+        // (ari-android#44): "remind me to call Mum" with no reminder skill.
+        if let Some(suggestion) = self.suggest_store_skill(&normalized) {
+            self.log(LogLevel::Info, &format!("suggest: store skill={}", suggestion.id));
+            trace.winner = Some(format!("suggest:{}", suggestion.id));
+            return (skill_suggestion_response(&suggestion, &self.ctx.locale), Some(trace));
         }
 
         // Still nothing. The assistant is the last tier — cloud (one call
@@ -5668,6 +5721,75 @@ mod tests {
         let (resp, _) = engine.process_input_traced("stop");
         assert!(matches!(resp, Response::Text(ref s) if s == exit_conversation_ack_for("en")));
         assert!(engine.take_exit_signal(), "exit signal must be set while active");
+    }
+
+    // --- Store skill suggestions (ari-android#44) ---
+
+    /// A cached registry index offering a reminder skill, in a fresh dir.
+    fn suggestion_index() -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ari-engine-suggest-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.json");
+        std::fs::write(
+            &path,
+            r#"{"index_version": 1, "generated_at": "now", "skills": [{
+                "id": "dev.heyari.reminder", "version": "0.5.0", "name": "reminder",
+                "description": "", "type": "skill", "bundle": "b", "signature": "s", "sha256": "h",
+                "matching": {"en": [{"regex": "\\bremind me\\b", "weight": 0.95}]}
+            }]}"#,
+        )
+        .unwrap();
+        path
+    }
+
+    /// Installed, but claims nothing, so input still reaches the later tiers.
+    struct QuietSkill(&'static str);
+    impl Skill for QuietSkill {
+        fn id(&self) -> &str { self.0 }
+        fn specificity(&self) -> Specificity { Specificity::High }
+        fn score(&self, _: &str, _: &SkillContext) -> f32 { 0.0 }
+        fn execute(&self, _: &str, _: &SkillContext) -> Response { Response::Text("quiet".into()) }
+    }
+
+    #[test]
+    fn suggests_a_store_skill_nothing_installed_handles() {
+        let mut engine = Engine::new();
+        engine.set_skill_suggestions_path(suggestion_index());
+        let (resp, trace) = engine.process_input_traced("Remind me to call Mum");
+        match resp {
+            Response::Action(v) => {
+                assert_eq!(v["suggest_skill"]["id"], "dev.heyari.reminder");
+                assert_eq!(v["suggest_skill"]["name"], "Reminder");
+                assert_eq!(v["speak"], "The Reminder skill can do that. Want to add it?");
+            }
+            other => panic!("expected a suggestion, got {other:?}"),
+        }
+        assert_eq!(trace.unwrap().winner.as_deref(), Some("suggest:dev.heyari.reminder"));
+    }
+
+    #[test]
+    fn does_not_suggest_an_installed_skill() {
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(QuietSkill("dev.heyari.reminder")));
+        engine.set_skill_suggestions_path(suggestion_index());
+        let (resp, _) = engine.process_input_traced("remind me to call mum");
+        assert!(matches!(resp, Response::Text(ref t) if t == fallback_response_for("en")), "got {resp:?}");
+    }
+
+    #[test]
+    fn suggests_nothing_without_a_cached_index_or_a_match() {
+        let mut engine = Engine::new();
+        engine.set_skill_suggestions_path(std::env::temp_dir().join("ari-no-such-dir/index.json"));
+        let (resp, _) = engine.process_input_traced("remind me to call mum");
+        assert!(matches!(resp, Response::Text(_)), "got {resp:?}");
+
+        engine.set_skill_suggestions_path(suggestion_index());
+        let (resp, _) = engine.process_input_traced("why is the sky blue");
+        assert!(matches!(resp, Response::Text(_)), "got {resp:?}");
     }
 
     #[test]

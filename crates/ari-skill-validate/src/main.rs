@@ -40,7 +40,7 @@ const MAX_SCREENSHOTS_PER_PLATFORM: usize = 6;
 
 use ari_skill_loader::{
     capability_name, load_single_skill_dir_with, load_skill_directory_with, HostCapabilities,
-    LoadFailure, LoadOptions, LoadReport, Skillfile,
+    LoadFailure, LoadOptions, LoadReport, MatchPattern, Skillfile,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -216,6 +216,11 @@ struct Row {
     /// right copy without downloading the bundle. English is omitted
     /// — `name` + `description` above already carry it.
     localizations: BTreeMap<String, LocalizedDisplay>,
+    /// Trigger patterns per locale, from each `SKILL.{locale}.md` (or a
+    /// legacy `SKILL.md`, as English). The index carries them so Ari can
+    /// suggest a skill that isn't installed when what the user said
+    /// matches it (ari-android#44). Emitted as the JSON key `matching`.
+    matching: BTreeMap<String, Vec<MatchPattern>>,
     /// Preview screenshots discovered under `screenshots/<platform>/`,
     /// keyed by platform and ordered by filename. Paths are relative to
     /// the skill directory; `tools/build-index.sh` rewrites them to
@@ -249,6 +254,7 @@ impl Row {
             languages: Vec::new(),
             examples: 0,
             localizations: BTreeMap::new(),
+            matching: BTreeMap::new(),
             screenshots: BTreeMap::new(),
             failures: vec!["path does not exist".to_string()],
             warnings: Vec::new(),
@@ -270,6 +276,7 @@ impl Row {
             languages: Vec::new(),
             examples: 0,
             localizations: BTreeMap::new(),
+            matching: BTreeMap::new(),
             screenshots: BTreeMap::new(),
             failures: vec![msg.to_string()],
             warnings: Vec::new(),
@@ -302,6 +309,7 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             languages: fields.languages,
             examples: fields.examples,
             localizations: fields.localizations,
+            matching: fields.matching,
             screenshots: shots.by_platform,
             failures: shots.failures,
             warnings: fields.warnings,
@@ -328,6 +336,7 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             languages: fields.languages,
             examples: fields.examples,
             localizations: fields.localizations,
+            matching: fields.matching,
             screenshots: shots.by_platform,
             failures: shots.failures,
             warnings: fields.warnings,
@@ -350,6 +359,7 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
             languages: Vec::new(),
             examples: 0,
             localizations: BTreeMap::new(),
+            matching: BTreeMap::new(),
             screenshots: BTreeMap::new(),
             failures: report.failures.iter().map(LoadFailure::to_string).collect(),
             warnings: Vec::new(),
@@ -371,6 +381,7 @@ fn push_rows_from_report(out: &mut Vec<Row>, path: &Path, report: &LoadReport) {
         languages: Vec::new(),
         examples: 0,
         localizations: BTreeMap::new(),
+        matching: BTreeMap::new(),
         screenshots: BTreeMap::new(),
         failures: vec!["SKILL.md has no metadata.ari extension (not an Ari skill)".to_string()],
         warnings: Vec::new(),
@@ -400,6 +411,8 @@ struct ManifestFields {
     /// Empty for skills using the legacy single-file (`SKILL.md`)
     /// layout — they have nothing to localise.
     localizations: BTreeMap<String, LocalizedDisplay>,
+    /// Trigger patterns per locale; see [`Row::matching`].
+    matching: BTreeMap<String, Vec<MatchPattern>>,
     warnings: Vec<String>,
 }
 
@@ -423,6 +436,7 @@ fn read_manifest_fields(skill_dir: &Path) -> ManifestFields {
         description: Some(sf.description),
         license: sf.license,
         localizations: read_localizations(skill_dir),
+        matching: read_matching(skill_dir),
         ..ManifestFields::default()
     };
     if let Some(ext) = sf.ari_extension {
@@ -512,6 +526,64 @@ fn read_localizations(skill_dir: &Path) -> BTreeMap<String, LocalizedDisplay> {
         );
     }
     out
+}
+
+/// Every locale's trigger patterns: each `SKILL.{locale}.md`, English
+/// included, or a legacy single-file `SKILL.md` as English. A file that
+/// won't parse, or declares no patterns, is left out; the loader has
+/// already judged the skill as a whole.
+fn read_matching(skill_dir: &Path) -> BTreeMap<String, Vec<MatchPattern>> {
+    fn patterns_in(path: &Path) -> Vec<MatchPattern> {
+        Skillfile::parse_file(path)
+            .ok()
+            .and_then(|sf| sf.ari_extension)
+            .and_then(|ext| ext.matching)
+            .map(|m| m.patterns)
+            .unwrap_or_default()
+    }
+    let mut out = BTreeMap::new();
+    if let Ok(entries) = std::fs::read_dir(skill_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(locale) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("SKILL."))
+                .and_then(|n| n.strip_suffix(".md"))
+            else {
+                continue;
+            };
+            if locale.len() != 2 || !locale.chars().all(|c| c.is_ascii_lowercase()) {
+                continue;
+            }
+            let patterns = patterns_in(&path);
+            if !patterns.is_empty() {
+                out.insert(locale.to_string(), patterns);
+            }
+        }
+    }
+    let legacy = skill_dir.join("SKILL.md");
+    if !out.contains_key("en") && legacy.is_file() {
+        let patterns = patterns_in(&legacy);
+        if !patterns.is_empty() {
+            out.insert("en".to_string(), patterns);
+        }
+    }
+    out
+}
+
+/// One pattern as the index carries it:
+/// `{"regex": "...", "weight": 0.95}` or `{"keywords": [...], "weight": 1}`.
+fn json_pattern(p: &MatchPattern) -> String {
+    match p {
+        MatchPattern::Regex { pattern, weight } => {
+            format!("{{\"regex\": {}, \"weight\": {weight}}}", json_string(pattern))
+        }
+        MatchPattern::Keywords { words, weight } => {
+            let words: Vec<String> = words.iter().map(|w| json_string(w)).collect();
+            format!("{{\"keywords\": [{}], \"weight\": {weight}}}", words.join(", "))
+        }
+    }
 }
 
 /// Outcome of walking a skill's `screenshots/` directory.
@@ -754,6 +826,23 @@ fn json_for_rows(rows: &[Row]) -> String {
             out.push('}');
         }
         if !row.localizations.is_empty() {
+            out.push(' ');
+        }
+        out.push_str("},\n");
+        // Trigger patterns per locale — `{ "en": [{"regex": "...", "weight": 0.95}] }`.
+        out.push_str("    \"matching\": {");
+        for (j, (locale, patterns)) in row.matching.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push(' ');
+            out.push_str(&json_string(locale));
+            out.push_str(": [");
+            let patterns: Vec<String> = patterns.iter().map(json_pattern).collect();
+            out.push_str(&patterns.join(", "));
+            out.push(']');
+        }
+        if !row.matching.is_empty() {
             out.push(' ');
         }
         out.push_str("},\n");
