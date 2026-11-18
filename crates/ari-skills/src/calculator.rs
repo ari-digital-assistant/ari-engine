@@ -542,6 +542,16 @@ impl Skill for CalculatorSkill {
 
         match eval_expr(&expr) {
             Some(result) => Response::Text(format_result(result)),
+            // The `{n1} times {n2}` example phrase also matches "you said
+            // cheetah 3 times and falcon twice" (ari-android#47). Nothing
+            // asked for a sum and it isn't one: step aside for the assistant.
+            None if !TRIGGER_WORDS
+                .iter()
+                .chain(leadin_phrases(ctx.locale.as_str()))
+                .any(|t| input.contains(t)) =>
+            {
+                Response::Action(serde_json::json!({ "v": 1, "_ari_no_match": true }))
+            }
             None => Response::Text(
                 match ctx.locale.as_str() {
                     "it" => "Mi spiace, non sono riuscito a calcolare quell'espressione.",
@@ -724,7 +734,18 @@ mod tests {
 
     #[test]
     fn invalid_expression() {
-        assert_eq!(exec("plus plus"), "Sorry, I couldn't evaluate that expression.");
+        assert_eq!(exec("calculate plus plus"), "Sorry, I couldn't evaluate that expression.");
+    }
+
+    #[test]
+    fn declines_what_it_was_not_asked_to_calculate() {
+        let skill = CalculatorSkill::new();
+        for input in ["you repeated cheetah 3 times and falcon twice", "plus plus"] {
+            match skill.execute(input, &ctx()) {
+                Response::Action(v) => assert_eq!(v["_ari_no_match"], true, "{input}"),
+                other => panic!("expected _ari_no_match for {input:?}, got {other:?}"),
+            }
+        }
     }
 
     #[test]

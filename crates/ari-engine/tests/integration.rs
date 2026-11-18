@@ -100,6 +100,13 @@ fn calculator_does_not_steal_greeting() {
     assert_eq!(calc_score.score, 0.0);
 }
 
+#[test]
+fn calculator_leaves_a_sentence_with_times_in_it_alone() {
+    let engine = full_engine();
+    let (_, trace) = engine.process_input_traced("you repeated cheetah 3 times and falcon twice");
+    assert_eq!(trace.unwrap().winner, None);
+}
+
 // --- Greeting routes correctly ---
 
 #[test]
