@@ -47,6 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Web search only runs when what was said starts with a search command ("search for X",
+  "look up X", "can you google X"), and searches for everything after the command. A
+  question with "find" or "search" in the middle, such as "where do you find them in
+  Europe?", goes to the assistant instead of the web, where it searched for "where do
+  them in europe" with every "you", "find", "for" and "me" removed
+  ([ari-android#43](https://github.com/ari-digital-assistant/ari-android/issues/43)).
 - The on-device model's one-minute idle timer held a raw pointer to the model's state.
   Removing or switching the model within a minute of an answer left the timer touching
   freed memory. It now holds a weak reference and stops if the model is gone

@@ -1,17 +1,91 @@
 use ari_core::{ExampleUtterance, Response, Skill, SkillContext, Specificity};
 
-const TRIGGER_PHRASES: &[&[&str]] = &[
-    // English
+// A search is a command at the start of what was said: "search for X",
+// "look up X", "can you google X". The word "find" or "search" in the
+// middle of a question ("where do you find them in Europe?") is a question
+// for the assistant, which also has the conversation to say what "them"
+// is (ari-android#43). Phrases are matched on whole words, in order.
+
+/// Politeness that may come before the command.
+const LEAD_INS: &[&[&str]] = &[
+    &["please"],
+    &["can", "you"],
+    &["could", "you"],
+    &["would", "you"],
+    &["will", "you"],
+    // Italian: puoi/potresti (can/could you), per favore (please)
+    &["puoi"],
+    &["potresti"],
+    &["per", "favore"],
+];
+
+/// The commands, longer before shorter so "search for" beats "search".
+const COMMANDS: &[&[&str]] = &[
     &["search", "for"],
+    &["search"],
     &["look", "up"],
     &["google"],
-    &["search"],
+    &["find", "out", "about"],
+    &["find", "out"],
+    &["find", "me"],
     &["find"],
-    // Italian — cerca (search), trova (find), cercare (to search)
+    // Italian: cerca/cercare (search), trova (find)
     &["cerca"],
     &["cercare"],
     &["trova"],
 ];
+
+/// Between the command and the query: "search the web for X".
+const BRIDGES: &[&[&str]] = &[
+    &["on", "the", "web"],
+    &["on", "the", "internet"],
+    &["the", "web"],
+    &["the", "internet"],
+    &["online"],
+    &["for"],
+    // Italian: su internet (on the internet), in rete (online)
+    &["su", "internet"],
+    &["in", "rete"],
+];
+
+/// After the query: "google that for me", "search for cats please".
+const TAILS: &[&[&str]] = &[&["please"], &["for", "me"], &["per", "favore"]];
+
+fn strip_leading<'a>(mut words: &'a [&'a str], phrases: &[&[&str]]) -> &'a [&'a str] {
+    'again: loop {
+        for phrase in phrases {
+            if words.starts_with(phrase) {
+                words = &words[phrase.len()..];
+                continue 'again;
+            }
+        }
+        return words;
+    }
+}
+
+fn strip_trailing<'a>(mut words: &'a [&'a str], phrases: &[&[&str]]) -> &'a [&'a str] {
+    'again: loop {
+        for phrase in phrases {
+            if words.ends_with(phrase) {
+                words = &words[..words.len() - phrase.len()];
+                continue 'again;
+            }
+        }
+        return words;
+    }
+}
+
+/// The query of an explicit search command: `None` when `input` isn't one,
+/// `Some("")` for a bare command such as "search for". Only the command and
+/// its politeness are removed; the query keeps every word, articles and
+/// prepositions included, since they're part of titles and names.
+fn command_query(input: &str) -> Option<String> {
+    let words: Vec<&str> = input.split_whitespace().collect();
+    let rest = strip_leading(&words, LEAD_INS);
+    let command = COMMANDS.iter().find(|c| rest.starts_with(c))?;
+    let rest = strip_leading(&rest[command.len()..], BRIDGES);
+    Some(strip_trailing(rest, TAILS).join(" "))
+}
 
 pub struct SearchSkill;
 
@@ -25,27 +99,6 @@ impl Default for SearchSkill {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn extract_query_explicit(input: &str) -> Option<String> {
-    let skip_words = [
-        // English — command/intent words and polite filler only (never articles)
-        "search", "for", "look", "up", "google", "find", "please",
-        "can", "you", "me",
-        // Italian — command verbs and polite filler only; deliberately NOT
-        // articles/prepositions (la/il/lo/le/di/su/per), which are load-bearing
-        // parts of proper nouns and titles.
-        "cerca", "cercare", "trova", "favore", "mi", "puoi", "dimmi",
-    ];
-
-    let words: Vec<&str> = input.split_whitespace().collect();
-    let query_words: Vec<&&str> = words.iter().filter(|w| !skip_words.contains(w)).collect();
-
-    if query_words.is_empty() {
-        return None;
-    }
-
-    Some(query_words.iter().map(|w| **w).collect::<Vec<&str>>().join(" "))
 }
 
 impl Skill for SearchSkill {
@@ -115,35 +168,19 @@ impl Skill for SearchSkill {
     }
 
     fn score(&self, input: &str, _ctx: &SkillContext) -> f32 {
-        let words: Vec<&str> = input.split_whitespace().collect();
-
-        for phrase in TRIGGER_PHRASES {
-            let matched = phrase
-                .iter()
-                .filter(|kw| words.contains(kw))
-                .count();
-
-            if matched == phrase.len() {
-                if extract_query_explicit(input).is_some() {
-                    return 0.90;
-                }
-                return 0.4;
-            }
+        match command_query(input) {
+            Some(query) if !query.is_empty() => 0.90,
+            Some(_) => 0.4,
+            None => 0.0,
         }
-
-        0.0
     }
 
     fn execute(&self, input: &str, _ctx: &SkillContext) -> Response {
-        let words: Vec<&str> = input.split_whitespace().collect();
-        let has_trigger = TRIGGER_PHRASES.iter().any(|phrase| {
-            phrase.iter().all(|kw| words.contains(kw))
-        });
-
-        let query = if has_trigger {
-            extract_query_explicit(input).unwrap_or_else(|| input.to_string())
-        } else {
-            input.to_string()
+        // Reached without a command only when something else routed here;
+        // then the whole input is the query.
+        let query = match command_query(input) {
+            Some(query) if !query.is_empty() => query,
+            _ => input.to_string(),
         };
 
         // `speak` omitted deliberately — the frontend produces the
@@ -163,8 +200,8 @@ mod tests {
         SkillContext::default()
     }
 
-    // Scoring: trigger + query = 0.90, trigger alone = 0.4, nothing = 0.0.
-    // Search fires ONLY on explicit triggers — bare questions go to the
+    // Scoring: command + query = 0.90, command alone = 0.4, nothing = 0.0.
+    // Search fires ONLY on an explicit command at the start — bare questions go to the
     // assistant, not here (search is also kept out of the router catalogue).
 
     #[test]
@@ -205,6 +242,15 @@ mod tests {
     }
 
     #[test]
+    fn score_question_containing_find_goes_to_the_assistant() {
+        // ari-android#43: a follow-up the assistant could answer, sent to
+        // the web with half its words missing.
+        let skill = SearchSkill::new();
+        assert_eq!(skill.score("where do you find them in europe", &ctx()), 0.0);
+        assert_eq!(skill.score("where do you find these in europe", &ctx()), 0.0);
+    }
+
+    #[test]
     fn score_zero_on_unrelated() {
         let skill = SearchSkill::new();
         assert_eq!(skill.score("hello there", &ctx()), 0.0);
@@ -218,27 +264,42 @@ mod tests {
         assert!(!SearchSkill::new().router_eligible());
     }
 
-    // --- extract_query_explicit ---
+    // --- command_query ---
 
     #[test]
-    fn extract_strips_trigger_and_skip_words() {
+    fn query_drops_only_the_command() {
+        assert_eq!(command_query("search for best rust crates").as_deref(), Some("best rust crates"));
+        // An inner "for" is part of the query.
         assert_eq!(
-            extract_query_explicit("search for best rust crates"),
-            Some("best rust crates".to_string())
+            command_query("search for things to do in paris for kids").as_deref(),
+            Some("things to do in paris for kids")
         );
+        assert_eq!(command_query("look up how to tie a tie").as_deref(), Some("how to tie a tie"));
     }
 
     #[test]
-    fn extract_strips_all_skip_words() {
+    fn query_drops_politeness_and_bridges() {
+        assert_eq!(command_query("can you please search for cats").as_deref(), Some("cats"));
         assert_eq!(
-            extract_query_explicit("can you please search for cats"),
-            Some("cats".to_string())
+            command_query("search the web for ari digital assistant").as_deref(),
+            Some("ari digital assistant")
         );
+        assert_eq!(command_query("find me a recipe for brownies").as_deref(), Some("a recipe for brownies"));
+        assert_eq!(command_query("find out about the mars rover").as_deref(), Some("the mars rover"));
+        assert_eq!(command_query("google that for me").as_deref(), Some("that"));
     }
 
     #[test]
-    fn extract_returns_none_when_only_skip_words() {
-        assert_eq!(extract_query_explicit("search for"), None);
+    fn bare_command_has_an_empty_query() {
+        assert_eq!(command_query("search for").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_command_word_mid_sentence_is_not_a_command() {
+        // ari-android#43: searched for "where do them in europe".
+        assert_eq!(command_query("where do you find them in europe"), None);
+        assert_eq!(command_query("where can i find a good pizza"), None);
+        assert_eq!(command_query("i lost my phone can you help me find it"), None);
     }
 
     // --- execute ---
@@ -311,10 +372,8 @@ mod tests {
         // "puoi cercare le pizzerie" = "can you search the pizzerias".
         // Strips the filler "puoi" and trigger "cercare"; KEEPS the
         // article "le" — articles are part of proper nouns/titles.
-        assert_eq!(
-            extract_query_explicit("puoi cercare le pizzerie"),
-            Some("le pizzerie".to_string())
-        );
+        assert_eq!(command_query("puoi cercare le pizzerie").as_deref(), Some("le pizzerie"));
+        assert_eq!(command_query("cerca su internet i voli per tokyo").as_deref(), Some("i voli per tokyo"));
     }
 
     #[test]
