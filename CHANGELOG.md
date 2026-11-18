@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finished sentence, so it can start speaking. Both are cleaned like the whole answer;
   an answer with no sentence to release early is spoken from the response as before
   ([ari-android#37](https://github.com/ari-digital-assistant/ari-android/issues/37)).
+- "Clear history", "start over", "new conversation" and similar phrases forget the
+  conversation so far (the follow-up memory and any question a skill is waiting on, but
+  not remembered facts) and set `clear_conversation` on the response so the host clears
+  its chat too. `clear_conversation()` does the same for a host that clears the chat
+  another way. Before this, the phrases went to the assistant, which said it couldn't
+  ([ari-android#40](https://github.com/ari-digital-assistant/ari-android/issues/40)).
 
 ### Changed
 

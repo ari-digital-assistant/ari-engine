@@ -741,7 +741,10 @@ pub enum FfiResponse {
     /// `facts_changed` true means this turn mutated the engine's durable
     /// personal facts (a remember/forget) — the host should re-read
     /// `remembered_facts()` and persist the snapshot.
-    Text { body: String, rearm: bool, enter_conversation: bool, exit_conversation: bool, facts_changed: bool },
+    /// `clear_conversation` true means the user cleared the conversation this
+    /// turn ("clear history") and the engine has already forgotten it; the
+    /// host clears its chat log to match.
+    Text { body: String, rearm: bool, enter_conversation: bool, exit_conversation: bool, facts_changed: bool, clear_conversation: bool },
     /// `skill_id` is the manifest id of the emitting skill (e.g.
     /// `dev.heyari.timer`), used by the frontend to resolve `asset:<path>`
     /// references back to the skill's bundle directory. Empty string if
@@ -753,7 +756,7 @@ pub enum FfiResponse {
     /// `enter_conversation` true means the engine entered "let's talk"
     /// continuous-conversation mode this turn; `exit_conversation` true means
     /// it left the mode this turn — the host mirrors that state.
-    Action { json: String, skill_id: String, rearm: bool, enter_conversation: bool, exit_conversation: bool, facts_changed: bool },
+    Action { json: String, skill_id: String, rearm: bool, enter_conversation: bool, exit_conversation: bool, facts_changed: bool, clear_conversation: bool },
     Binary { mime: String, data: Vec<u8> },
     /// The engine couldn't match any skill to the input. The host can use
     /// this signal to retry the upstream STT (e.g. with a fresh sherpa
@@ -1359,6 +1362,16 @@ impl AriEngine {
             .set_conversation_memory_enabled(enabled);
     }
 
+    /// Forget the conversation so far, as a spoken "clear history" does. The
+    /// frontend calls this when the user clears the chat by other means, so
+    /// the assistant doesn't answer follow-ups about what was just cleared.
+    pub fn clear_conversation(&self) {
+        self.inner
+            .lock()
+            .expect("engine mutex poisoned")
+            .clear_conversation();
+    }
+
     /// How much conversation the engine keeps, and for how long. Mirrors
     /// the Android `conversationLength` setting; hydrated at engine build and
     /// written through when the user changes it.
@@ -1515,6 +1528,7 @@ impl AriEngine {
         let enter_conversation = engine.take_enter_signal();
         let exit_conversation = engine.take_exit_signal();
         let facts_changed = engine.take_facts_changed_signal();
+        let clear_conversation = engine.take_clear_signal();
         match response {
             ari_core::Response::Text(s) => {
                 // The engine's fallback text is locale-specific
@@ -1528,7 +1542,14 @@ impl AriEngine {
                     // A fallback never re-arms.
                     FfiResponse::NotUnderstood { body: s }
                 } else {
-                    FfiResponse::Text { body: s, rearm, enter_conversation, exit_conversation, facts_changed }
+                    FfiResponse::Text {
+                        body: s,
+                        rearm,
+                        enter_conversation,
+                        exit_conversation,
+                        facts_changed,
+                        clear_conversation,
+                    }
                 }
             }
             ari_core::Response::Action(v) => FfiResponse::Action {
@@ -1538,6 +1559,7 @@ impl AriEngine {
                 enter_conversation,
                 exit_conversation,
                 facts_changed,
+                clear_conversation,
             },
             ari_core::Response::Binary { mime, data } => FfiResponse::Binary { mime, data },
         }
@@ -2089,6 +2111,7 @@ mod tests {
             enter_conversation: false,
             exit_conversation: false,
             facts_changed: false,
+            clear_conversation: false,
         };
         match r {
             FfiResponse::Action { rearm, .. } => assert!(rearm),

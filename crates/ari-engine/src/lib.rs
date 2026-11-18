@@ -290,6 +290,47 @@ pub fn conversation_memory_required_msg_for(locale: &str) -> &'static str {
     }
 }
 
+// Clearing the conversation. Whole utterances, POST-normalised, like the
+// let's-talk phrases. Without these "clear history" fell through to the
+// assistant, which could only say it couldn't (ari-android#40).
+// it: DRAFT, needs native review (see plan Global Constraints).
+fn clear_conversation_phrases(locale: &str) -> &'static [&'static str] {
+    match locale {
+        "it" => &[
+            "cancella la cronologia",
+            "cancella la chat",
+            "cancella la conversazione",
+            "nuova conversazione",
+            "ricominciamo da capo",
+            "ricomincia da capo",
+        ],
+        _ => &[
+            "clear history",
+            "clear the history",
+            "clear my history",
+            "clear chat history",
+            "clear the chat",
+            "clear chat",
+            "clear the conversation",
+            "new conversation",
+            "start a new conversation",
+            "start over",
+            "start again",
+        ],
+    }
+}
+
+fn is_clear_conversation_phrase(normalized: &str, locale: &str) -> bool {
+    clear_conversation_phrases(locale).contains(&normalized)
+}
+
+pub fn conversation_cleared_ack_for(locale: &str) -> &'static str {
+    match locale {
+        "it" => "Fatto, ricominciamo da capo.",
+        _ => "Done, fresh start.",
+    }
+}
+
 // ---- Remembered Facts (personal memory) command recognition ----
 // All matching is against POST-normalize_input text (lowercase, contractions
 // expanded, punctuation collapsed to spaces). Capture/forget are prefix
@@ -630,6 +671,9 @@ pub struct Engine {
     conversation_active: AtomicBool,
     enter_signal: AtomicBool,
     exit_signal: AtomicBool,
+    // Set when the user clears the conversation by voice; transient like
+    // enter/exit_signal, read-and-cleared by the FFI layer.
+    clear_signal: AtomicBool,
     // Behaviour B/C master switch, owned by the frontend (set via
     // set_conversation_memory_enabled). When false the engine keeps NO
     // conversation buffer and refuses "let's talk" entry.
@@ -669,6 +713,7 @@ impl Engine {
             conversation_active: AtomicBool::new(false),
             enter_signal: AtomicBool::new(false),
             exit_signal: AtomicBool::new(false),
+            clear_signal: AtomicBool::new(false),
             conversation_memory_enabled: AtomicBool::new(true),
             remembered_facts: Mutex::new(Vec::new()),
             facts_changed: AtomicBool::new(false),
@@ -851,6 +896,22 @@ impl Engine {
 
     pub fn take_exit_signal(&self) -> bool {
         self.exit_signal.swap(false, Ordering::SeqCst)
+    }
+
+    /// Read-and-clear the per-turn "conversation cleared" signal. The FFI
+    /// layer surfaces this after each process_input so the frontend can
+    /// clear its chat log to match.
+    pub fn take_clear_signal(&self) -> bool {
+        self.clear_signal.swap(false, Ordering::SeqCst)
+    }
+
+    /// Forget the conversation so far: the follow-up buffer and any question
+    /// a skill is waiting on. Remembered facts are durable and stay. Called
+    /// for a spoken "clear history", and by the frontend when the user
+    /// clears the chat some other way.
+    pub fn clear_conversation(&self) {
+        *self.conversation.lock().expect("conversation poisoned") = None;
+        self.clear_pending_turn();
     }
 
     /// Recent assistant turns if the buffer is within its inactivity TTL,
@@ -1288,6 +1349,7 @@ impl Engine {
         // Reset the transient signals first so a stale one can't leak.
         self.enter_signal.store(false, Ordering::SeqCst);
         self.exit_signal.store(false, Ordering::SeqCst);
+        self.clear_signal.store(false, Ordering::SeqCst);
         if is_enter_conversation_phrase(&normalized, &self.ctx.locale) {
             // "Let's talk" is pointless without memory — guide the user to the
             // toggle instead of entering the mode. Note: still intercepted here
@@ -1314,6 +1376,16 @@ impl Engine {
             self.clear_pending_turn();
             return (
                 Response::Text(exit_conversation_ack_for(&self.ctx.locale).to_string()),
+                None,
+            );
+        }
+        // Ahead of the pending-turn path too, so "start over" abandons a
+        // skill's question rather than being taken as the answer to it.
+        if is_clear_conversation_phrase(&normalized, &self.ctx.locale) {
+            self.clear_conversation();
+            self.clear_signal.store(true, Ordering::SeqCst);
+            return (
+                Response::Text(conversation_cleared_ack_for(&self.ctx.locale).to_string()),
                 None,
             );
         }
@@ -5586,6 +5658,57 @@ mod tests {
         let (resp, _) = engine.process_input_traced("stop");
         assert!(matches!(resp, Response::Text(ref s) if s == exit_conversation_ack_for("en")));
         assert!(engine.take_exit_signal(), "exit signal must be set while active");
+    }
+
+    #[test]
+    fn clear_phrase_wipes_conversation_and_signals_once() {
+        let engine = Engine::new();
+        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        let (resp, _) = engine.process_input_traced("Clear history.");
+        assert!(matches!(resp, Response::Text(ref s) if s == "Done, fresh start."), "got {resp:?}");
+        assert!(engine.conversation_context().is_empty(), "follow-up buffer must be gone");
+        assert!(engine.take_clear_signal());
+        assert!(!engine.take_clear_signal(), "signal is one-shot");
+    }
+
+    #[test]
+    fn clear_phrase_abandons_pending_turn() {
+        let mut engine = Engine::new();
+        engine.register_skill(Box::new(AskingSkill));
+        let _ = engine.process_input_traced("play music"); // arm
+        assert!(engine.has_pending_turn());
+        let (resp, _) = engine.process_input_traced("start over");
+        assert!(matches!(resp, Response::Text(ref s) if s == "Done, fresh start."), "got {resp:?}");
+        assert!(!engine.has_pending_turn(), "the skill's question must be dropped");
+    }
+
+    #[test]
+    fn clear_phrase_keeps_remembered_facts() {
+        let engine = Engine::new();
+        engine.process_input_traced("remember that i am vegetarian");
+        let _ = engine.process_input_traced("clear the chat");
+        assert_eq!(engine.remembered_facts(), vec!["i am vegetarian".to_string()]);
+    }
+
+    #[test]
+    fn clear_phrase_matches_whole_utterance_only() {
+        let engine = Engine::new();
+        let _ = engine.process_input_traced("start over the countdown");
+        assert!(!engine.take_clear_signal());
+    }
+
+    #[test]
+    fn clear_phrase_italian() {
+        let mut engine = Engine::new();
+        engine.set_locale("it".to_string());
+        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        let (resp, _) = engine.process_input_traced("Cancella la cronologia");
+        assert!(
+            matches!(resp, Response::Text(ref s) if s == "Fatto, ricominciamo da capo."),
+            "got {resp:?}"
+        );
+        assert!(engine.conversation_context().is_empty());
+        assert!(engine.take_clear_signal());
     }
 
     #[test]
