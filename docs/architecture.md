@@ -255,20 +255,16 @@ understand that." and returns to listening for the wake word.
 
 ## Across turns
 
-The pipeline above answers one utterance. Four pieces of state survive between
+The pipeline above answers one utterance. Three pieces of state survive between
 them, all held in `ari-engine` and all owned by the frontend, which persists
 them and pushes them back in on start.
-
-**The mic reopening.** An assistant answer carries a trailing `[continuation]`
-or `[new]` marker, stripped before the user ever sees it. `[continuation]`
-tells the frontend to reopen the mic without the wake word, so a follow-up
-needs no "hey Ari". An absent or unrecognised marker is read as
-`[continuation]` — keeping context is the safer default when the model has
-failed to say.
 
 **The conversation buffer.** The last 5 exchanges are replayed to the assistant
 so a follow-up can say "and tomorrow?". It is dropped after 90 seconds of
 inactivity, and is not kept at all when the user turns conversation memory off.
+Nothing else ends it but "clear history": the assistant used to tag each answer
+as continuing or starting a new topic, and Gemma 4 E2B tagged follow-ups as new,
+wiping answers the user was asking about (ari-android#48).
 
 **"Let's talk" mode.** Entered by phrase ("let us have a conversation"), left by
 phrase ("goodbye", "that is all"). While active, the mic stays open across turns

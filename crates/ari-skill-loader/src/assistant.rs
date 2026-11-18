@@ -336,7 +336,7 @@ fn build_request_body(
     };
     let mut system_prompt = system_prompt;
     if !history.is_empty() {
-        system_prompt = format!("{system_prompt}\n\n{}", ari_core::CONTINUATION_INSTRUCTION);
+        system_prompt = format!("{system_prompt}\n\n{}", ari_core::HISTORY_INSTRUCTION);
     }
     if let Some(block) = ari_core::personality_block(personality) {
         system_prompt = format!("{system_prompt}\n\n{block}");
@@ -798,7 +798,7 @@ mod tests {
         let msgs = v["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 4); // system + 2 history + current user
         assert_eq!(msgs[0]["role"], "system");
-        assert!(msgs[0]["content"].as_str().unwrap().contains("[continuation]"));
+        assert!(msgs[0]["content"].as_str().unwrap().contains(ari_core::HISTORY_INSTRUCTION));
         assert_eq!(msgs[1]["role"], "user");
         assert_eq!(msgs[1]["content"], "what is the capital of uae?");
         assert_eq!(msgs[2]["role"], "assistant");
@@ -840,7 +840,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let msgs = v["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2); // system + user only
-        assert!(!msgs[0]["content"].as_str().unwrap().contains("[continuation]"));
+        assert!(!msgs[0]["content"].as_str().unwrap().contains(ari_core::HISTORY_INSTRUCTION));
     }
 
     #[test]
@@ -1040,7 +1040,7 @@ mod tests {
         assert_eq!(msgs[1]["content"], "Abu Dhabi.");
         assert_eq!(msgs[2]["role"], "user");
         assert_eq!(msgs[2]["content"], "what is the population?");
-        assert!(v["system"].as_str().unwrap().contains("[continuation]"));
+        assert!(v["system"].as_str().unwrap().contains(ari_core::HISTORY_INSTRUCTION));
     }
 
     const TIER_CATALOG: &str = r#"{

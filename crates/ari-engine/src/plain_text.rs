@@ -343,9 +343,4 @@ mod tests {
         let table = "| Animal | Speed |\n|---|:---:|\n| Cheetah | 70 mph |";
         assert_eq!(plain_text(table), "Animal, Speed\nCheetah, 70 mph");
     }
-
-    #[test]
-    fn the_continuation_marker_survives() {
-        assert_eq!(plain_text("**Paris**. [new]"), "Paris. [new]");
-    }
 }

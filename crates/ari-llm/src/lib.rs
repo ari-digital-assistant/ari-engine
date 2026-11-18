@@ -807,7 +807,7 @@ fn build_system_prompt(
     let mut prompt = template.trim().to_string();
     if has_history {
         prompt.push_str("\n\n");
-        prompt.push_str(ari_core::CONTINUATION_INSTRUCTION);
+        prompt.push_str(ari_core::HISTORY_INSTRUCTION);
     }
     if let Some(block) = ari_core::personality_block(personality) {
         prompt.push_str("\n\n");

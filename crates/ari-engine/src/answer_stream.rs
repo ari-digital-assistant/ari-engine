@@ -6,10 +6,10 @@
 //! markdown flickers onto the screen. A sentence goes out once it can't
 //! change any more: up to the last newline, or the last sentence end once the
 //! next sentence has begun. Both get the same cleanup as the finished answer
-//! (reasoning removed, markdown reduced to plain text, continuation marker
-//! split off), so what is shown and spoken early reads as the whole answer.
+//! (reasoning removed, markdown reduced to plain text), so what is shown
+//! and spoken early reads as the whole answer.
 
-use crate::{assistant_answer, AnswerSink};
+use crate::{plain_text::plain_text, AnswerSink};
 
 /// One answer on its way to an [`AnswerSink`].
 pub(crate) struct AnswerStream<'a> {
@@ -32,7 +32,7 @@ impl<'a> AnswerStream<'a> {
     /// Show the words and release any sentences the model has finished,
     /// given its raw output so far.
     pub(crate) fn feed(&mut self, raw: &str) {
-        let (words, _) = assistant_answer(&ari_llm::strip_thinking(&raw[..shown_len(raw)]));
+        let words = plain_text(&ari_llm::strip_thinking(&raw[..shown_len(raw)]));
         if words != self.shown && words.chars().any(char::is_alphanumeric) {
             self.sink.text(&words);
             self.shown = words;
@@ -41,7 +41,7 @@ impl<'a> AnswerStream<'a> {
             return;
         }
         let settled = &raw[..settled_len(raw)];
-        let (clean, _) = assistant_answer(&ari_llm::strip_thinking(settled));
+        let clean = plain_text(&ari_llm::strip_thinking(settled));
         match clean.strip_prefix(self.released.as_str()) {
             Some(new) => {
                 if release(self.sink, new) {
@@ -222,7 +222,7 @@ mod tests {
         for (at, c) in raw.char_indices() {
             stream.feed(&raw[..at + c.len_utf8()]);
         }
-        let (answer, _) = assistant_answer(&ari_llm::strip_thinking(raw));
+        let answer = plain_text(&ari_llm::strip_thinking(raw));
         stream.finish(&answer);
         (sink.shown.into_inner().unwrap(), sink.sentences.into_inner().unwrap())
     }
@@ -248,8 +248,10 @@ mod tests {
 
     #[test]
     fn a_one_sentence_answer_shows_its_words_as_they_come() {
+        // The last word waits for the finished answer: nothing after it
+        // shows it is whole.
         assert_eq!(
-            shown("Some often named are Lionel Messi and Cristiano Ronaldo. [continuation]"),
+            shown("Some often named are Lionel Messi and Cristiano Ronaldo."),
             [
                 "Some",
                 "Some often",
@@ -259,25 +261,15 @@ mod tests {
                 "Some often named are Lionel Messi",
                 "Some often named are Lionel Messi and",
                 "Some often named are Lionel Messi and Cristiano",
-                "Some often named are Lionel Messi and Cristiano Ronaldo.",
             ]
         );
     }
 
     #[test]
-    fn shown_words_never_carry_markdown_or_the_marker() {
-        for words in shown("Top two:\n* **Lionel Messi**: Argentina.\n* **Cristiano Ronaldo**: Portugal. [new]") {
+    fn shown_words_never_carry_markdown() {
+        for words in shown("Top two:\n* **Lionel Messi**: Argentina.\n* **Cristiano Ronaldo**: Portugal.") {
             assert!(!words.contains(['*', '[']), "{words:?}");
         }
-    }
-
-    #[test]
-    fn a_marker_mid_reply_is_never_shown_or_spoken() {
-        let (shown, spoken) = stream_all("Hello [new]! How can I help you today? [new]");
-        for words in shown.iter().chain(&spoken) {
-            assert!(!words.contains('['), "{words:?}");
-        }
-        assert_eq!(spoken, ["Hello!", " How can I help you today?"]);
     }
 
     #[test]
@@ -310,9 +302,9 @@ mod tests {
     }
 
     #[test]
-    fn sentences_go_out_as_they_finish_and_the_marker_never_does() {
+    fn sentences_go_out_as_they_finish() {
         assert_eq!(
-            stream("Paris is the capital of France. It has about two million people. [continuation]"),
+            stream("Paris is the capital of France. It has about two million people."),
             ["Paris is the capital of France.", " It has about two million people."]
         );
     }
@@ -320,7 +312,7 @@ mod tests {
     #[test]
     fn a_list_goes_out_a_line_at_a_time_as_plain_text() {
         assert_eq!(
-            stream("Top five:\n* **Lionel Messi**: Argentina.\n* **Cristiano Ronaldo**: Portugal. [new]"),
+            stream("Top five:\n* **Lionel Messi**: Argentina.\n* **Cristiano Ronaldo**: Portugal."),
             ["Top five:", "\n• Lionel Messi: Argentina.", "\n• Cristiano Ronaldo: Portugal."]
         );
     }

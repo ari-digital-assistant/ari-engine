@@ -62,75 +62,6 @@ pub trait AnswerSink: Send + Sync {
 /// host uses that signal to trigger an STT retry path.
 pub const FALLBACK_RESPONSE: &str = "Sorry, I didn't understand that.";
 
-/// Engine-internal continuation signal the assistant emits inline at the
-/// end of an answer; parsed and stripped before the answer reaches the
-/// user. See docs/superpowers/specs/2026-06-26-conversation-continuation-design.md.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ContinuationFlag {
-    Continuation,
-    New,
-}
-
-/// Take the `[continuation]` / `[new]` marker out of an assistant answer.
-/// It is asked for at the very end, but Gemma 4 E2B sometimes writes it
-/// mid-reply, before the full stop, or where a name would go ("Hello
-/// [new]!", ari-android#46), so every one comes out, with the space before
-/// it and a comma it would leave dangling; the last one sets the flag.
-/// Matched case-insensitively, tolerant of quotes inside the brackets.
-/// Returns the cleaned answer (trailing whitespace trimmed) and the flag;
-/// a missing marker defaults to `Continuation` so context is kept.
-pub(crate) fn parse_continuation_flag(raw: &str) -> (String, ContinuationFlag) {
-    let mut text = String::with_capacity(raw.len());
-    let mut flag = ContinuationFlag::Continuation;
-    let mut rest = raw;
-    while let Some(open) = rest.find('[') {
-        let Some(close) = rest[open..].find(']').map(|at| open + at + 1) else {
-            break;
-        };
-        text.push_str(&rest[..open]);
-        let Some(found) = marker_flag(&rest[open..close]) else {
-            text.push_str(&rest[open..close]);
-            rest = &rest[close..];
-            continue;
-        };
-        flag = found;
-        text.truncate(text.trim_end_matches([' ', '\t']).len());
-        rest = &rest[close..];
-        if text.is_empty() || text.ends_with('\n') {
-            rest = rest.trim_start_matches([' ', '\t']);
-        }
-        if text.ends_with(',') && rest.starts_with(['.', '!', '?', ',', ';', ':']) {
-            text.pop();
-        }
-    }
-    text.push_str(rest);
-    (text.trim_end().to_string(), flag)
-}
-
-/// The flag a bracketed `token` stands for, if it is a continuation marker.
-fn marker_flag(token: &str) -> Option<ContinuationFlag> {
-    let inner = token
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .trim()
-        .trim_matches(|c| c == '\'' || c == '"')
-        .trim()
-        .to_ascii_lowercase();
-    match inner.as_str() {
-        "new" => Some(ContinuationFlag::New),
-        "continuation" => Some(ContinuationFlag::Continuation),
-        _ => None,
-    }
-}
-
-/// An assistant's reply as the user gets it: markdown reduced to plain
-/// text, since Ari neither renders it nor should read it aloud, then the
-/// continuation marker split off. Markdown goes first so a marker the
-/// model wrapped in bold is still found.
-pub(crate) fn assistant_answer(raw: &str) -> (String, ContinuationFlag) {
-    parse_continuation_flag(&plain_text::plain_text(raw))
-}
-
 /// The locale-appropriate version of [`FALLBACK_RESPONSE`]. Used when
 /// every routing layer (skill regex → router → assistant) returned
 /// nothing — engine surfaces this so the user gets a graceful "I'm
@@ -205,7 +136,7 @@ pub struct PendingTurn {
 }
 
 /// One recorded assistant exchange: the user's query and the assistant's
-/// answer (continuation marker already stripped).
+/// answer.
 #[derive(Clone, Debug)]
 pub(crate) struct ConversationTurn {
     pub(crate) user: String,
@@ -988,25 +919,22 @@ impl Engine {
         }
     }
 
-    /// Record an assistant answer (marker already stripped) as the latest
-    /// turn. `New` starts a fresh conversation seeded with just this turn;
-    /// `Continuation` appends and trims to the most recent
-    /// [`ConversationLength::turns`].
-    pub(crate) fn record_assistant_turn(&self, user: &str, assistant: &str, flag: ContinuationFlag) {
+    /// Record an assistant answer as the latest turn, keeping the most
+    /// recent [`ConversationLength::turns`].
+    pub(crate) fn record_assistant_turn(&self, user: &str, assistant: &str) {
         if !self.is_conversation_memory_enabled() {
             return;
         }
         let turn = ConversationTurn { user: user.to_string(), assistant: assistant.to_string() };
         let mut guard = self.conversation.lock().expect("conversation poisoned");
-        match (flag, guard.as_mut()) {
-            (ContinuationFlag::Continuation, Some(buf)) => {
+        match guard.as_mut() {
+            Some(buf) => {
                 buf.turns.push(turn);
                 let excess = buf.turns.len().saturating_sub(self.conversation_length().turns());
                 buf.turns.drain(0..excess);
                 buf.last_activity = Instant::now();
             }
-            // `New`, or first turn of a fresh buffer: seed with this turn.
-            _ => {
+            None => {
                 *guard = Some(ConversationBuffer { turns: vec![turn], last_activity: Instant::now() });
             }
         }
@@ -1031,7 +959,7 @@ impl Engine {
         if spoken.is_empty() {
             return;
         }
-        self.record_assistant_turn(user, &spoken, ContinuationFlag::Continuation);
+        self.record_assistant_turn(user, &spoken);
     }
 
     /// Install a log sink for engine-internal diagnostics. Currently only
@@ -1623,8 +1551,8 @@ impl Engine {
             // the transcript.
             let response = match outcome {
                 NamedAssistantOutcome::Answer(text) => {
-                    let (clean, flag) = assistant_answer(&text);
-                    self.record_assistant_turn(&m.remainder, &clean, flag);
+                    let clean = plain_text::plain_text(&text);
+                    self.record_assistant_turn(&m.remainder, &clean);
                     Response::Text(clean)
                 }
                 NamedAssistantOutcome::Failed(text) => Response::Text(text),
@@ -1751,8 +1679,8 @@ impl Engine {
                     }
                 }
                 Ok(RouteOrAnswer::Answer(text)) => {
-                    let (clean, flag) = assistant_answer(&text);
-                    self.record_assistant_turn(&normalized, &clean, flag);
+                    let clean = plain_text::plain_text(&text);
+                    self.record_assistant_turn(&normalized, &clean);
                     let label = match &self.active_assistant {
                         Some(ActiveAssistant::Api { skill_id, .. }) => format!("assistant:{skill_id}"),
                         _ => "assistant:one-shot".to_string(),
@@ -1904,11 +1832,11 @@ impl Engine {
                     );
                     match result {
                         Some(ari_llm::FallbackResult::DirectAnswer { text }) => {
-                            let (clean, flag) = assistant_answer(&text);
+                            let clean = plain_text::plain_text(&text);
                             if let Some(answer) = &answer {
                                 answer.finish(&clean);
                             }
-                            self.record_assistant_turn(&normalized, &clean, flag);
+                            self.record_assistant_turn(&normalized, &clean);
                             let preview: String = clean.chars().take(160).collect();
                             self.log(
                                 LogLevel::Info,
@@ -1957,8 +1885,8 @@ impl Engine {
                     self.model_catalog.as_deref(),
                 ) {
                     Ok(text) if !text.is_empty() => {
-                        let (clean, flag) = assistant_answer(&text);
-                        self.record_assistant_turn(&normalized, &clean, flag);
+                        let clean = plain_text::plain_text(&text);
+                        self.record_assistant_turn(&normalized, &clean);
                         trace.winner = Some(format!("assistant:{skill_id}"));
                         return (Response::Text(clean), Some(trace));
                     }
@@ -3851,24 +3779,6 @@ mod tests {
     }
 
     #[test]
-    fn named_assistant_strips_the_continuation_marker() {
-        let stub = StubAssistant::start(vec!["Rabat.", "About 580,000 people. [continuation]"]);
-        let engine = engine_with_named_assistant(&stub);
-
-        engine.process_input_traced("what is the capital city of morocco");
-        let (response, _) =
-            engine.process_input_traced("ask chatgpt what is the population there");
-
-        match response {
-            Response::Text(t) => assert_eq!(
-                t, "About 580,000 people.",
-                "the self-classification marker must never reach the user"
-            ),
-            other => panic!("expected text, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn named_assistant_receives_remembered_facts() {
         let stub = StubAssistant::start(vec!["Somewhere in Valletta."]);
         let engine = engine_with_named_assistant(&stub);
@@ -5112,88 +5022,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_flag_continuation_inline() {
-        let (text, flag) = parse_continuation_flag("Abu Dhabi is the capital. [continuation]");
-        assert_eq!(text, "Abu Dhabi is the capital.");
-        assert_eq!(flag, ContinuationFlag::Continuation);
-    }
-
-    #[test]
-    fn parse_flag_new_inline() {
-        let (text, flag) = parse_continuation_flag("27 times 3 is 81. [new]");
-        assert_eq!(text, "27 times 3 is 81.");
-        assert_eq!(flag, ContinuationFlag::New);
-    }
-
-    #[test]
-    fn parse_flag_case_and_quotes_tolerant() {
-        let (text, flag) = parse_continuation_flag("Sure. ['NEW']");
-        assert_eq!(text, "Sure.");
-        assert_eq!(flag, ContinuationFlag::New);
-    }
-
-    #[test]
-    fn parse_flag_missing_defaults_to_continuation() {
-        let (text, flag) = parse_continuation_flag("Just an answer with no marker.");
-        assert_eq!(text, "Just an answer with no marker.");
-        assert_eq!(flag, ContinuationFlag::Continuation);
-    }
-
-    #[test]
-    fn parse_flag_leaves_non_marker_brackets_intact() {
-        let (text, flag) = parse_continuation_flag("See item [3] on the list.");
-        assert_eq!(text, "See item [3] on the list.");
-        assert_eq!(flag, ContinuationFlag::Continuation);
-    }
-
-    #[test]
-    fn parse_flag_strips_trailing_newline_before_marker() {
-        let (text, flag) = parse_continuation_flag("Paris.\n[new]");
-        assert_eq!(text, "Paris.");
-        assert_eq!(flag, ContinuationFlag::New);
-    }
-
-    #[test]
-    fn parse_flag_strips_a_marker_written_where_a_name_goes() {
-        let (text, flag) = parse_continuation_flag("Hello [new]! How can I help you today?");
-        assert_eq!(text, "Hello! How can I help you today?");
-        assert_eq!(flag, ContinuationFlag::New);
-        let (text, flag) = parse_continuation_flag("Nice to meet you, [new].");
-        assert_eq!(text, "Nice to meet you.");
-        assert_eq!(flag, ContinuationFlag::New);
-        let (text, _) = parse_continuation_flag("Hi [new], what can I do?");
-        assert_eq!(text, "Hi, what can I do?");
-    }
-
-    #[test]
-    fn parse_flag_strips_a_marker_before_the_full_stop() {
-        let (text, flag) = parse_continuation_flag("It is 81 [new].");
-        assert_eq!(text, "It is 81.");
-        assert_eq!(flag, ContinuationFlag::New);
-    }
-
-    #[test]
-    fn parse_flag_strips_a_marker_at_the_start_of_a_line() {
-        let (text, flag) = parse_continuation_flag("[new] Paris.\n[new] It is big.");
-        assert_eq!(text, "Paris.\nIt is big.");
-        assert_eq!(flag, ContinuationFlag::New);
-    }
-
-    #[test]
-    fn parse_flag_takes_every_marker_out_and_the_last_one_wins() {
-        let (text, flag) = parse_continuation_flag("Hi [new]. It is 81. [continuation]");
-        assert_eq!(text, "Hi. It is 81.");
-        assert_eq!(flag, ContinuationFlag::Continuation);
-        let (text, flag) = parse_continuation_flag("Hi [continuation]. See item [3]. [new]");
-        assert_eq!(text, "Hi. See item [3].");
-        assert_eq!(flag, ContinuationFlag::New);
-    }
-
-    #[test]
     fn record_continuation_appends_turn() {
         let engine = Engine::new();
-        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
-        engine.record_assistant_turn("q2", "a2", ContinuationFlag::Continuation);
+        engine.record_assistant_turn("q1", "a1");
+        engine.record_assistant_turn("q2", "a2");
         let turns = engine.conversation_context();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].user, "q1");
@@ -5201,22 +5033,10 @@ mod tests {
     }
 
     #[test]
-    fn record_new_reseeds_buffer_with_single_turn() {
-        let engine = Engine::new();
-        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
-        engine.record_assistant_turn("q2", "a2", ContinuationFlag::Continuation);
-        engine.record_assistant_turn("27 times 3?", "81.", ContinuationFlag::New);
-        let turns = engine.conversation_context();
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].user, "27 times 3?");
-        assert_eq!(turns[0].assistant, "81.");
-    }
-
-    #[test]
     fn record_caps_to_five_most_recent_exchanges() {
         let engine = Engine::new();
         for i in 0..7 {
-            engine.record_assistant_turn(&format!("q{i}"), &format!("a{i}"), ContinuationFlag::Continuation);
+            engine.record_assistant_turn(&format!("q{i}"), &format!("a{i}"));
         }
         let turns = engine.conversation_context();
         assert_eq!(turns.len(), 5);
@@ -5229,7 +5049,7 @@ mod tests {
         let engine = Engine::new();
         engine.set_conversation_length(ConversationLength::Long);
         for i in 0..25 {
-            engine.record_assistant_turn(&format!("q{i}"), &format!("a{i}"), ContinuationFlag::Continuation);
+            engine.record_assistant_turn(&format!("q{i}"), &format!("a{i}"));
         }
         let turns = engine.conversation_context();
         assert_eq!(turns.len(), 20);
@@ -5241,7 +5061,7 @@ mod tests {
         let engine = Engine::new();
         engine.set_conversation_length(ConversationLength::Medium);
         for i in 0..8 {
-            engine.record_assistant_turn(&format!("q{i}"), &format!("a{i}"), ContinuationFlag::Continuation);
+            engine.record_assistant_turn(&format!("q{i}"), &format!("a{i}"));
         }
         engine.set_conversation_length(ConversationLength::Short);
         let turns = engine.conversation_context();
@@ -5258,14 +5078,14 @@ mod tests {
         };
         let engine = Engine::new();
         engine.set_conversation_length(ConversationLength::Medium);
-        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        engine.record_assistant_turn("q1", "a1");
         age(&engine, 4 * 60);
         assert_eq!(engine.conversation_context().len(), 1, "4 minutes is inside Medium's 5");
         age(&engine, 6 * 60);
         assert!(engine.conversation_context().is_empty(), "6 minutes is past Medium's 5");
 
         engine.set_conversation_length(ConversationLength::Long);
-        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        engine.record_assistant_turn("q1", "a1");
         age(&engine, 14 * 60);
         assert_eq!(engine.conversation_context().len(), 1, "14 minutes is inside Long's 15");
     }
@@ -5297,7 +5117,7 @@ mod tests {
     fn conversation_context_expires_stale_buffer() {
         use std::time::{Duration, Instant};
         let engine = Engine::new();
-        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        engine.record_assistant_turn("q1", "a1");
         // Age the buffer past the TTL.
         {
             let mut g = engine.conversation.lock().unwrap();
@@ -5312,7 +5132,7 @@ mod tests {
     fn conversation_context_refreshes_activity_when_fresh() {
         use std::time::{Duration, Instant};
         let engine = Engine::new();
-        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        engine.record_assistant_turn("q1", "a1");
         // Age it to 80s — still inside the 90s TTL.
         {
             let mut g = engine.conversation.lock().unwrap();
@@ -5328,7 +5148,7 @@ mod tests {
     #[test]
     fn memory_enabled_by_default() {
         let engine = Engine::new();
-        engine.record_assistant_turn("hi", "hello", ContinuationFlag::New);
+        engine.record_assistant_turn("hi", "hello");
         assert_eq!(engine.conversation_context().len(), 1, "memory on by default");
     }
 
@@ -5336,7 +5156,7 @@ mod tests {
     fn record_is_noop_while_memory_disabled() {
         let engine = Engine::new();
         engine.set_conversation_memory_enabled(false);
-        engine.record_assistant_turn("hi", "hello", ContinuationFlag::New);
+        engine.record_assistant_turn("hi", "hello");
         // Re-enable and read: nothing should have been recorded.
         engine.set_conversation_memory_enabled(true);
         assert!(
@@ -5348,7 +5168,7 @@ mod tests {
     #[test]
     fn disabling_memory_returns_empty_context_and_wipes_buffer() {
         let engine = Engine::new();
-        engine.record_assistant_turn("hi", "hello", ContinuationFlag::New);
+        engine.record_assistant_turn("hi", "hello");
         assert_eq!(engine.conversation_context().len(), 1);
 
         engine.set_conversation_memory_enabled(false);
@@ -5418,7 +5238,7 @@ mod tests {
             last_history: std::sync::Mutex::new(Vec::new()),
             last_facts: std::sync::Mutex::new(Vec::new()),
             last_personality: std::sync::Mutex::new(String::new()),
-            reply: "Top two:\n* **Lionel Messi**: Argentina.\n* **Cristiano Ronaldo**: Portugal. [continuation]",
+            reply: "Top two:\n* **Lionel Messi**: Argentina.\n* **Cristiano Ronaldo**: Portugal.",
         }));
         engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
         let sink = std::sync::Arc::new(RecordingAnswer::default());
@@ -5433,7 +5253,7 @@ mod tests {
         assert_eq!(shown.first().map(String::as_str), Some("Top"));
         assert_eq!(
             shown.last().map(String::as_str),
-            Some("Top two:\n• Lionel Messi: Argentina.\n• Cristiano Ronaldo: Portugal.")
+            Some("Top two:\n• Lionel Messi: Argentina.\n• Cristiano Ronaldo:")
         );
         match resp {
             Response::Text(t) => {
@@ -5451,12 +5271,12 @@ mod tests {
             last_history: std::sync::Mutex::new(Vec::new()),
             last_facts: std::sync::Mutex::new(Vec::new()),
             last_personality: std::sync::Mutex::new(String::new()),
-            reply: "Paris. [continuation]",
+            reply: "Paris.",
         });
         engine.set_llm(fb.clone());
         engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
 
-        // Turn 1: no history yet; answer recorded; flag stripped from response.
+        // Turn 1: no history yet; answer recorded.
         let (resp, _) = engine.process_input_traced("what is the capital of france");
         assert!(fb.last_history.lock().unwrap().is_empty(), "first turn sends no history");
         match resp { Response::Text(t) => assert_eq!(t, "Paris."), o => panic!("{o:?}") }
@@ -5479,7 +5299,7 @@ mod tests {
             last_history: std::sync::Mutex::new(Vec::new()),
             last_facts: std::sync::Mutex::new(Vec::new()),
             last_personality: std::sync::Mutex::new(String::new()),
-            reply: "ok. [continuation]",
+            reply: "ok.",
         });
         engine.set_llm(fb.clone());
         engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
@@ -5501,7 +5321,7 @@ mod tests {
             last_history: std::sync::Mutex::new(Vec::new()),
             last_facts: std::sync::Mutex::new(Vec::new()),
             last_personality: std::sync::Mutex::new(String::new()),
-            reply: "ok. [continuation]",
+            reply: "ok.",
         });
         engine.set_llm(fb.clone());
         engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
@@ -5509,28 +5329,6 @@ mod tests {
 
         let _ = engine.process_input_traced("tell me a joke");
         assert_eq!(*fb.last_personality.lock().unwrap(), "Talk like a pirate.");
-    }
-
-    #[cfg(feature = "llm")]
-    #[test]
-    fn new_flag_reseeds_conversation() {
-        let mut engine = Engine::new();
-        let fb = std::sync::Arc::new(RecordingFallback {
-            last_history: std::sync::Mutex::new(Vec::new()),
-            last_facts: std::sync::Mutex::new(Vec::new()),
-            last_personality: std::sync::Mutex::new(String::new()),
-            reply: "81. [new]",
-        });
-        engine.set_llm(fb.clone());
-        engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
-        engine.record_assistant_turn("capital of france", "Paris.", ContinuationFlag::Continuation);
-
-        let (resp, _) = engine.process_input_traced("what is 27 times 3");
-        match resp { Response::Text(t) => assert_eq!(t, "81."), o => panic!("{o:?}") }
-        let turns = engine.conversation_context();
-        assert_eq!(turns.len(), 1, "[new] reseeds to a single turn");
-        assert_eq!(turns[0].user, "what is 27 times 3");
-        assert_eq!(turns[0].assistant, "81.");
     }
 
     #[cfg(feature = "llm")]
@@ -5543,7 +5341,7 @@ mod tests {
             response: "It is sunny.", requires_setting: None,
         }));
         // A live conversation from a prior assistant turn, aged to 80s.
-        engine.record_assistant_turn("capital of france", "Paris.", ContinuationFlag::Continuation);
+        engine.record_assistant_turn("capital of france", "Paris.");
         {
             let mut g = engine.conversation.lock().unwrap();
             g.as_mut().unwrap().last_activity =
@@ -5560,7 +5358,7 @@ mod tests {
     fn behaviour_a_reply_does_not_record() {
         let mut engine = Engine::new();
         engine.register_skill(Box::new(AskingSkill));
-        engine.record_assistant_turn("capital of france", "Paris.", ContinuationFlag::Continuation);
+        engine.record_assistant_turn("capital of france", "Paris.");
 
         let _ = engine.process_input_traced("play music");   // AskingSkill asks → pending turn
         let _ = engine.process_input_traced("spotify");       // reply via execute_reply
@@ -5578,11 +5376,11 @@ mod tests {
             last_history: std::sync::Mutex::new(Vec::new()),
             last_facts: std::sync::Mutex::new(Vec::new()),
             last_personality: std::sync::Mutex::new(String::new()),
-            reply: "Fresh answer. [continuation]",
+            reply: "Fresh answer.",
         });
         engine.set_llm(fb.clone());
         engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
-        engine.record_assistant_turn("old question", "old answer", ContinuationFlag::Continuation);
+        engine.record_assistant_turn("old question", "old answer");
         {
             let mut g = engine.conversation.lock().unwrap();
             g.as_mut().unwrap().last_activity =
@@ -5858,7 +5656,7 @@ mod tests {
     #[test]
     fn clear_phrase_wipes_conversation_and_signals_once() {
         let engine = Engine::new();
-        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        engine.record_assistant_turn("q1", "a1");
         let (resp, _) = engine.process_input_traced("Clear history.");
         assert!(matches!(resp, Response::Text(ref s) if s == "Done, fresh start."), "got {resp:?}");
         assert!(engine.conversation_context().is_empty(), "follow-up buffer must be gone");
@@ -5896,7 +5694,7 @@ mod tests {
     fn clear_phrase_italian() {
         let mut engine = Engine::new();
         engine.set_locale("it".to_string());
-        engine.record_assistant_turn("q1", "a1", ContinuationFlag::Continuation);
+        engine.record_assistant_turn("q1", "a1");
         let (resp, _) = engine.process_input_traced("Cancella la cronologia");
         assert!(
             matches!(resp, Response::Text(ref s) if s == "Fatto, ricominciamo da capo."),

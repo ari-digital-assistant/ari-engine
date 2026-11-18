@@ -2,17 +2,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Appended to the assistant system prompt when prior conversation turns
-/// are supplied, instructing the model to self-classify the turn. The
-/// engine parses and strips the marker (see `ContinuationFlag`).
-/// Internal control directive — English source, NOT user-facing copy, so
-/// it is not localized. The marker is requested inline, a holdover from when
-/// the on-device path stopped at the first newline; the parser takes it out
-/// wherever in the reply it lands.
-pub const CONTINUATION_INSTRUCTION: &str = "You may be shown earlier turns of this \
+/// are supplied. Internal control directive: English source, NOT
+/// user-facing copy, so it is not localized. It once also asked the model
+/// to tag each reply as continuing the conversation or starting a new topic,
+/// and a "new topic" tag wiped it; Gemma 4 E2B tagged follow-ups such as "I
+/// think you are wrong" as new, so Ari forgot its own answers
+/// (ari-android#48). The conversation now ends only when it goes quiet,
+/// reaches its length, or the user clears it.
+pub const HISTORY_INSTRUCTION: &str = "You may be shown earlier turns of this \
 conversation as prior messages. If the user's latest message refers to them, use that \
-context to answer. At the very end of your reply, append a single space and then exactly \
-[continuation] if this message continues the earlier conversation, or [new] if it begins \
-a new, unrelated topic. Keep the marker on the same line as your answer.";
+context to answer.";
 
 /// Longest personality Ari keeps. A few sentences set a tone, and every
 /// character rides along in every assistant prompt, where the on-device
@@ -27,7 +26,7 @@ pub const MAX_PERSONALITY_CHARS: usize = 500;
 /// otherwise. It also holds the model to Ari's rules, so a personality can't
 /// talk it into claiming abilities it lacks or out of a requested format.
 /// Internal directive, English source, not localized (like
-/// [`CONTINUATION_INSTRUCTION`]).
+/// [`HISTORY_INSTRUCTION`]).
 pub fn personality_block(personality: &str) -> Option<String> {
     let text = personality.trim();
     if text.is_empty() {
@@ -1613,12 +1612,5 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&seen).unwrap();
         assert_eq!(v["_ari_reply"]["context"], "ctx-blob");
         assert_eq!(v["_ari_reply"]["text"], "spotify");
-    }
-
-    #[test]
-    fn continuation_instruction_mentions_both_markers() {
-        assert!(crate::CONTINUATION_INSTRUCTION.contains("[continuation]"));
-        assert!(crate::CONTINUATION_INSTRUCTION.contains("[new]"));
-        assert!(!crate::CONTINUATION_INSTRUCTION.is_empty());
     }
 }
