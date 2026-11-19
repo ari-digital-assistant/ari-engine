@@ -1448,6 +1448,43 @@ impl AriEngine {
             .set_personality(&personality);
     }
 
+    /// Whether the on-device assistant may offer to ask a cloud assistant
+    /// when it doesn't know. Mirrors the Android `handoffEnabled` setting;
+    /// hydrated at engine build and written through when the user toggles it.
+    pub fn set_handoff_enabled(&self, enabled: bool) {
+        self.inner
+            .lock()
+            .expect("engine mutex poisoned")
+            .set_handoff_enabled(enabled);
+    }
+
+    /// Skill ids of the installed cloud assistants a handoff could offer,
+    /// those with an API key, the one it would offer first leading. Empty
+    /// means the handoff setting can't do anything yet.
+    pub fn handoff_assistants(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .expect("engine mutex poisoned")
+            .handoff_assistants()
+    }
+
+    /// The cloud assistant that answered last, for the frontend to persist
+    /// after a turn: a handoff offers it first.
+    pub fn last_cloud_assistant(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("engine mutex poisoned")
+            .last_cloud_assistant()
+    }
+
+    /// Hydrate [`Self::last_cloud_assistant`] at engine build.
+    pub fn set_last_cloud_assistant(&self, skill_id: Option<String>) {
+        self.inner
+            .lock()
+            .expect("engine mutex poisoned")
+            .set_last_cloud_assistant(skill_id);
+    }
+
     /// Replace the engine's durable personal facts. Mirrors the Android
     /// persisted store; hydrated at engine build and written through after a
     /// settings-screen edit.

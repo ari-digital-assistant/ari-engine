@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   back together before `response_path` runs: Claude's text after its last search or
   thinking block, a Responses reply's messages minus commentary, a Gemini candidate's
   parts minus thoughts.
+- Handoff: with `set_handoff_enabled(true)`, the on-device assistant writes `QUERY:` and
+  the question instead of answering when it doesn't know or the question needs live
+  information, and Ari asks "Would you like me to ask Claude?". Yes sends the user's own
+  words, with the conversation, to that cloud assistant; no drops it; anything else is a
+  new request. It offers the cloud assistant that answered last, else the first with an
+  API key, and none without a key. `handoff_assistants()` lists the ones it could offer,
+  `last_cloud_assistant()` and `set_last_cloud_assistant()` let a frontend keep the last
+  one across restarts. The marker and its question are never shown or spoken.
 - Typed `/` commands for Ari's built-in phrases: `/clear`, `/remember …`, `/forget …`,
   `/forget-all` and `/recall` run exactly what saying "clear history", "remember …",
   "forget …", "forget everything about me" and "what do you remember about me" runs. The
@@ -85,6 +93,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Every on-device prompt has the model answer populations, sizes and other figures from
+  what it knows, with an example, instead of calling them live information it can't
+  reach ("I don't have live population data" for Australia). A model that copies the
+  examples' `Response:` label no longer has it read out.
 - The Medium and Large on-device models answer from what they know when asked about the
   best or most famous people and things, instead of calling it live information they
   can't reach, and answer a question about several things with a short list that covers

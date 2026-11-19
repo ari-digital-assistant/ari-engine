@@ -30,8 +30,10 @@ impl<'a> AnswerStream<'a> {
     }
 
     /// Show the words and release any sentences the model has finished,
-    /// given its raw output so far.
+    /// given its raw output so far. Nothing from the handoff marker on goes
+    /// out: it and the question after it are for the engine.
     pub(crate) fn feed(&mut self, raw: &str) {
+        let raw = ari_llm::before_handoff(raw);
         let words = plain_text(&ari_llm::strip_thinking(&raw[..shown_len(raw)]));
         if words != self.shown && words.chars().any(char::is_alphanumeric) {
             self.sink.text(&words);

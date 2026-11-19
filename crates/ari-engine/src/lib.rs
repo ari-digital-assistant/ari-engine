@@ -140,6 +140,12 @@ const MAX_REMEMBERED_FACTS: usize = 50;
 /// Reserved `pending_turn` id for the engine-internal name-capture round-trip.
 const NAME_CAPTURE_SENTINEL: &str = "__ari_name_capture";
 
+/// Reserved `pending_turn` id for the handoff offer: the on-device model
+/// didn't know, and Ari asked whether to put the question to a cloud
+/// assistant. The context is that assistant's skill id, a newline, and
+/// the question.
+const HANDOFF_SENTINEL: &str = "__ari_handoff";
+
 /// A skill is awaiting the user's reply to a question it just asked.
 #[derive(Clone, Debug)]
 pub struct PendingTurn {
@@ -551,6 +557,57 @@ pub fn no_facts_remembered_for(locale: &str) -> &'static str {
     }
 }
 
+/// Spoken when the on-device model doesn't know and has said nothing
+/// itself, whether or not a cloud assistant is offered after it.
+#[cfg(feature = "llm")]
+fn not_sure_for(locale: &str) -> &'static str {
+    match locale {
+        "it" => "Non lo so con certezza.",
+        _ => "I'm not sure about that.",
+    }
+}
+
+/// The handoff offer, after whatever the on-device model said before
+/// giving up, which already admits it doesn't know when there is any.
+#[cfg(feature = "llm")]
+fn handoff_offer_for(locale: &str, said: &str, assistant: &str) -> String {
+    let lead = if said.is_empty() { not_sure_for(locale) } else { said };
+    match locale {
+        "it" => format!("{lead} Vuoi che lo chieda a {assistant}?"),
+        _ => format!("{lead} Would you like me to ask {assistant}?"),
+    }
+}
+
+/// Replies accepting the handoff offer: the whole reply, or how it starts
+/// ("yes please", "sure, go ahead"). Post-normalisation, so "don't" is
+/// "do not".
+// it: DRAFT, needs native review.
+fn handoff_yes_phrases(locale: &str) -> &'static [&'static str] {
+    match locale {
+        "it" => &["sì", "si", "certo", "ok", "okay", "va bene", "dai", "vai", "volentieri", "perché no", "chiedi"],
+        _ => &["yes", "yeah", "yep", "yup", "sure", "ok", "okay", "please", "go ahead", "do it", "alright", "all right", "of course", "why not", "ask"],
+    }
+}
+
+/// Replies turning the handoff offer down, matched the same way.
+// it: DRAFT, needs native review.
+fn handoff_no_phrases(locale: &str) -> &'static [&'static str] {
+    match locale {
+        "it" => &["no", "niente", "non importa", "non serve", "lascia"],
+        _ => &["no", "nope", "nah", "do not", "not now", "not needed"],
+    }
+}
+
+/// Whether `normalized` is one of `phrases`, or starts with one followed
+/// by more words.
+fn starts_with_phrase(normalized: &str, phrases: &[&str]) -> bool {
+    phrases.iter().any(|p| {
+        normalized
+            .strip_prefix(p)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    })
+}
+
 /// Strip an `await_reply` field from an action envelope, returning its
 /// `context` string if present. Mirrors the `consult_assistant` strip pattern.
 fn extract_await_reply(action: &mut serde_json::Value) -> Option<String> {
@@ -684,6 +741,12 @@ pub struct Engine {
     personality: Mutex<String>,
     // Owned by the frontend (set via set_conversation_length).
     conversation_length: Mutex<ConversationLength>,
+    // Whether the on-device assistant may offer a cloud assistant when it
+    // doesn't know. Owned by the frontend (set via set_handoff_enabled).
+    handoff_enabled: AtomicBool,
+    // Skill id of the cloud assistant that answered last, which a handoff
+    // offers first. The frontend persists it and hydrates it at build.
+    last_cloud_assistant: Mutex<Option<String>>,
 }
 
 impl Engine {
@@ -714,6 +777,8 @@ impl Engine {
             facts_changed: AtomicBool::new(false),
             personality: Mutex::new(String::new()),
             conversation_length: Mutex::new(ConversationLength::default()),
+            handoff_enabled: AtomicBool::new(false),
+            last_cloud_assistant: Mutex::new(None),
         }
     }
 
@@ -812,6 +877,121 @@ impl Engine {
 
     pub fn personality(&self) -> String {
         self.personality.lock().expect("personality poisoned").clone()
+    }
+
+    /// Whether the on-device assistant may offer to ask a cloud assistant
+    /// when it doesn't know. Off by default. Turning it off drops an offer
+    /// still waiting for a yes.
+    pub fn set_handoff_enabled(&self, enabled: bool) {
+        self.handoff_enabled.store(enabled, Ordering::SeqCst);
+        if !enabled {
+            self.take_handoff_offer();
+        }
+    }
+
+    /// The cloud assistant that answered last, which a handoff offers first.
+    /// For the frontend to persist after a turn, and hydrate at build.
+    pub fn last_cloud_assistant(&self) -> Option<String> {
+        self.last_cloud_assistant.lock().expect("last_cloud_assistant poisoned").clone()
+    }
+
+    pub fn set_last_cloud_assistant(&self, skill_id: Option<String>) {
+        *self.last_cloud_assistant.lock().expect("last_cloud_assistant poisoned") = skill_id;
+    }
+
+    /// Skill ids of the installed cloud assistants a handoff could offer:
+    /// those with an API key, the one that answered last first.
+    pub fn handoff_assistants(&self) -> Vec<String> {
+        let last = self.last_cloud_assistant();
+        let mut keyed: Vec<&NamedAssistantBinding> =
+            self.named_assistants.iter().filter(|b| b.has_key()).collect();
+        // Stable: the rest keep registry order.
+        keyed.sort_by_key(|b| Some(&b.skill_id) != last.as_ref());
+        keyed.into_iter().map(|b| b.skill_id.clone()).collect()
+    }
+
+    /// The cloud assistant a handoff offers, or `None` while the setting is
+    /// off or no cloud assistant has its key.
+    #[cfg(feature = "llm")]
+    fn handoff_target(&self) -> Option<&NamedAssistantBinding> {
+        if !self.handoff_enabled.load(Ordering::SeqCst) {
+            return None;
+        }
+        let id = self.handoff_assistants().into_iter().next()?;
+        self.named_assistants.iter().find(|b| b.skill_id == id)
+    }
+
+    fn note_cloud_assistant_used(&self, skill_id: &str) {
+        self.set_last_cloud_assistant(Some(skill_id.to_string()));
+    }
+
+    /// Take a handoff offer still waiting for its yes, returning its
+    /// context. Leaves any other pending question alone.
+    fn take_handoff_offer(&self) -> Option<String> {
+        let mut guard = self.pending_turn.lock().expect("pending_turn poisoned");
+        if guard.as_ref()?.skill_id != HANDOFF_SENTINEL {
+            return None;
+        }
+        let offer = guard.take()?;
+        (offer.created_at.elapsed() < PENDING_TURN_TTL).then_some(offer.context)
+    }
+
+    /// The reply to a handoff offer: yes puts the question to the offered
+    /// assistant, no drops it. `None` for anything else, which is a new
+    /// request to route as usual.
+    fn answer_handoff_offer(
+        &self,
+        offer: &str,
+        normalized: &str,
+        history: &[(String, String)],
+        facts: &[String],
+        personality: &str,
+    ) -> Option<(Response, Option<DebugTrace>)> {
+        let locale = &self.ctx.locale;
+        if is_cancel_phrase(normalized, locale) || starts_with_phrase(normalized, handoff_no_phrases(locale)) {
+            return Some((Response::Text(cancel_ack_for(locale).to_string()), None));
+        }
+        if !starts_with_phrase(normalized, handoff_yes_phrases(locale)) {
+            return None;
+        }
+        let (skill_id, question) = offer.split_once('\n')?;
+        // Gone since the offer: the skill was uninstalled or reloaded.
+        let Some(binding) = self.named_assistants.iter().find(|b| b.skill_id == skill_id) else {
+            return Some((Response::Text(fallback_response_for(locale).to_string()), None));
+        };
+        self.log(LogLevel::Info, &format!("handoff: asking skill={skill_id} (prompt_len={})", question.len()));
+        let trace = DebugTrace {
+            normalized_input: normalized.to_string(),
+            scores: Vec::new(),
+            winner: Some(format!("named_assistant:{skill_id}")),
+            round: None,
+        };
+        Some((self.ask_named_assistant(binding, question, history, facts, personality), Some(trace)))
+    }
+
+    /// Put `prompt` to a named cloud assistant and answer with its reply, or
+    /// with what went wrong. A reply joins the conversation and makes this
+    /// the assistant a handoff offers first.
+    fn ask_named_assistant(
+        &self,
+        binding: &NamedAssistantBinding,
+        prompt: &str,
+        history: &[(String, String)],
+        facts: &[String],
+        personality: &str,
+    ) -> Response {
+        let outcome = dispatch_named_assistant(binding, prompt, &self.ctx.locale, history, facts, personality, self.model_catalog.as_deref(), |level, msg| {
+            self.log(level, msg)
+        });
+        match outcome {
+            NamedAssistantOutcome::Answer(text) => {
+                let clean = plain_text::plain_text(&text);
+                self.record_assistant_turn(prompt, &clean);
+                self.note_cloud_assistant_used(&binding.skill_id);
+                Response::Text(clean)
+            }
+            NamedAssistantOutcome::Failed(text) => Response::Text(text),
+        }
     }
 
     /// Replace the stored facts wholesale (frontend hydration + settings-screen
@@ -1506,6 +1686,14 @@ impl Engine {
         // likewise stays out of skill-serving calls.
         let personality = self.personality();
 
+        // Ari offered to ask a cloud assistant. Unlike a skill's question,
+        // a reply that is neither yes nor no is a new request, routed below.
+        if let Some(offer) = self.take_handoff_offer()
+            && let Some(reply) = self.answer_handoff_offer(&offer, &normalized, &history, &facts, &personality)
+        {
+            return reply;
+        }
+
         // Multi-turn: if a skill is awaiting a reply, this utterance belongs
         // to it — bypass all routing (scoring, router, assistant).
         if let Some(pending) = self.take_pending_turn_if_fresh() {
@@ -1575,20 +1763,10 @@ impl Engine {
                     m.remainder.len()
                 ),
             );
-            let outcome = dispatch_named_assistant(m.binding, &m.remainder, &self.ctx.locale, &history, &facts, &personality, self.model_catalog.as_deref(), |level, msg| {
-                self.log(level, msg)
-            });
             // The prompt actually sent is the remainder ("what is the capital
             // of morocco"), not the addressing wrapper, so that's what goes in
             // the transcript.
-            let response = match outcome {
-                NamedAssistantOutcome::Answer(text) => {
-                    let clean = plain_text::plain_text(&text);
-                    self.record_assistant_turn(&m.remainder, &clean);
-                    Response::Text(clean)
-                }
-                NamedAssistantOutcome::Failed(text) => Response::Text(text),
-            };
+            let response = self.ask_named_assistant(m.binding, &m.remainder, &history, &facts, &personality);
             return (response, Some(trace));
         }
 
@@ -1714,7 +1892,10 @@ impl Engine {
                     let clean = plain_text::plain_text(&text);
                     self.record_assistant_turn(&normalized, &clean);
                     let label = match &self.active_assistant {
-                        Some(ActiveAssistant::Api { skill_id, .. }) => format!("assistant:{skill_id}"),
+                        Some(ActiveAssistant::Api { skill_id, .. }) => {
+                            self.note_cloud_assistant_used(skill_id);
+                            format!("assistant:{skill_id}")
+                        }
                         _ => "assistant:one-shot".to_string(),
                     };
                     trace.winner = Some(label);
@@ -1848,11 +2029,13 @@ impl Engine {
                         .answer_sink
                         .as_deref()
                         .map(answer_stream::AnswerStream::new);
+                    let handoff_to = self.handoff_target();
                     let result = llm.try_answer(
                         &normalized,
                         &catalog,
                         &self.ctx.locale,
                         *tier,
+                        handoff_to.is_some(),
                         &history,
                         &facts,
                         &personality,
@@ -1880,6 +2063,32 @@ impl Engine {
                             );
                             trace.winner = Some("assistant:builtin".to_string());
                             return (Response::Text(clean), Some(trace));
+                        }
+                        // The question the model wrote after the marker is
+                        // only logged: the user's own words, with the
+                        // conversation, are what the cloud assistant gets.
+                        Some(ari_llm::FallbackResult::DoesNotKnow { said, query }) => {
+                            let said = plain_text::plain_text(&said);
+                            self.log(
+                                LogLevel::Info,
+                                &format!(
+                                    "assistant:builtin: doesn't know (query={query:?}), offering {:?}",
+                                    handoff_to.map(|b| b.skill_id.as_str())
+                                ),
+                            );
+                            let text = match handoff_to {
+                                Some(binding) => {
+                                    self.set_pending_turn(HANDOFF_SENTINEL, format!("{}\n{normalized}", binding.skill_id));
+                                    handoff_offer_for(&self.ctx.locale, &said, &assistant_display_name(&binding.skill_id))
+                                }
+                                None if said.is_empty() => not_sure_for(&self.ctx.locale).to_string(),
+                                None => said,
+                            };
+                            if let Some(answer) = &answer {
+                                answer.finish(&text);
+                            }
+                            trace.winner = Some("assistant:builtin".to_string());
+                            return (Response::Text(text), Some(trace));
                         }
                         None => {
                             let detail = llm
@@ -1921,6 +2130,7 @@ impl Engine {
                     Ok(text) if !text.is_empty() => {
                         let clean = plain_text::plain_text(&text);
                         self.record_assistant_turn(&normalized, &clean);
+                        self.note_cloud_assistant_used(skill_id);
                         trace.winner = Some(format!("assistant:{skill_id}"));
                         return (Response::Text(clean), Some(trace));
                     }
@@ -3681,6 +3891,248 @@ mod tests {
         );
     }
 
+    // --- Handoff: the on-device model doesn't know, Ari offers a cloud one ---
+
+    /// An on-device model that writes `raw`, a token at a time, and reports
+    /// it the way ari-llm parses it. Records the `handoff` flag of each call.
+    #[cfg(feature = "llm")]
+    struct UnsureFallback {
+        raw: &'static str,
+        handoff: Mutex<Vec<bool>>,
+    }
+
+    #[cfg(feature = "llm")]
+    impl ari_llm::Fallback for UnsureFallback {
+        fn try_answer(
+            &self,
+            _input: &str,
+            _skills: &[ari_llm::SkillInfo],
+            _locale: &str,
+            _tier: ari_llm::BuiltinTier,
+            handoff: bool,
+            _history: &[(String, String)],
+            _facts: &[String],
+            _personality: &str,
+            on_text: &mut dyn FnMut(&str),
+        ) -> Option<ari_llm::FallbackResult> {
+            self.handoff.lock().unwrap().push(handoff);
+            for (at, c) in self.raw.char_indices() {
+                on_text(&self.raw[..at + c.len_utf8()]);
+            }
+            Some(match self.raw.split_once(ari_llm::HANDOFF_MARKER) {
+                Some((said, query)) => ari_llm::FallbackResult::DoesNotKnow {
+                    said: said.trim().to_string(),
+                    query: query.trim().to_string(),
+                },
+                None => ari_llm::FallbackResult::DirectAnswer { text: self.raw.to_string() },
+            })
+        }
+    }
+
+    /// `stub` as the installed assistant `skill_id`, with its API key set
+    /// when `key` is given.
+    fn keyed_binding(skill_id: &str, alias: &str, stub: &StubAssistant, key: Option<&str>) -> NamedAssistantBinding {
+        use ari_skill_loader::assistant::MemoryConfigStore;
+        use ari_skill_loader::manifest::AuthScheme;
+
+        let mut store = MemoryConfigStore::new();
+        if let Some(key) = key {
+            store.set(skill_id, "api_key", key);
+        }
+        let mut config = stub.config();
+        config.auth = AuthScheme::Bearer;
+        config.auth_config_key = Some("api_key".to_string());
+        NamedAssistantBinding {
+            skill_id: skill_id.to_string(),
+            aliases: vec![alias.to_string()],
+            config,
+            config_store: Arc::new(store),
+        }
+    }
+
+    const CLAUDE: &str = "dev.heyari.assistant.claude";
+    const CHATGPT: &str = "dev.heyari.assistant.chatgpt";
+
+    /// The on-device assistant writing `raw`, with Claude installed and
+    /// keyed, and the handoff setting on.
+    #[cfg(feature = "llm")]
+    fn engine_offering_claude(stub: &StubAssistant, raw: &'static str) -> (Engine, Arc<UnsureFallback>) {
+        let mut engine = Engine::new();
+        let llm = Arc::new(UnsureFallback { raw, handoff: Mutex::new(Vec::new()) });
+        engine.set_llm(llm.clone());
+        engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Medium }));
+        engine.set_named_assistants(vec![keyed_binding(CLAUDE, "claude", stub, Some("sk-test"))]);
+        engine.set_handoff_enabled(true);
+        (engine, llm)
+    }
+
+    #[cfg(feature = "llm")]
+    fn text_of(response: Response) -> String {
+        match response {
+            Response::Text(text) => text,
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn not_knowing_offers_the_keyed_cloud_assistant() {
+        let stub = StubAssistant::start(vec![]);
+        let (engine, llm) = engine_offering_claude(&stub, "QUERY: weather in Rome");
+
+        let (response, _) = engine.process_input_traced("what is the weather in rome");
+
+        assert_eq!(text_of(response), "I'm not sure about that. Would you like me to ask Claude?");
+        assert_eq!(*llm.handoff.lock().unwrap(), [true]);
+        assert!(engine.has_pending_turn(), "the offer waits for a reply");
+        assert_eq!(stub.request_count(), 0);
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn what_the_model_said_first_leads_the_offer() {
+        let stub = StubAssistant::start(vec![]);
+        let (engine, _) = engine_offering_claude(&stub, "I don't have live weather data. QUERY: weather in Rome");
+
+        let (response, _) = engine.process_input_traced("what is the weather in rome");
+
+        assert_eq!(text_of(response), "I don't have live weather data. Would you like me to ask Claude?");
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn yes_puts_the_users_own_question_to_the_offered_assistant() {
+        let stub = StubAssistant::start(vec!["Sunny, 24 degrees."]);
+        let (engine, _) = engine_offering_claude(&stub, "QUERY: weather in Rome");
+        engine.process_input_traced("what is the weather in rome");
+
+        let (response, trace) = engine.process_input_traced("yes please");
+
+        assert_eq!(text_of(response), "Sunny, 24 degrees.");
+        assert_eq!(trace.and_then(|t| t.winner), Some(format!("named_assistant:{CLAUDE}")));
+        assert_eq!(stub.request_count(), 1);
+        assert_eq!(
+            stub.messages(0).last(),
+            Some(&("user".to_string(), "what is the weather in rome".to_string()))
+        );
+        assert_eq!(engine.last_cloud_assistant().as_deref(), Some(CLAUDE));
+        assert!(!engine.has_pending_turn());
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn no_drops_the_offer_without_asking() {
+        let stub = StubAssistant::start(vec![]);
+        let (engine, _) = engine_offering_claude(&stub, "QUERY: weather in Rome");
+        engine.process_input_traced("what is the weather in rome");
+
+        let (response, _) = engine.process_input_traced("no thanks");
+
+        assert_eq!(text_of(response), "Okay.");
+        assert_eq!(stub.request_count(), 0);
+        assert!(!engine.has_pending_turn());
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn a_reply_that_is_neither_yes_nor_no_is_a_new_request() {
+        let stub = StubAssistant::start(vec![]);
+        let (engine, llm) = engine_offering_claude(&stub, "QUERY: something");
+        engine.process_input_traced("what is the weather in rome");
+
+        engine.process_input_traced("what is the capital of peru");
+
+        assert_eq!(llm.handoff.lock().unwrap().len(), 2, "the new question went to the model");
+        assert_eq!(stub.request_count(), 0);
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn handoff_is_off_by_default_and_says_it_is_not_sure() {
+        let stub = StubAssistant::start(vec![]);
+        let mut engine = Engine::new();
+        let llm = Arc::new(UnsureFallback { raw: "QUERY: weather in Rome", handoff: Mutex::new(Vec::new()) });
+        engine.set_llm(llm.clone());
+        engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
+        engine.set_named_assistants(vec![keyed_binding(CLAUDE, "claude", &stub, Some("sk-test"))]);
+
+        let (response, _) = engine.process_input_traced("what is the weather in rome");
+
+        assert_eq!(text_of(response), "I'm not sure about that.");
+        assert_eq!(*llm.handoff.lock().unwrap(), [false]);
+        assert!(!engine.has_pending_turn());
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn no_assistant_with_a_key_means_no_handoff_prompt() {
+        let stub = StubAssistant::start(vec![]);
+        let (mut engine, llm) = engine_offering_claude(&stub, "Rome is the capital of Italy.");
+        engine.set_named_assistants(vec![keyed_binding(CLAUDE, "claude", &stub, None)]);
+
+        engine.process_input_traced("tell me about rome");
+
+        assert_eq!(*llm.handoff.lock().unwrap(), [false]);
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn turning_handoff_off_drops_a_waiting_offer() {
+        let stub = StubAssistant::start(vec![]);
+        let (engine, _) = engine_offering_claude(&stub, "QUERY: weather in Rome");
+        engine.process_input_traced("what is the weather in rome");
+
+        engine.set_handoff_enabled(false);
+
+        assert!(!engine.has_pending_turn());
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn the_marker_never_reaches_the_answer_sink() {
+        let stub = StubAssistant::start(vec![]);
+        let (mut engine, _) = engine_offering_claude(&stub, "Hmm. Not sure. QUERY: weather in Rome");
+        let sink = Arc::new(RecordingAnswer::default());
+        engine.set_answer_sink(Some(sink.clone()));
+
+        let (response, _) = engine.process_input_traced("what is the weather in rome");
+
+        for shown in sink.shown.lock().unwrap().iter() {
+            assert!(!shown.contains("QUERY") && !shown.contains("weather"), "{shown:?}");
+        }
+        let sentences = sink.sentences.lock().unwrap().concat();
+        assert_eq!(sentences, "Hmm. Not sure. Would you like me to ask Claude?");
+        assert_eq!(text_of(response), "Hmm. Not sure. Would you like me to ask Claude?");
+    }
+
+    #[test]
+    fn the_assistant_used_last_is_offered_first_and_keyless_ones_never() {
+        let stub = StubAssistant::start(vec![]);
+        let mut engine = Engine::new();
+        engine.set_named_assistants(vec![
+            keyed_binding("dev.heyari.assistant.gemini", "gemini", &stub, None),
+            keyed_binding(CHATGPT, "chatgpt", &stub, Some("sk-a")),
+            keyed_binding(CLAUDE, "claude", &stub, Some("sk-b")),
+        ]);
+
+        assert_eq!(engine.handoff_assistants(), [CHATGPT, CLAUDE]);
+        engine.set_last_cloud_assistant(Some(CLAUDE.to_string()));
+        assert_eq!(engine.handoff_assistants(), [CLAUDE, CHATGPT]);
+    }
+
+    #[test]
+    fn handoff_replies_match_whole_words_at_the_start() {
+        assert!(starts_with_phrase("yes", handoff_yes_phrases("en")));
+        assert!(starts_with_phrase("yes please ask it", handoff_yes_phrases("en")));
+        assert!(starts_with_phrase("go ahead", handoff_yes_phrases("en")));
+        assert!(!starts_with_phrase("yesterday was sunny", handoff_yes_phrases("en")));
+        assert!(starts_with_phrase("nope", handoff_no_phrases("en")));
+        assert!(starts_with_phrase("no thanks", handoff_no_phrases("en")));
+        assert!(!starts_with_phrase("nobody knows", handoff_no_phrases("en")));
+        assert!(starts_with_phrase("sì grazie", handoff_yes_phrases("it")));
+        assert!(!starts_with_phrase("sicuro", handoff_yes_phrases("it")));
+    }
+
     #[test]
     fn an_empty_cloud_reply_is_a_failed_turn_not_a_blank_answer() {
         // Reasoning models can spend the whole answer budget before emitting
@@ -5269,6 +5721,7 @@ mod tests {
             _skills: &[ari_llm::SkillInfo],
             _locale: &str,
             _tier: ari_llm::BuiltinTier,
+            _handoff: bool,
             history: &[(String, String)],
             facts: &[String],
             personality: &str,

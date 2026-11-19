@@ -32,6 +32,39 @@ pub struct SkillInfo {
 pub enum FallbackResult {
     /// The LLM answered the question directly.
     DirectAnswer { text: String },
+    /// The LLM wrote [`HANDOFF_MARKER`]: it doesn't know, or the question
+    /// needs live information. `said` is whatever it wrote before the
+    /// marker (usually nothing), `query` the question it wrote after it.
+    DoesNotKnow { said: String, query: String },
+}
+
+/// What the on-device model writes, followed by the question, when it
+/// can't answer and a cloud assistant could be offered instead. Only the
+/// handoff prompts ask for it, in every language, so it stays English.
+pub const HANDOFF_MARKER: &str = "QUERY:";
+
+/// The label the prompts' examples put before each reply, which Gemma 3 1B
+/// copies into its own now and then.
+const RESPONSE_LABEL: &str = "Response:";
+
+/// The part of the model's output so far that comes before
+/// [`HANDOFF_MARKER`]: the marker and the question after it are for the
+/// engine, never to be shown or spoken.
+pub fn before_handoff(raw: &str) -> &str {
+    let body = raw.trim_start();
+    let body = body.strip_prefix(RESPONSE_LABEL).map_or(body, str::trim_start);
+    let lead = raw.len() - body.len();
+    handoff_at(body).map_or(raw, |at| &raw[..lead + at])
+}
+
+/// Where [`HANDOFF_MARKER`] starts in `text`: in capitals anywhere, or in
+/// any case at the very start, where Gemma 3 1B writes "Query:" now and
+/// then. A lowercase "query:" further in is just a word in an answer.
+fn handoff_at(text: &str) -> Option<usize> {
+    let leads = text
+        .get(..HANDOFF_MARKER.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(HANDOFF_MARKER));
+    if leads { Some(0) } else { text.find(HANDOFF_MARKER) }
 }
 
 /// Trait so the engine can use a mock in tests.
@@ -45,6 +78,10 @@ pub trait Fallback: Send + Sync {
     ///
     /// `tier` picks the system prompt: Small keeps its own.
     ///
+    /// `handoff` asks the model to write [`HANDOFF_MARKER`] rather than
+    /// refuse when it doesn't know, because the engine can offer a cloud
+    /// assistant instead.
+    ///
     /// `on_text` sees the raw output so far, reasoning included, after
     /// every generated token, so the engine can speak finished sentences
     /// while the model writes the rest (ari-android#37).
@@ -55,6 +92,7 @@ pub trait Fallback: Send + Sync {
         skills: &[SkillInfo],
         locale: &str,
         tier: BuiltinTier,
+        handoff: bool,
         history: &[(String, String)],
         facts: &[String],
         personality: &str,
@@ -350,6 +388,7 @@ impl Fallback for LazyLlmFallback {
         skills: &[SkillInfo],
         locale: &str,
         tier: BuiltinTier,
+        handoff: bool,
         history: &[(String, String)],
         facts: &[String],
         personality: &str,
@@ -391,7 +430,7 @@ impl Fallback for LazyLlmFallback {
 
         let user_prompt = build_user_prompt(input);
         let model = state.loaded.as_ref().unwrap();
-        let system_for = |has_history| build_system_prompt(skills, locale, tier, has_history, facts, personality);
+        let system_for = |has_history| build_system_prompt(skills, locale, tier, handoff, has_history, facts, personality);
         let output = match answer(model, &system_for, history, &user_prompt, on_text) {
             Ok(answer) => answer,
             Err(e) => {
@@ -478,6 +517,7 @@ impl Fallback for LlmFallback {
         skills: &[SkillInfo],
         locale: &str,
         tier: BuiltinTier,
+        handoff: bool,
         _history: &[(String, String)],
         // Intentionally dropped here: this eager `LlmFallback` is only the
         // ari-cli dev-harness path. Production uses `LazyLlmFallback`, which
@@ -490,7 +530,7 @@ impl Fallback for LlmFallback {
         let _guard = self.inference_lock.lock().ok()?;
 
         // `&[]`: facts recall is a no-op in this dev-harness impl (see `_facts`).
-        let system_for = |_| build_system_prompt(skills, locale, tier, false, &[], "");
+        let system_for = |_| build_system_prompt(skills, locale, tier, handoff, false, &[], "");
         let user_prompt = build_user_prompt(input);
         let output = answer(&self.loaded, &system_for, &[], &user_prompt, on_text).ok()?;
 
@@ -540,6 +580,15 @@ const PROMPT_IT_SYSTEM: &str = include_str!("../prompts/it/system.md");
 const PROMPT_EN_SYSTEM_SMALL: &str = include_str!("../prompts/en/system-small.md");
 const PROMPT_IT_SYSTEM_SMALL: &str = include_str!("../prompts/it/system-small.md");
 
+/// The same prompts for when a cloud assistant can take over: a question
+/// needing live information gets [`HANDOFF_MARKER`] rather than a refusal,
+/// and the weather example shows it. Device control still gets the
+/// refusal, since no cloud assistant can do that either.
+const PROMPT_EN_SYSTEM_HANDOFF: &str = include_str!("../prompts/en/system-handoff.md");
+const PROMPT_IT_SYSTEM_HANDOFF: &str = include_str!("../prompts/it/system-handoff.md");
+const PROMPT_EN_SYSTEM_SMALL_HANDOFF: &str = include_str!("../prompts/en/system-small-handoff.md");
+const PROMPT_IT_SYSTEM_SMALL_HANDOFF: &str = include_str!("../prompts/it/system-small-handoff.md");
+
 /// The QA-style system prompt for the on-device LLM fallback. Picks
 /// the locale-specific template for the model's tier and trims trailing
 /// whitespace from the file. Unknown locales fall back to English with a
@@ -551,20 +600,25 @@ fn build_system_prompt(
     _skills: &[SkillInfo],
     locale: &str,
     tier: BuiltinTier,
+    handoff: bool,
     has_history: bool,
     facts: &[String],
     personality: &str,
 ) -> String {
     let small = tier == BuiltinTier::Small;
-    let template = match (locale, small) {
-        ("it", true) => PROMPT_IT_SYSTEM_SMALL,
-        ("it", false) => PROMPT_IT_SYSTEM,
+    let template = match (locale, small, handoff) {
+        ("it", true, false) => PROMPT_IT_SYSTEM_SMALL,
+        ("it", false, false) => PROMPT_IT_SYSTEM,
+        ("it", true, true) => PROMPT_IT_SYSTEM_SMALL_HANDOFF,
+        ("it", false, true) => PROMPT_IT_SYSTEM_HANDOFF,
         // No template for other locales — silently fall through to
         // English. Engine-level logging tracks the active locale
         // so the dev can see this is happening; we don't surface
         // it as a model error.
-        (_, true) => PROMPT_EN_SYSTEM_SMALL,
-        (_, false) => PROMPT_EN_SYSTEM,
+        (_, true, false) => PROMPT_EN_SYSTEM_SMALL,
+        (_, false, false) => PROMPT_EN_SYSTEM,
+        (_, true, true) => PROMPT_EN_SYSTEM_SMALL_HANDOFF,
+        (_, false, true) => PROMPT_EN_SYSTEM_HANDOFF,
     };
     let mut prompt = template.trim().to_string();
     if has_history {
@@ -634,9 +688,23 @@ fn drop_unfinished_tail(text: &str) -> &str {
 /// minimum of 11 characters, left from an older answer format, threw away
 /// "Paris.", "1945." and "12." and told the user it hadn't understood
 /// (ari-android#32).
+///
+/// [`HANDOFF_MARKER`] anywhere in it means the model doesn't know. Only
+/// the marker itself counts: the models copy the prompt's capitals, and a
+/// lowercase "query:" turns up in real answers about databases.
 fn parse_output(output: &str, _skills: &[SkillInfo]) -> Option<FallbackResult> {
     let output = output.trim();
     let text = output.strip_prefix("ANSWER:").unwrap_or(output).trim();
+    let text = text.strip_prefix(RESPONSE_LABEL).unwrap_or(text).trim();
+
+    if let Some(at) = handoff_at(text) {
+        // Small models wrap the marker in bold now and then.
+        let markup = |c: char| c == '*' || c == '_' || c.is_whitespace();
+        return Some(FallbackResult::DoesNotKnow {
+            said: text[..at].trim_matches(markup).to_string(),
+            query: text[at + HANDOFF_MARKER.len()..].trim_matches(markup).to_string(),
+        });
+    }
 
     if text == "NONE" || !text.chars().any(char::is_alphanumeric) {
         return None;
@@ -664,7 +732,7 @@ mod tests {
 
     #[test]
     fn system_prompt_english_is_concise_and_locale_fenced() {
-        let prompt = build_system_prompt(&test_skills(), "en", BuiltinTier::Medium, false, &[], "");
+        let prompt = build_system_prompt(&test_skills(), "en", BuiltinTier::Medium, false, false, &[], "");
         assert!(prompt.contains("Ari"));
         // Locale fence — the explicit "English" word matters for
         // small models that occasionally bleed in non-English tokens.
@@ -677,25 +745,148 @@ mod tests {
     #[test]
     fn small_tier_keeps_its_one_sentence_prompt() {
         for (locale, brevity) in [("en", "one short English sentence"), ("it", "una sola frase breve")] {
-            let small = build_system_prompt(&[], locale, BuiltinTier::Small, false, &[], "");
+            let small = build_system_prompt(&[], locale, BuiltinTier::Small, false, false, &[], "");
             assert!(small.contains(brevity), "{small}");
-            let medium = build_system_prompt(&[], locale, BuiltinTier::Medium, false, &[], "");
+            let medium = build_system_prompt(&[], locale, BuiltinTier::Medium, false, false, &[], "");
             assert!(!medium.contains(brevity), "{medium}");
-            assert_eq!(medium, build_system_prompt(&[], locale, BuiltinTier::Large, false, &[], ""));
+            assert_eq!(medium, build_system_prompt(&[], locale, BuiltinTier::Large, false, false, &[], ""));
         }
+    }
+
+    #[test]
+    fn only_the_handoff_prompts_ask_for_the_marker() {
+        for locale in ["en", "it"] {
+            for tier in [BuiltinTier::Small, BuiltinTier::Medium, BuiltinTier::Large] {
+                let without = build_system_prompt(&[], locale, tier, false, false, &[], "");
+                assert!(!without.contains(HANDOFF_MARKER), "{without}");
+                let with = build_system_prompt(&[], locale, tier, true, false, &[], "");
+                assert!(with.contains("Response: QUERY: "), "{with}");
+            }
+        }
+    }
+
+    #[test]
+    fn handoff_prompts_keep_each_tiers_brevity() {
+        for (locale, brevity) in [("en", "one short English sentence"), ("it", "una sola frase breve")] {
+            let small = build_system_prompt(&[], locale, BuiltinTier::Small, true, false, &[], "");
+            assert!(small.contains(brevity), "{small}");
+            let medium = build_system_prompt(&[], locale, BuiltinTier::Medium, true, false, &[], "");
+            assert!(!medium.contains(brevity), "{medium}");
+            assert_eq!(medium, build_system_prompt(&[], locale, BuiltinTier::Large, true, false, &[], ""));
+        }
+    }
+
+    #[test]
+    fn the_larger_models_handoff_prompt_still_refuses_device_control() {
+        // No cloud assistant can switch a light on either, so the marker
+        // would only lead to a second refusal.
+        for (locale, refusal) in [
+            ("en", "Response: I don't have a skill installed that can do that"),
+            ("it", "Response: Non ho una skill installata per farlo"),
+        ] {
+            let medium = build_system_prompt(&[], locale, BuiltinTier::Medium, true, false, &[], "");
+            assert_eq!(medium.matches(refusal).count(), 1, "{medium}");
+        }
+    }
+
+    #[test]
+    fn every_prompt_answers_figures_from_what_it_knows() {
+        // A population counted as live information once: "I don't have live
+        // population data" for Australia. A figure and an example settle it.
+        for (locale, line, example) in [
+            ("en", "populations, sizes and other figures", "About 68 million people live in France."),
+            ("it", "popolazioni, dimensioni e altri dati", "In Francia vivono circa 68 milioni di persone."),
+        ] {
+            for tier in [BuiltinTier::Small, BuiltinTier::Medium] {
+                for handoff in [false, true] {
+                    let prompt = build_system_prompt(&[], locale, tier, handoff, false, &[], "");
+                    assert!(prompt.contains(line), "{prompt}");
+                    assert!(prompt.contains(example), "{prompt}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_marker_alone_is_a_handoff_with_its_question() {
+        match parse_output("QUERY: what's the weather in Rome?", &test_skills()) {
+            Some(FallbackResult::DoesNotKnow { said, query }) => {
+                assert_eq!(said, "");
+                assert_eq!(query, "what's the weather in Rome?");
+            }
+            _ => panic!("expected a handoff"),
+        }
+    }
+
+    #[test]
+    fn words_before_the_marker_are_what_the_model_said() {
+        match parse_output("I don't have live data. QUERY: population of Australia", &test_skills()) {
+            Some(FallbackResult::DoesNotKnow { said, query }) => {
+                assert_eq!(said, "I don't have live data.");
+                assert_eq!(query, "population of Australia");
+            }
+            _ => panic!("expected a handoff"),
+        }
+    }
+
+    #[test]
+    fn an_echoed_label_and_bold_marker_are_not_part_of_what_was_said() {
+        match parse_output("Response: **QUERY:** latest news", &test_skills()) {
+            Some(FallbackResult::DoesNotKnow { said, query }) => {
+                assert_eq!(said, "");
+                assert_eq!(query, "latest news");
+            }
+            _ => panic!("expected a handoff"),
+        }
+    }
+
+    #[test]
+    fn a_capitalised_marker_counts_only_at_the_start() {
+        match parse_output("Query: What's the latest news?", &test_skills()) {
+            Some(FallbackResult::DoesNotKnow { said, query }) => {
+                assert_eq!(said, "");
+                assert_eq!(query, "What's the latest news?");
+            }
+            _ => panic!("expected a handoff"),
+        }
+        assert_eq!(before_handoff("Response: Query: news"), "Response: ");
+        assert_eq!(before_handoff("Quer"), "Quer");
+    }
+
+    #[test]
+    fn a_copied_response_label_is_not_said() {
+        match parse_output("Response: The capital of Australia is Canberra.", &test_skills()) {
+            Some(FallbackResult::DirectAnswer { text }) => assert_eq!(text, "The capital of Australia is Canberra."),
+            _ => panic!("expected an answer"),
+        }
+    }
+
+    #[test]
+    fn a_lowercase_query_is_an_answer() {
+        match parse_output("A SQL query: SELECT * FROM users.", &test_skills()) {
+            Some(FallbackResult::DirectAnswer { text }) => assert_eq!(text, "A SQL query: SELECT * FROM users."),
+            _ => panic!("expected an answer"),
+        }
+    }
+
+    #[test]
+    fn nothing_from_the_marker_on_is_released() {
+        assert_eq!(before_handoff("QUERY: weather in Rome"), "");
+        assert_eq!(before_handoff("Not sure. QUERY: weather"), "Not sure. ");
+        assert_eq!(before_handoff("Paris is the capital."), "Paris is the capital.");
     }
 
     #[test]
     fn build_system_prompt_injects_facts_block() {
         let facts = vec!["i live in valletta".to_string()];
-        let prompt = build_system_prompt(&[], "en", BuiltinTier::Medium, false, &facts, "");
+        let prompt = build_system_prompt(&[], "en", BuiltinTier::Medium, false, false, &facts, "");
         assert!(prompt.contains("Things you know about the user:\n- i live in valletta"));
     }
 
     #[test]
     fn personality_comes_after_the_rules_and_before_the_facts() {
         let facts = vec!["i live in valletta".to_string()];
-        let prompt = build_system_prompt(&[], "en", BuiltinTier::Medium, true, &facts, "Dry and witty.");
+        let prompt = build_system_prompt(&[], "en", BuiltinTier::Medium, false, true, &facts, "Dry and witty.");
         let rules = prompt.find("You cannot access live information").unwrap();
         let personality = prompt.find("Dry and witty.").unwrap();
         let known = prompt.find("Things you know about the user").unwrap();
@@ -704,7 +895,7 @@ mod tests {
 
     #[test]
     fn no_personality_block_when_blank() {
-        assert!(!build_system_prompt(&[], "en", BuiltinTier::Medium, false, &[], " ").contains("personality"));
+        assert!(!build_system_prompt(&[], "en", BuiltinTier::Medium, false, false, &[], " ").contains("personality"));
     }
 
     #[test]
@@ -726,14 +917,14 @@ mod tests {
 
     #[test]
     fn build_system_prompt_no_facts_block_when_empty() {
-        let prompt = build_system_prompt(&[], "en", BuiltinTier::Medium, false, &[], "");
+        let prompt = build_system_prompt(&[], "en", BuiltinTier::Medium, false, false, &[], "");
         assert!(!prompt.contains("Things you know about the user"));
     }
 
     #[test]
     fn system_prompt_forbids_bluffing_about_live_data_and_devices() {
         for tier in [BuiltinTier::Small, BuiltinTier::Medium] {
-            let p = build_system_prompt(&[], "en", tier, false, &[], "");
+            let p = build_system_prompt(&[], "en", tier, false, false, &[], "");
             assert!(
                 p.contains("You cannot access live information"),
                 "capability-honesty line missing from EN system prompt: {p}"
@@ -751,7 +942,7 @@ mod tests {
                 "few-shot answerable example missing from EN system prompt: {p}"
             );
 
-            let it = build_system_prompt(&[], "it", tier, false, &[], "");
+            let it = build_system_prompt(&[], "it", tier, false, false, &[], "");
             assert!(
                 it.contains("Non puoi accedere a informazioni in tempo reale"),
                 "capability-honesty line missing from IT system prompt: {it}"
@@ -786,7 +977,7 @@ mod tests {
 
     #[test]
     fn system_prompt_italian_is_localized() {
-        let prompt = build_system_prompt(&test_skills(), "it", BuiltinTier::Medium, false, &[], "");
+        let prompt = build_system_prompt(&test_skills(), "it", BuiltinTier::Medium, false, false, &[], "");
         assert!(prompt.contains("Ari"));
         assert!(prompt.contains("italiano"));
         assert!(prompt.contains("un breve elenco che le copra tutte"));
@@ -797,7 +988,7 @@ mod tests {
 
     #[test]
     fn system_prompt_unknown_locale_falls_back_to_english() {
-        let prompt = build_system_prompt(&test_skills(), "ja", BuiltinTier::Medium, false, &[], "");
+        let prompt = build_system_prompt(&test_skills(), "ja", BuiltinTier::Medium, false, false, &[], "");
         // "Ja" isn't shipped — should silently get the en template.
         assert!(prompt.contains("Ari"));
         assert!(prompt.contains("English"));
@@ -975,7 +1166,7 @@ mod tests {
             return;
         }
         let lazy = LazyLlmFallback::new(path, Accelerator::Cpu);
-        let ask = || lazy.try_answer("What's the capital of France?", &[], "en", BuiltinTier::Small, &[], &[], "", &mut |_| {});
+        let ask = || lazy.try_answer("What's the capital of France?", &[], "en", BuiltinTier::Small, false, &[], &[], "", &mut |_| {});
         assert!(ask().is_some(), "{:?}", lazy.last_error());
         assert!(lazy.is_loaded());
         lazy.release_memory();
@@ -1001,8 +1192,30 @@ mod tests {
     fn answer_of(result: Option<FallbackResult>, lazy: &LazyLlmFallback) -> String {
         match result {
             Some(FallbackResult::DirectAnswer { text }) => text,
+            Some(FallbackResult::DoesNotKnow { said, query }) => panic!("handed off: said {said:?}, query {query:?}"),
             None => panic!("no answer: {:?}", lazy.last_error()),
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn real_model_hands_off_a_live_question() {
+        let Some((lazy, tier)) = real_model() else { return };
+        let result = lazy.try_answer("What's the weather in Paris right now?", &[], "en", tier, true, &[], &[], "", &mut |_| {});
+        match result {
+            Some(FallbackResult::DoesNotKnow { .. }) => {}
+            Some(FallbackResult::DirectAnswer { text }) => panic!("answered instead: {text}"),
+            None => panic!("no answer: {:?}", lazy.last_error()),
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn real_model_answers_a_slow_fact_even_when_it_could_hand_off() {
+        let Some((lazy, tier)) = real_model() else { return };
+        let result = lazy.try_answer("What is the population of Australia?", &[], "en", tier, true, &[], &[], "", &mut |_| {});
+        let answer = answer_of(result, &lazy);
+        assert!(answer.contains("million"), "{answer}");
     }
 
     #[test]
@@ -1010,7 +1223,7 @@ mod tests {
     fn real_model_answers_and_streams() {
         let Some((lazy, tier)) = real_model() else { return };
         let mut streamed = String::new();
-        let result = lazy.try_answer("What's the capital of Australia?", &[], "en", tier, &[], &[], "", &mut |text| {
+        let result = lazy.try_answer("What's the capital of Australia?", &[], "en", tier, false, &[], &[], "", &mut |text| {
             streamed = text.to_string()
         });
         let answer = answer_of(result, &lazy);
@@ -1026,7 +1239,7 @@ mod tests {
             ("user".to_string(), "Please remember the number 4817.".to_string()),
             ("assistant".to_string(), "Okay, I'll remember 4817.".to_string()),
         ];
-        let result = lazy.try_answer("What number did I ask you to remember?", &[], "en", tier, &history, &[], "", &mut |_| {});
+        let result = lazy.try_answer("What number did I ask you to remember?", &[], "en", tier, false, &history, &[], "", &mut |_| {});
         let answer = answer_of(result, &lazy);
         assert!(answer.contains("4817"), "{answer}");
     }

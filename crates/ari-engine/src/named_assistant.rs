@@ -40,6 +40,18 @@ pub struct NamedAssistantBinding {
     pub config_store: Arc<dyn ConfigStore>,
 }
 
+impl NamedAssistantBinding {
+    /// Whether the user has given this assistant its API key. A handoff
+    /// only offers assistants that have one: the cloud services.
+    pub fn has_key(&self) -> bool {
+        self.config.auth_config_key.as_deref().is_some_and(|key| {
+            self.config_store
+                .get(&self.skill_id, key)
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+    }
+}
+
 /// Result of a successful match: which binding fired, and the prompt
 /// to send to its API (everything after the alias + optional connector).
 #[derive(Clone)]
