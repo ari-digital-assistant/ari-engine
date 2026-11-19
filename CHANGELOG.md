@@ -111,6 +111,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Remembering, forgetting or asking what Ari remembers now counts as conversation, so a
+  run of them no longer ends in the conversation being forgotten mid-chat.
 - Web search only runs when what was said starts with a search command ("search for X",
   "look up X", "can you google X"), and searches for everything after the command. A
   question with "find" or "search" in the middle, such as "where do you find them in

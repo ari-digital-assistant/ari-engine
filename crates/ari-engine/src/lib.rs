@@ -1609,6 +1609,15 @@ impl Engine {
             );
         }
 
+        // Behaviour B: read (and refresh) the conversation buffer for this
+        // turn. Any turn refreshes the inactivity timer, the memory commands
+        // below included, or a run of them would let the conversation lapse
+        // mid-chat; only assistant answers extend the buffer. Pending-turn
+        // replies and skill wins are transparent (refresh, never record).
+        let conversation = self.conversation_context();
+        let history = history_messages(&conversation);
+        exec_ctx.last_question = conversation.last().map(|t| t.user.clone()).unwrap_or_default();
+
         // Personal memory ("remember that ...") intercepts. Like the let's-talk
         // phrases, these run BEFORE routing so a command is never answered by
         // the assistant or mistaken for a skill query. Order: forget-all and
@@ -1670,13 +1679,6 @@ impl Engine {
             }
         }
 
-        // Behaviour B: read (and refresh) the conversation buffer for this
-        // turn. Any turn refreshes the inactivity timer; only assistant
-        // answers below extend the buffer. Pending-turn replies and skill
-        // wins are transparent (refresh, never record).
-        let conversation = self.conversation_context();
-        let history = history_messages(&conversation);
-        exec_ctx.last_question = conversation.last().map(|t| t.user.clone()).unwrap_or_default();
         // Personal memory: the durable facts snapshot handed to the assistant
         // for THIS turn's free-text answer, whether the user addressed an
         // assistant by name or not. Skill-serving calls (routing, layer-C)
@@ -5628,6 +5630,22 @@ mod tests {
         engine.record_assistant_turn("q2", "a2");
         engine.set_conversation_memory_enabled(false);
         assert_eq!(engine.conversation_memory(), ConversationMemory::None);
+    }
+
+    #[test]
+    fn memory_commands_keep_the_conversation_alive() {
+        use std::time::{Duration, Instant};
+        let engine = Engine::new();
+        engine.record_assistant_turn("q1", "a1");
+        for command in ["remember that i like tea", "what do you remember about me", "forget i like tea"] {
+            engine.conversation.lock().unwrap().as_mut().unwrap().last_activity =
+                Instant::now().checked_sub(Duration::from_secs(80)).unwrap();
+            engine.process_input_traced(command);
+            match engine.conversation_memory() {
+                ConversationMemory::Live(left) => assert!(left > Duration::from_secs(85), "{command}: {left:?}"),
+                other => panic!("{command}: expected Live, got {other:?}"),
+            }
+        }
     }
 
     #[test]
