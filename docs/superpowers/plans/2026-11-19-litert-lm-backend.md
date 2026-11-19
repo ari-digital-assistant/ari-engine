@@ -194,7 +194,8 @@ Built 2026-11-19, awaiting the phone check. Notes from doing it:
 
 ### Phase 3: Model mirror
 
-- [ ] **Task 9:** add the three LiteRT-LM files to `publish-llm-manifests.yml`, mirrored to the
+- [x] **Task 9 (2026-11-19, ari-tools `d939429`, run 44499427648; manifests and mirror
+  verified):** add the three LiteRT-LM files to `publish-llm-manifests.yml`, mirrored to the
   heyari-models bucket like the GGUFs. `litert-community/Gemma3-1B-IT` is gated (Gemma licence,
   automatic approval), so the workflow needs a Hugging Face token from an account that accepted
   it. Medium and Large are Apache-2.0 and ungated.
