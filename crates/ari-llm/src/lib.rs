@@ -15,6 +15,17 @@ mod cpu_build;
 mod litert;
 pub use cpu_build::{cpu_build, cpu_features, CpuBuild};
 
+/// Which runtime runs the model file at `model_path`: "LiteRT-LM" for a
+/// `.litertlm` or `.task` file, "llama.cpp" for anything else (GGUF). For
+/// diagnostics.
+pub fn runtime_name(model_path: &Path) -> &'static str {
+    if litert::handles(model_path) {
+        "LiteRT-LM"
+    } else {
+        "llama.cpp"
+    }
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -949,6 +960,13 @@ mod tests {
             SkillInfo { id: "open".into(), description: "Opens apps by name.".into() },
             SkillInfo { id: "calculator".into(), description: "Evaluates math expressions.".into() },
         ]
+    }
+
+    #[test]
+    fn runtime_names_follow_the_model_file() {
+        assert_eq!(runtime_name(Path::new("/m/gemma-4-E2B-it.litertlm")), "LiteRT-LM");
+        assert_eq!(runtime_name(Path::new("/m/Gemma3-1B-IT_multi-prefill-seq_q8_ekv2048.task")), "LiteRT-LM");
+        assert_eq!(runtime_name(Path::new("/m/gemma-4-E2B-it-Q4_K_M.gguf")), "llama.cpp");
     }
 
     #[test]

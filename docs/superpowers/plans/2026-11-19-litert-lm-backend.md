@@ -161,15 +161,32 @@ Real-model tests pass on the laptop for LiteRT-LM Small, Medium and Large and ll
 
 ### Phase 2: Android packaging and catalogue
 
-- [ ] **Task 6: package the library.** A Gradle task downloads the pinned C API zip once (checked
+Built 2026-11-19, awaiting the phone check. Notes from doing it:
+
+- Manifests are new tags, `llm-<tier>-litert-latest` (Phase 3 publishes them). The worker saves
+  whatever a manifest points at under the catalogue's file name, so repointing `llm-<tier>-latest`
+  would make older apps save a `.task` file as `.gguf`.
+- Each tier keeps its old GGUF as `legacyFileName`: `modelFile` falls back to it, so the
+  assistant keeps answering on llama.cpp; its version reads `unknown`, so the update check
+  offers the new file; the worker deletes it once the new file is verified. Deleting a model
+  already removes the whole tier directory, LiteRT's weight cache included.
+- `runtimeBytes` re-measured on the Fold with LiteRT-LM (peak RSS over three answers, larger of
+  first and second load): Small 1.745 GB (was 1.425), Medium 1.531 GB (was 4.57), Large
+  3.145 GB (was 6.1). Small now needs more than Medium, so `PhoneMemory.recommended` ranks by
+  tier instead of memory. Medium now fits 6 GB phones and Large 8 GB.
+- Bug reports get the runtime through the diagnostics text at the top of the report's log
+  (`model: gemma4-e2b-q4 (LiteRT-LM)`). A `setup.modelRuntime` field would need ari-web's
+  bug-report function, which keeps only known fields, changed and redeployed.
+
+- [x] **Task 6: package the library.** A Gradle task downloads the pinned C API zip once (checked
   against its SHA-256), extracts `lib/android_arm64` and `lib/android_x86_64`, and adds them to
   jniLibs next to the llama.cpp libraries (same pattern as `copyLlamaLibs`). The library's
   minimum API level is 24; Ari's `minSdk` is 29.
-- [ ] **Task 7: catalogue.** Each tier in `LlmModel.kt` points at its LiteRT-LM file and manifest
+- [x] **Task 7: catalogue.** Each tier in `LlmModel.kt` points at its LiteRT-LM file and manifest
   (Small the 8-bit `.task`, Decision 5). The old GGUF stays loaded until the new file is
   downloaded and verified, then is deleted. Deleting a model also deletes its
   `<file>_*.xnnpack_cache` files, and storage shown for a model includes them (Decision 6).
-- [ ] **Task 8: diagnostics.** `on_device_cpu_info` (or a sibling) reports the runtime: llama.cpp
+- [x] **Task 8: diagnostics.** `on_device_cpu_info` (or a sibling) reports the runtime: llama.cpp
   with its CPU build, or LiteRT-LM on CPU or GPU. `load_llm_model`'s docstring stops saying
   GGUF. Regenerate the Kotlin bindings; debug screen and bug reports show the runtime.
 - [ ] **Phone check:** fresh install and upgrade-over-GGUF on the Fold, each tier answers, debug

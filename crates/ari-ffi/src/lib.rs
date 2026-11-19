@@ -131,6 +131,22 @@ pub fn on_device_cpu_info() -> FfiCpuInfo {
     }
 }
 
+/// Which runtime the on-device assistant uses for the model file at
+/// `model_path`: "LiteRT-LM" for a .litertlm or .task file, "llama.cpp" for a
+/// GGUF (ari-android#52). Null in a build without the on-device assistant.
+#[uniffi::export]
+pub fn on_device_runtime(model_path: String) -> Option<String> {
+    #[cfg(feature = "llm")]
+    {
+        Some(ari_llm::runtime_name(std::path::Path::new(&model_path)).to_string())
+    }
+    #[cfg(not(feature = "llm"))]
+    {
+        let _ = model_path;
+        None
+    }
+}
+
 /// WASM-skill log level, mirrored from [`ari_skill_loader::LogLevel`] for
 /// the UniFFI boundary. The engine's own `LogLevel` isn't exportable
 /// directly because UniFFI types can't derive outside the FFI crate.
@@ -1634,7 +1650,8 @@ impl AriEngine {
 #[cfg(feature = "llm")]
 #[uniffi::export]
 impl AriEngine {
-    /// Set the GGUF model path for the LLM fallback. The model is NOT
+    /// Set the model file for the LLM fallback: a GGUF, which llama.cpp
+    /// runs, or a .litertlm or .task file, which LiteRT-LM runs. The model is NOT
     /// loaded immediately — it loads on demand when the first unmatched
     /// query arrives, and unloads after 60 seconds of idle to free RAM.
     ///
@@ -1679,7 +1696,8 @@ impl AriEngine {
 #[cfg(not(feature = "llm"))]
 #[uniffi::export]
 impl AriEngine {
-    /// Set the GGUF model path for the LLM fallback. The model is NOT
+    /// Set the model file for the LLM fallback: a GGUF, which llama.cpp
+    /// runs, or a .litertlm or .task file, which LiteRT-LM runs. The model is NOT
     /// loaded immediately — it loads on demand when the first unmatched
     /// query arrives, and unloads after 60 seconds of idle to free RAM.
     ///
@@ -1826,7 +1844,8 @@ mod uniffi_twin_guard {
         assert_eq!(sig, "load_llm_model(&self, model_path: String) -> bool");
         assert_eq!(
             doc,
-            "Set the GGUF model path for the LLM fallback. The model is NOT\n\
+            "Set the model file for the LLM fallback: a GGUF, which llama.cpp\n\
+             runs, or a .litertlm or .task file, which LiteRT-LM runs. The model is NOT\n\
              loaded immediately — it loads on demand when the first unmatched\n\
              query arrives, and unloads after 60 seconds of idle to free RAM.\n\
              \n\
