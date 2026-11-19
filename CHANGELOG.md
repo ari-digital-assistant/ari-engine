@@ -113,6 +113,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Remembering, forgetting or asking what Ari remembers now counts as conversation, so a
   run of them no longer ends in the conversation being forgotten mid-chat.
+- The on-device and cloud assistants get what the user said, not the text Ari cleans up
+  for its skills, which lowercases it and turns number words into digits: "who came
+  second?" reached the model as "who came 2", and it asked what was meant. "Ask Claude
+  …", a handoff and the conversation the assistants read back keep the user's words too.
 - Web search only runs when what was said starts with a search command ("search for X",
   "look up X", "can you google X"), and searches for everything after the command. A
   question with "find" or "search" in the middle, such as "where do you find them in

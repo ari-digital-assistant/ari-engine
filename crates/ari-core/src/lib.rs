@@ -147,7 +147,7 @@ pub struct SkillContext {
     /// must not reach for it there.
     pub raw_input: String,
     /// The user's latest question in the conversation Ari still remembers,
-    /// normalised, or empty when there is none. For a skill told to act on
+    /// as they said it, or empty when there is none. For a skill told to act on
     /// "it" or "that": "search for it" straight after a question searches
     /// for that question, not for the word "it". Populated for `execute`
     /// only, like [`raw_input`](SkillContext::raw_input).

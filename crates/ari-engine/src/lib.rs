@@ -1544,14 +1544,18 @@ impl Engine {
     }
 
     pub fn process_input_traced(&self, input: &str) -> (Response, Option<DebugTrace>) {
-        let normalized = normalize_input(input.trim(), &self.ctx.locale);
+        // The assistants, on-device and cloud, get the utterance as said, and
+        // so does the conversation they read back: normalised, "who came
+        // second?" is "who came 2", which a model can't make sense of.
+        let utterance = input.trim();
+        let normalized = normalize_input(utterance, &self.ctx.locale);
         let normalized = slash_command::expand(&normalized, &self.ctx.locale).unwrap_or(normalized);
         // Skills that quote the user verbatim need the utterance as spoken, and
         // normalisation is lossy in one direction only. Built once per turn and
         // handed to `execute`; scoring deliberately keeps the stored ctx, whose
         // `raw_input` stays empty.
         let mut exec_ctx = SkillContext {
-            raw_input: input.trim().to_string(),
+            raw_input: utterance.to_string(),
             ..self.ctx.clone()
         };
         if normalized.is_empty() {
@@ -1734,7 +1738,7 @@ impl Engine {
                 let resp = skill.execute_reply(&pending.context, &normalized, &exec_ctx);
                 // Route through the same chokepoint so a chained await_reply
                 // (the skill asks again) re-arms.
-                let resp = self.maybe_intercept_consult(skill, &normalized, resp);
+                let resp = self.maybe_intercept_consult(skill, utterance, resp);
                 return (resp, None);
             }
             return (
@@ -1768,7 +1772,8 @@ impl Engine {
             // The prompt actually sent is the remainder ("what is the capital
             // of morocco"), not the addressing wrapper, so that's what goes in
             // the transcript.
-            let response = self.ask_named_assistant(m.binding, &m.remainder, &history, &facts, &personality);
+            let prompt = m.prompt_in(utterance, &self.ctx.locale);
+            let response = self.ask_named_assistant(m.binding, &prompt, &history, &facts, &personality);
             return (response, Some(trace));
         }
 
@@ -1793,7 +1798,7 @@ impl Engine {
                 .clone();
 
             let response = skill.execute(&normalized, &exec_ctx);
-            let response = self.maybe_intercept_consult(skill, &normalized, response);
+            let response = self.maybe_intercept_consult(skill, utterance, response);
             return (response, Some(trace));
         }
 
@@ -1824,7 +1829,7 @@ impl Engine {
             } else {
                 trace.winner = Some(format!("phrase:{}", winner.skill_id));
                 trace.round = Some(round_idx);
-                let response = self.maybe_intercept_consult(skill, &normalized, response);
+                let response = self.maybe_intercept_consult(skill, utterance, response);
                 return (response, Some(trace));
             }
         }
@@ -1870,7 +1875,7 @@ impl Engine {
             // call that either routes to a skill or answers directly, instead
             // of route-then-separate-answer. The combined prompt is English
             // only, so non-English keeps the translated two-step below.
-            match self.route_or_answer(&normalized, &history, &facts, &personality) {
+            match self.route_or_answer(utterance, &history, &facts, &personality) {
                 Ok(RouteOrAnswer::Skill(id)) => {
                     if let Some(skill) = self.skills.iter().find(|s| s.id() == id).cloned() {
                         self.log(
@@ -1885,14 +1890,14 @@ impl Engine {
                             );
                         } else {
                             trace.winner = Some(format!("router:assistant:{id}"));
-                            let response = self.maybe_intercept_consult(skill, &normalized, response);
+                            let response = self.maybe_intercept_consult(skill, utterance, response);
                             return (response, Some(trace));
                         }
                     }
                 }
                 Ok(RouteOrAnswer::Answer(text)) => {
                     let clean = plain_text::plain_text(&text);
-                    self.record_assistant_turn(&normalized, &clean);
+                    self.record_assistant_turn(utterance, &clean);
                     let label = match &self.active_assistant {
                         Some(ActiveAssistant::Api { skill_id, .. }) => {
                             self.note_cloud_assistant_used(skill_id);
@@ -1956,7 +1961,7 @@ impl Engine {
                         );
                     } else {
                         trace.winner = Some(format!("router:assistant:{picked_id}"));
-                        let response = self.maybe_intercept_consult(skill, &normalized, response);
+                        let response = self.maybe_intercept_consult(skill, utterance, response);
                         return (response, Some(trace));
                     }
                 }
@@ -2000,7 +2005,7 @@ impl Engine {
             let response = skill.execute(&normalized, &exec_ctx);
             if !Self::is_no_match_envelope(&response) {
                 trace.winner = Some(format!("fallback:{}", skill.id()));
-                let response = self.maybe_intercept_consult(skill, &normalized, response);
+                let response = self.maybe_intercept_consult(skill, utterance, response);
                 return (response, Some(trace));
             }
         }
@@ -2024,7 +2029,7 @@ impl Engine {
                         LogLevel::Info,
                         &format!(
                             "assistant:builtin: invoking llm.try_answer (input_len={})",
-                            normalized.len()
+                            utterance.len()
                         ),
                     );
                     let mut answer = self
@@ -2033,7 +2038,7 @@ impl Engine {
                         .map(answer_stream::AnswerStream::new);
                     let handoff_to = self.handoff_target();
                     let result = llm.try_answer(
-                        &normalized,
+                        utterance,
                         &catalog,
                         &self.ctx.locale,
                         *tier,
@@ -2053,7 +2058,7 @@ impl Engine {
                             if let Some(answer) = &answer {
                                 answer.finish(&clean);
                             }
-                            self.record_assistant_turn(&normalized, &clean);
+                            self.record_assistant_turn(utterance, &clean);
                             let preview: String = clean.chars().take(160).collect();
                             let runtime = llm.runtime().unwrap_or_else(|| "runtime unknown".to_string());
                             self.log(
@@ -2080,7 +2085,7 @@ impl Engine {
                             );
                             let text = match handoff_to {
                                 Some(binding) => {
-                                    self.set_pending_turn(HANDOFF_SENTINEL, format!("{}\n{normalized}", binding.skill_id));
+                                    self.set_pending_turn(HANDOFF_SENTINEL, format!("{}\n{utterance}", binding.skill_id));
                                     handoff_offer_for(&self.ctx.locale, &said, &assistant_display_name(&binding.skill_id))
                                 }
                                 None if said.is_empty() => not_sure_for(&self.ctx.locale).to_string(),
@@ -2121,7 +2126,7 @@ impl Engine {
                     config,
                     skill_id,
                     config_store.as_ref(),
-                    &normalized,
+                    utterance,
                     &self.ctx.locale,
                     &history,
                     &facts,
@@ -2131,7 +2136,7 @@ impl Engine {
                 ) {
                     Ok(text) if !text.is_empty() => {
                         let clean = plain_text::plain_text(&text);
-                        self.record_assistant_turn(&normalized, &clean);
+                        self.record_assistant_turn(utterance, &clean);
                         self.note_cloud_assistant_used(skill_id);
                         trace.winner = Some(format!("assistant:{skill_id}"));
                         return (Response::Text(clean), Some(trace));
@@ -3871,6 +3876,23 @@ mod tests {
     }
 
     #[test]
+    fn cloud_assistants_get_the_question_as_said() {
+        let stub = StubAssistant::start(vec!["Lando Norris.", "Max Verstappen."]);
+        let engine = engine_with_named_assistant(&stub);
+
+        engine.process_input_traced("Ask ChatGPT who won in São Paulo?");
+        engine.process_input_traced("Who came second?");
+
+        assert_eq!(
+            stub.messages(0).last(),
+            Some(&("user".to_string(), "who won in São Paulo?".to_string()))
+        );
+        let second = stub.messages(1);
+        assert_eq!(second[1], ("user".to_string(), "who won in São Paulo?".to_string()));
+        assert!(second[3].1.contains("\"Who came second?\""), "got {:?}", second[3].1);
+    }
+
+    #[test]
     fn named_assistant_answer_extends_the_transcript() {
         let stub = StubAssistant::start(vec!["Rabat.", "About 580,000 people."]);
         let engine = engine_with_named_assistant(&stub);
@@ -3896,10 +3918,12 @@ mod tests {
     // --- Handoff: the on-device model doesn't know, Ari offers a cloud one ---
 
     /// An on-device model that writes `raw`, a token at a time, and reports
-    /// it the way ari-llm parses it. Records the `handoff` flag of each call.
+    /// it the way ari-llm parses it. Records what each call was asked and
+    /// its `handoff` flag.
     #[cfg(feature = "llm")]
     struct UnsureFallback {
         raw: &'static str,
+        asked: Mutex<Vec<String>>,
         handoff: Mutex<Vec<bool>>,
     }
 
@@ -3907,7 +3931,7 @@ mod tests {
     impl ari_llm::Fallback for UnsureFallback {
         fn try_answer(
             &self,
-            _input: &str,
+            input: &str,
             _skills: &[ari_llm::SkillInfo],
             _locale: &str,
             _tier: ari_llm::BuiltinTier,
@@ -3917,6 +3941,7 @@ mod tests {
             _personality: &str,
             on_text: &mut dyn FnMut(&str),
         ) -> Option<ari_llm::FallbackResult> {
+            self.asked.lock().unwrap().push(input.to_string());
             self.handoff.lock().unwrap().push(handoff);
             for (at, c) in self.raw.char_indices() {
                 on_text(&self.raw[..at + c.len_utf8()]);
@@ -3960,7 +3985,7 @@ mod tests {
     #[cfg(feature = "llm")]
     fn engine_offering_claude(stub: &StubAssistant, raw: &'static str) -> (Engine, Arc<UnsureFallback>) {
         let mut engine = Engine::new();
-        let llm = Arc::new(UnsureFallback { raw, handoff: Mutex::new(Vec::new()) });
+        let llm = Arc::new(UnsureFallback { raw, asked: Mutex::new(Vec::new()), handoff: Mutex::new(Vec::new()) });
         engine.set_llm(llm.clone());
         engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Medium }));
         engine.set_named_assistants(vec![keyed_binding(CLAUDE, "claude", stub, Some("sk-test"))]);
@@ -4023,6 +4048,22 @@ mod tests {
 
     #[cfg(feature = "llm")]
     #[test]
+    fn the_model_and_the_handoff_get_the_question_as_said() {
+        let stub = StubAssistant::start(vec!["Oscar Piastri."]);
+        let (engine, llm) = engine_offering_claude(&stub, "QUERY: second place");
+        engine.process_input_traced("Who came second?");
+
+        engine.process_input_traced("yes");
+
+        assert_eq!(*llm.asked.lock().unwrap(), ["Who came second?"]);
+        assert_eq!(
+            stub.messages(0).last(),
+            Some(&("user".to_string(), "Who came second?".to_string()))
+        );
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
     fn no_drops_the_offer_without_asking() {
         let stub = StubAssistant::start(vec![]);
         let (engine, _) = engine_offering_claude(&stub, "QUERY: weather in Rome");
@@ -4053,7 +4094,11 @@ mod tests {
     fn handoff_is_off_by_default_and_says_it_is_not_sure() {
         let stub = StubAssistant::start(vec![]);
         let mut engine = Engine::new();
-        let llm = Arc::new(UnsureFallback { raw: "QUERY: weather in Rome", handoff: Mutex::new(Vec::new()) });
+        let llm = Arc::new(UnsureFallback {
+            raw: "QUERY: weather in Rome",
+            asked: Mutex::new(Vec::new()),
+            handoff: Mutex::new(Vec::new()),
+        });
         engine.set_llm(llm.clone());
         engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
         engine.set_named_assistants(vec![keyed_binding(CLAUDE, "claude", &stub, Some("sk-test"))]);

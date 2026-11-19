@@ -10,6 +10,7 @@
 //! likewise be lowercase ASCII alphanum + spaces (validated at manifest
 //! parse time in `ari_skill_loader::manifest::validate_alias`).
 
+use ari_core::normalize_input;
 use ari_skill_loader::assistant::ConfigStore;
 use ari_skill_loader::manifest::ApiConfig;
 use std::sync::Arc;
@@ -58,6 +59,24 @@ impl NamedAssistantBinding {
 pub struct NamedAssistantMatch<'a> {
     pub binding: &'a NamedAssistantBinding,
     pub remainder: String,
+    /// How many words of the normalised utterance came before the prompt.
+    prompt_at: usize,
+}
+
+impl NamedAssistantMatch<'_> {
+    /// The prompt in the user's own words, taken from `said`, the utterance
+    /// before normalisation: "Ask Claude who came second?" asks "who came
+    /// second?", where the remainder is "who came 2". It starts at the first
+    /// word of `said` past the addressing words once normalised, so words
+    /// that normalising drops or splits ("Hey , ask Claude") don't move it.
+    pub fn prompt_in(&self, said: &str, locale: &str) -> String {
+        let words: Vec<&str> = said.split_whitespace().collect();
+        (0..=words.len())
+            .rev()
+            .find(|&n| normalize_input(&words[..n].join(" "), locale).split_whitespace().count() == self.prompt_at)
+            .map(|n| words[n..].join(" "))
+            .unwrap_or_else(|| self.remainder.clone())
+    }
 }
 
 /// Try to match `normalized` against any of `bindings`. Returns
@@ -77,10 +96,11 @@ pub fn match_named<'a>(
 
     for binding in bindings {
         for alias in &binding.aliases {
-            if let Some(remainder) = try_match_alias(&words, alias) {
+            if let Some(prompt_at) = try_match_alias(&words, alias) {
                 return Some(NamedAssistantMatch {
                     binding,
-                    remainder,
+                    remainder: words[prompt_at..].join(" "),
+                    prompt_at,
                 });
             }
         }
@@ -88,15 +108,15 @@ pub fn match_named<'a>(
     None
 }
 
-/// Try one alias against the tokenised input. Returns the remainder
-/// (joined with single spaces) when matched, or `None`. Allows:
+/// Try one alias against the tokenised input. Returns where the remainder
+/// starts when matched, or `None`. Allows:
 ///
 /// 1. Optional leading fluff words (any number — "hey", "can", "you" …).
 /// 2. Optional single verb ("ask", "tell", "use", "get").
 /// 3. The alias itself (1+ tokens, must match consecutively).
 /// 4. Optional connector ("to", "for", "about").
 /// 5. Non-empty prompt remainder.
-fn try_match_alias(words: &[&str], alias: &str) -> Option<String> {
+fn try_match_alias(words: &[&str], alias: &str) -> Option<usize> {
     let alias_tokens: Vec<&str> = alias.split_whitespace().collect();
     if alias_tokens.is_empty() {
         return None;
@@ -124,10 +144,7 @@ fn try_match_alias(words: &[&str], alias: &str) -> Option<String> {
         idx += 1;
     }
 
-    if idx >= words.len() {
-        return None;
-    }
-    Some(words[idx..].join(" "))
+    (idx < words.len()).then_some(idx)
 }
 
 #[cfg(test)]
@@ -219,6 +236,23 @@ mod tests {
         let bindings = vec![make_binding("claude", &["claude"])];
         let m = match_named("ask claude about quantum computing", &bindings).unwrap();
         assert_eq!(m.remainder, "quantum computing");
+    }
+
+    #[test]
+    fn prompt_in_keeps_the_words_as_said() {
+        let bindings = vec![make_binding("claude", &["claude"])];
+        let said = "Hey, ask Claude who came second?";
+        let m = match_named(&normalize_input(said, "en"), &bindings).unwrap();
+        assert_eq!(m.remainder, "who came 2");
+        assert_eq!(m.prompt_in(said, "en"), "who came second?");
+    }
+
+    #[test]
+    fn prompt_in_skips_words_normalising_drops() {
+        let bindings = vec![make_binding("chatgpt", &["chat gpt"])];
+        let said = "Hey , tell Chat GPT to write a haiku!";
+        let m = match_named(&normalize_input(said, "en"), &bindings).unwrap();
+        assert_eq!(m.prompt_in(said, "en"), "write a haiku!");
     }
 
     #[test]
