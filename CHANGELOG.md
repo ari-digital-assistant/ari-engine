@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "llama.cpp", for the host's diagnostics; `load_llm_model`'s description no longer says
   the model must be a GGUF
   ([ari-android#52](https://github.com/ari-digital-assistant/ari-android/issues/52)).
+- `load_llm_model(model_path, use_gpu)` runs a LiteRT-LM model on the GPU when asked,
+  falling back to the CPU when the GPU won't load it. The answer log line names what ran
+  it ("LiteRT-LM GPU", or the CPU with the GPU's error)
+  ([ari-android#52](https://github.com/ari-digital-assistant/ari-android/issues/52)).
 - A personality for assistant answers: the user's own description of how Ari should
   talk, added to the on-device and cloud assistants' instructions after Ari's own rules
   ([ari-android#31](https://github.com/ari-digital-assistant/ari-android/issues/31)).

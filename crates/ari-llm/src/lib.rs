@@ -101,11 +101,26 @@ pub trait Fallback: Send + Sync {
         None
     }
 
+    /// What runs the loaded model, for logs: "llama.cpp", "LiteRT-LM GPU",
+    /// "LiteRT-LM CPU", or the CPU with the reason the GPU didn't load.
+    /// None while nothing is loaded. Default `None`, for impls with no model.
+    fn runtime(&self) -> Option<String> {
+        None
+    }
+
     /// Drop the model's weights from memory but stay ready: the next
     /// question loads them again. For the phone running short of memory,
     /// where removing the fallback would switch the assistant off.
     /// Default does nothing, for impls that hold no model.
     fn release_memory(&self) {}
+}
+
+/// Where LiteRT-LM runs the model. llama.cpp always uses the CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Accelerator {
+    Cpu,
+    /// Falls back to the CPU when the GPU won't load the model.
+    Gpu,
 }
 
 /// Size classification of the loaded built-in model. Layer C uses this to
@@ -227,13 +242,20 @@ fn shared_backend() -> Result<&'static LlamaBackend, LlmError> {
 }
 
 impl LoadedModel {
-    fn load(model_path: &Path) -> Result<Self, LlmError> {
+    fn load(model_path: &Path, accelerator: Accelerator) -> Result<Self, LlmError> {
         if litert::handles(model_path) {
-            litert::LoadedModel::load(model_path, CONTEXT_TOKENS)
+            litert::LoadedModel::load(model_path, CONTEXT_TOKENS, accelerator)
                 .map(Self::LiteRt)
                 .map_err(LlmError::Model)
         } else {
             LlamaLoaded::load(model_path).map(Self::Llama)
+        }
+    }
+
+    fn runtime(&self) -> String {
+        match self {
+            LoadedModel::Llama(_) => "llama.cpp".to_string(),
+            LoadedModel::LiteRt(model) => model.runtime().to_string(),
         }
     }
 
@@ -430,6 +452,7 @@ impl LlamaLoaded {
 /// freed. The next miss reloads it (cold start ~1-2 s on phone).
 pub struct LazyLlmFallback {
     model_path: PathBuf,
+    accelerator: Accelerator,
     /// Shared with the idle-eviction timers, which hold it weakly.
     inner: Arc<Mutex<LazyState>>,
     /// Last error from a `try_answer` or `run_prompt` failure, surfaced
@@ -453,11 +476,12 @@ unsafe impl Sync for LazyLlmFallback {}
 unsafe impl Send for LazyState {}
 
 impl LazyLlmFallback {
-    /// Create a lazy fallback that will load from `model_path` on first use.
-    /// This is cheap — no model loading happens here.
-    pub fn new(model_path: &Path) -> Self {
+    /// Create a lazy fallback that will load from `model_path` on first use,
+    /// on `accelerator`. This is cheap — no model loading happens here.
+    pub fn new(model_path: &Path, accelerator: Accelerator) -> Self {
         LazyLlmFallback {
             model_path: model_path.to_path_buf(),
+            accelerator,
             inner: Arc::new(Mutex::new(LazyState {
                 loaded: None,
                 last_used: None,
@@ -535,7 +559,7 @@ impl Fallback for LazyLlmFallback {
         }
 
         if state.loaded.is_none() {
-            let loaded = LoadedModel::load(&self.model_path)?;
+            let loaded = LoadedModel::load(&self.model_path, self.accelerator)?;
             state.loaded = Some(loaded);
         }
 
@@ -620,7 +644,7 @@ impl Fallback for LazyLlmFallback {
 
         // Load on demand.
         if state.loaded.is_none() {
-            match LoadedModel::load(&self.model_path) {
+            match LoadedModel::load(&self.model_path, self.accelerator) {
                 Ok(m) => state.loaded = Some(m),
                 Err(e) => {
                     self.record_error(format!(
@@ -675,6 +699,10 @@ impl Fallback for LazyLlmFallback {
         self.last_error.lock().ok().and_then(|g| g.clone())
     }
 
+    fn runtime(&self) -> Option<String> {
+        self.inner.lock().ok()?.loaded.as_ref().map(LoadedModel::runtime)
+    }
+
     fn release_memory(&self) {
         self.unload();
     }
@@ -693,15 +721,19 @@ unsafe impl Send for LlmFallback {}
 unsafe impl Sync for LlmFallback {}
 
 impl LlmFallback {
-    pub fn load(model_path: &Path) -> Result<Self, LlmError> {
+    pub fn load(model_path: &Path, accelerator: Accelerator) -> Result<Self, LlmError> {
         Ok(LlmFallback {
-            loaded: LoadedModel::load(model_path)?,
+            loaded: LoadedModel::load(model_path, accelerator)?,
             inference_lock: Mutex::new(()),
         })
     }
 }
 
 impl Fallback for LlmFallback {
+    fn runtime(&self) -> Option<String> {
+        Some(self.loaded.runtime())
+    }
+
     fn run_prompt(&self, prompt: &str) -> Result<String, LlmError> {
         let _guard = self
             .inference_lock
@@ -1292,7 +1324,7 @@ mod tests {
     }
 
     fn lazy_marked_used() -> (LazyLlmFallback, Instant) {
-        let lazy = LazyLlmFallback::new(Path::new("/nonexistent/model.gguf"));
+        let lazy = LazyLlmFallback::new(Path::new("/nonexistent/model.gguf"), Accelerator::Cpu);
         let used_at = Instant::now();
         lazy.inner.lock().unwrap().last_used = Some(used_at);
         (lazy, used_at)
@@ -1345,7 +1377,7 @@ mod tests {
             eprintln!("Model not found at {model_path}, skipping");
             return;
         }
-        let lazy = LazyLlmFallback::new(path);
+        let lazy = LazyLlmFallback::new(path, Accelerator::Cpu);
         let ask = || lazy.try_answer("What's the capital of France?", &[], "en", BuiltinTier::Small, &[], &[], "", &mut |_| {});
         assert!(ask().is_some(), "{:?}", lazy.last_error());
         assert!(lazy.is_loaded());
@@ -1365,7 +1397,8 @@ mod tests {
             return None;
         }
         let tier = std::env::var("LLM_TEST_TIER").unwrap_or_else(|_| "small".to_string());
-        Some((LazyLlmFallback::new(Path::new(&model_path)), BuiltinTier::parse(&tier).expect("LLM_TEST_TIER")))
+        let accelerator = if std::env::var("LLM_TEST_GPU").is_ok() { Accelerator::Gpu } else { Accelerator::Cpu };
+        Some((LazyLlmFallback::new(Path::new(&model_path), accelerator), BuiltinTier::parse(&tier).expect("LLM_TEST_TIER")))
     }
 
     fn answer_of(result: Option<FallbackResult>, lazy: &LazyLlmFallback) -> String {
@@ -1421,7 +1454,7 @@ mod tests {
         }
 
         eprintln!("Loading model from {model_path}...");
-        let fallback = LlmFallback::load(path).expect("failed to load model");
+        let fallback = LlmFallback::load(path, Accelerator::Cpu).expect("failed to load model");
         let LoadedModel::Llama(model) = &fallback.loaded else {
             eprintln!("real_model_debug_output shows llama.cpp's prompt; {model_path} isn't a GGUF, skipping");
             return;

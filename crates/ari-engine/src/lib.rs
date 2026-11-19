@@ -1868,10 +1868,11 @@ impl Engine {
                             }
                             self.record_assistant_turn(&normalized, &clean);
                             let preview: String = clean.chars().take(160).collect();
+                            let runtime = llm.runtime().unwrap_or_else(|| "runtime unknown".to_string());
                             self.log(
                                 LogLevel::Info,
                                 &format!(
-                                    "assistant:builtin: try_answer returned answer ({} bytes): {preview:?}",
+                                    "assistant:builtin: try_answer returned answer ({} bytes, {runtime}): {preview:?}",
                                     clean.len()
                                 ),
                             );

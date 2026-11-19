@@ -18,7 +18,7 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::Path;
 use std::sync::{mpsc, OnceLock};
 
-use crate::Generation;
+use crate::{Accelerator, Generation};
 
 /// Model files LiteRT-LM runs: its own `.litertlm`, and MediaPipe's older
 /// `.task`, which it also loads. Small ships as `.task`: Google's
@@ -177,9 +177,12 @@ impl Drop for Owned {
     }
 }
 
-/// A model loaded into LiteRT-LM on the CPU, ready for questions.
+/// A model loaded into LiteRT-LM, ready for questions.
 pub(crate) struct LoadedModel {
     api: &'static Api,
+    /// What it runs on, for logs: "LiteRT-LM GPU", "LiteRT-LM CPU", or the
+    /// CPU with the reason the GPU didn't load.
+    runtime: String,
     // Field order is drop order: the engine before the settings it was made from.
     engine: Owned,
     _settings: Owned,
@@ -187,14 +190,24 @@ pub(crate) struct LoadedModel {
 
 impl LoadedModel {
     /// Load the model at `path`, allowing `context_tokens` for a prompt and
-    /// its answer together.
-    pub(crate) fn load(path: &Path, context_tokens: usize) -> Result<Self, String> {
+    /// its answer together, on `accelerator`. A model the GPU won't load
+    /// goes on the CPU instead, and [`Self::runtime`] says why.
+    pub(crate) fn load(path: &Path, context_tokens: usize, accelerator: Accelerator) -> Result<Self, String> {
+        match accelerator {
+            Accelerator::Cpu => Self::load_on(path, context_tokens, c"cpu", "LiteRT-LM CPU".into()),
+            Accelerator::Gpu => Self::load_on(path, context_tokens, c"gpu", "LiteRT-LM GPU".into()).or_else(|gpu| {
+                Self::load_on(path, context_tokens, c"cpu", format!("LiteRT-LM CPU (GPU failed: {gpu})"))
+            }),
+        }
+    }
+
+    fn load_on(path: &Path, context_tokens: usize, backend: &CStr, runtime: String) -> Result<Self, String> {
         let api = api()?;
         let model = CString::new(path.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
         // SAFETY (all calls below): arguments are live handles from this
         // library, NUL-terminated strings, or valid out-pointers.
         let settings = Owned::create(api, "engine_settings_create", api.engine_settings_delete, |out| unsafe {
-            (api.engine_settings_create)(model.as_ptr(), c"cpu".as_ptr(), std::ptr::null(), std::ptr::null(), out)
+            (api.engine_settings_create)(model.as_ptr(), backend.as_ptr(), std::ptr::null(), std::ptr::null(), out)
         })?;
         api.check("engine_settings_set_max_num_tokens", unsafe {
             (api.engine_settings_set_max_num_tokens)(settings.handle, context_tokens as c_int)
@@ -203,7 +216,11 @@ impl LoadedModel {
             (api.engine_create)(settings.handle, out)
         })?;
         remove_stale_caches(path);
-        Ok(LoadedModel { api, engine, _settings: settings })
+        Ok(LoadedModel { api, runtime, engine, _settings: settings })
+    }
+
+    pub(crate) fn runtime(&self) -> &str {
+        &self.runtime
     }
 
     /// How many tokens `text` takes, without the start token the tokenizer

@@ -202,10 +202,11 @@ Built 2026-11-19, awaiting the phone check. Notes from doing it:
 
 ### Phase 4: GPU option
 
-- [ ] **Task 10:** declare `<uses-native-library android:name="libOpenCL.so" android:required="false"/>`
+- [x] **Task 10:** declare `<uses-native-library android:name="libOpenCL.so" android:required="false"/>`
   and the same for `libvndksupport.so` in the manifest; without them an app cannot open the
   vendor OpenCL driver (the shell test didn't need them).
-- [ ] **Task 11:** `load_llm_model` takes the accelerator; a setting in the on-device model screen,
+- [x] **Task 11:** `load_llm_model` takes the accelerator (`use_gpu`; the engine's answer log line
+  names what ran it, "LiteRT-LM GPU" or the CPU with the GPU's error); a setting in the on-device model screen,
   off by default. If the GPU engine fails to load, fall back to CPU and record why in `last_error`.
 - [ ] **Phone check:** GPU on the Fold answers and the debug screen says GPU.
 

@@ -106,7 +106,7 @@ fn main() -> ExitCode {
         if parsed.debug {
             eprintln!("[ari] loading LLM model: {}", model_path.display());
         }
-        match ari_llm::LlmFallback::load(model_path) {
+        match ari_llm::LlmFallback::load(model_path, ari_llm::Accelerator::Cpu) {
             Ok(llm) => {
                 engine.set_llm(std::sync::Arc::new(llm));
                 if parsed.debug {

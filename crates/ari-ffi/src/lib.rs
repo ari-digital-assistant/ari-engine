@@ -1651,18 +1651,20 @@ impl AriEngine {
 #[uniffi::export]
 impl AriEngine {
     /// Set the model file for the LLM fallback: a GGUF, which llama.cpp
-    /// runs, or a .litertlm or .task file, which LiteRT-LM runs. The model is NOT
+    /// runs, or a .litertlm or .task file, which LiteRT-LM runs, on the GPU
+    /// when `use_gpu` is set and the GPU loads it, else on the CPU. The model is NOT
     /// loaded immediately — it loads on demand when the first unmatched
     /// query arrives, and unloads after 60 seconds of idle to free RAM.
     ///
     /// Returns `true` if the path exists, `false` otherwise.
     /// Call at app startup if a model file is available on disk.
-    pub fn load_llm_model(&self, model_path: String) -> bool {
+    pub fn load_llm_model(&self, model_path: String, use_gpu: bool) -> bool {
         let path = std::path::Path::new(&model_path);
         if !path.is_file() {
             return false;
         }
-        let lazy = ari_llm::LazyLlmFallback::new(path);
+        let accelerator = if use_gpu { ari_llm::Accelerator::Gpu } else { ari_llm::Accelerator::Cpu };
+        let lazy = ari_llm::LazyLlmFallback::new(path, accelerator);
         let mut engine = self.inner.lock().expect("engine mutex poisoned");
         engine.set_llm(std::sync::Arc::new(lazy));
         true
@@ -1697,14 +1699,15 @@ impl AriEngine {
 #[uniffi::export]
 impl AriEngine {
     /// Set the model file for the LLM fallback: a GGUF, which llama.cpp
-    /// runs, or a .litertlm or .task file, which LiteRT-LM runs. The model is NOT
+    /// runs, or a .litertlm or .task file, which LiteRT-LM runs, on the GPU
+    /// when `use_gpu` is set and the GPU loads it, else on the CPU. The model is NOT
     /// loaded immediately — it loads on demand when the first unmatched
     /// query arrives, and unloads after 60 seconds of idle to free RAM.
     ///
     /// Returns `true` if the path exists, `false` otherwise.
     /// Call at app startup if a model file is available on disk.
-    pub fn load_llm_model(&self, model_path: String) -> bool {
-        let _ = model_path;
+    pub fn load_llm_model(&self, model_path: String, use_gpu: bool) -> bool {
+        let _ = (model_path, use_gpu);
         false
     }
 
@@ -1841,11 +1844,12 @@ mod uniffi_twin_guard {
         let with = methods(block(LLM_MARKER));
         let (name, sig, doc) = &with[0];
         assert_eq!(name, "load_llm_model");
-        assert_eq!(sig, "load_llm_model(&self, model_path: String) -> bool");
+        assert_eq!(sig, "load_llm_model(&self, model_path: String, use_gpu: bool) -> bool");
         assert_eq!(
             doc,
             "Set the model file for the LLM fallback: a GGUF, which llama.cpp\n\
-             runs, or a .litertlm or .task file, which LiteRT-LM runs. The model is NOT\n\
+             runs, or a .litertlm or .task file, which LiteRT-LM runs, on the GPU\n\
+             when `use_gpu` is set and the GPU loads it, else on the CPU. The model is NOT\n\
              loaded immediately — it loads on demand when the first unmatched\n\
              query arrives, and unloads after 60 seconds of idle to free RAM.\n\
              \n\
