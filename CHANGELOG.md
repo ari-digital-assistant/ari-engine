@@ -21,9 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assistant skill's optional `web_search` block names the provider's search tool and
   whatever the search call needs that differs from the skill's own call (endpoint,
   request format, auth header, response path, instructions); older engines ignore it.
-  `call_assistant_api` takes a `web_search` flag: answers turn it on, as does the
-  one-shot call that may answer or hand off to a skill, while skill routing and
-  `consult_assistant` round trips leave it off. Two request formats come with it:
+  `call_assistant_api` takes a `WebSearch`: answers allow a search, as does the one-shot
+  call that may answer or hand off to a skill, while skill routing and
+  `consult_assistant` round trips leave it off. A handoff requires one: the assistant is
+  told to search before it answers, and OpenAI's Responses API gets a forced
+  `tool_choice` (Anthropic's current models reject one and Gemini has none). Two request
+  formats come with it:
   `openai_responses` (OpenAI's Responses API, sent without `temperature`, which its
   current models reject, and with `store: false`) and `gemini` (`generateContent`). An
   endpoint's `{model}` becomes the model ID. An answer that arrives in pieces is put
@@ -33,11 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Handoff: with `set_handoff_enabled(true)`, the on-device assistant writes `QUERY:` and
   the question instead of answering when it doesn't know or the question needs live
   information, and Ari asks "Would you like me to ask Claude?". Yes sends the user's own
-  words, with the conversation, to that cloud assistant; no drops it; anything else is a
-  new request. It offers the cloud assistant that answered last, else the first with an
-  API key, and none without a key. `handoff_assistants()` lists the ones it could offer,
-  `last_cloud_assistant()` and `set_last_cloud_assistant()` let a frontend keep the last
-  one across restarts. The marker and its question are never shown or spoken.
+  words, with the conversation, to that cloud assistant, which must search the web for
+  the answer; no drops it; anything else is a new request. It offers the cloud assistant
+  that answered last, else the first with an API key, and none without a key.
+  `handoff_assistants()` lists the ones it could offer, `last_cloud_assistant()` and
+  `set_last_cloud_assistant()` let a frontend keep the last one across restarts. The
+  marker and its question are never shown or spoken.
 - Typed `/` commands for Ari's built-in phrases: `/clear`, `/remember …`, `/forget …`,
   `/forget-all` and `/recall` run exactly what saying "clear history", "remember …",
   "forget …", "forget everything about me" and "what do you remember about me" runs. The

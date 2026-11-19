@@ -2,7 +2,7 @@ use ari_core::{
     normalize_input, AppEntry, Response, Skill, SkillContext,
     Specificity,
 };
-use ari_skill_loader::assistant::{AssistantApiError, ConfigStore};
+use ari_skill_loader::assistant::{AssistantApiError, ConfigStore, WebSearch};
 use ari_skill_loader::manifest::ApiConfig;
 use ari_skill_loader::wasm::{LogLevel, LogSink};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -966,7 +966,9 @@ impl Engine {
             winner: Some(format!("named_assistant:{skill_id}")),
             round: None,
         };
-        Some((self.ask_named_assistant(binding, question, history, facts, personality), Some(trace)))
+        // Handed over because the on-device model judged it needs current
+        // information, so the assistant must look it up.
+        Some((self.ask_named_assistant(binding, question, history, facts, personality, WebSearch::Required), Some(trace)))
     }
 
     /// Put `prompt` to a named cloud assistant and answer with its reply, or
@@ -979,8 +981,9 @@ impl Engine {
         history: &[(String, String)],
         facts: &[String],
         personality: &str,
+        web_search: WebSearch,
     ) -> Response {
-        let outcome = dispatch_named_assistant(binding, prompt, &self.ctx.locale, history, facts, personality, self.model_catalog.as_deref(), |level, msg| {
+        let outcome = dispatch_named_assistant(binding, prompt, &self.ctx.locale, history, facts, personality, self.model_catalog.as_deref(), web_search, |level, msg| {
             self.log(level, msg)
         });
         match outcome {
@@ -1773,7 +1776,7 @@ impl Engine {
             // of morocco"), not the addressing wrapper, so that's what goes in
             // the transcript.
             let prompt = m.prompt_in(utterance, &self.ctx.locale);
-            let response = self.ask_named_assistant(m.binding, &prompt, &history, &facts, &personality);
+            let response = self.ask_named_assistant(m.binding, &prompt, &history, &facts, &personality, WebSearch::Allowed);
             return (response, Some(trace));
         }
 
@@ -2132,7 +2135,7 @@ impl Engine {
                     &facts,
                     &personality,
                     self.model_catalog.as_deref(),
-                    true,
+                    WebSearch::Allowed,
                 ) {
                     Ok(text) if !text.is_empty() => {
                         let clean = plain_text::plain_text(&text);
@@ -2183,7 +2186,7 @@ impl Engine {
         skill_catalog: &[(String, String, String)],
     ) -> Result<Option<String>, AssistantCallError> {
         let prompt = build_assistant_routing_prompt(input, skill_catalog, &self.ctx.locale);
-        let response = match self.call_active_assistant(&prompt, &[], &[], "", false) {
+        let response = match self.call_active_assistant(&prompt, &[], &[], "", WebSearch::Off) {
             Ok(response) => response,
             Err(e @ AssistantCallError::Terminal(_)) => return Err(e),
             Err(AssistantCallError::Transient(_)) => return Ok(None),
@@ -2214,7 +2217,7 @@ impl Engine {
         history: &[(String, String)],
         facts: &[String],
         personality: &str,
-        web_search: bool,
+        web_search: WebSearch,
     ) -> Result<String, AssistantCallError> {
         let fail = |reason: String| -> Result<String, AssistantCallError> {
             self.log(LogLevel::Warn, &format!("assistant: {reason}"));
@@ -2300,7 +2303,7 @@ impl Engine {
     ) -> Result<RouteOrAnswer, AssistantCallError> {
         let catalog = self.router_catalog();
         let prompt = build_combined_route_or_answer_prompt(input, &catalog);
-        let response = self.call_active_assistant(&prompt, history, facts, personality, true)?;
+        let response = self.call_active_assistant(&prompt, history, facts, personality, WebSearch::Allowed)?;
         Ok(parse_combined_response(&response, &catalog))
     }
 
@@ -2678,6 +2681,7 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
     facts: &[String],
     personality: &str,
     catalog: Option<&ari_skill_loader::ModelCatalog>,
+    web_search: WebSearch,
     log: F,
 ) -> NamedAssistantOutcome {
     let display = assistant_display_name(&binding.skill_id);
@@ -2691,7 +2695,7 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
         facts,
         personality,
         catalog,
-        true,
+        web_search,
     ) {
         Ok(text) if !text.is_empty() => NamedAssistantOutcome::Answer(text),
         Ok(_) => {
@@ -3097,7 +3101,7 @@ fn call_assistant_for_consult(
                 &[],
                 "",
                 catalog,
-                false,
+                WebSearch::Off,
             )
             .map_err(|e| e.to_string())?;
             if text.trim().is_empty() {
@@ -3165,7 +3169,7 @@ fn call_assistant_for_consult(
                 &[],
                 "",
                 catalog,
-                false,
+                WebSearch::Off,
             )
             .map_err(|e| e.to_string())?;
             if text.trim().is_empty() {
@@ -4060,6 +4064,38 @@ mod tests {
             stub.messages(0).last(),
             Some(&("user".to_string(), "Who came second?".to_string()))
         );
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn a_handoff_must_search_and_asking_by_name_may() {
+        use ari_skill_loader::assistant::SEARCH_FIRST_INSTRUCTION;
+        use ari_skill_loader::manifest::WebSearchConfig;
+
+        let stub = StubAssistant::start(vec!["Oscar Piastri.", "Leaves fall softly."]);
+        let (mut engine, _) = engine_offering_claude(&stub, "QUERY: second place");
+        let mut claude = keyed_binding(CLAUDE, "claude", &stub, Some("sk-test"));
+        claude.config.web_search = Some(WebSearchConfig {
+            endpoint: None,
+            request_format: None,
+            auth: None,
+            auth_header: None,
+            response_path: None,
+            system_prompt: None,
+            tool: serde_json::json!({"type": "web_search"}),
+        });
+        engine.set_named_assistants(vec![claude]);
+
+        engine.process_input_traced("Who came second?");
+        engine.process_input_traced("yes");
+        engine.process_input_traced("ask claude for a haiku");
+
+        assert_eq!(stub.messages(0)[0].1, format!("You are Ari.\n\n{SEARCH_FIRST_INSTRUCTION}"));
+        let bodies = stub.bodies.lock().unwrap();
+        assert_eq!(bodies[0]["tools"], serde_json::json!([{"type": "web_search"}]));
+        assert_eq!(bodies[1]["tools"], serde_json::json!([{"type": "web_search"}]));
+        drop(bodies);
+        assert!(!stub.messages(1)[0].1.contains(SEARCH_FIRST_INSTRUCTION));
     }
 
     #[cfg(feature = "llm")]

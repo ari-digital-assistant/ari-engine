@@ -195,9 +195,31 @@ pub enum AssistantApiError {
 
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Call an assistant API and return the response text. With `web_search`, a
-/// skill that declares a `web_search` block may search the web first; leave
-/// it off for calls that want structured output rather than an answer.
+/// Whether an assistant call may search the web. Only a skill whose
+/// `web_search` block says how can; for any other, every call goes out as
+/// `Off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSearch {
+    /// Routing and structured replies: the skill's own call, without the tool.
+    Off,
+    /// An answer: the assistant searches when the question needs it.
+    Allowed,
+    /// A question the on-device model handed over because it needs current
+    /// information: the assistant is told to search before it answers, and
+    /// made to where the provider allows it.
+    Required,
+}
+
+/// Added to the instructions of a call that must search. Left to decide,
+/// ChatGPT answered a handed-over "who won the most recent Formula 1 race?"
+/// from memory, with a race from weeks before.
+pub const SEARCH_FIRST_INSTRUCTION: &str = "This question needs current information: \
+search the web before you answer, and answer from what you find.";
+
+/// Call an assistant API and return the response text. A skill that declares
+/// a `web_search` block may search the web first, as `web_search` allows;
+/// leave it `Off` for calls that want structured output rather than an
+/// answer.
 pub fn call_assistant_api(
     config: &ApiConfig,
     skill_id: &str,
@@ -208,9 +230,9 @@ pub fn call_assistant_api(
     facts: &[String],
     personality: &str,
     catalog: Option<&ModelCatalog>,
-    web_search: bool,
+    web_search: WebSearch,
 ) -> Result<String, AssistantApiError> {
-    let search = config.web_search.as_ref().filter(|_| web_search);
+    let search = config.web_search.as_ref().filter(|_| web_search != WebSearch::Off);
     let searching_config;
     let config = match search {
         Some(search) => {
@@ -229,7 +251,7 @@ pub fn call_assistant_api(
         history,
         facts,
         personality,
-        search.map(|s| &s.tool),
+        search.map(|s| (&s.tool, web_search)),
     );
 
     let tls_config = tls::webpki_roots_config();
@@ -420,7 +442,7 @@ fn build_request_body(
     history: &[(String, String)],
     facts: &[String],
     personality: &str,
-    tool: Option<&serde_json::Value>,
+    search: Option<(&serde_json::Value, WebSearch)>,
 ) -> String {
     // Two-tier locale handling for cloud assistants:
     //   1. If the skill ships a `system_prompt` translation for this
@@ -447,6 +469,10 @@ fn build_request_body(
         base_prompt.to_string()
     };
     let mut system_prompt = system_prompt;
+    let must_search = matches!(search, Some((_, WebSearch::Required)));
+    if must_search {
+        system_prompt = format!("{system_prompt}\n\n{SEARCH_FIRST_INSTRUCTION}");
+    }
     if !history.is_empty() {
         system_prompt = format!("{system_prompt}\n\n{}", ari_core::HISTORY_INSTRUCTION);
     }
@@ -533,8 +559,14 @@ fn build_request_body(
             })
         }
     };
-    if let Some(tool) = tool {
+    if let Some((tool, _)) = search {
         body["tools"] = serde_json::json!([tool]);
+    }
+    // Only OpenAI's Responses API can be made to call it. Anthropic's current
+    // models reject a forced `tool_choice` (HTTP 400) and Gemini has no way to
+    // force its search, so for those the instruction above is all there is.
+    if must_search && config.request_format == RequestFormat::OpenaiResponses {
+        body["tool_choice"] = serde_json::json!("required");
     }
     serde_json::to_string(&body).expect("json serialisation cannot fail")
 }
@@ -801,7 +833,7 @@ mod tests {
             &history,
             &[],
             "",
-            Some(&tool),
+            Some((&tool, WebSearch::Allowed)),
         );
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
@@ -837,7 +869,7 @@ mod tests {
             &history,
             &[],
             "",
-            Some(&tool),
+            Some((&tool, WebSearch::Allowed)),
         );
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
@@ -859,10 +891,58 @@ mod tests {
     fn an_anthropic_request_with_search_lists_the_tool() {
         let config = plain_config(RequestFormat::Anthropic);
         let tool = serde_json::json!({"type": "web_search_20250305", "name": "web_search", "max_uses": 3});
-        let body = build_request_body(&config, &resolved_for("claude-x", Vec::new()), "hi", "en", &[], &[], "", Some(&tool));
+        let body = build_request_body(&config, &resolved_for("claude-x", Vec::new()), "hi", "en", &[], &[], "", Some((&tool, WebSearch::Allowed)));
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["tools"], serde_json::json!([tool]));
         assert_eq!(parsed["system"], "No live data.");
+    }
+
+    #[test]
+    fn a_required_search_is_forced_on_the_responses_api() {
+        let config = plain_config(RequestFormat::OpenaiResponses);
+        let tool = serde_json::json!({"type": "web_search"});
+        let body = build_request_body(
+            &config,
+            &resolved_for("gpt-x", Vec::new()),
+            "who came second?",
+            "en",
+            &[],
+            &[],
+            "",
+            Some((&tool, WebSearch::Required)),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["instructions"], format!("No live data.\n\n{SEARCH_FIRST_INSTRUCTION}"));
+        assert_eq!(parsed["tools"], serde_json::json!([tool]));
+        assert_eq!(parsed["tool_choice"], "required");
+    }
+
+    #[test]
+    fn a_required_search_is_only_asked_for_where_it_cannot_be_forced() {
+        for (format, tool, instructions) in [
+            (RequestFormat::Anthropic, serde_json::json!({"type": "web_search_20250305", "name": "web_search"}), "/system"),
+            (RequestFormat::Gemini, serde_json::json!({"google_search": {}}), "/systemInstruction/parts/0/text"),
+        ] {
+            let config = plain_config(format);
+            let body = build_request_body(
+                &config,
+                &resolved_for("m", Vec::new()),
+                "who came second?",
+                "en",
+                &[],
+                &[],
+                "",
+                Some((&tool, WebSearch::Required)),
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                parsed.pointer(instructions),
+                Some(&serde_json::json!(format!("No live data.\n\n{SEARCH_FIRST_INSTRUCTION}"))),
+                "{format:?}"
+            );
+            assert_eq!(parsed["tools"], serde_json::json!([tool]), "{format:?}");
+            assert!(parsed.get("tool_choice").is_none(), "{format:?}");
+        }
     }
 
     #[test]
@@ -1392,7 +1472,7 @@ mod tests {
     #[test]
     #[ignore] // requires OPENAI_API_KEY env var
     fn chatgpt_real_api_call() {
-        let Some(answer) = ask_real_chatgpt("what is the capital of malta", false) else {
+        let Some(answer) = ask_real_chatgpt("what is the capital of malta", WebSearch::Off) else {
             return;
         };
         eprintln!("ChatGPT response: {answer}");
@@ -1402,7 +1482,7 @@ mod tests {
     #[test]
     #[ignore] // requires OPENAI_API_KEY env var
     fn chatgpt_real_api_call_with_web_search() {
-        let Some(answer) = ask_real_chatgpt("who won the most recent formula 1 grand prix?", true) else {
+        let Some(answer) = ask_real_chatgpt("who won the most recent formula 1 grand prix?", WebSearch::Allowed) else {
             return;
         };
         // A live answer can't be pinned down; this proves the Responses
@@ -1411,9 +1491,21 @@ mod tests {
         assert!(!answer.trim().is_empty());
     }
 
+    #[test]
+    #[ignore] // requires OPENAI_API_KEY env var
+    fn chatgpt_real_api_call_with_required_search() {
+        let Some(answer) = ask_real_chatgpt("who came second in the most recent formula 1 grand prix?", WebSearch::Required) else {
+            return;
+        };
+        // Proves OpenAI accepts the forced `tool_choice` with the skill's
+        // search tool on the model the catalog picks.
+        eprintln!("ChatGPT response: {answer}");
+        assert!(!answer.trim().is_empty());
+    }
+
     /// The answer the ChatGPT skill in a sibling ari-skills checkout gives,
     /// or `None` when there's no key to ask with.
-    fn ask_real_chatgpt(question: &str, web_search: bool) -> Option<String> {
+    fn ask_real_chatgpt(question: &str, web_search: WebSearch) -> Option<String> {
         let api_key = match std::env::var("OPENAI_API_KEY") {
             Ok(k) if !k.is_empty() => k,
             _ => {
