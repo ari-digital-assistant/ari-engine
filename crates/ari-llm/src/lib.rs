@@ -7,8 +7,12 @@
 //! The model uses a **lazy lifecycle**: it stays on disk until a query
 //! actually misses all skills, loads on demand (~1-2 s cold start), then
 //! unloads after 60 seconds of idle to free RAM.
+//!
+//! Two runtimes run it, picked by the model file: LiteRT-LM for `.litertlm`
+//! and `.task` files (see [`litert`]), llama.cpp for GGUF.
 
 mod cpu_build;
+mod litert;
 pub use cpu_build::{cpu_build, cpu_features, CpuBuild};
 
 use std::path::{Path, PathBuf};
@@ -137,9 +141,15 @@ impl std::error::Error for LlmError {}
 
 // ── Loaded model (internal) ─────────────────────────────────────────────
 
-/// A loaded GGUF model ready for inference. Held transiently by
-/// `LazyLlmFallback` and dropped when the idle timer fires.
-struct LoadedModel {
+/// A model loaded by one of the two runtimes, ready for inference. Held
+/// transiently by `LazyLlmFallback` and dropped when the idle timer fires.
+enum LoadedModel {
+    Llama(LlamaLoaded),
+    LiteRt(litert::LoadedModel),
+}
+
+/// A GGUF model loaded into llama.cpp.
+struct LlamaLoaded {
     model: LlamaModel,
 }
 
@@ -207,11 +217,65 @@ fn shared_backend() -> Result<&'static LlamaBackend, LlmError> {
 
 impl LoadedModel {
     fn load(model_path: &Path) -> Result<Self, LlmError> {
+        if litert::handles(model_path) {
+            litert::LoadedModel::load(model_path, CONTEXT_TOKENS)
+                .map(Self::LiteRt)
+                .map_err(LlmError::Model)
+        } else {
+            LlamaLoaded::load(model_path).map(Self::Llama)
+        }
+    }
+
+    /// The answer to `user` after as much of `history` as fits the context,
+    /// with the system prompt `system_for` gives for whether any history
+    /// is kept: the user-facing text, and the chat template's failure when
+    /// the prompt went out without it (llama.cpp only). The error is for
+    /// `last_error`.
+    fn answer(
+        &self,
+        system_for: &dyn Fn(bool) -> String,
+        history: &[(String, String)],
+        user: &str,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<(String, Option<String>), String> {
+        match self {
+            LoadedModel::Llama(model) => {
+                let wrap = |history: &[(String, String)]| {
+                    let system_prompt = system_for(!history.is_empty());
+                    match model.build_chat_prompt(&system_prompt, history, user) {
+                        Ok(p) => (p, None),
+                        Err(e) => (format!("{system_prompt}\n\nUser: {user}\n\nResponse: "), Some(e)),
+                    }
+                };
+                let history = fit_history(history, |h| {
+                    model.token_count(&wrap(h).0) + ANSWER_MAX_TOKENS <= CONTEXT_TOKENS
+                });
+                let (prompt, template_err) = wrap(history);
+                let generation = model
+                    .run_inference(&prompt, ANSWER_MAX_TOKENS, template_err.is_some(), on_text)
+                    .map_err(|e| format!("run_inference failed: {e}"))?;
+                Ok((answer_text(&generation), template_err))
+            }
+            LoadedModel::LiteRt(model) => {
+                let history = fit_history(history, |h| {
+                    model
+                        .prompt_tokens(&system_for(!h.is_empty()), h, user)
+                        .is_ok_and(|n| n + ANSWER_MAX_TOKENS <= CONTEXT_TOKENS)
+                });
+                let generation = model.generate(&system_for(!history.is_empty()), history, user, ANSWER_MAX_TOKENS, on_text)?;
+                Ok((answer_text(&generation), None))
+            }
+        }
+    }
+}
+
+impl LlamaLoaded {
+    fn load(model_path: &Path) -> Result<Self, LlmError> {
         let backend = shared_backend()?;
         let model_params = LlamaModelParams::default();
         let model = LlamaModel::load_from_file(backend, model_path, &model_params)
             .map_err(|e| LlmError::Model(e.to_string()))?;
-        Ok(LoadedModel { model })
+        Ok(LlamaLoaded { model })
     }
 
     /// Wrap the conversation in the model's own chat template, rendered with
@@ -467,32 +531,46 @@ impl Fallback for LazyLlmFallback {
         let now = Instant::now();
         state.last_used = Some(now);
 
-        let model = state.loaded.as_ref().unwrap();
-        let (wrapped, wrapping) = match model.build_chat_prompt("", &[], prompt) {
-            Ok(p) => (p, "native".to_string()),
-            Err(e) => {
-                // Neither minijinja nor llama.cpp's matcher could apply the
-                // GGUF's chat template. Last resort: Gemma 3's turn markers,
-                // the format of the Small tier. The tokenizer adds <bos>.
-                (
-                    format!("<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"),
-                    format!("manual_gemma ({e})"),
-                )
+        let output = match state.loaded.as_ref().unwrap() {
+            LoadedModel::Llama(model) => {
+                let (wrapped, wrapping) = match model.build_chat_prompt("", &[], prompt) {
+                    Ok(p) => (p, "native".to_string()),
+                    Err(e) => {
+                        // Neither minijinja nor llama.cpp's matcher could apply the
+                        // GGUF's chat template. Last resort: Gemma 3's turn markers,
+                        // the format of the Small tier. The tokenizer adds <bos>.
+                        (
+                            format!("<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"),
+                            format!("manual_gemma ({e})"),
+                        )
+                    }
+                };
+
+                let output = model.run_inference(&wrapped, MAX_GENERATION_TOKENS, false, &mut |_| {})?.text;
+
+                // Surface a diagnostic when the model produces zero tokens.
+                // Fold in whether the chat template applied and a head sample of
+                // the wrapped prompt so logcat can tell us which path is broken.
+                if output.is_empty() {
+                    let head: String = wrapped.chars().take(120).collect();
+                    return Err(LlmError::Backend(format!(
+                        "model emitted zero tokens; wrapping={wrapping}, wrapped_len={}, wrapped_head={head:?}",
+                        wrapped.len()
+                    )));
+                }
+                output
+            }
+            LoadedModel::LiteRt(model) => {
+                let output = model
+                    .generate("", &[], prompt, MAX_GENERATION_TOKENS, &mut |_| {})
+                    .map_err(LlmError::Context)?
+                    .text;
+                if output.is_empty() {
+                    return Err(LlmError::Backend("model emitted zero tokens".into()));
+                }
+                output
             }
         };
-
-        let output = model.run_inference(&wrapped, MAX_GENERATION_TOKENS, false, &mut |_| {})?.text;
-
-        // Surface a diagnostic when the model produces zero tokens.
-        // Fold in whether the chat template applied and a head sample of
-        // the wrapped prompt so logcat can tell us which path is broken.
-        if output.is_empty() {
-            let head: String = wrapped.chars().take(120).collect();
-            return Err(LlmError::Backend(format!(
-                "model emitted zero tokens; wrapping={wrapping}, wrapped_len={}, wrapped_head={head:?}",
-                wrapped.len()
-            )));
-        }
 
         let last_used_at = Instant::now();
         state.last_used = Some(last_used_at);
@@ -549,22 +627,11 @@ impl Fallback for LazyLlmFallback {
 
         let user_prompt = build_user_prompt(input);
         let model = state.loaded.as_ref().unwrap();
-        let wrap = |history: &[(String, String)]| {
-            let system_prompt = build_system_prompt(skills, locale, tier, !history.is_empty(), facts, personality);
-            match model.build_chat_prompt(&system_prompt, history, &user_prompt) {
-                Ok(p) => (p, None),
-                Err(e) => (format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "), Some(e)),
-            }
-        };
-        let history = fit_history(history, |h| {
-            model.token_count(&wrap(h).0) + ANSWER_MAX_TOKENS <= CONTEXT_TOKENS
-        });
-        let (prompt, template_err) = wrap(history);
-
-        let output = match model.run_inference(&prompt, ANSWER_MAX_TOKENS, template_err.is_some(), on_text) {
-            Ok(generation) => answer_text(&generation),
+        let system_for = |has_history| build_system_prompt(skills, locale, tier, has_history, facts, personality);
+        let (output, template_err) = match model.answer(&system_for, history, &user_prompt, on_text) {
+            Ok(answer) => answer,
             Err(e) => {
-                self.record_error(format!("run_inference failed: {e}"));
+                self.record_error(e);
                 return None;
             }
         };
@@ -621,20 +688,6 @@ impl LlmFallback {
             inference_lock: Mutex::new(()),
         })
     }
-
-    fn build_chat_prompt(&self, system: &str, history: &[(String, String)], user: &str) -> Result<String, String> {
-        self.loaded.build_chat_prompt(system, history, user)
-    }
-
-    fn run_inference(
-        &self,
-        prompt: &str,
-        max_tokens: usize,
-        stop_on_newline: bool,
-        on_text: &mut dyn FnMut(&str),
-    ) -> Result<Generation, LlmError> {
-        self.loaded.run_inference(prompt, max_tokens, stop_on_newline, on_text)
-    }
 }
 
 impl Fallback for LlmFallback {
@@ -644,11 +697,18 @@ impl Fallback for LlmFallback {
             .lock()
             .map_err(|_| LlmError::Backend("inference mutex poisoned".into()))?;
 
-        let wrapped = self
-            .build_chat_prompt("", &[], prompt)
-            .unwrap_or_else(|_| prompt.to_string());
-
-        self.run_inference(&wrapped, MAX_GENERATION_TOKENS, false, &mut |_| {}).map(|g| g.text)
+        match &self.loaded {
+            LoadedModel::Llama(model) => {
+                let wrapped = model
+                    .build_chat_prompt("", &[], prompt)
+                    .unwrap_or_else(|_| prompt.to_string());
+                model.run_inference(&wrapped, MAX_GENERATION_TOKENS, false, &mut |_| {}).map(|g| g.text)
+            }
+            LoadedModel::LiteRt(model) => model
+                .generate("", &[], prompt, MAX_GENERATION_TOKENS, &mut |_| {})
+                .map(|g| g.text)
+                .map_err(LlmError::Context),
+        }
     }
 
     fn try_answer(
@@ -669,18 +729,9 @@ impl Fallback for LlmFallback {
         let _guard = self.inference_lock.lock().ok()?;
 
         // `&[]`: facts recall is a no-op in this dev-harness impl (see `_facts`).
-        let system_prompt = build_system_prompt(skills, locale, tier, false, &[], "");
+        let system_for = |_| build_system_prompt(skills, locale, tier, false, &[], "");
         let user_prompt = build_user_prompt(input);
-
-        let (prompt, templated) = match self.build_chat_prompt(&system_prompt, &[], &user_prompt) {
-            Ok(p) => (p, true),
-            Err(_) => (format!("{system_prompt}\n\nUser: {user_prompt}\n\nResponse: "), false),
-        };
-
-        let output = match self.run_inference(&prompt, ANSWER_MAX_TOKENS, !templated, on_text) {
-            Ok(generation) => answer_text(&generation),
-            Err(_) => return None,
-        };
+        let (output, _) = self.loaded.answer(&system_for, &[], &user_prompt, on_text).ok()?;
 
         parse_output(&output, skills)
     }
@@ -1286,6 +1337,60 @@ mod tests {
         assert!(lazy.is_loaded());
     }
 
+    /// A lazy fallback over `LLM_TEST_MODEL` (a GGUF, or a `.litertlm` or
+    /// `.task` file, which also needs liblitert-lm.so on LD_LIBRARY_PATH)
+    /// and the tier `LLM_TEST_TIER` names, or `None` with no model there.
+    fn real_model() -> Option<(LazyLlmFallback, BuiltinTier)> {
+        let model_path = std::env::var("LLM_TEST_MODEL").unwrap_or_else(|_| "/tmp/gemma3-1b-q4.gguf".to_string());
+        if !Path::new(&model_path).exists() {
+            eprintln!("Model not found at {model_path}, skipping");
+            return None;
+        }
+        let tier = std::env::var("LLM_TEST_TIER").unwrap_or_else(|_| "small".to_string());
+        Some((LazyLlmFallback::new(Path::new(&model_path)), BuiltinTier::parse(&tier).expect("LLM_TEST_TIER")))
+    }
+
+    fn answer_of(result: Option<FallbackResult>, lazy: &LazyLlmFallback) -> String {
+        match result {
+            Some(FallbackResult::DirectAnswer { text }) => text,
+            None => panic!("no answer: {:?}", lazy.last_error()),
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn real_model_answers_and_streams() {
+        let Some((lazy, tier)) = real_model() else { return };
+        let mut streamed = String::new();
+        let result = lazy.try_answer("What's the capital of Australia?", &[], "en", tier, &[], &[], "", &mut |text| {
+            streamed = text.to_string()
+        });
+        let answer = answer_of(result, &lazy);
+        assert!(answer.contains("Canberra"), "{answer}");
+        assert_eq!(strip_thinking(&streamed), answer);
+    }
+
+    #[test]
+    #[ignore]
+    fn real_model_answers_from_the_history() {
+        let Some((lazy, tier)) = real_model() else { return };
+        let history = [
+            ("user".to_string(), "Please remember the number 4817.".to_string()),
+            ("assistant".to_string(), "Okay, I'll remember 4817.".to_string()),
+        ];
+        let result = lazy.try_answer("What number did I ask you to remember?", &[], "en", tier, &history, &[], "", &mut |_| {});
+        let answer = answer_of(result, &lazy);
+        assert!(answer.contains("4817"), "{answer}");
+    }
+
+    #[test]
+    #[ignore]
+    fn real_model_runs_a_bare_prompt() {
+        let Some((lazy, _)) = real_model() else { return };
+        let output = lazy.run_prompt("Reply with the single word yes, in lower case.").expect("run_prompt");
+        assert!(strip_thinking(&output).to_lowercase().contains("yes"), "{output}");
+    }
+
     #[test]
     #[ignore]
     fn real_model_debug_output() {
@@ -1299,6 +1404,10 @@ mod tests {
 
         eprintln!("Loading model from {model_path}...");
         let fallback = LlmFallback::load(path).expect("failed to load model");
+        let LoadedModel::Llama(model) = &fallback.loaded else {
+            eprintln!("real_model_debug_output shows llama.cpp's prompt; {model_path} isn't a GGUF, skipping");
+            return;
+        };
         eprintln!("Model loaded.");
 
         let skills = test_skills();
@@ -1310,7 +1419,7 @@ mod tests {
         eprintln!("--- User prompt ---");
         eprintln!("{user}");
 
-        let prompt = match fallback.build_chat_prompt(&system, &[], &user) {
+        let prompt = match model.build_chat_prompt(&system, &[], &user) {
             Ok(p) => {
                 eprintln!("--- Chat template applied ---");
                 eprintln!("{p}");
@@ -1325,7 +1434,7 @@ mod tests {
         };
 
         eprintln!("--- Running inference ---");
-        let generation = fallback
+        let generation = model
             .run_inference(&prompt, ANSWER_MAX_TOKENS, false, &mut |_| {})
             .expect("inference failed");
         eprintln!("--- Raw output (cut off: {}) ---", generation.cut_off);

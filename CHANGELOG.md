@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- LiteRT-LM as a second runtime for the on-device assistant, chosen by the model file:
+  `.litertlm` and `.task` files run on it, GGUF stays on llama.cpp. On a Pixel 10 Pro
+  Fold it answered the same questions 1.7 times sooner on Small, 2.8 on Medium and 2.1 on
+  Large, as accurately. It is opened at run time as `liblitert-lm.so`, which the host
+  ships, and keeps a repacked copy of the weights beside the model for fast loads,
+  removing older copies when the model file changes
+  ([ari-android#52](https://github.com/ari-digital-assistant/ari-android/issues/52)).
 - A personality for assistant answers: the user's own description of how Ari should
   talk, added to the on-device and cloud assistants' instructions after Ari's own rules
   ([ari-android#31](https://github.com/ari-digital-assistant/ari-android/issues/31)).

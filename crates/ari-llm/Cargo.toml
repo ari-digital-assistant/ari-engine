@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 ari-core = { path = "../ari-core" }
+libloading = "0.9.1"
 llama-cpp-2 = "0.1.161"
 minijinja = { version = "3.1.0", features = ["loop_controls"] }
 minijinja-contrib = { version = "3.1.0", features = ["pycompat"] }

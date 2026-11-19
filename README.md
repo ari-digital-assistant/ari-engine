@@ -24,7 +24,7 @@ Four tiers, cheapest first, and most utterances never get past the second:
 3. **The assistant routes** — a cloud assistant folds route-or-answer into one
    call; other configurations pick a skill id from the catalogue.
 4. **The assistant answers** — whatever routing left behind, answered directly
-   by the on-device GGUF model or a configured cloud provider.
+   by the on-device model or a configured cloud provider.
 
 The full pipeline, including wake word, speech-to-text and the retry ladder, is
 in **[docs/architecture.md](docs/architecture.md)**.
@@ -100,8 +100,9 @@ cargo run -p ari-cli -- --debug "what is 12 times 7"   # scoring trace on stderr
 ```
 
 Give it no utterance and it reads one per line from stdin. `--extra-skill-dir`
-sideloads a skill directory, `--llm-model <path.gguf>` wires up the on-device
-fallback, and `ari install` / `list` / `check-updates` / `update` drive the
+sideloads a skill directory, `--llm-model <path>` wires up the on-device
+fallback (a GGUF, or a `.litertlm` or `.task` file with `liblitert-lm.so` on
+`LD_LIBRARY_PATH`), and `ari install` / `list` / `check-updates` / `update` drive the
 skill store. `cargo run -p ari-cli -- --help` has the rest.
 
 ## How the frontends use it

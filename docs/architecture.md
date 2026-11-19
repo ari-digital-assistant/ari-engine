@@ -212,8 +212,9 @@ answered.
 If routing produced no skill (no phrase matched, or the assistant said
 "none"), the active assistant answers the question directly:
 
-- **Builtin** — on-device GGUF model (Gemma 3 1B default). One-sentence
-  general-knowledge answer. Lazy-loaded, 60s idle eviction.
+- **Builtin** — on-device model, run by LiteRT-LM for a `.litertlm` or `.task`
+  file and by llama.cpp for a GGUF. One-sentence general-knowledge answer.
+  Lazy-loaded, 60s idle eviction.
 - **API** — cloud provider (ChatGPT, Claude, Ollama, etc.) configured via a
   declarative `type: assistant` SKILL.md manifest. (For a cloud assistant the
   one-shot in step 5 already produced the answer in the same call.)

@@ -251,14 +251,14 @@ fn parse_args(args: Vec<String>) -> Result<ParsedArgs, String> {
             "--llm-model" => {
                 let value = iter
                     .next()
-                    .ok_or_else(|| "--llm-model requires a path to a GGUF model".to_string())?;
+                    .ok_or_else(|| "--llm-model requires a path to a model file".to_string())?;
                 parsed.llm_model = Some(PathBuf::from(value));
             }
             #[cfg(feature = "llm")]
             other_llm if other_llm.starts_with("--llm-model=") => {
                 let value = &other_llm["--llm-model=".len()..];
                 if value.is_empty() {
-                    return Err("--llm-model requires a path to a GGUF model".to_string());
+                    return Err("--llm-model requires a path to a model file".to_string());
                 }
                 parsed.llm_model = Some(PathBuf::from(value));
             }
@@ -355,7 +355,9 @@ fn print_usage() {
     }
     eprintln!("  --no-host-capabilities           grant the empty capability set; any skill with");
     eprintln!("                                   declared capabilities will be rejected at load.");
-    eprintln!("  --llm-model <path>               load a GGUF model for the LLM fallback.");
+    eprintln!("  --llm-model <path>               load a model for the LLM fallback: GGUF, or");
+    eprintln!("                                   .litertlm or .task (needs liblitert-lm.so on");
+    eprintln!("                                   LD_LIBRARY_PATH).");
     eprintln!("                                   when loaded, unmatched input is sent to the model");
     eprintln!("                                   for skill rerouting or direct QA before giving up.");
     eprintln!("  --storage-dir <path>             directory used for the WASM storage_kv per-skill");
