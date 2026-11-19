@@ -355,9 +355,8 @@ fn print_usage() {
     }
     eprintln!("  --no-host-capabilities           grant the empty capability set; any skill with");
     eprintln!("                                   declared capabilities will be rejected at load.");
-    eprintln!("  --llm-model <path>               load a model for the LLM fallback: GGUF, or");
-    eprintln!("                                   .litertlm or .task (needs liblitert-lm.so on");
-    eprintln!("                                   LD_LIBRARY_PATH).");
+    eprintln!("  --llm-model <path>               load a .litertlm or .task model for the LLM");
+    eprintln!("                                   fallback (needs liblitert-lm.so on LD_LIBRARY_PATH).");
     eprintln!("                                   when loaded, unmatched input is sent to the model");
     eprintln!("                                   for skill rerouting or direct QA before giving up.");
     eprintln!("  --storage-dir <path>             directory used for the WASM storage_kv per-skill");

@@ -40,13 +40,6 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
-      - name: Install llama.cpp build deps
-        run: |
-          sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
-          LIBCLANG_DIR="$(dirname "$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)")"
-          echo "Found libclang in: $LIBCLANG_DIR"
-          echo "LIBCLANG_PATH=$LIBCLANG_DIR" >> "$GITHUB_ENV"
-
       # keyword-hit's tests read the REAL community manifests rather than
       # fixtures — the oracle's correctness is a property of those manifests,
       # so a fixture would let the two drift apart — and resolve them as a

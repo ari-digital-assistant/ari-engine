@@ -97,53 +97,25 @@ pub fn engine_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-/// The on-device assistant's CPU code and the CPU it runs on, for bug
-/// reports and the debug screen.
+/// The CPU the on-device assistant runs on, for bug reports and the debug
+/// screen.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiCpuInfo {
-    /// Which build of llama.cpp's CPU code is loaded: "ARMv8.6", "ARMv8.2",
-    /// "ARMv8.0", or "built in" off Android arm64. Null when none would load,
-    /// or in a build without the on-device assistant.
-    pub build: Option<String>,
-    /// What that build uses, in words.
-    pub build_description: Option<String>,
-    /// The CPU features this device reports that llama.cpp can use.
+    /// The CPU features this device reports that LiteRT-LM's CPU kernels
+    /// can use.
     pub features: Vec<String>,
 }
 
-/// Which llama.cpp CPU build the on-device assistant runs on, loading it if
-/// no model has yet (a few MB, once per process), and this CPU's features
-/// (ari-android#32).
+/// This CPU's features (ari-android#32).
 #[uniffi::export]
 pub fn on_device_cpu_info() -> FfiCpuInfo {
     #[cfg(feature = "llm")]
     {
-        let build = ari_llm::cpu_build();
-        FfiCpuInfo {
-            build: build.as_ref().map(|b| b.name.clone()),
-            build_description: build.map(|b| b.description),
-            features: ari_llm::cpu_features(),
-        }
+        FfiCpuInfo { features: ari_llm::cpu_features() }
     }
     #[cfg(not(feature = "llm"))]
     {
-        FfiCpuInfo { build: None, build_description: None, features: Vec::new() }
-    }
-}
-
-/// Which runtime the on-device assistant uses for the model file at
-/// `model_path`: "LiteRT-LM" for a .litertlm or .task file, "llama.cpp" for a
-/// GGUF (ari-android#52). Null in a build without the on-device assistant.
-#[uniffi::export]
-pub fn on_device_runtime(model_path: String) -> Option<String> {
-    #[cfg(feature = "llm")]
-    {
-        Some(ari_llm::runtime_name(std::path::Path::new(&model_path)).to_string())
-    }
-    #[cfg(not(feature = "llm"))]
-    {
-        let _ = model_path;
-        None
+        FfiCpuInfo { features: Vec::new() }
     }
 }
 
@@ -1650,9 +1622,9 @@ impl AriEngine {
 #[cfg(feature = "llm")]
 #[uniffi::export]
 impl AriEngine {
-    /// Set the model file for the LLM fallback: a GGUF, which llama.cpp
-    /// runs, or a .litertlm or .task file, which LiteRT-LM runs, on the GPU
-    /// when `use_gpu` is set and the GPU loads it, else on the CPU. The model is NOT
+    /// Set the model file for the LLM fallback: a .litertlm or .task file,
+    /// which LiteRT-LM runs on the GPU when `use_gpu` is set and the GPU
+    /// loads it, else on the CPU. The model is NOT
     /// loaded immediately — it loads on demand when the first unmatched
     /// query arrives, and unloads after 60 seconds of idle to free RAM.
     ///
@@ -1691,16 +1663,15 @@ impl AriEngine {
 }
 
 /// Stubs for builds without the `llm` feature (e.g. the `keyword-hit`
-/// oracle, which must compile in containers with no libclang for
-/// `llama-cpp-sys`). Signatures match the real methods exactly; there is
+/// oracle the training pipeline builds). Signatures match the real methods exactly; there is
 /// no model to load, so loading always reports failure and unloading is a
 /// no-op.
 #[cfg(not(feature = "llm"))]
 #[uniffi::export]
 impl AriEngine {
-    /// Set the model file for the LLM fallback: a GGUF, which llama.cpp
-    /// runs, or a .litertlm or .task file, which LiteRT-LM runs, on the GPU
-    /// when `use_gpu` is set and the GPU loads it, else on the CPU. The model is NOT
+    /// Set the model file for the LLM fallback: a .litertlm or .task file,
+    /// which LiteRT-LM runs on the GPU when `use_gpu` is set and the GPU
+    /// loads it, else on the CPU. The model is NOT
     /// loaded immediately — it loads on demand when the first unmatched
     /// query arrives, and unloads after 60 seconds of idle to free RAM.
     ///
@@ -1847,9 +1818,9 @@ mod uniffi_twin_guard {
         assert_eq!(sig, "load_llm_model(&self, model_path: String, use_gpu: bool) -> bool");
         assert_eq!(
             doc,
-            "Set the model file for the LLM fallback: a GGUF, which llama.cpp\n\
-             runs, or a .litertlm or .task file, which LiteRT-LM runs, on the GPU\n\
-             when `use_gpu` is set and the GPU loads it, else on the CPU. The model is NOT\n\
+            "Set the model file for the LLM fallback: a .litertlm or .task file,\n\
+             which LiteRT-LM runs on the GPU when `use_gpu` is set and the GPU\n\
+             loads it, else on the CPU. The model is NOT\n\
              loaded immediately — it loads on demand when the first unmatched\n\
              query arrives, and unloads after 60 seconds of idle to free RAM.\n\
              \n\

@@ -54,23 +54,10 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-`ari-llm` wraps llama.cpp, so any build of it needs `cmake` and a `libclang`.
-Both are found automatically — bindgen locates the system libclang on its own,
-and there is nothing to configure for a host build.
-
-**Cross-compiling for Android additionally needs `ANDROID_NDK` set.**
-llama-cpp-sys-2's cmake path requires it explicitly and panics without it. Copy
-`.cargo/config.toml.example` to `.cargo/config.toml` and put your NDK path in
-it, or export the variable in your shell:
-
-```bash
-export ANDROID_NDK="$HOME/Android/Sdk/ndk/28.0.13004108"
-```
-
-`config.toml` is gitignored because cargo cannot expand `~` or `$HOME` — the
-value has to be a literal path, so a tracked one only ever works on one machine.
-The shell export takes precedence; the file exists so Android Studio, which may
-not inherit your shell environment, works too.
+`ari-llm` opens LiteRT-LM's `liblitert-lm.so` at run time rather than linking
+it, so building needs nothing of its own; running an on-device model needs the
+library on the loader's path. Cross-compiling for Android needs only the NDK's
+compilers, which Gradle's Rust plugin sets up.
 
 If `cmake` is not installed system-wide, the Android SDK ships one — put it on
 `PATH` rather than installing a second:
@@ -101,7 +88,7 @@ cargo run -p ari-cli -- --debug "what is 12 times 7"   # scoring trace on stderr
 
 Give it no utterance and it reads one per line from stdin. `--extra-skill-dir`
 sideloads a skill directory, `--llm-model <path>` wires up the on-device
-fallback (a GGUF, or a `.litertlm` or `.task` file with `liblitert-lm.so` on
+fallback (a `.litertlm` or `.task` file, with `liblitert-lm.so` on
 `LD_LIBRARY_PATH`), and `ari install` / `list` / `check-updates` / `update` drive the
 skill store. `cargo run -p ari-cli -- --help` has the rest.
 

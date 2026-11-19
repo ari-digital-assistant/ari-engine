@@ -8,36 +8,16 @@
 //! actually misses all skills, loads on demand (~1-2 s cold start), then
 //! unloads after 60 seconds of idle to free RAM.
 //!
-//! Two runtimes run it, picked by the model file: LiteRT-LM for `.litertlm`
-//! and `.task` files (see [`litert`]), llama.cpp for GGUF.
+//! LiteRT-LM runs it, from a `.litertlm` or `.task` file (see [`litert`]).
+//! llama.cpp, which ran GGUF files, went in ari-android#52.
 
-mod cpu_build;
+mod cpu;
 mod litert;
-pub use cpu_build::{cpu_build, cpu_features, CpuBuild};
-
-/// Which runtime runs the model file at `model_path`: "LiteRT-LM" for a
-/// `.litertlm` or `.task` file, "llama.cpp" for anything else (GGUF). For
-/// diagnostics.
-pub fn runtime_name(model_path: &Path) -> &'static str {
-    if litert::handles(model_path) {
-        "LiteRT-LM"
-    } else {
-        "llama.cpp"
-    }
-}
+pub use cpu::cpu_features;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{LlamaChatMessage, LlamaModel};
-use llama_cpp_2::sampling::LlamaSampler;
-use llama_cpp_2::token::LlamaToken;
-use llama_cpp_2::vocab::LlamaVocab;
 
 // ── Public types ────────────────────────────────────────────────────────
 
@@ -101,8 +81,8 @@ pub trait Fallback: Send + Sync {
         None
     }
 
-    /// What runs the loaded model, for logs: "llama.cpp", "LiteRT-LM GPU",
-    /// "LiteRT-LM CPU", or the CPU with the reason the GPU didn't load.
+    /// What runs the loaded model, for logs: "LiteRT-LM GPU", "LiteRT-LM
+    /// CPU", or the CPU with the reason the GPU didn't load.
     /// None while nothing is loaded. Default `None`, for impls with no model.
     fn runtime(&self) -> Option<String> {
         None
@@ -115,7 +95,7 @@ pub trait Fallback: Send + Sync {
     fn release_memory(&self) {}
 }
 
-/// Where LiteRT-LM runs the model. llama.cpp always uses the CPU.
+/// Where LiteRT-LM runs the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Accelerator {
     Cpu,
@@ -167,18 +147,6 @@ impl std::error::Error for LlmError {}
 
 // ── Loaded model (internal) ─────────────────────────────────────────────
 
-/// A model loaded by one of the two runtimes, ready for inference. Held
-/// transiently by `LazyLlmFallback` and dropped when the idle timer fires.
-enum LoadedModel {
-    Llama(LlamaLoaded),
-    LiteRt(litert::LoadedModel),
-}
-
-/// A GGUF model loaded into llama.cpp.
-struct LlamaLoaded {
-    model: LlamaModel,
-}
-
 /// Maximum number of tokens we allow the model to generate per call.
 /// Generous enough to fit Gemma 4's optional thinking mode preamble
 /// plus the structured JSON output Layer C asks for.
@@ -205,243 +173,35 @@ struct Generation {
 /// How long the model stays loaded after the last query.
 const IDLE_TIMEOUT_SECS: u64 = 60;
 
-/// Process-wide shared `LlamaBackend`. llama.cpp's backend is a global
-/// singleton — calling `LlamaBackend::init()` more than once fails
-/// with `BackendAlreadyInitialized`, which previously broke any path
-/// that loaded a second model after the first (e.g. the QA fallback's
-/// first invocation when another model was already resident). Shared
-/// access via `OnceLock` ensures every loader sees the same
-/// already-initialized backend.
-static SHARED_BACKEND: std::sync::OnceLock<LlamaBackend> = std::sync::OnceLock::new();
-
-fn shared_backend() -> Result<&'static LlamaBackend, LlmError> {
-    // Double-checked locking. `OnceLock::get_or_try_init` is still
-    // nightly-only, so we fall back to an explicit mutex-guarded
-    // init: fast path = lock-free read; slow path = serialise the
-    // first init across threads so we don't race two LlamaBackend
-    // creations.
-    static INIT_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    if let Some(b) = SHARED_BACKEND.get() {
-        return Ok(b);
+/// Load the model at `model_path` on `accelerator`. Only `.litertlm` and
+/// `.task` files: a GGUF from before ari-android#52 has to be replaced.
+fn load_model(model_path: &Path, accelerator: Accelerator) -> Result<litert::LoadedModel, LlmError> {
+    if !litert::handles(model_path) {
+        return Err(LlmError::Model(format!(
+            "{} isn't a .litertlm or .task file, the only models Ari runs: update the model",
+            model_path.display()
+        )));
     }
-    let _guard = INIT_MUTEX
-        .lock()
-        .map_err(|_| LlmError::Backend("backend init mutex poisoned".into()))?;
-    if let Some(b) = SHARED_BACKEND.get() {
-        return Ok(b);
-    }
-    // The CPU backend first: without one, llama.cpp has nothing to run on.
-    if cpu_build::ensure_loaded().is_none() {
-        return Err(LlmError::Backend("no llama.cpp CPU build would load on this device".into()));
-    }
-    let backend = LlamaBackend::init().map_err(|e| LlmError::Backend(e.to_string()))?;
-    let _ = SHARED_BACKEND.set(backend);
-    SHARED_BACKEND
-        .get()
-        .ok_or_else(|| LlmError::Backend("backend set race lost".into()))
+    litert::LoadedModel::load(model_path, CONTEXT_TOKENS, accelerator).map_err(LlmError::Model)
 }
 
-impl LoadedModel {
-    fn load(model_path: &Path, accelerator: Accelerator) -> Result<Self, LlmError> {
-        if litert::handles(model_path) {
-            litert::LoadedModel::load(model_path, CONTEXT_TOKENS, accelerator)
-                .map(Self::LiteRt)
-                .map_err(LlmError::Model)
-        } else {
-            LlamaLoaded::load(model_path).map(Self::Llama)
-        }
-    }
-
-    fn runtime(&self) -> String {
-        match self {
-            LoadedModel::Llama(_) => "llama.cpp".to_string(),
-            LoadedModel::LiteRt(model) => model.runtime().to_string(),
-        }
-    }
-
-    /// The answer to `user` after as much of `history` as fits the context,
-    /// with the system prompt `system_for` gives for whether any history
-    /// is kept: the user-facing text, and the chat template's failure when
-    /// the prompt went out without it (llama.cpp only). The error is for
-    /// `last_error`.
-    fn answer(
-        &self,
-        system_for: &dyn Fn(bool) -> String,
-        history: &[(String, String)],
-        user: &str,
-        on_text: &mut dyn FnMut(&str),
-    ) -> Result<(String, Option<String>), String> {
-        match self {
-            LoadedModel::Llama(model) => {
-                let wrap = |history: &[(String, String)]| {
-                    let system_prompt = system_for(!history.is_empty());
-                    match model.build_chat_prompt(&system_prompt, history, user) {
-                        Ok(p) => (p, None),
-                        Err(e) => (format!("{system_prompt}\n\nUser: {user}\n\nResponse: "), Some(e)),
-                    }
-                };
-                let history = fit_history(history, |h| {
-                    model.token_count(&wrap(h).0) + ANSWER_MAX_TOKENS <= CONTEXT_TOKENS
-                });
-                let (prompt, template_err) = wrap(history);
-                let generation = model
-                    .run_inference(&prompt, ANSWER_MAX_TOKENS, template_err.is_some(), on_text)
-                    .map_err(|e| format!("run_inference failed: {e}"))?;
-                Ok((answer_text(&generation), template_err))
-            }
-            LoadedModel::LiteRt(model) => {
-                let history = fit_history(history, |h| {
-                    model
-                        .prompt_tokens(&system_for(!h.is_empty()), h, user)
-                        .is_ok_and(|n| n + ANSWER_MAX_TOKENS <= CONTEXT_TOKENS)
-                });
-                let generation = model.generate(&system_for(!history.is_empty()), history, user, ANSWER_MAX_TOKENS, on_text)?;
-                Ok((answer_text(&generation), None))
-            }
-        }
-    }
-}
-
-impl LlamaLoaded {
-    fn load(model_path: &Path) -> Result<Self, LlmError> {
-        let backend = shared_backend()?;
-        let model_params = LlamaModelParams::default();
-        let model = LlamaModel::load_from_file(backend, model_path, &model_params)
-            .map_err(|e| LlmError::Model(e.to_string()))?;
-        Ok(LlamaLoaded { model })
-    }
-
-    /// Wrap the conversation in the model's own chat template, rendered with
-    /// minijinja. llama.cpp's built-in matcher only knows a fixed list of
-    /// formats and Gemma 4 (Medium, Large) isn't on it: left to the matcher,
-    /// those tiers get an unwrapped prompt and answer with nothing. The
-    /// matcher stays as a second try for templates minijinja can't render.
-    /// The error names both failures so a caller can log why it fell back.
-    fn build_chat_prompt(&self, system: &str, history: &[(String, String)], user: &str) -> Result<String, String> {
-        let tmpl = self.model.chat_template(None).map_err(|e| format!("no chat template: {e}"))?;
-        let mut turns: Vec<(&str, &str)> = Vec::with_capacity(history.len() + 2);
-        // Some Gemma chat templates raise on the system role outright
-        // ("System role not supported") — drop the system message when
-        // it's empty so the template doesn't reject the whole prompt.
-        if !system.is_empty() {
-            turns.push(("system", system));
-        }
-        turns.extend(history.iter().map(|(role, content)| (role.as_str(), content.as_str())));
-        turns.push(("user", user));
-
-        let vocab = self.model.vocab();
-        let bos = token_text(&vocab, vocab.bos());
-        let rendered = tmpl.to_str().map_err(|e| e.to_string()).and_then(|source| {
-            render_chat_template(source, &turns, &bos, &token_text(&vocab, vocab.eos()))
-        });
-        let jinja_err = match rendered {
-            // run_inference's tokenizer adds BOS when the model wants one, so a
-            // template that prints it too would double it.
-            Ok(prompt) if vocab.should_add_bos() => {
-                return Ok(prompt.strip_prefix(bos.as_str()).map(str::to_string).unwrap_or(prompt))
-            }
-            Ok(prompt) => return Ok(prompt),
-            Err(e) => e,
-        };
-
-        let messages = turns
-            .iter()
-            .map(|(role, content)| LlamaChatMessage::new(role.to_string(), content.to_string()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("template: {jinja_err}; matcher: {e}"))?;
-        self.model
-            .apply_chat_template(&tmpl, &messages, true)
-            .map_err(|e| format!("template: {jinja_err}; matcher: {e}"))
-    }
-
-    fn token_count(&self, prompt: &str) -> usize {
-        self.model.vocab().tokenize(prompt.as_bytes(), true, true).len()
-    }
-
-    /// Generate until the model ends its turn or [`max_tokens`] run out,
-    /// showing `on_text` the output so far after every token.
-    /// `stop_on_newline` also ends it at the first complete line, for a
-    /// prompt sent without the model's chat template: left to run on, a
-    /// model writes the next "User:" turn itself.
-    fn run_inference(
-        &self,
-        prompt: &str,
-        max_tokens: usize,
-        stop_on_newline: bool,
-        on_text: &mut dyn FnMut(&str),
-    ) -> Result<Generation, LlmError> {
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(std::num::NonZeroU32::new(CONTEXT_TOKENS as u32));
-
-        let mut ctx = self
-            .model
-            .new_context(shared_backend()?, ctx_params)
-            .map_err(|e| LlmError::Context(e.to_string()))?;
-
-        let tokens = self
-            .model
-            .vocab()
-            .tokenize(prompt.as_bytes(), true, true);
-
-        let mut batch = LlamaBatch::new(tokens.len() + max_tokens, 1);
-        for (i, &token) in tokens.iter().enumerate() {
-            let is_last = i == tokens.len() - 1;
-            batch
-                .add(token, i as i32, &[0], is_last)
-                .map_err(|e| LlmError::Context(format!("batch add: {e}")))?;
-        }
-
-        ctx.decode(&mut batch)
-            .map_err(|e| LlmError::Context(format!("decode prompt: {e}")))?;
-
-        let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::temp(0.7),
-            LlamaSampler::greedy(),
-        ]);
-
-        let mut output = String::new();
-        let mut n_cur = tokens.len() as i32;
-        let mut cut_off = true;
-
-        for _ in 0..max_tokens {
-            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-            sampler.accept(token);
-
-            if self.model.vocab().is_eog(token) {
-                cut_off = false;
-                break;
-            }
-
-            let bytes = self
-                .model
-                .vocab()
-                .token_to_piece(token, false, None);
-            let piece = String::from_utf8_lossy(&bytes);
-            output.push_str(&piece);
-            on_text(&output);
-
-            if stop_on_newline {
-                let cleaned = strip_thinking(&output);
-                if !cleaned.is_empty() && cleaned.contains('\n') {
-                    cut_off = false;
-                    break;
-                }
-            }
-
-            batch.clear();
-            batch
-                .add(token, n_cur, &[0], true)
-                .map_err(|e| LlmError::Context(format!("batch add gen: {e}")))?;
-            n_cur += 1;
-
-            ctx.decode(&mut batch)
-                .map_err(|e| LlmError::Context(format!("decode gen: {e}")))?;
-        }
-
-        // Return raw output — callers strip thinking blocks themselves
-        // so Layer C can log both raw and stripped for diagnostics.
-        Ok(Generation { text: output, cut_off })
-    }
+/// The answer to `user` after as much of `history` as fits the context,
+/// with the system prompt `system_for` gives for whether any history is
+/// kept. The error is for `last_error`.
+fn answer(
+    model: &litert::LoadedModel,
+    system_for: &dyn Fn(bool) -> String,
+    history: &[(String, String)],
+    user: &str,
+    on_text: &mut dyn FnMut(&str),
+) -> Result<String, String> {
+    let history = fit_history(history, |h| {
+        model
+            .prompt_tokens(&system_for(!h.is_empty()), h, user)
+            .is_ok_and(|n| n + ANSWER_MAX_TOKENS <= CONTEXT_TOKENS)
+    });
+    let generation = model.generate(&system_for(!history.is_empty()), history, user, ANSWER_MAX_TOKENS, on_text)?;
+    Ok(answer_text(&generation))
 }
 
 // ── Lazy LLM fallback ───────────────────────────────────────────────────
@@ -463,12 +223,12 @@ pub struct LazyLlmFallback {
 }
 
 struct LazyState {
-    loaded: Option<LoadedModel>,
+    loaded: Option<litert::LoadedModel>,
     last_used: Option<Instant>,
 }
 
-// SAFETY: LoadedModel fields (LlamaModel) are Send once
-// loaded. All access is serialised through the Mutex.
+// SAFETY: the loaded model's LiteRT-LM handles may be used from any thread
+// but not from two at once; all access is serialised through the Mutex.
 unsafe impl Send for LazyLlmFallback {}
 unsafe impl Sync for LazyLlmFallback {}
 // SAFETY: as above. The eviction timer moves a handle to the state to its
@@ -539,9 +299,8 @@ impl LazyLlmFallback {
 
 impl Fallback for LazyLlmFallback {
     /// Run an arbitrary prompt through the loaded model and return the
-    /// raw stripped output. The prompt is wrapped in the model's chat
-    /// template as a single user turn (no system prompt) so
-    /// instruction-tuned models get the turn markers they expect.
+    /// raw output. The prompt goes in as a single user turn (no system
+    /// prompt), which the model's own chat template wraps.
     /// Mirrors the lazy lifecycle of [`Self::try_answer`]: evicts on
     /// idle, loads on demand, schedules a 60-second eviction timer after
     /// each call. Serialised through the same mutex — concurrent callers
@@ -559,53 +318,23 @@ impl Fallback for LazyLlmFallback {
         }
 
         if state.loaded.is_none() {
-            let loaded = LoadedModel::load(&self.model_path, self.accelerator)?;
+            let loaded = load_model(&self.model_path, self.accelerator)?;
             state.loaded = Some(loaded);
         }
 
         let now = Instant::now();
         state.last_used = Some(now);
 
-        let output = match state.loaded.as_ref().unwrap() {
-            LoadedModel::Llama(model) => {
-                let (wrapped, wrapping) = match model.build_chat_prompt("", &[], prompt) {
-                    Ok(p) => (p, "native".to_string()),
-                    Err(e) => {
-                        // Neither minijinja nor llama.cpp's matcher could apply the
-                        // GGUF's chat template. Last resort: Gemma 3's turn markers,
-                        // the format of the Small tier. The tokenizer adds <bos>.
-                        (
-                            format!("<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"),
-                            format!("manual_gemma ({e})"),
-                        )
-                    }
-                };
-
-                let output = model.run_inference(&wrapped, MAX_GENERATION_TOKENS, false, &mut |_| {})?.text;
-
-                // Surface a diagnostic when the model produces zero tokens.
-                // Fold in whether the chat template applied and a head sample of
-                // the wrapped prompt so logcat can tell us which path is broken.
-                if output.is_empty() {
-                    let head: String = wrapped.chars().take(120).collect();
-                    return Err(LlmError::Backend(format!(
-                        "model emitted zero tokens; wrapping={wrapping}, wrapped_len={}, wrapped_head={head:?}",
-                        wrapped.len()
-                    )));
-                }
-                output
-            }
-            LoadedModel::LiteRt(model) => {
-                let output = model
-                    .generate("", &[], prompt, MAX_GENERATION_TOKENS, &mut |_| {})
-                    .map_err(LlmError::Context)?
-                    .text;
-                if output.is_empty() {
-                    return Err(LlmError::Backend("model emitted zero tokens".into()));
-                }
-                output
-            }
-        };
+        let output = state
+            .loaded
+            .as_ref()
+            .unwrap()
+            .generate("", &[], prompt, MAX_GENERATION_TOKENS, &mut |_| {})
+            .map_err(LlmError::Context)?
+            .text;
+        if output.is_empty() {
+            return Err(LlmError::Backend("model emitted zero tokens".into()));
+        }
 
         let last_used_at = Instant::now();
         state.last_used = Some(last_used_at);
@@ -644,11 +373,11 @@ impl Fallback for LazyLlmFallback {
 
         // Load on demand.
         if state.loaded.is_none() {
-            match LoadedModel::load(&self.model_path, self.accelerator) {
+            match load_model(&self.model_path, self.accelerator) {
                 Ok(m) => state.loaded = Some(m),
                 Err(e) => {
                     self.record_error(format!(
-                        "LoadedModel::load failed for {:?}: {e}",
+                        "model load failed for {:?}: {e}",
                         self.model_path
                     ));
                     return None;
@@ -663,7 +392,7 @@ impl Fallback for LazyLlmFallback {
         let user_prompt = build_user_prompt(input);
         let model = state.loaded.as_ref().unwrap();
         let system_for = |has_history| build_system_prompt(skills, locale, tier, has_history, facts, personality);
-        let (output, template_err) = match model.answer(&system_for, history, &user_prompt, on_text) {
+        let output = match answer(model, &system_for, history, &user_prompt, on_text) {
             Ok(answer) => answer,
             Err(e) => {
                 self.record_error(e);
@@ -676,11 +405,8 @@ impl Fallback for LazyLlmFallback {
             // model's response. Common reasons: empty / "NONE" /
             // nothing but punctuation after trimming.
             let preview: String = output.chars().take(120).collect();
-            let template = template_err
-                .map(|e| format!("; chat template failed, prompt sent unwrapped: {e}"))
-                .unwrap_or_default();
             self.record_error(format!(
-                "parse_output rejected response (output_len={}, first_120={preview:?}){template}",
+                "parse_output rejected response (output_len={}, first_120={preview:?})",
                 output.len()
             ));
         }
@@ -700,7 +426,7 @@ impl Fallback for LazyLlmFallback {
     }
 
     fn runtime(&self) -> Option<String> {
-        self.inner.lock().ok()?.loaded.as_ref().map(LoadedModel::runtime)
+        self.inner.lock().ok()?.loaded.as_ref().map(|m| m.runtime().to_string())
     }
 
     fn release_memory(&self) {
@@ -713,7 +439,7 @@ impl Fallback for LazyLlmFallback {
 /// Eagerly-loaded LLM fallback. Loads the model immediately and keeps it
 /// in RAM until dropped. Used by the CLI where lazy lifecycle isn't needed.
 pub struct LlmFallback {
-    loaded: LoadedModel,
+    loaded: litert::LoadedModel,
     inference_lock: Mutex<()>,
 }
 
@@ -723,7 +449,7 @@ unsafe impl Sync for LlmFallback {}
 impl LlmFallback {
     pub fn load(model_path: &Path, accelerator: Accelerator) -> Result<Self, LlmError> {
         Ok(LlmFallback {
-            loaded: LoadedModel::load(model_path, accelerator)?,
+            loaded: load_model(model_path, accelerator)?,
             inference_lock: Mutex::new(()),
         })
     }
@@ -731,7 +457,7 @@ impl LlmFallback {
 
 impl Fallback for LlmFallback {
     fn runtime(&self) -> Option<String> {
-        Some(self.loaded.runtime())
+        Some(self.loaded.runtime().to_string())
     }
 
     fn run_prompt(&self, prompt: &str) -> Result<String, LlmError> {
@@ -740,18 +466,10 @@ impl Fallback for LlmFallback {
             .lock()
             .map_err(|_| LlmError::Backend("inference mutex poisoned".into()))?;
 
-        match &self.loaded {
-            LoadedModel::Llama(model) => {
-                let wrapped = model
-                    .build_chat_prompt("", &[], prompt)
-                    .unwrap_or_else(|_| prompt.to_string());
-                model.run_inference(&wrapped, MAX_GENERATION_TOKENS, false, &mut |_| {}).map(|g| g.text)
-            }
-            LoadedModel::LiteRt(model) => model
-                .generate("", &[], prompt, MAX_GENERATION_TOKENS, &mut |_| {})
-                .map(|g| g.text)
-                .map_err(LlmError::Context),
-        }
+        self.loaded
+            .generate("", &[], prompt, MAX_GENERATION_TOKENS, &mut |_| {})
+            .map(|g| g.text)
+            .map_err(LlmError::Context)
     }
 
     fn try_answer(
@@ -774,7 +492,7 @@ impl Fallback for LlmFallback {
         // `&[]`: facts recall is a no-op in this dev-harness impl (see `_facts`).
         let system_for = |_| build_system_prompt(skills, locale, tier, false, &[], "");
         let user_prompt = build_user_prompt(input);
-        let (output, _) = self.loaded.answer(&system_for, &[], &user_prompt, on_text).ok()?;
+        let output = answer(&self.loaded, &system_for, &[], &user_prompt, on_text).ok()?;
 
         parse_output(&output, skills)
     }
@@ -807,56 +525,6 @@ fn strip_reasoning(text: &str, open: &str, close: &str) -> String {
         out.truncate(open_at);
     }
     out
-}
-
-/// A special token's text, for templates that print `bos_token` or
-/// `eos_token` themselves.
-fn token_text(vocab: &LlamaVocab<'_>, token: LlamaToken) -> String {
-    String::from_utf8_lossy(&vocab.token_to_piece(token, true, None)).into_owned()
-}
-
-/// Render a GGUF's Hugging Face chat template the way `transformers` does
-/// (trim_blocks, lstrip_blocks, Python string and dict methods), ending in
-/// the generation prompt with reasoning switched off. An on-device answer
-/// is one spoken sentence: hidden reasoning costs seconds per answer and
-/// adds nothing the user hears.
-fn render_chat_template(source: &str, turns: &[(&str, &str)], bos: &str, eos: &str) -> Result<String, String> {
-    let mut env = minijinja::Environment::new();
-    env.set_syntax(
-        minijinja::syntax::SyntaxConfig::builder()
-            .trim_blocks(true)
-            .lstrip_blocks(true)
-            .build()
-            .map_err(|e| e.to_string())?,
-    );
-    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-    env.add_function("raise_exception", |msg: String| -> Result<minijinja::Value, minijinja::Error> {
-        Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
-    });
-    // `{% generation %}…{% endgeneration %}` is a transformers extension that
-    // marks assistant text for training loss masks and renders nothing of its
-    // own; LFM3's template uses it and minijinja has no such tag. An
-    // always-true block keeps the tags' whitespace control.
-    static GENERATION_TAG: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"\{%(-?)\s*(end)?generation\s*(-?)%\}").unwrap());
-    let source = GENERATION_TAG.replace_all(source, |caps: &regex::Captures| {
-        let tag = if caps.get(2).is_some() { "endif" } else { "if true" };
-        format!("{{%{} {tag} {}%}}", &caps[1], &caps[3])
-    });
-    let template = env.template_from_str(&source).map_err(|e| e.to_string())?;
-    let messages: Vec<minijinja::Value> = turns
-        .iter()
-        .map(|(role, content)| minijinja::context! { role => *role, content => *content })
-        .collect();
-    template
-        .render(minijinja::context! {
-            messages => messages,
-            add_generation_prompt => true,
-            enable_thinking => false,
-            bos_token => bos,
-            eos_token => eos,
-        })
-        .map_err(|e| e.to_string())
 }
 
 /// Per-locale system prompt baked into the binary at compile time
@@ -992,13 +660,6 @@ mod tests {
             SkillInfo { id: "open".into(), description: "Opens apps by name.".into() },
             SkillInfo { id: "calculator".into(), description: "Evaluates math expressions.".into() },
         ]
-    }
-
-    #[test]
-    fn runtime_names_follow_the_model_file() {
-        assert_eq!(runtime_name(Path::new("/m/gemma-4-E2B-it.litertlm")), "LiteRT-LM");
-        assert_eq!(runtime_name(Path::new("/m/Gemma3-1B-IT_multi-prefill-seq_q8_ekv2048.task")), "LiteRT-LM");
-        assert_eq!(runtime_name(Path::new("/m/gemma-4-E2B-it-Q4_K_M.gguf")), "llama.cpp");
     }
 
     #[test]
@@ -1259,70 +920,6 @@ mod tests {
         assert_eq!(strip_thinking("  Jane Austen wrote it.  "), "Jane Austen wrote it.");
     }
 
-    #[test]
-    fn chat_template_renders_generation_prompt_with_reasoning_off() {
-        // The generation-prompt end of LFM3's template, cut down to what a
-        // regression would break: the thinking switch and bos_token.
-        let template = "{{- bos_token -}}\
-            {%- for message in messages -%}\
-            {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' -}}\
-            {%- endfor -%}\
-            {%- if add_generation_prompt -%}{{- '<|im_start|>assistant\\n' -}}\
-            {%- if enable_thinking -%}{{- '<think>' -}}{%- else -%}{{- '<think></think>' -}}{%- endif -%}\
-            {%- endif -%}";
-        let out = render_chat_template(template, &[("system", "Be brief."), ("user", "Hi")], "<s>", "</s>").unwrap();
-        assert_eq!(
-            out,
-            "<s><|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think></think>"
-        );
-    }
-
-    #[test]
-    fn chat_template_trims_block_lines_like_transformers() {
-        // Hugging Face templates are written for trim_blocks + lstrip_blocks:
-        // lines holding only block tags must vanish entirely.
-        let template = "{% for message in messages %}\n  {% if message.role == 'user' %}\n[{{ message.content }}]\n  {% endif %}\n{% endfor %}\n";
-        let out = render_chat_template(template, &[("system", "S"), ("user", "Hi")], "", "").unwrap();
-        assert_eq!(out, "[Hi]\n");
-    }
-
-    #[test]
-    fn chat_template_supports_python_methods() {
-        // Gemma 4's template calls dict.get and str.split, which plain
-        // minijinja doesn't provide.
-        let template = "{%- for message in messages -%}\
-            {{- '<|turn>' + message['role'] + '\\n' + (message.get('content', '').split('<channel|>')[-1] | trim) + '<turn|>\\n' -}}\
-            {%- endfor -%}\
-            {%- if add_generation_prompt -%}{{- '<|turn>model\\n' -}}{%- endif -%}";
-        let out = render_chat_template(
-            template,
-            &[("assistant", "<|channel>x<channel|>Old answer"), ("user", "Hi")],
-            "",
-            "",
-        )
-        .unwrap();
-        assert_eq!(out, "<|turn>assistant\nOld answer<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n");
-    }
-
-    #[test]
-    fn chat_template_accepts_transformers_generation_tag() {
-        // LFM3's template wraps assistant turns in {% generation %}; without
-        // handling, the whole template fails and reasoning can't be switched off.
-        let template = "{%- for message in messages -%}\
-            {%- if message.role == 'assistant' -%}{%- generation -%}{{- '[' + message.content + ']' -}}{%- endgeneration -%}\
-            {%- else -%}{{- message.content -}}{%- endif -%}\
-            {%- endfor -%}";
-        let out = render_chat_template(template, &[("user", "Hi"), ("assistant", "Hello")], "", "").unwrap();
-        assert_eq!(out, "Hi[Hello]");
-    }
-
-    #[test]
-    fn chat_template_raise_exception_becomes_an_error() {
-        let err = render_chat_template("{{ raise_exception('System role not supported') }}", &[("user", "Hi")], "", "")
-            .unwrap_err();
-        assert!(err.contains("System role not supported"), "{err}");
-    }
-
     fn lazy_marked_used() -> (LazyLlmFallback, Instant) {
         let lazy = LazyLlmFallback::new(Path::new("/nonexistent/model.gguf"), Accelerator::Cpu);
         let used_at = Instant::now();
@@ -1440,63 +1037,5 @@ mod tests {
         let Some((lazy, _)) = real_model() else { return };
         let output = lazy.run_prompt("Reply with the single word yes, in lower case.").expect("run_prompt");
         assert!(strip_thinking(&output).to_lowercase().contains("yes"), "{output}");
-    }
-
-    #[test]
-    #[ignore]
-    fn real_model_debug_output() {
-        let model_path = std::env::var("LLM_TEST_MODEL")
-            .unwrap_or_else(|_| "/tmp/gemma3-1b-q4.gguf".to_string());
-        let path = std::path::Path::new(&model_path);
-        if !path.exists() {
-            eprintln!("Model not found at {model_path}, skipping");
-            return;
-        }
-
-        eprintln!("Loading model from {model_path}...");
-        let fallback = LlmFallback::load(path, Accelerator::Cpu).expect("failed to load model");
-        let LoadedModel::Llama(model) = &fallback.loaded else {
-            eprintln!("real_model_debug_output shows llama.cpp's prompt; {model_path} isn't a GGUF, skipping");
-            return;
-        };
-        eprintln!("Model loaded.");
-
-        let skills = test_skills();
-        let system = build_system_prompt(&skills, "en", BuiltinTier::Small, false, &[], "");
-        let user = build_user_prompt("what is the capital of australia");
-
-        eprintln!("--- System prompt ---");
-        eprintln!("{system}");
-        eprintln!("--- User prompt ---");
-        eprintln!("{user}");
-
-        let prompt = match model.build_chat_prompt(&system, &[], &user) {
-            Ok(p) => {
-                eprintln!("--- Chat template applied ---");
-                eprintln!("{p}");
-                p
-            }
-            Err(e) => {
-                eprintln!("--- No chat template ({e}), using raw ---");
-                let raw = format!("{system}\n\nUser: {user}\n\nResponse: ");
-                eprintln!("{raw}");
-                raw
-            }
-        };
-
-        eprintln!("--- Running inference ---");
-        let generation = model
-            .run_inference(&prompt, ANSWER_MAX_TOKENS, false, &mut |_| {})
-            .expect("inference failed");
-        eprintln!("--- Raw output (cut off: {}) ---", generation.cut_off);
-        eprintln!("[{}]", generation.text);
-        let output = answer_text(&generation);
-
-        let result = parse_output(&output, &skills);
-        eprintln!("--- Parsed result ---");
-        match &result {
-            Some(FallbackResult::DirectAnswer { text }) => eprintln!("DirectAnswer: {text}"),
-            None => eprintln!("None (no match)"),
-        }
     }
 }

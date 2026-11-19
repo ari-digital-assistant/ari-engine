@@ -214,7 +214,11 @@ Built 2026-11-19, awaiting the phone check. Notes from doing it:
 
 After one beta cycle with LiteRT-LM as the default and no regressions in bug reports.
 
-- [ ] **Task 12:** remove `llama-cpp-2`, `llama-cpp-sys-2`, `cpu_build.rs`, `copyLlamaLibs`, the
+- Done 2026-11-19 at Keith's call, ahead of the beta cycle. No automatic download for a tier still
+  on its GGUF (`ModelUpdateWorker` never installs by itself, by design): it stays counted as
+  installed, so the update check offers its file, and until then the engine refuses the GGUF
+  with a message to update.
+- [x] **Task 12:** remove `llama-cpp-2`, `llama-cpp-sys-2`, `cpu_build.rs`, `copyLlamaLibs`, the
   minijinja template rendering and the GGUF catalogue entries. The APK loses the llama.cpp
   libraries.
 

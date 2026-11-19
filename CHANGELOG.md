@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- llama.cpp, and with it GGUF models, the chat-template renderer, the per-ARM CPU builds
+  and `on_device_runtime`. LiteRT-LM runs every on-device model; a GGUF path now fails
+  to load with a message saying the model needs updating. `on_device_cpu_info` keeps
+  only the CPU's features. Builds no longer need cmake's llama.cpp path, libclang or
+  bindgen ([ari-android#52](https://github.com/ari-digital-assistant/ari-android/issues/52)).
+
 ### Added
 
 - LiteRT-LM as a second runtime for the on-device assistant, chosen by the model file:
