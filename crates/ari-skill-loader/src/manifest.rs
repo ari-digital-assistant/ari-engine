@@ -103,6 +103,29 @@ pub struct ApiConfig {
     pub api_version_header: Option<String>,
     pub max_tokens: u32,
     pub temperature: f32,
+    pub web_search: Option<WebSearchConfig>,
+}
+
+/// How to ask the provider to search the web before it answers, for the calls
+/// that want current information. Each field left out keeps the skill's own
+/// value, so a provider that searches through the same endpoint needs only its
+/// `tool`. Engines from before this block ignore it and keep calling the
+/// skill's own endpoint without search, which is why it lives apart from the
+/// fields above instead of changing them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WebSearchConfig {
+    /// `{model}` is replaced with the resolved model ID, for providers that
+    /// put it in the path.
+    pub endpoint: Option<String>,
+    pub request_format: Option<RequestFormat>,
+    pub auth: Option<AuthScheme>,
+    pub auth_header: Option<String>,
+    pub response_path: Option<String>,
+    /// Instructions for an assistant that can search, replacing the skill's
+    /// own, which tell it it has no live data.
+    pub system_prompt: Option<LocalizedPrompt>,
+    /// The provider's search tool, sent as the request's only tool.
+    pub tool: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,8 +270,15 @@ impl<'de> Deserialize<'de> for LocalizedPrompt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestFormat {
+    /// Chat Completions, which OpenAI-compatible APIs share.
     Openai,
     Anthropic,
+    /// OpenAI's Responses API, the only one of theirs that searches the web
+    /// with the general models.
+    OpenaiResponses,
+    /// Gemini's own `generateContent`; its OpenAI-compatible endpoint can't
+    /// ground answers in Google Search.
+    Gemini,
 }
 
 impl Default for RequestFormat {
@@ -527,6 +557,9 @@ pub enum ManifestError {
 
     #[error("`metadata.ari.assistant.api.auth_config_key` is required when auth is not `none`")]
     MissingAuthConfigKey,
+
+    #[error("`metadata.ari.assistant.api.web_search.tool` is required and must be a map")]
+    MissingWebSearchTool,
 
     #[error("config key `{key}` referenced by `{field}` not found in config array")]
     ConfigKeyNotFound { key: String, field: String },
@@ -1251,6 +1284,12 @@ impl ApiConfig {
             default_tier = field.default.clone();
         }
 
+        let web_search = raw
+            .web_search
+            .as_ref()
+            .map(|search| WebSearchConfig::from_raw(search, raw.auth_config_key.is_some()))
+            .transpose()?;
+
         Ok(ApiConfig {
             endpoint: raw.endpoint.clone(),
             endpoint_config_key: raw.endpoint_config_key.clone(),
@@ -1271,6 +1310,33 @@ impl ApiConfig {
             api_version_header: raw.api_version_header.clone(),
             max_tokens: raw.max_tokens.unwrap_or(256),
             temperature: raw.temperature.unwrap_or(0.7),
+            web_search,
+        })
+    }
+}
+
+impl WebSearchConfig {
+    fn from_raw(raw: &RawWebSearch, has_auth_config_key: bool) -> Result<Self, ManifestError> {
+        let tool = raw
+            .tool
+            .clone()
+            .filter(|t| t.is_object())
+            .ok_or(ManifestError::MissingWebSearchTool)?;
+        if let Some(ref path) = raw.response_path {
+            validate_response_path(path)?;
+        }
+        // The key is read through the skill's own `auth_config_key`.
+        if raw.auth.is_some_and(|a| !matches!(a, AuthScheme::None)) && !has_auth_config_key {
+            return Err(ManifestError::MissingAuthConfigKey);
+        }
+        Ok(WebSearchConfig {
+            endpoint: raw.endpoint.clone(),
+            request_format: raw.request_format,
+            auth: raw.auth,
+            auth_header: raw.auth_header.clone(),
+            response_path: raw.response_path.clone(),
+            system_prompt: raw.system_prompt.clone(),
+            tool,
         })
     }
 }
@@ -1653,6 +1719,18 @@ struct RawApiConfig {
     api_version_header: Option<String>,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
+    web_search: Option<RawWebSearch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawWebSearch {
+    endpoint: Option<String>,
+    request_format: Option<RequestFormat>,
+    auth: Option<AuthScheme>,
+    auth_header: Option<String>,
+    response_path: Option<String>,
+    system_prompt: Option<LocalizedPrompt>,
+    tool: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2954,6 +3032,150 @@ metadata:
 "#;
         let err = Skillfile::parse(src, None).unwrap_err();
         assert!(matches!(err, ManifestError::InvalidResponsePath { .. }));
+    }
+
+    /// An API assistant with `web_search` set to `block`, indented to sit
+    /// under `api:`.
+    fn assistant_with_web_search(block: &str) -> String {
+        format!(
+            r#"---
+name: x
+description: x
+metadata:
+  ari:
+    id: a.b.c
+    version: "1"
+    engine: ">=0.3"
+    type: assistant
+    assistant:
+      provider: api
+      privacy: cloud
+      api:
+        endpoint: https://example.com/v1/chat/completions
+        auth: bearer
+        auth_config_key: api_key
+        default_model: m
+        system_prompt: No live data.
+        response_path: "choices[0].message.content"
+        web_search:
+{block}
+      config:
+        - key: api_key
+          label: Key
+          type: secret
+---
+"#
+        )
+    }
+
+    fn api_of(src: &str) -> Result<ApiConfig, ManifestError> {
+        let sf = Skillfile::parse(src, None)?;
+        Ok(sf.ari_extension.unwrap().assistant.unwrap().api.unwrap())
+    }
+
+    #[test]
+    fn parses_a_web_search_block() {
+        let src = assistant_with_web_search(
+            r#"          endpoint: "https://example.com/v1/models/{model}:generate"
+          request_format: gemini
+          auth: header
+          auth_header: x-goog-api-key
+          response_path: "candidates[0].content.parts[0].text"
+          system_prompt: Search when you need to.
+          tool:
+            google_search: {}"#,
+        );
+        let search = api_of(&src).unwrap().web_search.expect("web_search parsed");
+        assert_eq!(
+            search,
+            WebSearchConfig {
+                endpoint: Some("https://example.com/v1/models/{model}:generate".into()),
+                request_format: Some(RequestFormat::Gemini),
+                auth: Some(AuthScheme::Header),
+                auth_header: Some("x-goog-api-key".into()),
+                response_path: Some("candidates[0].content.parts[0].text".into()),
+                system_prompt: Some(LocalizedPrompt::from_english("Search when you need to.".into())),
+                tool: serde_json::json!({"google_search": {}}),
+            }
+        );
+    }
+
+    #[test]
+    fn a_web_search_block_may_hold_only_its_tool() {
+        let src = assistant_with_web_search(
+            r#"          tool:
+            type: web_search_20250305
+            name: web_search
+            max_uses: 3"#,
+        );
+        let search = api_of(&src).unwrap().web_search.expect("web_search parsed");
+        assert_eq!(
+            search.tool,
+            serde_json::json!({"type": "web_search_20250305", "name": "web_search", "max_uses": 3})
+        );
+        assert_eq!(search.endpoint, None);
+        assert_eq!(search.request_format, None);
+        assert_eq!(search.auth, None);
+        assert_eq!(search.response_path, None);
+        assert_eq!(search.system_prompt, None);
+    }
+
+    #[test]
+    fn an_assistant_without_web_search_has_none() {
+        let sf = Skillfile::parse(chatgpt_assistant_source(), Some("chatgpt")).unwrap();
+        let api = sf.ari_extension.unwrap().assistant.unwrap().api.unwrap();
+        assert_eq!(api.web_search, None);
+    }
+
+    #[test]
+    fn rejects_a_web_search_block_without_a_tool() {
+        let src = assistant_with_web_search(r#"          request_format: openai_responses"#);
+        assert!(matches!(api_of(&src).unwrap_err(), ManifestError::MissingWebSearchTool));
+    }
+
+    #[test]
+    fn rejects_a_web_search_tool_that_isnt_a_map() {
+        let src = assistant_with_web_search(r#"          tool: web_search"#);
+        assert!(matches!(api_of(&src).unwrap_err(), ManifestError::MissingWebSearchTool));
+    }
+
+    #[test]
+    fn rejects_a_web_search_block_with_a_bad_response_path() {
+        let src = assistant_with_web_search(
+            r#"          response_path: "output[abc]"
+          tool:
+            type: web_search"#,
+        );
+        assert!(matches!(api_of(&src).unwrap_err(), ManifestError::InvalidResponsePath { .. }));
+    }
+
+    #[test]
+    fn rejects_web_search_auth_with_no_key_to_send() {
+        let src = r#"---
+name: x
+description: x
+metadata:
+  ari:
+    id: a.b.c
+    version: "1"
+    engine: ">=0.3"
+    type: assistant
+    assistant:
+      provider: api
+      privacy: cloud
+      api:
+        endpoint: https://example.com
+        default_model: m
+        system_prompt: x
+        response_path: "choices[0].message.content"
+        web_search:
+          auth: header
+          auth_header: x-key
+          tool:
+            type: web_search
+---
+"#;
+        assert!(matches!(api_of(src).unwrap_err(), ManifestError::MissingAuthConfigKey));
     }
 
     #[test]

@@ -144,6 +144,7 @@ mod tests {
             api_version_header: None,
             max_tokens: 256,
             temperature: 0.5,
+            web_search: None,
         }
     }
 

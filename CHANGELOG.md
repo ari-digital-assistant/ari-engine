@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Cloud assistants can search the web for answers that need current information. An
+  assistant skill's optional `web_search` block names the provider's search tool and
+  whatever the search call needs that differs from the skill's own call (endpoint,
+  request format, auth header, response path, instructions); older engines ignore it.
+  `call_assistant_api` takes a `web_search` flag: answers turn it on, as does the
+  one-shot call that may answer or hand off to a skill, while skill routing and
+  `consult_assistant` round trips leave it off. Two request formats come with it:
+  `openai_responses` (OpenAI's Responses API, sent without `temperature`, which its
+  current models reject, and with `store: false`) and `gemini` (`generateContent`). An
+  endpoint's `{model}` becomes the model ID. An answer that arrives in pieces is put
+  back together before `response_path` runs: Claude's text after its last search or
+  thinking block, a Responses reply's messages minus commentary, a Gemini candidate's
+  parts minus thoughts.
 - LiteRT-LM as a second runtime for the on-device assistant, chosen by the model file:
   `.litertlm` and `.task` files run on it, GGUF stays on llama.cpp. On a Pixel 10 Pro
   Fold it answered the same questions 1.7 times sooner on Small, 2.8 on Medium and 2.1 on

@@ -1914,6 +1914,7 @@ impl Engine {
                     &facts,
                     &personality,
                     self.model_catalog.as_deref(),
+                    true,
                 ) {
                     Ok(text) if !text.is_empty() => {
                         let clean = plain_text::plain_text(&text);
@@ -1963,7 +1964,7 @@ impl Engine {
         skill_catalog: &[(String, String, String)],
     ) -> Result<Option<String>, AssistantCallError> {
         let prompt = build_assistant_routing_prompt(input, skill_catalog, &self.ctx.locale);
-        let response = match self.call_active_assistant(&prompt, &[], &[], "") {
+        let response = match self.call_active_assistant(&prompt, &[], &[], "", false) {
             Ok(response) => response,
             Err(e @ AssistantCallError::Terminal(_)) => return Err(e),
             Err(AssistantCallError::Transient(_)) => return Ok(None),
@@ -1994,6 +1995,7 @@ impl Engine {
         history: &[(String, String)],
         facts: &[String],
         personality: &str,
+        web_search: bool,
     ) -> Result<String, AssistantCallError> {
         let fail = |reason: String| -> Result<String, AssistantCallError> {
             self.log(LogLevel::Warn, &format!("assistant: {reason}"));
@@ -2018,6 +2020,7 @@ impl Engine {
                 facts,
                 personality,
                 self.model_catalog.as_deref(),
+                web_search,
             ) {
                 Ok(text) => text,
                 Err(AssistantApiError::MissingConfig { ref key }) => {
@@ -2078,7 +2081,7 @@ impl Engine {
     ) -> Result<RouteOrAnswer, AssistantCallError> {
         let catalog = self.router_catalog();
         let prompt = build_combined_route_or_answer_prompt(input, &catalog);
-        let response = self.call_active_assistant(&prompt, history, facts, personality)?;
+        let response = self.call_active_assistant(&prompt, history, facts, personality, true)?;
         Ok(parse_combined_response(&response, &catalog))
     }
 
@@ -2469,6 +2472,7 @@ fn dispatch_named_assistant<F: Fn(LogLevel, &str)>(
         facts,
         personality,
         catalog,
+        true,
     ) {
         Ok(text) if !text.is_empty() => NamedAssistantOutcome::Answer(text),
         Ok(_) => {
@@ -2874,6 +2878,7 @@ fn call_assistant_for_consult(
                 &[],
                 "",
                 catalog,
+                false,
             )
             .map_err(|e| e.to_string())?;
             if text.trim().is_empty() {
@@ -2941,6 +2946,7 @@ fn call_assistant_for_consult(
                 &[],
                 "",
                 catalog,
+                false,
             )
             .map_err(|e| e.to_string())?;
             if text.trim().is_empty() {
@@ -3604,6 +3610,7 @@ mod tests {
                 api_version_header: None,
                 max_tokens: 64,
                 temperature: 0.0,
+                web_search: None,
             }
         }
 
