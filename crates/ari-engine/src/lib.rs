@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 pub mod named_assistant;
 mod plain_text;
+pub mod slash_command;
 #[cfg(feature = "llm")]
 mod answer_stream;
 pub use named_assistant::NamedAssistantBinding;
@@ -1364,6 +1365,7 @@ impl Engine {
 
     pub fn process_input_traced(&self, input: &str) -> (Response, Option<DebugTrace>) {
         let normalized = normalize_input(input.trim(), &self.ctx.locale);
+        let normalized = slash_command::expand(&normalized, &self.ctx.locale).unwrap_or(normalized);
         // Skills that quote the user verbatim need the utterance as spoken, and
         // normalisation is lossy in one direction only. Built once per turn and
         // handed to `execute`; scoring deliberately keeps the stored ctx, whose

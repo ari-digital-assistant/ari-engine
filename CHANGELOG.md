@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   back together before `response_path` runs: Claude's text after its last search or
   thinking block, a Responses reply's messages minus commentary, a Gemini candidate's
   parts minus thoughts.
+- Typed `/` commands for Ari's built-in phrases: `/clear`, `/remember …`, `/forget …`,
+  `/forget-all` and `/recall` run exactly what saying "clear history", "remember …",
+  "forget …", "forget everything about me" and "what do you remember about me" runs. The
+  names are the same in every language. `slash_commands(locale)` lists them with a
+  description in that language, for a frontend to offer as the user types.
 - LiteRT-LM as a second runtime for the on-device assistant, chosen by the model file:
   `.litertlm` and `.task` files run on it, GGUF stays on llama.cpp. On a Pixel 10 Pro
   Fold it answered the same questions 1.7 times sooner on Small, 2.8 on Medium and 2.1 on

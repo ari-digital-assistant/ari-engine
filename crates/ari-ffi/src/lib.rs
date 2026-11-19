@@ -119,6 +119,30 @@ pub fn on_device_cpu_info() -> FfiCpuInfo {
     }
 }
 
+/// One of Ari's built-in commands, which typed input runs as `/name`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSlashCommand {
+    /// What follows the `/`, the same in every language.
+    pub name: String,
+    pub description: String,
+    /// Whether the command needs words after it ("/remember I like tea").
+    pub takes_argument: bool,
+}
+
+/// The built-in `/` commands, described in `locale`, for a frontend to offer
+/// as the user types.
+#[uniffi::export]
+pub fn slash_commands(locale: String) -> Vec<FfiSlashCommand> {
+    ari_engine::slash_command::SlashCommand::ALL
+        .into_iter()
+        .map(|c| FfiSlashCommand {
+            name: c.name().to_string(),
+            description: c.description_for(&locale).to_string(),
+            takes_argument: c.takes_argument(),
+        })
+        .collect()
+}
+
 /// WASM-skill log level, mirrored from [`ari_skill_loader::LogLevel`] for
 /// the UniFFI boundary. The engine's own `LogLevel` isn't exportable
 /// directly because UniFFI types can't derive outside the FFI crate.
