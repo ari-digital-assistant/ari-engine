@@ -215,7 +215,7 @@ impl LoadedModel {
         let engine = Owned::create(api, "engine_create", api.engine_delete, |out| unsafe {
             (api.engine_create)(settings.handle, out)
         })?;
-        remove_stale_caches(path);
+        remove_unused_caches(path, backend == c"gpu");
         Ok(LoadedModel { api, runtime, engine, _settings: settings })
     }
 
@@ -380,15 +380,20 @@ unsafe extern "C" fn on_chunk(data: *mut c_void, chunk: *const c_void) {
     }
 }
 
-/// LiteRT-LM keeps a repacked copy of the weights beside the model, named
-/// `<model file>_<mtime>_<size>.xnnpack_cache` and about as big again
-/// (Medium 0.8 GB, Large 2.2 GB): with it a load takes under a second on the
-/// Fold, without it several. A model replaced by a newer download gets a
-/// new cache and leaves the old one behind, so this removes caches for the
-/// same file name other than the current one. It only does so when the
-/// current cache is where that naming says, so a change in the naming
+/// LiteRT-LM keeps repacked copies of the weights beside the model, each
+/// named after the model file, its mtime and its size: on the CPU
+/// `<stamp>.xnnpack_cache`, about as big as the model again (Medium 0.8 GB,
+/// Large 2.2 GB), and on the GPU `<stamp>_mldrift_weight_cache.bin` and
+/// `<stamp>_mldrift_program_cache.bin` (Medium 0.8 GB together). With them a
+/// load takes under a second on the Fold, without them several.
+///
+/// A model replaced by a newer download gets new caches and leaves the old
+/// ones behind, and the GPU's stay after the GPU is switched off. So after a
+/// load this removes this model's caches other than the current CPU one and,
+/// loaded on the GPU, the current GPU ones. It only does so when the loaded
+/// backend's cache is where that naming says, so a change in the naming
 /// deletes nothing.
-fn remove_stale_caches(model: &Path) {
+fn remove_unused_caches(model: &Path, on_gpu: bool) {
     let (Some(dir), Some(name), Ok(meta)) = (model.parent(), model.file_name(), std::fs::metadata(model)) else {
         return;
     };
@@ -396,21 +401,29 @@ fn remove_stale_caches(model: &Path) {
     let Some(mtime) = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()) else {
         return;
     };
-    let current = format!("{name}_{}_{}.xnnpack_cache", mtime.as_secs(), meta.len());
-    if !dir.join(&current).is_file() {
+    let stamp = format!("{name}_{}_{}", mtime.as_secs(), meta.len());
+    let cpu = format!("{stamp}.xnnpack_cache");
+    let gpu = [format!("{stamp}_mldrift_weight_cache.bin"), format!("{stamp}_mldrift_program_cache.bin")];
+    let (marker, kept) = if on_gpu {
+        (&gpu[0], vec![&cpu, &gpu[0], &gpu[1]])
+    } else {
+        (&cpu, vec![&cpu])
+    };
+    if !dir.join(marker).is_file() {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let file = entry.file_name().to_string_lossy().into_owned();
-        if is_stale_cache(&file, &name, &current) {
+        if is_cache(&file, &name) && !kept.contains(&&file) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
 }
 
-fn is_stale_cache(file: &str, model: &str, current: &str) -> bool {
-    file != current && file.starts_with(&format!("{model}_")) && file.ends_with(".xnnpack_cache")
+fn is_cache(file: &str, model: &str) -> bool {
+    file.starts_with(&format!("{model}_"))
+        && (file.ends_with(".xnnpack_cache") || (file.contains("_mldrift_") && file.ends_with(".bin")))
 }
 
 fn system_message(text: &str) -> serde_json::Value {
@@ -488,47 +501,106 @@ mod tests {
     }
 
     #[test]
-    fn only_other_caches_of_the_same_model_are_stale() {
+    fn a_cache_is_one_of_this_models_cpu_or_gpu_caches() {
         let model = "gemma-4-E2B-it.litertlm";
-        let current = "gemma-4-E2B-it.litertlm_1795073019_2588147712.xnnpack_cache";
-        assert!(is_stale_cache("gemma-4-E2B-it.litertlm_1790000000_2588147000.xnnpack_cache", model, current));
-        assert!(!is_stale_cache(current, model, current));
-        assert!(!is_stale_cache(model, model, current));
-        assert!(!is_stale_cache("gemma-4-E4B-it.litertlm_1795075025_3659530240.xnnpack_cache", model, current));
-        assert!(!is_stale_cache("gemma-4-E2B-it.litertlm_notes.txt", model, current));
+        assert!(is_cache("gemma-4-E2B-it.litertlm_1795073019_2588147712.xnnpack_cache", model));
+        assert!(is_cache("gemma-4-E2B-it.litertlm_1795083487_2588147712_mldrift_weight_cache.bin", model));
+        assert!(is_cache("gemma-4-E2B-it.litertlm_1795083487_2588147712_mldrift_program_cache.bin", model));
+        assert!(!is_cache(model, model));
+        assert!(!is_cache("gemma-4-E4B-it.litertlm_1795075025_3659530240.xnnpack_cache", model));
+        assert!(!is_cache("gemma-4-E2B-it.litertlm_notes.txt", model));
+        assert!(!is_cache("gemma-4-E2B-it.litertlm_1795073019_2588147712.bin", model));
     }
 
-    #[test]
-    fn stale_caches_go_and_the_current_one_stays() {
-        let dir = std::env::temp_dir().join(format!("ari-litert-cache-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let model = dir.join("m.task");
-        std::fs::write(&model, b"weights").unwrap();
-        let meta = std::fs::metadata(&model).unwrap();
-        let mtime = meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let current = dir.join(format!("m.task_{mtime}_7.xnnpack_cache"));
-        let stale = dir.join("m.task_1_5.xnnpack_cache");
-        let other = dir.join("n.task_1_5.xnnpack_cache");
-        for f in [&current, &stale, &other] {
-            std::fs::write(f, b"cache").unwrap();
+    /// A model `m.task` in a fresh directory, with a cache file of each kind
+    /// for its current stamp, for an older stamp, and for another model.
+    struct CacheDir {
+        dir: std::path::PathBuf,
+        model: std::path::PathBuf,
+        files: Vec<(&'static str, std::path::PathBuf)>,
+    }
+
+    impl CacheDir {
+        fn new(test: &str, with: &[&'static str]) -> Self {
+            let dir = std::env::temp_dir().join(format!("ari-litert-{test}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let model = dir.join("m.task");
+            std::fs::write(&model, b"weights").unwrap();
+            let mtime = std::fs::metadata(&model).unwrap().modified().unwrap();
+            let mtime = mtime.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let all = [
+                ("cpu", format!("m.task_{mtime}_7.xnnpack_cache")),
+                ("gpu weights", format!("m.task_{mtime}_7_mldrift_weight_cache.bin")),
+                ("gpu program", format!("m.task_{mtime}_7_mldrift_program_cache.bin")),
+                ("old cpu", "m.task_1_5.xnnpack_cache".to_string()),
+                ("old gpu weights", "m.task_1_5_mldrift_weight_cache.bin".to_string()),
+                ("old gpu program", "m.task_1_5_mldrift_program_cache.bin".to_string()),
+                ("other model", "n.task_1_5.xnnpack_cache".to_string()),
+                ("other file", "m.task_notes.txt".to_string()),
+            ];
+            let files: Vec<_> = all
+                .into_iter()
+                .filter(|(label, _)| with.contains(label))
+                .map(|(label, file)| (label, dir.join(file)))
+                .collect();
+            for (_, f) in &files {
+                std::fs::write(f, b"cache").unwrap();
+            }
+            CacheDir { dir, model, files }
         }
-        remove_stale_caches(&model);
-        let left: Vec<bool> = [&model, &current, &stale, &other].iter().map(|f| f.exists()).collect();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(left, [true, true, false, true]);
+
+        /// The labels of the files still there, after checking the model is.
+        fn left(&self) -> Vec<&'static str> {
+            assert!(self.model.exists());
+            self.files.iter().filter(|(_, f)| f.exists()).map(|(label, _)| *label).collect()
+        }
+    }
+
+    impl Drop for CacheDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    const EVERY_FILE: [&str; 8] = [
+        "cpu",
+        "gpu weights",
+        "gpu program",
+        "old cpu",
+        "old gpu weights",
+        "old gpu program",
+        "other model",
+        "other file",
+    ];
+
+    #[test]
+    fn on_the_cpu_only_the_current_cpu_cache_stays() {
+        let dir = CacheDir::new("cpu", &EVERY_FILE);
+        remove_unused_caches(&dir.model, false);
+        assert_eq!(dir.left(), ["cpu", "other model", "other file"]);
     }
 
     #[test]
-    fn without_the_current_cache_nothing_is_removed() {
-        let dir = std::env::temp_dir().join(format!("ari-litert-nocache-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let model = dir.join("m.task");
-        std::fs::write(&model, b"weights").unwrap();
-        let other = dir.join("m.task_1_5.xnnpack_cache");
-        std::fs::write(&other, b"cache").unwrap();
-        remove_stale_caches(&model);
-        let kept = other.exists();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert!(kept);
+    fn on_the_gpu_the_current_cpu_and_gpu_caches_stay() {
+        let dir = CacheDir::new("gpu", &EVERY_FILE);
+        remove_unused_caches(&dir.model, true);
+        assert_eq!(dir.left(), ["cpu", "gpu weights", "gpu program", "other model", "other file"]);
+    }
+
+    #[test]
+    fn without_the_current_cpu_cache_nothing_is_removed() {
+        let with = ["gpu weights", "gpu program", "old cpu", "old gpu weights"];
+        let dir = CacheDir::new("nocpu", &with);
+        remove_unused_caches(&dir.model, false);
+        assert_eq!(dir.left(), with);
+    }
+
+    #[test]
+    fn without_the_current_gpu_cache_nothing_is_removed() {
+        let with = ["cpu", "old cpu", "old gpu weights", "old gpu program"];
+        let dir = CacheDir::new("nogpu", &with);
+        remove_unused_caches(&dir.model, true);
+        assert_eq!(dir.left(), with);
     }
 }
