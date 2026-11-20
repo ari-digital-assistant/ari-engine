@@ -570,7 +570,29 @@ pub fn replace_number_words(input: &str) -> String {
     let mut i = 0;
 
     while i < words.len() {
-        if let Some((num, consumed)) = parse_number_words(&words[i..]) {
+        // "second" is an ordinal and a unit of time. Straight after a number
+        // it is the unit: "set a 10 second timer" reached the timer skill as
+        // "set a 10 2 timer", with no duration in it.
+        if words[i] == "second" && result.last().is_some_and(|w: &String| w.parse::<i64>().is_ok()) {
+            result.push(words[i].to_string());
+            i += 1;
+            continue;
+        }
+        let span = match parse_number_words(&words[i..]) {
+            // "twenty second" is a date after "the" or before "of" ("the
+            // twenty second of may") and twenty seconds anywhere else. Stop
+            // before "second" so the check above keeps it as the unit.
+            Some((_, consumed))
+                if consumed > 1
+                    && words[i + consumed - 1] == "second"
+                    && !(i > 0 && words[i - 1] == "the")
+                    && words.get(i + consumed) != Some(&"of") =>
+            {
+                parse_number_words(&words[i..i + consumed - 1])
+            }
+            span => span,
+        };
+        if let Some((num, consumed)) = span {
             result.push(num.to_string());
             i += consumed;
         } else {
@@ -1593,6 +1615,29 @@ mod tests {
     fn ordinal_hyphenated_day_of_month() {
         assert_eq!(parse_number_words(&["twenty-seventh"]), Some((27, 1)));
         assert_eq!(parse_number_words(&["thirty-first"]), Some((31, 1)));
+    }
+
+    #[test]
+    fn second_after_a_number_is_the_unit() {
+        assert_eq!(
+            replace_number_words("set a 10 second homework timer"),
+            "set a 10 second homework timer",
+        );
+        assert_eq!(replace_number_words("set a ten second timer"), "set a 10 second timer");
+        assert_eq!(replace_number_words("a timer for one second"), "a timer for 1 second");
+        assert_eq!(replace_number_words("set a twenty second timer"), "set a 20 second timer");
+        assert_eq!(
+            normalize_input("Set a 10 second homework timer", "en"),
+            "set a 10 second homework timer",
+        );
+    }
+
+    #[test]
+    fn second_as_a_date_stays_an_ordinal() {
+        assert_eq!(replace_number_words("the twenty second of may"), "the 22 of may");
+        assert_eq!(replace_number_words("on the twenty second"), "on the 22");
+        assert_eq!(replace_number_words("twenty second of may"), "22 of may");
+        assert_eq!(replace_number_words("the second of june"), "the 2 of june");
     }
 
     // --- execute_reply ---
