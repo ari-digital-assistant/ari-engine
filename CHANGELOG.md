@@ -145,3 +145,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Assistant replies, on-device and cloud, have their markdown reduced to plain text:
   emphasis, code, links, headings, quotes, rules and tables lose their syntax, and
   bullets become "•" ([ari-android#30](https://github.com/ari-digital-assistant/ari-android/issues/30)).
+- "second" straight after a number is the unit of time, not the ordinal 2: "set a 10
+  second timer" reached the timer skill as "set a 10 2 timer", and it asked for a
+  duration. "twenty second" stays 22 after "the" or before "of", as in "the twenty
+  second of may", and is twenty seconds anywhere else.
