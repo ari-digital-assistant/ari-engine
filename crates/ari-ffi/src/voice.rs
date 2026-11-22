@@ -1,10 +1,11 @@
 //! UniFFI wrapper around [`ari_voice`]: the wake phrase rules, the wake word
-//! models and their ladders.
+//! models and their ladders, and cloud speech-to-text.
 //!
 //! A thin shim, like `skill_registry.rs`. The rules live in `ari-voice`; this
 //! file mirrors its types as UniFFI records and enums and converts between
 //! them.
 
+use ari_voice::cloud_stt::{self, CloudSttError, CloudSttFailure, CloudSttService};
 use ari_voice::ladder::{self, FalseWakeRemedy, LadderFit, TunedLadder, TunedSession};
 use ari_voice::wake_model::{self, OperatingPoint, WakeEngine, WakeSensitivity, WakeWordModel};
 use ari_voice::wake_phrase::{self, EarlyNameCheck, StreamingPartial, WakeMatch};
@@ -421,4 +422,82 @@ pub fn fit_tuned_ladder(
 ) -> Option<FfiLadderFit> {
     let sessions: Vec<TunedSession> = sessions.into_iter().map(Into::into).collect();
     ladder::fit(&sessions, &model.into()).map(Into::into)
+}
+
+/// Which cloud speech-to-text service to use. See [`CloudSttService`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiCloudSttService {
+    OpenAi,
+    SelfHosted { endpoint: String, model: String },
+}
+
+impl From<FfiCloudSttService> for CloudSttService {
+    fn from(s: FfiCloudSttService) -> Self {
+        match s {
+            FfiCloudSttService::OpenAi => Self::OpenAi,
+            FfiCloudSttService::SelfHosted { endpoint, model } => {
+                Self::SelfHosted { endpoint, model }
+            }
+        }
+    }
+}
+
+/// A failed cloud transcription, one variant per [`CloudSttFailure`] so the
+/// host can tell the user which wall they hit. `reason` is for the log.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum FfiCloudSttError {
+    #[error("{reason}")]
+    NotConfigured { reason: String },
+    #[error("{reason}")]
+    Network { reason: String },
+    #[error("{reason}")]
+    Auth { reason: String },
+    #[error("{reason}")]
+    Server { reason: String },
+    #[error("{reason}")]
+    Empty { reason: String },
+}
+
+impl From<CloudSttError> for FfiCloudSttError {
+    fn from(e: CloudSttError) -> Self {
+        let reason = e.message;
+        match e.failure {
+            CloudSttFailure::NotConfigured => Self::NotConfigured { reason },
+            CloudSttFailure::Network => Self::Network { reason },
+            CloudSttFailure::Auth => Self::Auth { reason },
+            CloudSttFailure::Server => Self::Server { reason },
+            CloudSttFailure::Empty => Self::Empty { reason },
+        }
+    }
+}
+
+/// See [`cloud_stt::transcribe`]. Blocking: call it off the main thread.
+#[uniffi::export]
+pub fn cloud_transcribe(
+    service: FfiCloudSttService,
+    api_key: Option<String>,
+    wav: Vec<u8>,
+    locale: String,
+) -> Result<String, FfiCloudSttError> {
+    Ok(cloud_stt::transcribe(
+        &service.into(),
+        api_key.as_deref(),
+        &wav,
+        &locale,
+    )?)
+}
+
+/// See [`cloud_stt::transcribe_wake_clip`]. `None` where the early check does
+/// not run. Blocking: call it off the main thread.
+#[uniffi::export]
+pub fn cloud_transcribe_wake_clip(
+    service: FfiCloudSttService,
+    api_key: Option<String>,
+    wav: Vec<u8>,
+    locale: String,
+) -> Result<Option<String>, FfiCloudSttError> {
+    Ok(
+        cloud_stt::transcribe_wake_clip(&service.into(), api_key.as_deref(), &wav, &locale)
+            .transpose()?,
+    )
 }
