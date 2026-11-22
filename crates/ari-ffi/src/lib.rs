@@ -227,8 +227,9 @@ impl EnvelopeSink for ForeignEnvelopeSinkAdapter {
 /// answer as sentences, so it speaks those instead of the response text.
 #[uniffi::export(with_foreign)]
 pub trait FfiAnswerSink: Send + Sync {
-    /// The answer so far, in whole words. Each call replaces the last.
-    fn text(&self, so_far: String);
+    /// The answer so far, in whole words, and as markdown once it formats
+    /// anything. Each call replaces the last.
+    fn text(&self, so_far: String, markdown: Option<String>);
     /// The next finished sentence.
     fn sentence(&self, text: String);
 }
@@ -240,8 +241,8 @@ struct ForeignAnswerSinkAdapter(Arc<dyn FfiAnswerSink>);
 
 #[cfg(feature = "llm")]
 impl AnswerSink for ForeignAnswerSinkAdapter {
-    fn text(&self, so_far: &str) {
-        self.0.text(so_far.to_string());
+    fn text(&self, so_far: &str, markdown: Option<&str>) {
+        self.0.text(so_far.to_string(), markdown.map(str::to_string));
     }
     fn sentence(&self, text: &str) {
         self.0.sentence(text.to_string());
@@ -778,7 +779,11 @@ pub enum FfiResponse {
     /// `clear_conversation` true means the user cleared the conversation this
     /// turn ("clear history") and the engine has already forgotten it; the
     /// host clears its chat log to match.
-    Text { body: String, rearm: bool, enter_conversation: bool, exit_conversation: bool, facts_changed: bool, clear_conversation: bool },
+    /// `markdown` is an assistant answer as written, for a host that renders
+    /// markdown to show; `body` is the same answer as plain text, for
+    /// speaking. `None` for anything else, and for an answer that formats
+    /// nothing.
+    Text { body: String, markdown: Option<String>, rearm: bool, enter_conversation: bool, exit_conversation: bool, facts_changed: bool, clear_conversation: bool },
     /// `skill_id` is the manifest id of the emitting skill (e.g.
     /// `dev.heyari.timer`), used by the frontend to resolve `asset:<path>`
     /// references back to the skill's bundle directory. Empty string if
@@ -1622,6 +1627,7 @@ impl AriEngine {
         let exit_conversation = engine.take_exit_signal();
         let facts_changed = engine.take_facts_changed_signal();
         let clear_conversation = engine.take_clear_signal();
+        let markdown = engine.take_answer_markdown();
         match response {
             ari_core::Response::Text(s) => {
                 // The engine's fallback text is locale-specific
@@ -1637,6 +1643,7 @@ impl AriEngine {
                 } else {
                     FfiResponse::Text {
                         body: s,
+                        markdown,
                         rearm,
                         enter_conversation,
                         exit_conversation,

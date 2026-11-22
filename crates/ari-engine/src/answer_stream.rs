@@ -3,19 +3,24 @@
 //! each finished sentence, for it to speak.
 //!
 //! Words go out whole, never inside emphasis, a code span or a link, so no
-//! markdown flickers onto the screen. A sentence goes out once it can't
-//! change any more: up to the last newline, or the last sentence end once the
-//! next sentence has begun. Both get the same cleanup as the finished answer
-//! (reasoning removed, markdown reduced to plain text), so what is shown
-//! and spoken early reads as the whole answer.
+//! markdown flickers onto the screen, plain or rendered. A sentence goes out
+//! once it can't change any more: up to the last newline, or the last
+//! sentence end once the next sentence has begun. Both get the same cleanup
+//! as the finished answer (reasoning removed, markdown reduced to plain
+//! text), so what is shown and spoken early reads as the whole answer.
 
-use crate::{plain_text::plain_text, AnswerSink};
+use crate::{
+    plain_text::{plain_text, with_markdown},
+    AnswerSink,
+};
 
 /// One answer on its way to an [`AnswerSink`].
 pub(crate) struct AnswerStream<'a> {
     sink: &'a dyn AnswerSink,
     /// The words last shown.
     shown: String,
+    /// The markdown last shown with them.
+    shown_markdown: Option<String>,
     /// The cleaned answer up to the end of the last sentence released.
     released: String,
     /// The cleaned text stopped starting with what was already released,
@@ -26,7 +31,13 @@ pub(crate) struct AnswerStream<'a> {
 
 impl<'a> AnswerStream<'a> {
     pub(crate) fn new(sink: &'a dyn AnswerSink) -> Self {
-        Self { sink, shown: String::new(), released: String::new(), diverged: false }
+        Self {
+            sink,
+            shown: String::new(),
+            shown_markdown: None,
+            released: String::new(),
+            diverged: false,
+        }
     }
 
     /// Show the words and release any sentences the model has finished,
@@ -34,10 +45,13 @@ impl<'a> AnswerStream<'a> {
     /// out: it and the question after it are for the engine.
     pub(crate) fn feed(&mut self, raw: &str) {
         let raw = ari_llm::before_handoff(raw);
-        let words = plain_text(&ari_llm::strip_thinking(&raw[..shown_len(raw)]));
-        if words != self.shown && words.chars().any(char::is_alphanumeric) {
-            self.sink.text(&words);
+        let (words, markdown) = with_markdown(&ari_llm::strip_thinking(&raw[..shown_len(raw)]));
+        if (words != self.shown || markdown != self.shown_markdown)
+            && words.chars().any(char::is_alphanumeric)
+        {
+            self.sink.text(&words, markdown.as_deref());
             self.shown = words;
+            self.shown_markdown = markdown;
         }
         if self.diverged {
             return;
@@ -203,12 +217,14 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         shown: Mutex<Vec<String>>,
+        markdown: Mutex<Vec<Option<String>>>,
         sentences: Mutex<Vec<String>>,
     }
 
     impl AnswerSink for Recorder {
-        fn text(&self, so_far: &str) {
+        fn text(&self, so_far: &str, markdown: Option<&str>) {
             self.shown.lock().unwrap().push(so_far.to_string());
+            self.markdown.lock().unwrap().push(markdown.map(str::to_string));
         }
         fn sentence(&self, text: &str) {
             self.sentences.lock().unwrap().push(text.to_string());
@@ -216,9 +232,9 @@ mod tests {
     }
 
     /// Feed `raw` the way the model writes it, a character at a time, then
-    /// finish with the cleaned whole, and return everything shown and every
-    /// sentence released.
-    fn stream_all(raw: &str) -> (Vec<String>, Vec<String>) {
+    /// finish with the cleaned whole, and return everything shown, every
+    /// sentence released, and the markdown shown with each.
+    fn stream_all(raw: &str) -> (Vec<String>, Vec<String>, Vec<Option<String>>) {
         let sink = Recorder::default();
         let mut stream = AnswerStream::new(&sink);
         for (at, c) in raw.char_indices() {
@@ -226,7 +242,11 @@ mod tests {
         }
         let answer = plain_text(&ari_llm::strip_thinking(raw));
         stream.finish(&answer);
-        (sink.shown.into_inner().unwrap(), sink.sentences.into_inner().unwrap())
+        (
+            sink.shown.into_inner().unwrap(),
+            sink.sentences.into_inner().unwrap(),
+            sink.markdown.into_inner().unwrap(),
+        )
     }
 
     fn stream(raw: &str) -> Vec<String> {
@@ -235,6 +255,10 @@ mod tests {
 
     fn shown(raw: &str) -> Vec<String> {
         stream_all(raw).0
+    }
+
+    fn shown_markdown(raw: &str) -> Vec<Option<String>> {
+        stream_all(raw).2
     }
 
     fn settled(text: &str) -> &str {
@@ -272,6 +296,22 @@ mod tests {
         for words in shown("Top two:\n* **Lionel Messi**: Argentina.\n* **Cristiano Ronaldo**: Portugal.") {
             assert!(!words.contains(['*', '[']), "{words:?}");
         }
+    }
+
+    #[test]
+    fn formatted_words_show_with_their_markdown() {
+        let markdown =
+            shown_markdown("Top two:\n* **Lionel Messi**: Argentina.\n* **Cristiano Ronaldo**: Portugal.");
+        assert_eq!(markdown.first(), Some(&None));
+        assert_eq!(
+            markdown.last().cloned().flatten().as_deref(),
+            Some("Top two:\n* **Lionel Messi**: Argentina.\n* **Cristiano Ronaldo**:")
+        );
+    }
+
+    #[test]
+    fn plain_words_show_without_markdown() {
+        assert!(shown_markdown("Paris is the capital. It is in France.").iter().all(Option::is_none));
     }
 
     #[test]

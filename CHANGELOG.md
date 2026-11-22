@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Assistant answers keep the markdown they were written in, for a host that renders it.
+  `FfiResponse::Text` has a `markdown` field, set when an assistant answer formats
+  anything, and `FfiAnswerSink::text` gets the markdown so far alongside the words.
+  `body` is still the plain text, and is what gets spoken
+  ([ari-android#57](https://github.com/ari-digital-assistant/ari-android/issues/57)).
 - Cloud assistants can search the web for answers that need current information. An
   assistant skill's optional `web_search` block names the provider's search tool and
   whatever the search call needs that differs from the skill's own call (endpoint,

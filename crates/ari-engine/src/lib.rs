@@ -43,9 +43,12 @@ pub trait EnvelopeSink: Send + Sync {
 /// to show, and each finished sentence to speak. Called on the thread
 /// running `process_input`, before it returns.
 pub trait AnswerSink: Send + Sync {
-    /// The answer so far, in whole words, cleaned like the finished answer.
-    /// Each call replaces the last; the response holds the finished text.
-    fn text(&self, so_far: &str);
+    /// The answer so far, in whole words, cleaned like the finished answer,
+    /// and as the markdown it was written in once it formats anything (see
+    /// [`Engine::take_answer_markdown`]). The markdown never stops inside
+    /// emphasis, a code span or a link. Each call replaces the last; the
+    /// response holds the finished text.
+    fn text(&self, so_far: &str, markdown: Option<&str>);
 
     /// The next finished sentence. A host that gets any sentence gets the
     /// whole answer this way, the last of it just before `process_input`
@@ -725,6 +728,9 @@ pub struct Engine {
     // Set when the user clears the conversation by voice; transient like
     // enter/exit_signal, read-and-cleared by the FFI layer.
     clear_signal: AtomicBool,
+    // The markdown this turn's assistant answer was written in, when it
+    // formats anything; transient like clear_signal.
+    answer_markdown: Mutex<Option<String>>,
     // Behaviour B/C master switch, owned by the frontend (set via
     // set_conversation_memory_enabled). When false the engine keeps NO
     // conversation buffer and refuses "let's talk" entry.
@@ -772,6 +778,7 @@ impl Engine {
             enter_signal: AtomicBool::new(false),
             exit_signal: AtomicBool::new(false),
             clear_signal: AtomicBool::new(false),
+            answer_markdown: Mutex::new(None),
             conversation_memory_enabled: AtomicBool::new(true),
             remembered_facts: Mutex::new(Vec::new()),
             facts_changed: AtomicBool::new(false),
@@ -988,7 +995,7 @@ impl Engine {
         });
         match outcome {
             NamedAssistantOutcome::Answer(text) => {
-                let clean = plain_text::plain_text(&text);
+                let clean = self.plain_answer(&text);
                 self.record_assistant_turn(prompt, &clean);
                 self.note_cloud_assistant_used(&binding.skill_id);
                 Response::Text(clean)
@@ -1081,6 +1088,22 @@ impl Engine {
     /// clear its chat log to match.
     pub fn take_clear_signal(&self) -> bool {
         self.clear_signal.swap(false, Ordering::SeqCst)
+    }
+
+    /// Read-and-clear the markdown this turn's assistant answer was written
+    /// in, for a host that renders it (ari-android#57). `None` when the turn
+    /// wasn't an assistant answer or the answer formats nothing. The
+    /// response text is always the plain version, for speaking.
+    pub fn take_answer_markdown(&self) -> Option<String> {
+        self.answer_markdown.lock().expect("answer_markdown poisoned").take()
+    }
+
+    /// `answer` as plain text, keeping its markdown for
+    /// [`Self::take_answer_markdown`].
+    fn plain_answer(&self, answer: &str) -> String {
+        let (plain, markdown) = plain_text::with_markdown(answer);
+        *self.answer_markdown.lock().expect("answer_markdown poisoned") = markdown;
+        plain
     }
 
     /// Forget the conversation so far: the follow-up buffer and any question
@@ -1547,6 +1570,8 @@ impl Engine {
     }
 
     pub fn process_input_traced(&self, input: &str) -> (Response, Option<DebugTrace>) {
+        // Only an answer given this turn may be shown formatted.
+        self.answer_markdown.lock().expect("answer_markdown poisoned").take();
         // The assistants, on-device and cloud, get the utterance as said, and
         // so does the conversation they read back: normalised, "who came
         // second?" is "who came 2", which a model can't make sense of.
@@ -1899,7 +1924,7 @@ impl Engine {
                     }
                 }
                 Ok(RouteOrAnswer::Answer(text)) => {
-                    let clean = plain_text::plain_text(&text);
+                    let clean = self.plain_answer(&text);
                     self.record_assistant_turn(utterance, &clean);
                     let label = match &self.active_assistant {
                         Some(ActiveAssistant::Api { skill_id, .. }) => {
@@ -2057,7 +2082,7 @@ impl Engine {
                     );
                     match result {
                         Some(ari_llm::FallbackResult::DirectAnswer { text }) => {
-                            let clean = plain_text::plain_text(&text);
+                            let clean = self.plain_answer(&text);
                             if let Some(answer) = &answer {
                                 answer.finish(&clean);
                             }
@@ -2138,7 +2163,7 @@ impl Engine {
                     WebSearch::Allowed,
                 ) {
                     Ok(text) if !text.is_empty() => {
-                        let clean = plain_text::plain_text(&text);
+                        let clean = self.plain_answer(&text);
                         self.record_assistant_turn(utterance, &clean);
                         self.note_cloud_assistant_used(skill_id);
                         trace.winner = Some(format!("assistant:{skill_id}"));
@@ -5840,13 +5865,15 @@ mod tests {
     #[derive(Default)]
     struct RecordingAnswer {
         shown: std::sync::Mutex<Vec<String>>,
+        markdown: std::sync::Mutex<Vec<Option<String>>>,
         sentences: std::sync::Mutex<Vec<String>>,
     }
 
     #[cfg(feature = "llm")]
     impl AnswerSink for RecordingAnswer {
-        fn text(&self, so_far: &str) {
+        fn text(&self, so_far: &str, markdown: Option<&str>) {
             self.shown.lock().unwrap().push(so_far.to_string());
+            self.markdown.lock().unwrap().push(markdown.map(str::to_string));
         }
         fn sentence(&self, text: &str) {
             self.sentences.lock().unwrap().push(text.to_string());
@@ -5878,12 +5905,48 @@ mod tests {
             shown.last().map(String::as_str),
             Some("Top two:\n• Lionel Messi: Argentina.\n• Cristiano Ronaldo:")
         );
+        assert_eq!(
+            sink.markdown.lock().unwrap().last().cloned().flatten().as_deref(),
+            Some("Top two:\n* **Lionel Messi**: Argentina.\n* **Cristiano Ronaldo**:")
+        );
         match resp {
             Response::Text(t) => {
                 assert_eq!(t, "Top two:\n• Lionel Messi: Argentina.\n• Cristiano Ronaldo: Portugal.")
             }
             o => panic!("{o:?}"),
         }
+        assert_eq!(
+            engine.take_answer_markdown().as_deref(),
+            Some("Top two:\n* **Lionel Messi**: Argentina.\n* **Cristiano Ronaldo**: Portugal.")
+        );
+        assert_eq!(engine.take_answer_markdown(), None, "read-and-clear");
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn answer_markdown_is_only_for_a_formatted_answer_this_turn() {
+        let mut engine = Engine::new();
+        engine.set_llm(std::sync::Arc::new(RecordingFallback {
+            last_history: std::sync::Mutex::new(Vec::new()),
+            last_facts: std::sync::Mutex::new(Vec::new()),
+            last_personality: std::sync::Mutex::new(String::new()),
+            reply: "**Paris.**",
+        }));
+        engine.set_active_assistant(Some(ActiveAssistant::Builtin { tier: ari_llm::BuiltinTier::Small }));
+        engine.process_input_traced("capital of france");
+        assert_eq!(engine.take_answer_markdown().as_deref(), Some("**Paris.**"));
+        engine.process_input_traced("capital of france");
+        engine.process_input_traced("");
+        assert_eq!(engine.take_answer_markdown(), None, "a later turn clears one never taken");
+
+        engine.set_llm(std::sync::Arc::new(RecordingFallback {
+            last_history: std::sync::Mutex::new(Vec::new()),
+            last_facts: std::sync::Mutex::new(Vec::new()),
+            last_personality: std::sync::Mutex::new(String::new()),
+            reply: "Paris.",
+        }));
+        engine.process_input_traced("capital of france");
+        assert_eq!(engine.take_answer_markdown(), None);
     }
 
     #[cfg(feature = "llm")]

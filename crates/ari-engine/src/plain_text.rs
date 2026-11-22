@@ -1,11 +1,12 @@
 //! Markdown to plain text, for assistant replies.
 //!
 //! Language models format with markdown whether or not anything renders
-//! it. Ari shows replies as plain text and speaks them, so a list came
-//! through as `**Cheetah**` with the asterisks on screen (ari-android#30).
-//! This keeps the words and the line structure and drops the syntax. It
-//! covers what models write (emphasis, headings, bullets, code, links,
-//! quotes, rules, tables), not the whole of CommonMark.
+//! it. Ari speaks replies, and a host that shows them unrendered had a list
+//! come through as `**Cheetah**` with the asterisks on screen
+//! (ari-android#30). This keeps the words and the line structure and drops
+//! the syntax. It covers what models write (emphasis, headings, bullets,
+//! code, links, quotes, rules, tables), not the whole of CommonMark. A host
+//! that renders markdown gets the original alongside (ari-android#57).
 
 /// `markdown` as plain text. Emphasis, code and link syntax go, headings
 /// and quotes keep their text, bullets become "•", table rows become
@@ -36,6 +37,15 @@ pub(crate) fn plain_text(markdown: &str) -> String {
         }
     }
     lines.join("\n").trim().to_string()
+}
+
+/// `markdown` as plain text, and the markdown itself when it formats
+/// anything: `None` when the plain text already reads the same.
+pub(crate) fn with_markdown(markdown: &str) -> (String, Option<String>) {
+    let plain = plain_text(markdown);
+    let markdown = markdown.trim();
+    let formatted = (plain != markdown).then(|| markdown.to_string());
+    (plain, formatted)
 }
 
 /// One line outside a code block, or `None` for a line that is only
@@ -273,7 +283,19 @@ fn emphasis(chars: Vec<Ch>) -> Vec<Ch> {
 
 #[cfg(test)]
 mod tests {
-    use super::plain_text;
+    use super::{plain_text, with_markdown};
+
+    #[test]
+    fn formatted_answers_keep_their_markdown() {
+        assert_eq!(
+            with_markdown("\nTop two:\n* **Messi**\n* **Ronaldo**\n"),
+            (
+                "Top two:\n• Messi\n• Ronaldo".to_string(),
+                Some("Top two:\n* **Messi**\n* **Ronaldo**".to_string())
+            )
+        );
+        assert_eq!(with_markdown(" Paris. "), ("Paris.".to_string(), None));
+    }
 
     #[test]
     fn a_gemma_style_list_comes_out_clean() {
