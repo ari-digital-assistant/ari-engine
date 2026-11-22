@@ -103,6 +103,7 @@ dependencies = [
  "ari-llm",
  "ari-skill-loader",
  "ari-skills",
+ "ari-voice",
  "serde_json",
  "thiserror 2.0.18",
  "uniffi",
@@ -165,6 +166,17 @@ dependencies = [
  "chrono",
  "fasteval",
  "serde_json",
+]
+
+[[package]]
+name = "ari-voice"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "reqwest",
+ "rustls",
+ "serde_json",
+ "webpki-roots",
 ]
 
 [[package]]

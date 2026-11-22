@@ -10,6 +10,7 @@ members = [
     "crates/ari-cli",
     "crates/ari-ffi",
     "crates/ari-llm",
+    "crates/ari-voice",
 ]
 
 [workspace.dependencies]
