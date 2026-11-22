@@ -7,10 +7,11 @@
 //! exam_oww puts in front of every clip. Made by
 //! `ari-tools/wakeword/corpus/tater/scripts/oww_parity_fixture.py`.
 
-use std::path::{Path, PathBuf};
+mod common;
 
 use ari_voice::detector::{OWW_EMBEDDING_FILE, OWW_MELSPECTROGRAM_FILE, SILERO_VAD_FILE, WakeDetector};
-use ari_voice::native::{self, OWW_FRAME_SAMPLES, OpenWakeWord, SileroVad, VAD_WINDOW_SAMPLES};
+use ari_voice::native::{OWW_FRAME_SAMPLES, OpenWakeWord, SileroVad, VAD_WINDOW_SAMPLES};
+use common::{asset, fixture, use_host_library, wav};
 use ari_voice::wake_model::{OperatingPoint, by_id};
 
 /// The capture loop's read size (WakeWordService.CHUNK_SIZE).
@@ -26,45 +27,6 @@ const OWW_TOLERANCE: f32 = 1e-3;
 /// The reference is plain ONNX Runtime, which is all sherpa-onnx's
 /// `Vad.compute` is; the spike found differences below 1e-9.
 const VAD_TOLERANCE: f32 = 1e-5;
-
-fn workspace() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn use_host_library() {
-    let library = workspace().join("target/voice-native/libari_voice_native.so");
-    assert!(
-        library.exists(),
-        "{} is missing: run native/voice/build-host.sh first",
-        library.display()
-    );
-    native::set_library_path(library);
-}
-
-fn asset(name: &str) -> Result<Vec<u8>, String> {
-    std::fs::read(workspace().join("assets/voice").join(name)).map_err(|e| format!("{name}: {e}"))
-}
-
-fn fixture(name: &str) -> String {
-    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)).unwrap()
-}
-
-/// The samples of a 16-bit mono WAV's data chunk.
-fn wav(name: &str) -> Vec<i16> {
-    let bytes = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)).unwrap();
-    let mut offset = 12;
-    while offset + 8 <= bytes.len() {
-        let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
-        if &bytes[offset..offset + 4] == b"data" {
-            return bytes[offset + 8..offset + 8 + size]
-                .chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0], b[1]]))
-                .collect();
-        }
-        offset += 8 + size + (size & 1);
-    }
-    panic!("{name} has no data chunk");
-}
 
 fn expected_oww_scores() -> Vec<f32> {
     fixture("oww_parity_scores.txt").lines().map(|l| l.parse().unwrap()).collect()
@@ -189,9 +151,11 @@ fn silero_vad_matches_plain_onnx_runtime_window_by_window() {
 
     let mut vad = SileroVad::new(&asset(SILERO_VAD_FILE).unwrap()).unwrap();
     let probabilities: Vec<f32> = audio
-        .chunks_exact(VAD_WINDOW_SAMPLES)
+        .as_chunks::<VAD_WINDOW_SAMPLES>()
+        .0
+        .iter()
         .map(|w| {
-            let window: [f32; VAD_WINDOW_SAMPLES] = std::array::from_fn(|i| w[i] as f32 / 32768.0);
+            let window = w.map(|s| s as f32 / 32768.0);
             vad.compute(&window).unwrap()
         })
         .collect();

@@ -180,10 +180,13 @@ name = "ari-voice"
 version = "0.1.0"
 dependencies = [
  "ari-native",
+ "chrono",
  "regex",
  "reqwest",
  "rustls",
  "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
  "webpki-roots",
 ]
 
