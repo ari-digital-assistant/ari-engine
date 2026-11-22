@@ -19,6 +19,7 @@ pub mod pipeline;
 pub mod ring;
 pub mod sherpa;
 pub mod speech_check;
+pub mod stt;
 pub mod wake_log;
 pub mod wake_model;
 pub mod wake_phrase;

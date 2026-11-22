@@ -146,9 +146,12 @@ fn nothing_wakes_while_paused_or_while_a_listen_is_armed() {
     assert_eq!(0, paused.wakes());
 
     let armed = run(Host::default(), false);
-    armed.pipeline.set_listen_armed(true);
+    let feed = armed.pipeline.arm(0.0).unwrap();
     armed.push_fixture();
     assert_eq!(0, armed.wakes());
+    // Every chunk reached the feed, none dropped.
+    let fed: usize = feed.try_iter().map(|chunk| chunk.len()).sum();
+    assert_eq!(wav("oww_parity.wav").len(), fed);
 }
 
 #[test]
@@ -169,4 +172,29 @@ fn a_stopped_pipeline_hears_nothing() {
     run.pipeline.stop_wake();
     run.push_fixture();
     assert_eq!(0, run.wakes());
+}
+
+#[test]
+fn a_feed_starts_with_the_preroll_in_100_ms_slices_then_live_audio() {
+    let run = run(Host::default(), false);
+    let audio = wav("oww_parity.wav");
+    let (before, after) = audio.split_at(48_000);
+    for read in before.chunks(READ) {
+        run.pipeline.push_audio(read);
+    }
+    let feed = run.pipeline.arm(2.0).unwrap();
+    assert!(run.pipeline.arm(2.0).is_none(), "one consumer at a time");
+    for read in after.chunks(READ).take(3) {
+        run.pipeline.push_audio(read);
+    }
+    let chunks: Vec<Vec<i16>> = feed.try_iter().collect();
+    let sizes: Vec<usize> = chunks.iter().map(Vec::len).collect();
+    assert_eq!(vec![1_600; 20].into_iter().chain([480; 3]).collect::<Vec<_>>(), sizes);
+    assert_eq!(before[16_000..], chunks[..20].concat()[..]);
+    assert_eq!(after[..1_440], chunks[20..].concat()[..]);
+
+    run.pipeline.disarm();
+    assert!(feed.recv().is_err(), "disarm ends the feed");
+    assert!(!run.pipeline.is_armed());
+    assert_eq!(audio[48_000 + 1_440 - 16_000..48_000 + 1_440], run.pipeline.peek_recent(1.0)[..]);
 }

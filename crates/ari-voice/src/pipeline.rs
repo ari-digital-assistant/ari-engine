@@ -7,12 +7,15 @@
 //! this decides what counts as one.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Instant;
 
 use crate::detector::{SILERO_VAD_FILE, WakeDetector};
+use crate::cloud_stt::CloudSttService;
 use crate::ring::{AudioRing, RING_CAPACITY_SAMPLES};
 use crate::speech_check::{SPEECH_CHECK_BUFFER_SAMPLES, SPEECH_CHECK_TAIL_SAMPLES, SpeechCheckPacing, SpeechGate};
+use crate::stt::{Stt, SttEvent};
 use crate::wake_log::{ALIVE_INTERVAL_MS, WakeLog, model_fingerprint};
 use crate::wake_model::{WakeSensitivity, WakeWordModel};
 
@@ -41,6 +44,24 @@ pub trait VoiceHost: Send + Sync {
     /// A line for the frontend's own log. Nothing is stored.
     fn log(&self, level: LogLevel, message: &str) {
         let _ = (level, message);
+    }
+
+    /// The user's language, as the engine's locale codes go (`en`, `it`):
+    /// for the wake phrase rules and Whisper.
+    fn locale(&self) -> String {
+        "en".into()
+    }
+
+    /// What a listen has to say. Called on the listen's thread; hand it on.
+    fn stt_event(&self, event: SttEvent) {
+        let _ = event;
+    }
+
+    /// The cloud transcription service the user set up, and its key, asked
+    /// for at each transcription so a settings change needs no push. `None`
+    /// when there is none.
+    fn cloud_stt(&self) -> Option<(CloudSttService, Option<String>)> {
+        None
     }
 }
 
@@ -75,7 +96,18 @@ struct Wake {
 struct Capture {
     ring: AudioRing,
     wake: Option<Wake>,
+    /// The armed listen feed. Unbounded: the capture thread never blocks on a
+    /// slow decode, and no audio is ever dropped for one. Dropping it under
+    /// load was causing intermittent transcription corruption ("what time is
+    /// it" became "wheat" or "okay").
+    feed: Option<Sender<Vec<i16>>>,
 }
+
+/// Pre-roll goes to a feed as 100 ms slices, not one blob. sherpa is a
+/// streaming zipformer and gets confused by 2 s in a single acceptWaveform
+/// call: the encoder rhythm breaks and transcription truncates ("tell me some
+/// wisdom" became "tell"). Slices make the pre-roll look like live audio.
+pub const PREROLL_SLICE_SAMPLES: usize = 1_600;
 
 /// The one voice pipeline in a process: one microphone, one pipeline.
 pub struct VoicePipeline {
@@ -83,9 +115,9 @@ pub struct VoicePipeline {
     wake_log: Arc<WakeLog>,
     capture: Mutex<Capture>,
     paused: AtomicBool,
-    listen_armed: AtomicBool,
     last_detection_at: AtomicI64,
     clock: Box<dyn Fn() -> i64 + Send + Sync>,
+    pub(crate) stt: Stt,
 }
 
 static LIVE: OnceLock<Mutex<Weak<VoicePipeline>>> = OnceLock::new();
@@ -122,11 +154,11 @@ impl VoicePipeline {
         let pipeline = Arc::new(Self {
             host,
             wake_log,
-            capture: Mutex::new(Capture { ring: AudioRing::new(RING_CAPACITY_SAMPLES), wake: None }),
+            capture: Mutex::new(Capture { ring: AudioRing::new(RING_CAPACITY_SAMPLES), wake: None, feed: None }),
             paused: AtomicBool::new(false),
-            listen_armed: AtomicBool::new(false),
             last_detection_at: AtomicI64::new(i64::MIN / 2),
             clock,
+            stt: Stt::default(),
         });
         *live() = Arc::downgrade(&pipeline);
         pipeline
@@ -138,6 +170,14 @@ impl VoicePipeline {
 
     fn now(&self) -> i64 {
         (self.clock)()
+    }
+
+    pub(crate) fn now_ms(&self) -> i64 {
+        self.now()
+    }
+
+    pub(crate) fn host(&self) -> &Arc<dyn VoiceHost> {
+        &self.host
     }
 
     fn capture(&self) -> MutexGuard<'_, Capture> {
@@ -223,10 +263,45 @@ impl VoicePipeline {
         self.paused.store(paused, Ordering::Relaxed);
     }
 
-    /// Interim, until speech-to-text moves here: whether a listen is consuming
-    /// the microphone, during which a detection is never a wake.
-    pub fn set_listen_armed(&self, armed: bool) {
-        self.listen_armed.store(armed, Ordering::Relaxed);
+    /// Open a feed: the last `rewind_seconds` of the ring as 100 ms slices,
+    /// then every chunk the microphone delivers, until [`disarm`](Self::disarm).
+    /// `None` while another feed is armed: one consumer at a time. While a
+    /// feed is armed the wake word never wakes.
+    pub fn arm(&self, rewind_seconds: f32) -> Option<Receiver<Vec<i16>>> {
+        let mut capture = self.capture();
+        if capture.feed.is_some() {
+            self.host.log(LogLevel::Warn, "arm() called while already armed — ignoring");
+            return None;
+        }
+        let head = capture.ring.samples_written();
+        let rewind = (16_000.0 * rewind_seconds) as u64;
+        let from = head.saturating_sub(rewind);
+        let preroll = capture.ring.snapshot(from, head);
+        let (sender, receiver) = mpsc::channel();
+        let slices = preroll.chunks(PREROLL_SLICE_SAMPLES).map(|slice| sender.send(slice.to_vec())).count();
+        capture.feed = Some(sender);
+        self.host.log(
+            LogLevel::Info,
+            &format!("armed: head={head} from={from} prerollSamples={} slices={slices}", preroll.len()),
+        );
+        Some(receiver)
+    }
+
+    /// Close the feed, which ends its consumer's receive. Idempotent.
+    pub fn disarm(&self) {
+        if self.capture().feed.take().is_some() {
+            self.host.log(LogLevel::Info, "disarmed");
+        }
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.capture().feed.is_some()
+    }
+
+    /// The last `seconds` of audio, without arming: kept while a wake turn
+    /// plays out, so a wake nobody answers can be kept as a hard negative.
+    pub fn peek_recent(&self, seconds: f32) -> Vec<i16> {
+        self.capture().ring.recent((16_000.0 * seconds) as usize)
     }
 
     /// One chunk of 16 kHz mono audio from the microphone.
@@ -244,6 +319,13 @@ impl VoicePipeline {
         let mut capture = self.capture();
         let capture = &mut *capture;
         capture.ring.write(samples);
+        if let Some(feed) = &capture.feed
+            && feed.send(samples.to_vec()).is_err()
+        {
+            // The consumer went away without disarming.
+            capture.feed = None;
+        }
+        let armed = capture.feed.is_some();
         let Some(wake) = capture.wake.as_mut().filter(|w| w.started) else { return false };
 
         if now - wake.alive_logged_at >= ALIVE_INTERVAL_MS {
@@ -259,7 +341,7 @@ impl VoicePipeline {
         // Belt-and-braces: don't fire wake while a listen is armed. The
         // debounce below covers the common case, but the mic is permanently
         // open, so an in-utterance fire is possible.
-        if self.listen_armed.load(Ordering::Relaxed) {
+        if armed {
             wake.detector.reset();
             return false;
         }
