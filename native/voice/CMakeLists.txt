@@ -317,27 +317,30 @@ if(ANDROID)
 endif()
 
 # ------------------------------------------------------------------------------
-# Host builds (cargo test): a real ONNX Runtime beside the library
+# Host builds (cargo test): sherpa-onnx's libraries beside ours
 # ------------------------------------------------------------------------------
-# Android loads the libonnxruntime.so sherpa-onnx ships. A laptop or CI runner
-# has none, so the host build fetches the Linux one from ONNX Runtime's Java
-# package on Maven Central (the release the headers come from) and puts it next
-# to libari_voice_native.so, where $ORIGIN finds it.
+# Android loads the libsherpa-onnx-c-api.so and libonnxruntime.so sherpa-onnx's
+# AAR ships, and both the wake engines and speech-to-text run on that one ONNX
+# Runtime. A laptop or CI runner has neither, so the host build fetches the
+# same release's Linux build, the sherpa-onnx-core wheel on PyPI, and puts its
+# two libraries next to libari_voice_native.so, where $ORIGIN finds them. One
+# process can hold only one libonnxruntime.so, so this is the only one.
 if(NOT ANDROID)
     if(NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64"))
         message(FATAL_ERROR "Host builds of libari_voice_native are Linux x86_64 only so far")
     endif()
     FetchContent_Declare(
-        onnxruntime_host
-        URL https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime/1.23.2/onnxruntime-1.23.2.jar
-        URL_HASH SHA256=e0ab4a1af57d2da09097202f2dfd691e390c82e81183314788ccde4cf7c3cc38
-        DOWNLOAD_NAME onnxruntime-1.23.2.zip
+        sherpa_onnx_host
+        URL https://files.pythonhosted.org/packages/9a/4e/d946cc081864c8c242e787a73dd2ea61f861445f3d4207787d873e4dc65d/sherpa_onnx_core-2.0.1-py3-none-manylinux2014_x86_64.whl
+        URL_HASH SHA256=f4ee0ab91c4ae596e0e49d7de32522a946295e038a652f1c1884d89014ee4ec2
+        DOWNLOAD_NAME sherpa_onnx_core-2.0.1.zip
     )
-    FetchContent_MakeAvailable(onnxruntime_host)
+    FetchContent_MakeAvailable(sherpa_onnx_host)
     set_target_properties(ari_voice_native PROPERTIES BUILD_RPATH "$ORIGIN")
     add_custom_command(TARGET ari_voice_native POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${onnxruntime_host_SOURCE_DIR}/ai/onnxruntime/native/linux-x64/libonnxruntime.so
+            ${sherpa_onnx_host_SOURCE_DIR}/sherpa_onnx/lib/libsherpa-onnx-c-api.so
+            ${sherpa_onnx_host_SOURCE_DIR}/sherpa_onnx/lib/libonnxruntime.so
             $<TARGET_FILE_DIR:ari_voice_native>
     )
 endif()

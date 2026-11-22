@@ -12,11 +12,14 @@
 
 pub mod cloud_stt;
 pub mod detector;
+pub mod endpoint;
 pub mod ladder;
 pub mod native;
 pub mod pipeline;
 pub mod ring;
+pub mod sherpa;
 pub mod speech_check;
+pub mod stt;
 pub mod wake_log;
 pub mod wake_model;
 pub mod wake_phrase;

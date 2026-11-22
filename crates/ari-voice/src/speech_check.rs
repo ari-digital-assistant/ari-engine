@@ -14,21 +14,76 @@ pub const SPEECH_CHECK_BUFFER_SAMPLES: usize = 2 * 16_000;
 /// ...with speech required in its last second.
 pub const SPEECH_CHECK_TAIL_SAMPLES: usize = 16_000;
 
-/// Silero over a stretch of audio, asking whether anyone was speaking at the
-/// end of it. One instance belongs to one thread.
+/// Silero asking "has anyone been speaking recently?", one 512-sample window
+/// at a time against [`SPEECH_PROBABILITY`]; sherpa's segment machinery is not
+/// used.
+///
+/// Two kinds of owner, each with its own instance: a listen, for the streaming
+/// endpoint's veto through [`feed`](Self::feed) and the buffered listen's
+/// speech marks through [`heard_speech`](Self::heard_speech); and the wake
+/// word's check for speech before a wake, through
+/// [`speech_in_tail`](Self::speech_in_tail). One instance belongs to one thread.
 pub struct SpeechGate {
     vad: SileroVad,
+    // Carry-over so 1600-sample batches don't drop the 3.125-window tail.
+    pending: Vec<f32>,
+    last_speech_at: Option<i64>,
 }
 
 impl SpeechGate {
     pub fn new(model: &[u8]) -> Result<Self, String> {
-        Ok(Self { vad: SileroVad::new(model)? })
+        Ok(Self { vad: SileroVad::new(model)?, pending: Vec::new(), last_speech_at: None })
+    }
+
+    /// Reset per-utterance state at each listen start: the gate is reused
+    /// across utterances, since the model is not cheap to rebuild.
+    pub fn begin_utterance(&mut self) {
+        self.pending.clear();
+        self.last_speech_at = None;
+        self.vad.reset();
+    }
+
+    /// Feed one decode-loop batch; `now_ms` is the caller's clock.
+    pub fn feed(&mut self, samples: &[f32], now_ms: i64) -> Result<(), String> {
+        if self.scan(samples)? {
+            self.last_speech_at = Some(now_ms);
+        }
+        Ok(())
+    }
+
+    /// Feed one chunk; whether a window it completed was speech.
+    pub fn heard_speech(&mut self, samples: &[i16]) -> Result<bool, String> {
+        let floats: Vec<f32> = samples.iter().map(|s| *s as f32 / 32768.0).collect();
+        self.scan(&floats)
+    }
+
+    fn scan(&mut self, samples: &[f32]) -> Result<bool, String> {
+        self.pending.extend_from_slice(samples);
+        let mut heard = false;
+        let mut offset = 0;
+        while self.pending.len() - offset >= VAD_WINDOW_SAMPLES {
+            let window: &[f32; VAD_WINDOW_SAMPLES] =
+                self.pending[offset..offset + VAD_WINDOW_SAMPLES].try_into().expect("a whole window");
+            if self.vad.compute(window).ok_or("Silero failed to run")? >= SPEECH_PROBABILITY {
+                heard = true;
+            }
+            offset += VAD_WINDOW_SAMPLES;
+        }
+        self.pending.drain(..offset);
+        Ok(heard)
+    }
+
+    /// `i64::MAX` until the first speech window: arming silence must not read
+    /// as "recent speech".
+    pub fn ms_since_last_speech(&self, now_ms: i64) -> i64 {
+        self.last_speech_at.map_or(i64::MAX, |at| now_ms - at)
     }
 
     /// Whether `pcm` holds speech in a window ending within its last
     /// `tail_samples`, scored from a fresh state with the windows aligned so
     /// the last ends where `pcm` does. An error when the model fails to run.
     pub fn speech_in_tail(&mut self, pcm: &[i16], tail_samples: usize) -> Result<bool, String> {
+        // Clears the state feed() keeps, so the two uses never share an instance.
         self.vad.reset();
         let mut start = pcm.len() % VAD_WINDOW_SAMPLES;
         while start + VAD_WINDOW_SAMPLES <= pcm.len() {

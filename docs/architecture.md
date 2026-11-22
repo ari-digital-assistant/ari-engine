@@ -76,11 +76,10 @@ Silero VAD for the speech check. The models and their licences are in
 `assets/voice/`; the frontend reads them and hands the engine the bytes. User
 picks a wake word in Settings.
 
-On Android the microphone belongs to a foreground service (`WakeWordService`),
-and `CaptureBus` still keeps its own 2-second ring for speech-to-text until
-that moves too. The same mic feed is shared with STT — no handover, no gap.
-When the wake word fires, `CaptureBus` arms the STT channel and slices the
-2-second ring buffer (pre-roll) into the STT stream. The voice overlay
+On Android the microphone belongs to a foreground service (`WakeWordService`).
+The engine keeps the last 2 seconds of it, and the same feed serves STT — no
+handover, no gap. When the wake word fires, the listen arms the engine's feed,
+which hands it the 2-second ring (pre-roll) as 100 ms slices, then live audio. The voice overlay
 activity launches over the lock screen via the SYSTEM_ALERT_WINDOW BAL
 privilege.
 
@@ -300,8 +299,9 @@ before it could cancel.
 | Wake engines and VAD (C++) | `ari-engine/native/voice/` |
 | Wake log | `ari-engine/crates/ari-voice/src/wake_log.rs` |
 | Microphone and wake handling | `ari-android/.../wakeword/WakeWordService.kt` |
-| Audio pipeline | `ari-android/.../audio/CaptureBus.kt`, `AudioRingBuffer.kt` |
-| STT | `ari-android/.../stt/SpeechRecognizer.kt` (sherpa-onnx) |
+| Audio ring and listen feed | `ari-engine/crates/ari-voice/src/pipeline.rs`, `ring.rs` |
+| STT (sherpa-onnx's C API, cloud) | `ari-engine/crates/ari-voice/src/stt.rs`, `sherpa/`, `endpoint.rs` |
+| Android's system speech service | `ari-android/.../stt/SpeechRecognizer.kt` |
 | Cloud STT | `ari-engine/crates/ari-voice/src/cloud_stt.rs` |
 | Wake phrase matching and name checks | `ari-engine/crates/ari-voice/src/wake_phrase.rs` |
 | Wake word models, sensitivity ladders, tuning fit | `ari-engine/crates/ari-voice/src/wake_model.rs`, `ladder.rs` |

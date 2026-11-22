@@ -7,15 +7,20 @@
 //! and UniFFI's route (JNA, a copy into a buffer, boxing) costs more than the
 //! JNI call it replaces.
 
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use ari_voice::cloud_stt::{CloudSttFailure, CloudSttService};
 use ari_voice::detector::{OWW_EMBEDDING_FILE, OWW_MELSPECTROGRAM_FILE, WakeDetector};
 use ari_voice::pipeline::{self, LogLevel, VoiceHost, VoicePipeline, WakeConfig};
+use ari_voice::stt::{ListenEnded, ListenParams, SttError, SttEvent, SttModelSpec};
 use ari_voice::wake_log::{WakeLog, WakeOutcome};
 use ari_voice::wake_model::WakeEngine;
 
 use crate::FfiLogLevel;
-use crate::voice::{FfiOperatingPoint, FfiWakeSensitivity, FfiWakeWordModel};
+use crate::voice::{FfiCloudSttService, FfiEarlyNameCheck, FfiOperatingPoint, FfiWakeSensitivity, FfiWakeWordModel};
 
 /// How a wake the user could see ended (`ari_voice::wake_log::WakeOutcome`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -104,9 +109,95 @@ impl FfiWakeLog {
     }
 }
 
-/// What the pipeline needs from the app: model files, wakes, and log lines.
-/// Called on engine threads and the capture thread; hand work on rather than
-/// doing it in the call.
+/// The cloud transcription service the user set up, with its key.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCloudSttSetup {
+    pub service: FfiCloudSttService,
+    pub api_key: Option<String>,
+}
+
+/// Why a listen could not produce a transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSttFailure {
+    /// No model is loaded and the cloud is not selected.
+    NoModel,
+    /// Something else holds the listen feed.
+    Busy,
+    CloudNotConfigured,
+    CloudNetwork,
+    CloudAuth,
+    CloudServer,
+}
+
+/// How a buffered listen ended (`ListenEnd` slug) and when, for the wake log.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiListenEnded {
+    pub end: String,
+    pub after_ms: i64,
+}
+
+impl From<ListenEnded> for FfiListenEnded {
+    fn from(e: ListenEnded) -> Self {
+        Self { end: e.end.slug().into(), after_ms: e.after_ms }
+    }
+}
+
+/// What a listen tells the app (`ari_voice::stt::SttEvent`). Audio is 16-bit
+/// little-endian PCM.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiSttEvent {
+    Listening { partial: String, name_matched: Option<bool> },
+    Transcribing,
+    Done {
+        text: String,
+        parallel: Option<String>,
+        audio: Option<Vec<u8>>,
+        raw: Option<String>,
+        name_matched: Option<bool>,
+        listen_end: Option<FfiListenEnded>,
+    },
+    NoSpeech { audio: Option<Vec<u8>>, listen_end: Option<FfiListenEnded> },
+    Failed { failure: FfiSttFailure },
+}
+
+fn pcm_bytes(samples: &[i16]) -> Vec<u8> {
+    samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+}
+
+impl From<SttEvent> for FfiSttEvent {
+    fn from(event: SttEvent) -> Self {
+        match event {
+            SttEvent::Listening { partial, name_matched } => Self::Listening { partial, name_matched },
+            SttEvent::Transcribing => Self::Transcribing,
+            SttEvent::Done { text, parallel, audio, raw, name_matched, listen_end } => Self::Done {
+                text,
+                parallel,
+                audio: audio.as_deref().map(pcm_bytes),
+                raw,
+                name_matched,
+                listen_end: listen_end.map(Into::into),
+            },
+            SttEvent::NoSpeech { audio, listen_end } => {
+                Self::NoSpeech { audio: audio.as_deref().map(pcm_bytes), listen_end: listen_end.map(Into::into) }
+            }
+            SttEvent::Error(error) => Self::Failed {
+                failure: match error {
+                    SttError::NoModel => FfiSttFailure::NoModel,
+                    SttError::Busy => FfiSttFailure::Busy,
+                    SttError::Cloud(CloudSttFailure::NotConfigured) => FfiSttFailure::CloudNotConfigured,
+                    SttError::Cloud(CloudSttFailure::Network) => FfiSttFailure::CloudNetwork,
+                    SttError::Cloud(CloudSttFailure::Auth) => FfiSttFailure::CloudAuth,
+                    // An empty transcript arrives as NoSpeech; this is for completeness.
+                    SttError::Cloud(CloudSttFailure::Server | CloudSttFailure::Empty) => FfiSttFailure::CloudServer,
+                },
+            },
+        }
+    }
+}
+
+/// What the pipeline needs from the app: model files, wakes, speech events,
+/// settings and log lines. Called on engine threads and the capture thread;
+/// hand work on rather than doing it in the call.
 #[uniffi::export(with_foreign)]
 pub trait FfiVoiceHost: Send + Sync {
     /// A model file by name, or `None` when it cannot be read.
@@ -114,6 +205,12 @@ pub trait FfiVoiceHost: Send + Sync {
     /// The wake word was heard and passed the debounce and the speech check.
     fn wake_detected(&self);
     fn log(&self, level: FfiLogLevel, message: String);
+    /// The user's language code (`en`, `it`).
+    fn locale(&self) -> String;
+    /// What a listen has to say, on the listen's thread.
+    fn stt_event(&self, event: FfiSttEvent);
+    /// The cloud transcription service and key, asked for at each request.
+    fn cloud_stt(&self) -> Option<FfiCloudSttSetup>;
 }
 
 struct ForeignVoiceHost(Arc<dyn FfiVoiceHost>);
@@ -132,6 +229,78 @@ impl VoiceHost for ForeignVoiceHost {
             LogLevel::Warn => FfiLogLevel::Warn,
         };
         self.0.log(level, message.to_string());
+    }
+    fn locale(&self) -> String {
+        self.0.locale()
+    }
+    fn stt_event(&self, event: SttEvent) {
+        self.0.stt_event(event.into());
+    }
+    fn cloud_stt(&self) -> Option<(CloudSttService, Option<String>)> {
+        self.0.cloud_stt().map(|setup| (setup.service.into(), setup.api_key))
+    }
+}
+
+/// A model in a directory, as the app's `SttModel` describes it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSttModelSpec {
+    pub id: String,
+    pub model_type: String,
+    pub dir: String,
+    pub encoder_file: String,
+    pub decoder_file: String,
+    pub joiner_file: Option<String>,
+    pub tokens_file: String,
+}
+
+impl From<FfiSttModelSpec> for SttModelSpec {
+    fn from(s: FfiSttModelSpec) -> Self {
+        Self {
+            id: s.id,
+            model_type: s.model_type,
+            dir: PathBuf::from(s.dir),
+            encoder_file: s.encoder_file,
+            decoder_file: s.decoder_file,
+            joiner_file: s.joiner_file,
+            tokens_file: s.tokens_file,
+        }
+    }
+}
+
+/// One read from a [`FfiListenFeed`].
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiFeedRead {
+    /// 16-bit little-endian PCM.
+    Chunk { pcm: Vec<u8> },
+    /// Nothing arrived in time; the feed is still open.
+    Timeout,
+    /// The feed was disarmed.
+    Closed,
+}
+
+/// The listen feed for readers that live in the app: the pre-roll as 100 ms
+/// slices, then every chunk, until it is closed. No wake fires meanwhile.
+#[derive(uniffi::Object)]
+pub struct FfiListenFeed {
+    pipeline: Arc<VoicePipeline>,
+    receiver: Mutex<Receiver<Vec<i16>>>,
+}
+
+#[uniffi::export]
+impl FfiListenFeed {
+    /// The next chunk, waiting up to `timeout_ms` for it.
+    pub fn next(&self, timeout_ms: u64) -> FfiFeedRead {
+        let receiver = self.receiver.lock().unwrap_or_else(|e| e.into_inner());
+        match receiver.recv_timeout(Duration::from_millis(timeout_ms)) {
+            Ok(chunk) => FfiFeedRead::Chunk { pcm: pcm_bytes(&chunk) },
+            Err(RecvTimeoutError::Timeout) => FfiFeedRead::Timeout,
+            Err(RecvTimeoutError::Disconnected) => FfiFeedRead::Closed,
+        }
+    }
+
+    /// The end of this feed, and of the wake word's pause for it.
+    pub fn disarm(&self) {
+        self.pipeline.disarm();
     }
 }
 
@@ -185,9 +354,73 @@ impl FfiVoicePipeline {
         self.inner.set_wake_paused(paused);
     }
 
-    /// Interim until speech-to-text moves (step 3): a listen is consuming the mic.
-    pub fn set_listen_armed(&self, armed: bool) {
-        self.inner.set_listen_armed(armed);
+    /// Load a speech-to-text model and warm it up, releasing any other.
+    /// Blocking: call it off the UI thread.
+    pub fn load_stt(&self, spec: FfiSttModelSpec) -> Result<(), FfiVoiceError> {
+        Ok(self.inner.load_stt(&spec.into())?)
+    }
+
+    pub fn unload_stt(&self) {
+        self.inner.unload_stt();
+    }
+
+    /// Transcribe through the cloud (`cloud_stt` on the host) instead of a model.
+    pub fn set_cloud_mode(&self, enabled: bool) {
+        self.inner.set_cloud_mode(enabled);
+    }
+
+    pub fn stt_model_loaded(&self) -> bool {
+        self.inner.stt_model_loaded()
+    }
+
+    pub fn stt_model_id(&self) -> Option<String> {
+        self.inner.stt_model_id()
+    }
+
+    /// The streaming recogniser is in use: partials mean liveness, a retry means something.
+    pub fn stt_streaming(&self) -> bool {
+        self.inner.stt_streaming()
+    }
+
+    /// Listen from `rewind_seconds` back; the limits are a quiet wake's.
+    /// Events arrive through the host's `stt_event`.
+    pub fn start_listen(&self, rewind_seconds: f32, give_up_without_speech_ms: Option<i64>, limit_ms: Option<i64>) {
+        self.inner.start_listen(ListenParams { rewind_seconds, give_up_without_speech_ms, limit_ms });
+    }
+
+    pub fn stop_listen(&self) {
+        self.inner.stop_listen();
+    }
+
+    /// Interim until the session moves (step 4): the retry decode for a
+    /// streaming transcript the engine did not understand. Blocking.
+    pub fn transcribe_again(&self, pcm: Vec<u8>) -> Option<String> {
+        self.inner.transcribe_again(&samples(&pcm))
+    }
+
+    /// Interim until the session moves (step 4): the cloud's early name
+    /// check on the 2 s ending at a quiet wake. Blocking.
+    pub fn check_name_early(&self, pcm: Vec<u8>) -> Option<FfiEarlyNameCheck> {
+        self.inner.check_name_early(&samples(&pcm)).map(Into::into)
+    }
+
+    pub fn can_check_name_early(&self) -> bool {
+        self.inner.can_check_name_early()
+    }
+
+    /// Interim until the session moves (step 4): the last `seconds` of audio.
+    pub fn peek_recent(&self, seconds: f32) -> Vec<u8> {
+        pcm_bytes(&self.inner.peek_recent(seconds))
+    }
+
+    /// The listen feed for a reader in the app, or `None` while another holds it.
+    pub fn open_feed(&self, rewind_seconds: f32) -> Option<Arc<FfiListenFeed>> {
+        let receiver = self.inner.arm(rewind_seconds)?;
+        Some(Arc::new(FfiListenFeed { pipeline: Arc::clone(&self.inner), receiver: Mutex::new(receiver) }))
+    }
+
+    pub fn is_feed_armed(&self) -> bool {
+        self.inner.is_armed()
     }
 }
 

@@ -1,8 +1,9 @@
 #!/bin/sh
 # Builds libari_voice_native.so for this machine into target/voice-native/,
-# with the ONNX Runtime it loads beside it. ari-voice's tests load it from
-# there, so run this before `cargo test` whenever anything in native/voice
-# changes. The first run downloads TFLite Micro and ONNX Runtime.
+# with sherpa-onnx's C API and the ONNX Runtime both load beside it.
+# ari-voice's tests load them from there, so run this before `cargo test`
+# whenever anything in native/voice changes. The first run downloads TFLite
+# Micro, ONNX Runtime's headers and sherpa-onnx.
 set -eu
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 out="$root/target/voice-native"
