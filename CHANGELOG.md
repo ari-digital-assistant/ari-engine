@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ari-voice`, the voice pipeline every frontend shares, moving out of ari-android a step
+  at a time (`docs/superpowers/plans/2026-11-22-audio-in-engine.md`). It starts with the
+  rules and tables: finding the wake phrase in a transcript and the name checks on it,
+  the bundled wake word models and their sensitivity ladders, ladders tuned on the phone,
+  the false-wake remedy and the tuning fit. `ari-ffi` exports them (`match_wake_phrase`,
+  `wake_word_models`, `fit_tuned_ladder` and the rest), and ari-android no longer keeps
+  its own copies.
 - Assistant answers keep the markdown they were written in, for a host that renders it.
   `FfiResponse::Text` has a `markdown` field, set when an assistant answer formats
   anything, and `FfiAnswerSink::text` gets the markdown so far alongside the words.

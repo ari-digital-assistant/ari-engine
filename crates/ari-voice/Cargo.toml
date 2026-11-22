@@ -1,0 +1,9 @@
+[package]
+name = "ari-voice"
+version = "0.1.0"
+edition = "2024"
+description = "The voice pipeline every frontend shares: wake word, speech-to-text and the rules around them"
+license = "MIT"
+
+[dependencies]
+regex = "1.12.3"

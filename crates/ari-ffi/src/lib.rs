@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 mod assistant_registry;
 mod settings_store;
 mod skill_registry;
+mod voice;
 
 pub use assistant_registry::{
     AssistantRegistry, FfiAssistantEntry, FfiConfigField, FfiSelectOption,
