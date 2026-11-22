@@ -15,12 +15,16 @@ use std::time::Duration;
 use ari_voice::cloud_stt::{CloudSttFailure, CloudSttService};
 use ari_voice::detector::{OWW_EMBEDDING_FILE, OWW_MELSPECTROGRAM_FILE, WakeDetector};
 use ari_voice::pipeline::{self, LogLevel, VoiceHost, VoicePipeline, WakeConfig};
-use ari_voice::stt::{ListenEnded, ListenParams, SttError, SttEvent, SttModelSpec};
+use ari_voice::session::{
+    ActionOutcome, AnswerSink, CaptureMode, EngineReply, Intercepted, LoggedReply, LoggedTurn, Phrase, ReplyFlags,
+    HostHeard, SessionConfig, SessionError, SessionHost, SessionState, TurnEngine,
+};
+use ari_voice::stt::{ListenParams, SttError, SttModelSpec};
 use ari_voice::wake_log::{WakeLog, WakeOutcome};
 use ari_voice::wake_model::WakeEngine;
 
-use crate::FfiLogLevel;
-use crate::voice::{FfiCloudSttService, FfiEarlyNameCheck, FfiOperatingPoint, FfiWakeSensitivity, FfiWakeWordModel};
+use crate::voice::{FfiCloudSttService, FfiOperatingPoint, FfiWakeSensitivity, FfiWakeWordModel};
+use crate::{AriEngine, FfiLogLevel, FfiResponse};
 
 /// How a wake the user could see ended (`ari_voice::wake_log::WakeOutcome`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -50,18 +54,6 @@ impl From<FfiWakeOutcome> for WakeOutcome {
     }
 }
 
-#[uniffi::export]
-impl FfiWakeOutcome {
-    /// The overlay opened and nobody had called Ari.
-    pub fn false_wake(&self) -> bool {
-        WakeOutcome::from(*self).false_wake()
-    }
-
-    pub fn slug(&self) -> String {
-        WakeOutcome::from(*self).slug().to_string()
-    }
-}
-
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum FfiVoiceError {
     #[error("{reason}")]
@@ -74,8 +66,8 @@ impl From<String> for FfiVoiceError {
     }
 }
 
-/// The wake log file (`ari_voice::wake_log::WakeLog`). One per process, shared
-/// by the pipeline and the frontend's voice session.
+/// The wake log file (`ari_voice::wake_log::WakeLog`). One per process,
+/// shared by the pipeline and the frontend.
 #[derive(uniffi::Object)]
 pub struct FfiWakeLog {
     inner: Arc<WakeLog>,
@@ -88,19 +80,10 @@ impl FfiWakeLog {
         Arc::new(Self { inner: Arc::new(WakeLog::new(path)) })
     }
 
-    /// `hidden`: a quiet wake that ended without ever showing anything.
+    /// How a wake ended that never reached a session: the overlay could not
+    /// be opened. The session writes every other ending itself.
     pub fn outcome(&self, outcome: FfiWakeOutcome, hidden: bool) {
         self.inner.outcome(outcome.into(), hidden);
-    }
-
-    /// Interim until the session moves (step 4): how a wake's listen ended.
-    pub fn listen_ended(&self, end: String, after_ms: i64) {
-        self.inner.listen_ended(&end, after_ms);
-    }
-
-    /// Interim until the session moves (step 4): a quiet wake's early name check.
-    pub fn early_name_check(&self, result: String, after_ms: i64, in_time: bool) {
-        self.inner.early_name_check(&result, after_ms, in_time);
     }
 
     /// The last day and week summarised, then the week's lines, for a bug report.
@@ -127,76 +110,72 @@ pub enum FfiSttFailure {
     CloudNetwork,
     CloudAuth,
     CloudServer,
+    /// The host's own transcriber refused the request.
+    ServiceRefused,
+    /// The host's own transcriber failed.
+    ServiceFailed,
 }
 
-/// How a buffered listen ended (`ListenEnd` slug) and when, for the wake log.
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct FfiListenEnded {
-    pub end: String,
-    pub after_ms: i64,
-}
-
-impl From<ListenEnded> for FfiListenEnded {
-    fn from(e: ListenEnded) -> Self {
-        Self { end: e.end.slug().into(), after_ms: e.after_ms }
+impl From<SttError> for FfiSttFailure {
+    fn from(error: SttError) -> Self {
+        match error {
+            SttError::NoModel => Self::NoModel,
+            SttError::Busy => Self::Busy,
+            SttError::Cloud(CloudSttFailure::NotConfigured) => Self::CloudNotConfigured,
+            SttError::Cloud(CloudSttFailure::Network) => Self::CloudNetwork,
+            SttError::Cloud(CloudSttFailure::Auth) => Self::CloudAuth,
+            // An empty transcript arrives as NoSpeech; this is for completeness.
+            SttError::Cloud(CloudSttFailure::Server | CloudSttFailure::Empty) => Self::CloudServer,
+            SttError::HostRefused => Self::ServiceRefused,
+            SttError::HostFailed => Self::ServiceFailed,
+        }
     }
 }
 
-/// What a listen tells the app (`ari_voice::stt::SttEvent`). Audio is 16-bit
-/// little-endian PCM.
+impl From<FfiSttFailure> for SttError {
+    fn from(failure: FfiSttFailure) -> Self {
+        match failure {
+            FfiSttFailure::NoModel => Self::NoModel,
+            FfiSttFailure::Busy => Self::Busy,
+            FfiSttFailure::CloudNotConfigured => Self::Cloud(CloudSttFailure::NotConfigured),
+            FfiSttFailure::CloudNetwork => Self::Cloud(CloudSttFailure::Network),
+            FfiSttFailure::CloudAuth => Self::Cloud(CloudSttFailure::Auth),
+            FfiSttFailure::CloudServer => Self::Cloud(CloudSttFailure::Server),
+            FfiSttFailure::ServiceRefused => Self::HostRefused,
+            FfiSttFailure::ServiceFailed => Self::HostFailed,
+        }
+    }
+}
+
+/// What the app's own transcriber (the system speech service) heard, for
+/// the listen the session asked it for. Audio is 16-bit little-endian PCM.
 #[derive(Debug, Clone, uniffi::Enum)]
-pub enum FfiSttEvent {
-    Listening { partial: String, name_matched: Option<bool> },
-    Transcribing,
-    Done {
-        text: String,
-        parallel: Option<String>,
-        audio: Option<Vec<u8>>,
-        raw: Option<String>,
-        name_matched: Option<bool>,
-        listen_end: Option<FfiListenEnded>,
-    },
-    NoSpeech { audio: Option<Vec<u8>>, listen_end: Option<FfiListenEnded> },
+pub enum FfiHostHeard {
+    /// The words so far.
+    Partial { text: String },
+    /// The transcript, and all the audio the transcriber was handed.
+    Final { text: String, audio: Vec<u8> },
+    NoSpeech { audio: Vec<u8> },
     Failed { failure: FfiSttFailure },
+}
+
+impl From<FfiHostHeard> for HostHeard {
+    fn from(heard: FfiHostHeard) -> Self {
+        match heard {
+            FfiHostHeard::Partial { text } => Self::Partial(text),
+            FfiHostHeard::Final { text, audio } => Self::Final { text, audio: samples(&audio) },
+            FfiHostHeard::NoSpeech { audio } => Self::NoSpeech { audio: samples(&audio) },
+            FfiHostHeard::Failed { failure } => Self::Failed(failure.into()),
+        }
+    }
 }
 
 fn pcm_bytes(samples: &[i16]) -> Vec<u8> {
     samples.iter().flat_map(|s| s.to_le_bytes()).collect()
 }
 
-impl From<SttEvent> for FfiSttEvent {
-    fn from(event: SttEvent) -> Self {
-        match event {
-            SttEvent::Listening { partial, name_matched } => Self::Listening { partial, name_matched },
-            SttEvent::Transcribing => Self::Transcribing,
-            SttEvent::Done { text, parallel, audio, raw, name_matched, listen_end } => Self::Done {
-                text,
-                parallel,
-                audio: audio.as_deref().map(pcm_bytes),
-                raw,
-                name_matched,
-                listen_end: listen_end.map(Into::into),
-            },
-            SttEvent::NoSpeech { audio, listen_end } => {
-                Self::NoSpeech { audio: audio.as_deref().map(pcm_bytes), listen_end: listen_end.map(Into::into) }
-            }
-            SttEvent::Error(error) => Self::Failed {
-                failure: match error {
-                    SttError::NoModel => FfiSttFailure::NoModel,
-                    SttError::Busy => FfiSttFailure::Busy,
-                    SttError::Cloud(CloudSttFailure::NotConfigured) => FfiSttFailure::CloudNotConfigured,
-                    SttError::Cloud(CloudSttFailure::Network) => FfiSttFailure::CloudNetwork,
-                    SttError::Cloud(CloudSttFailure::Auth) => FfiSttFailure::CloudAuth,
-                    // An empty transcript arrives as NoSpeech; this is for completeness.
-                    SttError::Cloud(CloudSttFailure::Server | CloudSttFailure::Empty) => FfiSttFailure::CloudServer,
-                },
-            },
-        }
-    }
-}
-
-/// What the pipeline needs from the app: model files, wakes, speech events,
-/// settings and log lines. Called on engine threads and the capture thread;
+/// What the pipeline needs from the app: model files, wakes, settings and
+/// log lines. Called on engine threads and the capture thread;
 /// hand work on rather than doing it in the call.
 #[uniffi::export(with_foreign)]
 pub trait FfiVoiceHost: Send + Sync {
@@ -207,8 +186,6 @@ pub trait FfiVoiceHost: Send + Sync {
     fn log(&self, level: FfiLogLevel, message: String);
     /// The user's language code (`en`, `it`).
     fn locale(&self) -> String;
-    /// What a listen has to say, on the listen's thread.
-    fn stt_event(&self, event: FfiSttEvent);
     /// The cloud transcription service and key, asked for at each request.
     fn cloud_stt(&self) -> Option<FfiCloudSttSetup>;
 }
@@ -232,9 +209,6 @@ impl VoiceHost for ForeignVoiceHost {
     }
     fn locale(&self) -> String {
         self.0.locale()
-    }
-    fn stt_event(&self, event: SttEvent) {
-        self.0.stt_event(event.into());
     }
     fn cloud_stt(&self) -> Option<(CloudSttService, Option<String>)> {
         self.0.cloud_stt().map(|setup| (setup.service.into(), setup.api_key))
@@ -377,40 +351,58 @@ impl FfiVoicePipeline {
         self.inner.stt_model_id()
     }
 
-    /// The streaming recogniser is in use: partials mean liveness, a retry means something.
-    pub fn stt_streaming(&self) -> bool {
-        self.inner.stt_streaming()
+    /// Start the voice session, with `host` to show, play and run what it
+    /// decides. Once, before any turn.
+    pub fn attach_session_host(&self, host: Arc<dyn FfiSessionHost>) {
+        self.inner.attach_session_host(Arc::new(ForeignSessionHost(host)));
     }
 
-    /// Listen from `rewind_seconds` back; the limits are a quiet wake's.
-    /// Events arrive through the host's `stt_event`.
-    pub fn start_listen(&self, rewind_seconds: f32, give_up_without_speech_ms: Option<i64>, limit_ms: Option<i64>) {
-        self.inner.start_listen(ListenParams { rewind_seconds, give_up_without_speech_ms, limit_ms });
+    /// The engine voice turns go to, once it is built. A turn that reaches it
+    /// sooner waits.
+    pub fn attach_engine(&self, engine: Arc<AriEngine>) {
+        self.inner.attach_engine(engine);
     }
 
-    pub fn stop_listen(&self) {
-        self.inner.stop_listen();
+    /// The settings the session acts on. Again whenever one changes.
+    pub fn configure_session(&self, config: FfiSessionConfig) {
+        self.inner.configure_session(config.into());
     }
 
-    /// Interim until the session moves (step 4): the retry decode for a
-    /// streaming transcript the engine did not understand. Blocking.
-    pub fn transcribe_again(&self, pcm: Vec<u8>) -> Option<String> {
-        self.inner.transcribe_again(&samples(&pcm))
+    /// Begin a voice turn: `verify_wake` for a wake word, `quiet` for one the
+    /// wake service started, unseen until a name check passes. False when a
+    /// session is already running. The first state has reached the host by
+    /// the time this returns; never call it from inside a host callback.
+    pub fn start_turn(&self, verify_wake: bool, quiet: bool) -> bool {
+        self.inner.start_turn(verify_wake, quiet)
     }
 
-    /// Interim until the session moves (step 4): the cloud's early name
-    /// check on the 2 s ending at a quiet wake. Blocking.
-    pub fn check_name_early(&self, pcm: Vec<u8>) -> Option<FfiEarlyNameCheck> {
-        self.inner.check_name_early(&samples(&pcm)).map(Into::into)
+    /// Begin a dictation; false when a session is already running.
+    pub fn start_dictation(&self) -> bool {
+        self.inner.start_dictation()
     }
 
-    pub fn can_check_name_early(&self) -> bool {
-        self.inner.can_check_name_early()
+    pub fn stop_dictation(&self) {
+        self.inner.stop_dictation();
     }
 
-    /// Interim until the session moves (step 4): the last `seconds` of audio.
-    pub fn peek_recent(&self, seconds: f32) -> Vec<u8> {
-        pcm_bytes(&self.inner.peek_recent(seconds))
+    /// End the session: the overlay was closed.
+    pub fn dismiss(&self) {
+        self.inner.dismiss();
+    }
+
+    /// The speech the session asked for under `id` has finished, been
+    /// stopped, or could not start.
+    pub fn speech_finished(&self, id: u64) {
+        self.inner.speech_finished(id);
+    }
+
+    /// What the app's own transcriber heard, for the listen it was asked to do.
+    pub fn host_heard(&self, heard: FfiHostHeard) {
+        self.inner.host_heard(heard.into());
+    }
+
+    pub fn is_session_active(&self) -> bool {
+        self.inner.is_session_active()
     }
 
     /// The listen feed for a reader in the app, or `None` while another holds it.
@@ -421,6 +413,295 @@ impl FfiVoicePipeline {
 
     pub fn is_feed_armed(&self) -> bool {
         self.inner.is_armed()
+    }
+}
+
+/// What the overlay shows (`ari_voice::session::SessionState`).
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum FfiSessionState {
+    /// No session. `keep_cards`: leave the answer's cards on the overlay.
+    Idle { keep_cards: bool },
+    /// The speech model is loading; `message` is being said.
+    Preparing { message: String },
+    Listening { partial: String },
+    Thinking,
+    /// `cards`: show the cards the last `handle_action` or `intercept` made.
+    Responding { text: String, cards: bool },
+    Error { error: FfiSessionError },
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum FfiSessionError {
+    NoSpeechModel,
+    Stt { failure: FfiSttFailure },
+    NoSpeech,
+    Failed { message: String },
+}
+
+impl From<SessionState> for FfiSessionState {
+    fn from(state: SessionState) -> Self {
+        match state {
+            SessionState::Idle { keep_cards } => Self::Idle { keep_cards },
+            SessionState::Preparing { message } => Self::Preparing { message },
+            SessionState::Listening { partial } => Self::Listening { partial },
+            SessionState::Thinking => Self::Thinking,
+            SessionState::Responding { text, cards } => Self::Responding { text, cards },
+            SessionState::Error(error) => Self::Error {
+                error: match error {
+                    SessionError::NoSpeechModel => FfiSessionError::NoSpeechModel,
+                    SessionError::Stt(e) => FfiSessionError::Stt { failure: e.into() },
+                    SessionError::NoSpeech => FfiSessionError::NoSpeech,
+                    SessionError::Failed(message) => FfiSessionError::Failed { message },
+                },
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiPhrase {
+    PleaseWait,
+    PleaseRepeat,
+}
+
+/// How the mic is captured: wake-word listening, or echo-cancelled for a
+/// "let's talk" session with barge-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiCaptureMode {
+    Normal,
+    Conversation,
+}
+
+/// The settings the session acts on.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSessionConfig {
+    pub barge_in_enabled: bool,
+    pub echo_canceller: bool,
+    pub keep_false_trigger_audio: bool,
+    pub keep_wake_audio: bool,
+    pub keep_utterance_audio: bool,
+    pub keep_everything_audio: bool,
+    /// The directory the capture directories sit under.
+    pub captures_dir: Option<String>,
+    /// The app transcribes listens itself (the system speech service).
+    pub host_transcribes: bool,
+}
+
+impl From<FfiSessionConfig> for SessionConfig {
+    fn from(c: FfiSessionConfig) -> Self {
+        Self {
+            barge_in_enabled: c.barge_in_enabled,
+            echo_canceller: c.echo_canceller,
+            keep_false_trigger_audio: c.keep_false_trigger_audio,
+            keep_wake_audio: c.keep_wake_audio,
+            keep_utterance_audio: c.keep_utterance_audio,
+            keep_everything_audio: c.keep_everything_audio,
+            captures_dir: c.captures_dir.map(PathBuf::from),
+            host_transcribes: c.host_transcribes,
+        }
+    }
+}
+
+/// What the app did with words an alert or a card claimed. It has already
+/// acted and written the conversation log.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiIntercepted {
+    No,
+    Alert,
+    CardSilent,
+    CardSpoken { text: String, cards: bool },
+}
+
+/// An action envelope the app ran.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiActionOutcome {
+    pub text: String,
+    pub display_text: Option<String>,
+    pub cards: bool,
+    pub attachments: bool,
+}
+
+/// A spoken turn for the conversation log.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiLoggedTurn {
+    /// Clear the log first, and log `heard` no longer.
+    pub clear: bool,
+    pub heard: String,
+    /// With the attachments the app holds from this turn's action.
+    pub reply: Option<FfiLoggedReply>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiLoggedReply {
+    pub text: String,
+    pub markdown: Option<String>,
+    pub skill_id: Option<String>,
+}
+
+impl From<LoggedTurn> for FfiLoggedTurn {
+    fn from(t: LoggedTurn) -> Self {
+        Self {
+            clear: t.clear,
+            heard: t.heard,
+            reply: t.reply.map(|r: LoggedReply| FfiLoggedReply { text: r.text, markdown: r.markdown, skill_id: r.skill_id }),
+        }
+    }
+}
+
+/// A listen for the app's own transcriber.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiListenParams {
+    pub rewind_seconds: f32,
+    /// A quiet wake's limit: stop the audio here, so the transcriber has to end.
+    pub limit_ms: Option<i64>,
+}
+
+/// What the voice session needs from the app. Called on the session's
+/// threads; the ones that block run on workers. None may call back into the
+/// pipeline's start commands before returning.
+#[uniffi::export(with_foreign)]
+pub trait FfiSessionHost: Send + Sync {
+    fn state(&self, state: FfiSessionState);
+    /// Show a quiet wake: it passed a name check.
+    fn reveal(&self);
+    fn play_cue(&self, volume: f32);
+    /// Say `text`, cutting off whatever plays when `flush`. Report
+    /// `speech_finished(id)` once it has finished, been stopped, or could not start.
+    fn speak(&self, id: u64, text: String, flush: bool);
+    fn stop_speaking(&self);
+    fn phrase(&self, phrase: FfiPhrase) -> String;
+    fn capture_mode(&self, mode: FfiCaptureMode);
+    /// Blocking: load the user's speech model for a cold start.
+    fn load_speech_model(&self) -> bool;
+    /// Transcribe a listen, reporting through `host_heard`.
+    fn host_listen(&self, params: FfiListenParams);
+    fn host_stop_listen(&self);
+    /// Blocking: give the words to a sounding alert or, when `cards`, the card on screen.
+    fn intercept(&self, text: String, cards: bool) -> FfiIntercepted;
+    /// Blocking: run an action envelope.
+    fn handle_action(&self, json: String, skill_id: String) -> FfiActionOutcome;
+    fn turn_logged(&self, turn: FfiLoggedTurn);
+    fn facts_changed(&self);
+    fn false_wake(&self);
+    fn dictated(&self, text: String);
+    /// The engine finished a call.
+    fn engine_turn_finished(&self);
+}
+
+struct ForeignSessionHost(Arc<dyn FfiSessionHost>);
+
+impl SessionHost for ForeignSessionHost {
+    fn state(&self, state: SessionState) {
+        self.0.state(state.into());
+    }
+    fn reveal(&self) {
+        self.0.reveal();
+    }
+    fn play_cue(&self, volume: f32) {
+        self.0.play_cue(volume);
+    }
+    fn speak(&self, id: u64, text: &str, flush: bool) {
+        self.0.speak(id, text.to_string(), flush);
+    }
+    fn stop_speaking(&self) {
+        self.0.stop_speaking();
+    }
+    fn phrase(&self, phrase: Phrase) -> String {
+        self.0.phrase(match phrase {
+            Phrase::PleaseWait => FfiPhrase::PleaseWait,
+            Phrase::PleaseRepeat => FfiPhrase::PleaseRepeat,
+        })
+    }
+    fn capture_mode(&self, mode: CaptureMode) {
+        self.0.capture_mode(match mode {
+            CaptureMode::Normal => FfiCaptureMode::Normal,
+            CaptureMode::Conversation => FfiCaptureMode::Conversation,
+        });
+    }
+    fn load_speech_model(&self) -> bool {
+        self.0.load_speech_model()
+    }
+    fn host_listen(&self, params: ListenParams) {
+        self.0.host_listen(FfiListenParams { rewind_seconds: params.rewind_seconds, limit_ms: params.limit_ms });
+    }
+    fn host_stop_listen(&self) {
+        self.0.host_stop_listen();
+    }
+    fn intercept(&self, text: &str, cards: bool) -> Intercepted {
+        match self.0.intercept(text.to_string(), cards) {
+            FfiIntercepted::No => Intercepted::No,
+            FfiIntercepted::Alert => Intercepted::Alert,
+            FfiIntercepted::CardSilent => Intercepted::CardSilent,
+            FfiIntercepted::CardSpoken { text, cards } => Intercepted::CardSpoken { text, cards },
+        }
+    }
+    fn handle_action(&self, json: &str, skill_id: &str) -> ActionOutcome {
+        let o = self.0.handle_action(json.to_string(), skill_id.to_string());
+        ActionOutcome { text: o.text, display_text: o.display_text, cards: o.cards, attachments: o.attachments }
+    }
+    fn turn_logged(&self, turn: LoggedTurn) {
+        self.0.turn_logged(turn.into());
+    }
+    fn facts_changed(&self) {
+        self.0.facts_changed();
+    }
+    fn false_wake(&self) {
+        self.0.false_wake();
+    }
+    fn dictated(&self, text: &str) {
+        self.0.dictated(text.to_string());
+    }
+    fn engine_turn_finished(&self) {
+        self.0.engine_turn_finished();
+    }
+}
+
+/// An answer the engine writes, handed on to the session.
+struct VoiceAnswerSink(Arc<dyn AnswerSink>);
+
+impl ari_engine::AnswerSink for VoiceAnswerSink {
+    fn text(&self, so_far: &str, markdown: Option<&str>) {
+        self.0.text(so_far, markdown);
+    }
+    fn sentence(&self, text: &str) {
+        self.0.sentence(text);
+    }
+}
+
+fn engine_reply(response: FfiResponse) -> EngineReply {
+    match response {
+        FfiResponse::Text { body, markdown, rearm, enter_conversation, exit_conversation, facts_changed, clear_conversation } => {
+            EngineReply::Text {
+                body,
+                markdown,
+                flags: ReplyFlags { rearm, enter_conversation, exit_conversation, facts_changed, clear_conversation },
+            }
+        }
+        FfiResponse::Action { json, skill_id, rearm, enter_conversation, exit_conversation, facts_changed, clear_conversation } => {
+            EngineReply::Action {
+                json,
+                skill_id,
+                flags: ReplyFlags { rearm, enter_conversation, exit_conversation, facts_changed, clear_conversation },
+            }
+        }
+        FfiResponse::Binary { mime, data } => EngineReply::Binary { mime, len: data.len() },
+        FfiResponse::NotUnderstood { body } => EngineReply::NotUnderstood { body },
+    }
+}
+
+impl TurnEngine for AriEngine {
+    fn respond(&self, input: &str, alternative: Option<&str>, answer: Option<Arc<dyn AnswerSink>>) -> (EngineReply, bool) {
+        let answer = answer.map(|a| Arc::new(VoiceAnswerSink(a)) as Arc<dyn ari_engine::AnswerSink>);
+        let (response, used_alternative) = self.respond_with(input.to_string(), alternative.map(str::to_string), answer);
+        (engine_reply(response), used_alternative)
+    }
+
+    fn cancel_pending_reply(&self) {
+        AriEngine::cancel_pending_reply(self);
+    }
+
+    fn set_conversation_active(&self, active: bool) {
+        AriEngine::set_conversation_active(self, active);
     }
 }
 
@@ -459,6 +740,15 @@ pub fn wake_model_files(model: FfiWakeWordModel) -> Vec<String> {
 /// a whole session's audio through many times over.
 fn samples(pcm: &[u8]) -> Vec<i16> {
     pcm.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)).collect()
+}
+
+/// Write `pcm` as `<stem>.wav` and `sidecar` as `<stem>.txt` in `dir`, then
+/// evict the oldest pairs past the caps: the wake sample recorder's store,
+/// written as the session writes its captures.
+#[uniffi::export]
+pub fn save_clip(dir: String, stem: String, pcm: Vec<u8>, sidecar: String, max_files: u32, max_bytes: u64) -> Result<(), FfiVoiceError> {
+    ari_voice::session::captures::save_clip(&PathBuf::from(dir), &stem, &samples(&pcm), &sidecar, max_files as usize, max_bytes)
+        .map_err(|e| e.to_string().into())
 }
 
 /// One wake engine outside the pipeline, for the tuner and the parity test.

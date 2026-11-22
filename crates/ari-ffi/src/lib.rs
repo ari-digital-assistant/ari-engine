@@ -169,14 +169,6 @@ impl From<LogLevel> for FfiLogLevel {
     }
 }
 
-/// What a spoken turn produced, and whether the engine acted on the
-/// recogniser's second transcript instead of its first.
-#[derive(Debug, uniffi::Record)]
-pub struct FfiSpokenResponse {
-    pub response: FfiResponse,
-    pub used_alternative: bool,
-}
-
 /// Callback interface the host implements to receive log lines from WASM
 /// skills. Rust calls `log` whenever a skill invokes `ari::log(...)` via
 /// the SDK's `host_log` import. On Android this is wired to
@@ -246,10 +238,8 @@ pub trait FfiAnswerSink: Send + Sync {
 
 /// Wraps a foreign [`FfiAnswerSink`] so it satisfies the engine's
 /// [`AnswerSink`]. Same `&str`→`String` copy as the other adapters.
-#[cfg(feature = "llm")]
 struct ForeignAnswerSinkAdapter(Arc<dyn FfiAnswerSink>);
 
-#[cfg(feature = "llm")]
 impl AnswerSink for ForeignAnswerSinkAdapter {
     fn text(&self, so_far: &str, markdown: Option<&str>) {
         self.0.text(so_far.to_string(), markdown.map(str::to_string));
@@ -1386,23 +1376,7 @@ impl AriEngine {
     /// (ari-android#37). The sink is called on this thread, under the engine
     /// lock, so it must not call back into the engine.
     pub fn process_input_streaming(&self, input: String, sink: Arc<dyn FfiAnswerSink>) -> FfiResponse {
-        self.respond(input, Some(sink))
-    }
-
-    /// [`Self::process_input_streaming`] for a spoken turn the recogniser
-    /// also heard a second way: the streaming path's parallel stream. When
-    /// `input` finds no skill and `alternative` does, the engine acts on
-    /// `alternative` at the point it would otherwise hand `input` to the
-    /// assistant, which on-device answers anything and so leaves the host's
-    /// not-understood retry nothing to do. The result says which it acted on.
-    pub fn process_spoken_input(
-        &self,
-        input: String,
-        alternative: Option<String>,
-        sink: Arc<dyn FfiAnswerSink>,
-    ) -> FfiSpokenResponse {
-        let (response, used_alternative) = self.respond_with(input, alternative, Some(sink));
-        FfiSpokenResponse { response, used_alternative }
+        self.respond(input, Some(Arc::new(ForeignAnswerSinkAdapter(sink))))
     }
 
     /// Discard any pending question the engine is awaiting a reply to. Called
@@ -1629,17 +1603,18 @@ impl AriEngine {
 impl AriEngine {
     /// The body of [`Self::process_input`], with an on-device answer going to
     /// `answer` while it's written, when there is one.
-    fn respond(&self, input: String, answer: Option<Arc<dyn FfiAnswerSink>>) -> FfiResponse {
+    fn respond(&self, input: String, answer: Option<Arc<dyn AnswerSink>>) -> FfiResponse {
         self.respond_with(input, None, answer).0
     }
 
     /// [`Self::respond`], with a second transcript of the turn the engine may
-    /// act on instead; also says whether it did.
-    fn respond_with(
+    /// act on instead; also says whether it did. The voice session's turns
+    /// come through here (`TurnEngine`).
+    pub(crate) fn respond_with(
         &self,
         input: String,
         alternative: Option<String>,
-        answer: Option<Arc<dyn FfiAnswerSink>>,
+        answer: Option<Arc<dyn AnswerSink>>,
     ) -> (FfiResponse, bool) {
         // Refresh the engine's locale on every call so per-locale
         // skill scorers and responses pick up live changes from the
@@ -1650,9 +1625,7 @@ impl AriEngine {
         let mut engine = self.inner.lock().expect("engine mutex poisoned");
         engine.set_locale(locale.clone());
         #[cfg(feature = "llm")]
-        engine.set_answer_sink(
-            answer.map(|s| Arc::new(ForeignAnswerSinkAdapter(s)) as Arc<dyn AnswerSink>),
-        );
+        engine.set_answer_sink(answer);
         // Without the on-device assistant there are no answers to stream.
         #[cfg(not(feature = "llm"))]
         drop(answer);
