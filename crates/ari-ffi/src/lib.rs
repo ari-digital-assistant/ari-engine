@@ -169,6 +169,14 @@ impl From<LogLevel> for FfiLogLevel {
     }
 }
 
+/// What a spoken turn produced, and whether the engine acted on the
+/// recogniser's second transcript instead of its first.
+#[derive(Debug, uniffi::Record)]
+pub struct FfiSpokenResponse {
+    pub response: FfiResponse,
+    pub used_alternative: bool,
+}
+
 /// Callback interface the host implements to receive log lines from WASM
 /// skills. Rust calls `log` whenever a skill invokes `ari::log(...)` via
 /// the SDK's `host_log` import. On Android this is wired to
@@ -1381,6 +1389,22 @@ impl AriEngine {
         self.respond(input, Some(sink))
     }
 
+    /// [`Self::process_input_streaming`] for a spoken turn the recogniser
+    /// also heard a second way: the streaming path's parallel stream. When
+    /// `input` finds no skill and `alternative` does, the engine acts on
+    /// `alternative` at the point it would otherwise hand `input` to the
+    /// assistant, which on-device answers anything and so leaves the host's
+    /// not-understood retry nothing to do. The result says which it acted on.
+    pub fn process_spoken_input(
+        &self,
+        input: String,
+        alternative: Option<String>,
+        sink: Arc<dyn FfiAnswerSink>,
+    ) -> FfiSpokenResponse {
+        let (response, used_alternative) = self.respond_with(input, alternative, Some(sink));
+        FfiSpokenResponse { response, used_alternative }
+    }
+
     /// Discard any pending question the engine is awaiting a reply to. Called
     /// by the host when the re-armed mic times out, the user dismisses, or a
     /// fresh wake word starts a new session. No-op when nothing is pending.
@@ -1606,6 +1630,17 @@ impl AriEngine {
     /// The body of [`Self::process_input`], with an on-device answer going to
     /// `answer` while it's written, when there is one.
     fn respond(&self, input: String, answer: Option<Arc<dyn FfiAnswerSink>>) -> FfiResponse {
+        self.respond_with(input, None, answer).0
+    }
+
+    /// [`Self::respond`], with a second transcript of the turn the engine may
+    /// act on instead; also says whether it did.
+    fn respond_with(
+        &self,
+        input: String,
+        alternative: Option<String>,
+        answer: Option<Arc<dyn FfiAnswerSink>>,
+    ) -> (FfiResponse, bool) {
         // Refresh the engine's locale on every call so per-locale
         // skill scorers and responses pick up live changes from the
         // frontend's settings store. The locale provider's read is a
@@ -1621,7 +1656,9 @@ impl AriEngine {
         // Without the on-device assistant there are no answers to stream.
         #[cfg(not(feature = "llm"))]
         drop(answer);
+        engine.set_alternative_transcript(alternative);
         let (response, skill_id) = engine.process_input_with_skill(&input);
+        let used_alternative = engine.take_used_alternative();
         #[cfg(feature = "llm")]
         engine.set_answer_sink(None);
         let rearm = engine.has_pending_turn();
@@ -1630,7 +1667,7 @@ impl AriEngine {
         let facts_changed = engine.take_facts_changed_signal();
         let clear_conversation = engine.take_clear_signal();
         let markdown = engine.take_answer_markdown();
-        match response {
+        let response = match response {
             ari_core::Response::Text(s) => {
                 // The engine's fallback text is locale-specific
                 // (Phase 5 step 2). Compare against the locale-
@@ -1664,7 +1701,8 @@ impl AriEngine {
                 clear_conversation,
             },
             ari_core::Response::Binary { mime, data } => FfiResponse::Binary { mime, data },
-        }
+        };
+        (response, used_alternative)
     }
 }
 

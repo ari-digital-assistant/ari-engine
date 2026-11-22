@@ -731,6 +731,11 @@ pub struct Engine {
     // The markdown this turn's assistant answer was written in, when it
     // formats anything; transient like clear_signal.
     answer_markdown: Mutex<Option<String>>,
+    // A second transcript of the next utterance (the streaming recogniser's
+    // parallel stream), set by the host just before processing it and taken
+    // by that one call; and whether the call acted on it.
+    alternative_transcript: Mutex<Option<String>>,
+    used_alternative: AtomicBool,
     // Behaviour B/C master switch, owned by the frontend (set via
     // set_conversation_memory_enabled). When false the engine keeps NO
     // conversation buffer and refuses "let's talk" entry.
@@ -779,6 +784,8 @@ impl Engine {
             exit_signal: AtomicBool::new(false),
             clear_signal: AtomicBool::new(false),
             answer_markdown: Mutex::new(None),
+            alternative_transcript: Mutex::new(None),
+            used_alternative: AtomicBool::new(false),
             conversation_memory_enabled: AtomicBool::new(true),
             remembered_facts: Mutex::new(Vec::new()),
             facts_changed: AtomicBool::new(false),
@@ -1096,6 +1103,20 @@ impl Engine {
     /// response text is always the plain version, for speaking.
     pub fn take_answer_markdown(&self) -> Option<String> {
         self.answer_markdown.lock().expect("answer_markdown poisoned").take()
+    }
+
+    /// A second way the recogniser heard the next utterance: its parallel
+    /// stream. Taken by the next [`Self::process_input_traced`] call, which
+    /// acts on it instead of the utterance only when the utterance finds no
+    /// skill and this does, at the point the assistant would otherwise get it.
+    pub fn set_alternative_transcript(&self, alternative: Option<String>) {
+        *self.alternative_transcript.lock().expect("alternative_transcript poisoned") = alternative;
+        self.used_alternative.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether the last turn acted on the alternative transcript, read and cleared.
+    pub fn take_used_alternative(&self) -> bool {
+        self.used_alternative.swap(false, Ordering::SeqCst)
     }
 
     /// `answer` as plain text, keeping its markdown for
@@ -1572,6 +1593,8 @@ impl Engine {
     pub fn process_input_traced(&self, input: &str) -> (Response, Option<DebugTrace>) {
         // Only an answer given this turn may be shown formatted.
         self.answer_markdown.lock().expect("answer_markdown poisoned").take();
+        // This turn's alternative, if any: taken here so it never outlives it.
+        let alternative = self.alternative_transcript.lock().expect("alternative_transcript poisoned").take();
         // The assistants, on-device and cloud, get the utterance as said, and
         // so does the conversation they read back: normalised, "who came
         // second?" is "who came 2", which a model can't make sense of.
@@ -1859,6 +1882,27 @@ impl Engine {
                 trace.round = Some(round_idx);
                 let response = self.maybe_intercept_consult(skill, utterance, response);
                 return (response, Some(trace));
+            }
+        }
+
+        // No skill claims it as heard. If the recogniser also heard it another
+        // way (its parallel stream) and that way does find a skill, act on
+        // that instead, before the assistant: an on-device assistant answers
+        // anything, so the host's own not-understood retry would never run.
+        // "reminded me to buy milk" finds nothing; "remind me to buy milk",
+        // heard by the parallel stream, finds the reminders skill.
+        if let Some(alternative) = alternative.as_deref() {
+            let heard = normalize_input(alternative.trim(), &self.ctx.locale);
+            if !heard.is_empty()
+                && heard != normalized
+                && (self.keyword_winner(&heard).is_some() || Self::rank(&self.phrase_scores(&heard)).is_some())
+            {
+                self.log(
+                    LogLevel::Info,
+                    &format!("alternative: '{alternative}' finds a skill where '{utterance}' found none"),
+                );
+                self.used_alternative.store(true, Ordering::SeqCst);
+                return self.process_input_traced(alternative);
             }
         }
 
@@ -6572,6 +6616,52 @@ mod tests {
             other => panic!("expected fallback Text, got {other:?}"),
         }
         assert!(engine.remembered_facts().is_empty());
+    }
+
+    fn time_engine() -> crate::Engine {
+        let mut engine = crate::Engine::new();
+        engine.register_skill(Box::new(ari_skills::CurrentTimeSkill::new()));
+        engine.set_locale("en".to_string());
+        engine
+    }
+
+    #[test]
+    fn the_alternative_transcript_is_acted_on_when_the_utterance_finds_no_skill() {
+        let engine = time_engine();
+        assert_eq!(engine.keyword_decision("reminded banana is it"), None);
+        engine.set_alternative_transcript(Some("what time is it".into()));
+        let (_, trace) = engine.process_input_traced("reminded banana is it");
+        assert_eq!(trace.unwrap().winner.as_deref(), Some("current_time"));
+        assert!(engine.take_used_alternative());
+        assert!(!engine.take_used_alternative(), "read and cleared");
+    }
+
+    #[test]
+    fn the_alternative_transcript_is_ignored_when_the_utterance_finds_a_skill() {
+        let engine = time_engine();
+        engine.set_alternative_transcript(Some("reminded banana is it".into()));
+        let (_, trace) = engine.process_input_traced("what time is it");
+        assert_eq!(trace.unwrap().winner.as_deref(), Some("current_time"));
+        assert!(!engine.take_used_alternative());
+    }
+
+    #[test]
+    fn the_alternative_transcript_belongs_to_one_turn_only() {
+        let engine = time_engine();
+        engine.set_alternative_transcript(Some("what time is it".into()));
+        engine.process_input_traced("what time is it");
+        // The next turn has no alternative left to fall back on.
+        let (response, _) = engine.process_input_traced("reminded banana is it");
+        assert!(!engine.take_used_alternative());
+        assert!(!matches!(response, Response::Text(ref t) if t.to_lowercase().contains("time")));
+    }
+
+    #[test]
+    fn an_alternative_that_finds_nothing_either_changes_nothing() {
+        let engine = time_engine();
+        engine.set_alternative_transcript(Some("banana bread recipe".into()));
+        engine.process_input_traced("reminded banana is it");
+        assert!(!engine.take_used_alternative());
     }
 
     #[test]

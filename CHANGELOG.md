@@ -133,6 +133,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `process_spoken_input` takes a second transcript of a spoken turn (the streaming
+  recogniser's parallel stream) and acts on it instead when the first finds no skill and
+  it does, before the assistant tier; the result says which it acted on.
 - Every on-device prompt has the model answer populations, sizes and other figures from
   what it knows, with an example, instead of calling them live information it can't
   reach ("I don't have live population data" for Australia). A model that copies the
