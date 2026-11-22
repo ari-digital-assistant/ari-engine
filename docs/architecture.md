@@ -90,7 +90,7 @@ result:
   self-hosted `faster-whisper` (Home Assistant's Whisper add-on among them).
 
 Whichever path ran, the wake phrase is stripped from the transcript via regex
-(`WakePhrase.kt`).
+(`ari-voice/src/wake_phrase.rs`).
 
 Endpoint detection is custom, because sherpa's built-in endpoint is disabled
 (it freezes the stream on fire, and `reset()` destroys encoder context). The
@@ -289,6 +289,9 @@ before it could cancel.
 | Wake word detection | `ari-android/.../wakeword/` (C++/JNI + Kotlin) |
 | Audio pipeline | `ari-android/.../audio/CaptureBus.kt`, `AudioRingBuffer.kt` |
 | STT | `ari-android/.../stt/SpeechRecognizer.kt` (sherpa-onnx) |
+| Cloud STT | `ari-engine/crates/ari-voice/src/cloud_stt.rs` |
+| Wake phrase matching and name checks | `ari-engine/crates/ari-voice/src/wake_phrase.rs` |
+| Wake word models, sensitivity ladders, tuning fit | `ari-engine/crates/ari-voice/src/wake_model.rs`, `ladder.rs` |
 | Input normalisation | `ari-engine/crates/ari-core/src/lib.rs` |
 | Keyword scoring | `ari-engine/crates/ari-skills/src/*.rs` (built-in), `ari-skill-loader` (community) |
 | Phrase matching | `ari-engine/crates/ari-core/src/lib.rs` (`phrase_matches`), `ari-skill-loader/src/scoring.rs` |

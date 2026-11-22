@@ -40,6 +40,7 @@ in **[docs/architecture.md](docs/architecture.md)**.
 | `ari-skill-validate` | The registry's validator, a thin binary over the loader |
 | `ari-sign-bundle` | Ed25519 signing for published skill bundles |
 | `ari-llm` | On-device LLM, lazy-loaded and idle-evicted |
+| `ari-voice` | The voice pipeline every frontend shares, moving in from ari-android: wake phrase rules, wake word models and ladders, cloud speech-to-text |
 | `ari-ffi` | The UniFFI boundary the frontends link against |
 | `ari-cli` | A terminal harness for the whole thing |
 
