@@ -179,6 +179,7 @@ dependencies = [
 name = "ari-voice"
 version = "0.1.0"
 dependencies = [
+ "ari-native",
  "regex",
  "reqwest",
  "rustls",

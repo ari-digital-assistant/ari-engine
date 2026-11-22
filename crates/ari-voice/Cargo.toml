@@ -6,6 +6,7 @@ description = "The voice pipeline every frontend shares: wake word, speech-to-te
 license = "MIT"
 
 [dependencies]
+ari-native = { path = "../ari-native" }
 regex = "1.12.3"
 reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }

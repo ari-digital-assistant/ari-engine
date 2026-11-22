@@ -11,6 +11,8 @@
 //! wraps it for Kotlin.
 
 pub mod cloud_stt;
+pub mod detector;
 pub mod ladder;
+pub mod native;
 pub mod wake_model;
 pub mod wake_phrase;
