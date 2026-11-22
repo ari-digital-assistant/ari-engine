@@ -15,6 +15,7 @@ use crate::detector::{SILERO_VAD_FILE, WakeDetector};
 use crate::cloud_stt::CloudSttService;
 use crate::ring::{AudioRing, RING_CAPACITY_SAMPLES};
 use crate::speech_check::{SPEECH_CHECK_BUFFER_SAMPLES, SPEECH_CHECK_TAIL_SAMPLES, SpeechCheckPacing, SpeechGate};
+use crate::session::runner::{EngineSlot, SessionRunner};
 use crate::stt::{Stt, SttEvent};
 use crate::wake_log::{ALIVE_INTERVAL_MS, WakeLog, model_fingerprint};
 use crate::wake_model::{WakeSensitivity, WakeWordModel};
@@ -118,6 +119,8 @@ pub struct VoicePipeline {
     last_detection_at: AtomicI64,
     clock: Box<dyn Fn() -> i64 + Send + Sync>,
     pub(crate) stt: Stt,
+    session: Mutex<Option<SessionRunner>>,
+    pub(crate) engine: Arc<EngineSlot>,
 }
 
 static LIVE: OnceLock<Mutex<Weak<VoicePipeline>>> = OnceLock::new();
@@ -159,6 +162,8 @@ impl VoicePipeline {
             last_detection_at: AtomicI64::new(i64::MIN / 2),
             clock,
             stt: Stt::default(),
+            session: Mutex::new(None),
+            engine: Arc::default(),
         });
         *live() = Arc::downgrade(&pipeline);
         pipeline
@@ -178,6 +183,10 @@ impl VoicePipeline {
 
     pub(crate) fn host(&self) -> &Arc<dyn VoiceHost> {
         &self.host
+    }
+
+    pub(crate) fn session(&self) -> MutexGuard<'_, Option<SessionRunner>> {
+        self.session.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn capture(&self) -> MutexGuard<'_, Capture> {
