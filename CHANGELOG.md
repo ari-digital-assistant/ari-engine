@@ -122,6 +122,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A personality no longer talks the assistants out of formatting their answers. With
+  "Be funny." set, the on-device model wrote lists as plain "•" lines with no bold. The
+  personality block now says a personality changes how Ari sounds, not how a reply is
+  laid out ([ari-android#58](https://github.com/ari-digital-assistant/ari-android/issues/58)).
 - Remembering, forgetting or asking what Ari remembers now counts as conversation, so a
   run of them no longer ends in the conversation being forgotten mid-chat.
 - The on-device and cloud assistants get what the user said, not the text Ari cleans up

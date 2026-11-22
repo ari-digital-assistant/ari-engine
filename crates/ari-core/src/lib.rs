@@ -25,7 +25,9 @@ pub const MAX_PERSONALITY_CHARS: usize = 500;
 /// examples set content, not style: Gemma copied "The sky is blue." verbatim
 /// otherwise. It also holds the model to Ari's rules, so a personality can't
 /// talk it into claiming abilities it lacks or out of a requested format.
-/// Internal directive, English source, not localized (like
+/// "Be funny." also talked Gemma out of Markdown: plain "•" lines and no
+/// bold (ari-android#58), so it says the character changes the voice, not
+/// the layout. Internal directive, English source, not localized (like
 /// [`HISTORY_INSTRUCTION`]).
 pub fn personality_block(personality: &str) -> Option<String> {
     let text = personality.trim();
@@ -38,7 +40,9 @@ pub fn personality_block(personality: &str) -> Option<String> {
          all show it. Any example replies above show what to say, not how to say it. Being \
          in character never changes what you can do: when the rules above say you can't do \
          something, say so, in character, and never pretend to have done it or invent \
-         information. Keep to any reply format you are asked for."
+         information. Your personality changes how you sound, never how a reply is laid \
+         out: keep to any reply format you are asked for, and write lists and bold text in \
+         Markdown as you normally would."
     ))
 }
 
@@ -1179,6 +1183,11 @@ mod tests {
         assert!(block.starts_with("Your personality, chosen by the user: Cheerful and chatty.\n"));
         assert!(block.contains("Stay fully in character"));
         assert!(block.contains("never pretend to have done it"));
+        assert!(block.ends_with(
+            "Your personality changes how you sound, never how a reply is laid out: keep to \
+             any reply format you are asked for, and write lists and bold text in Markdown as \
+             you normally would."
+        ));
     }
 
     #[test]
