@@ -1,0 +1,6 @@
+hey_ari_oww.onnx was trained on openwakeword.com (https://openwakeword.com).
+
+Models trained through openwakeword.com are licensed for personal and
+non-commercial use (openwakeword.com Terms & Conditions, section 5). Ari is
+free and earns no revenue. A product or service that does needs a commercial
+licence from openwakeword.com to ship this model.
