@@ -64,6 +64,14 @@ pub trait VoiceHost: Send + Sync {
     fn cloud_stt(&self) -> Option<(CloudSttService, Option<String>)> {
         None
     }
+
+    /// Called first on every thread the pipeline starts that calls the host:
+    /// listens, the voice session and its workers. A JVM host keeps the
+    /// thread attached for its life here. Otherwise JNA attaches it for each
+    /// callback and detaches it after, and a callback that calls back into
+    /// the pipeline, which then calls the host again, has the thread
+    /// detached under it when the inner call returns: ART aborts the process.
+    fn thread_started(&self) {}
 }
 
 /// How to listen for the wake word, as the frontend's settings say.

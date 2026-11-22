@@ -188,6 +188,12 @@ pub trait FfiVoiceHost: Send + Sync {
     fn locale(&self) -> String;
     /// The cloud transcription service and key, asked for at each request.
     fn cloud_stt(&self) -> Option<FfiCloudSttSetup>;
+    /// First thing on every thread the pipeline starts that calls back here.
+    /// Keep the thread attached to the VM for its life (JNA's
+    /// `Native.detach(false)`): detached after each callback, a callback that
+    /// calls back into the pipeline loses its thread when the inner one
+    /// returns, and ART aborts.
+    fn thread_started(&self);
 }
 
 struct ForeignVoiceHost(Arc<dyn FfiVoiceHost>);
@@ -212,6 +218,9 @@ impl VoiceHost for ForeignVoiceHost {
     }
     fn cloud_stt(&self) -> Option<(CloudSttService, Option<String>)> {
         self.0.cloud_stt().map(|setup| (setup.service.into(), setup.api_key))
+    }
+    fn thread_started(&self) {
+        self.0.thread_started();
     }
 }
 

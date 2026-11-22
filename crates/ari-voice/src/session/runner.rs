@@ -203,6 +203,7 @@ impl SessionIo for RunnerIo {
         let pipeline = self.pipeline.clone();
         let failed = tx.clone();
         let spawned = std::thread::Builder::new().name("AriSessionJob".into()).spawn(move || {
+            thread_started(&pipeline);
             let result = catch_unwind(AssertUnwindSafe(|| match job {
                 Job::LoadSpeechModel => Finished::ModelLoaded(host.load_speech_model()),
                 Job::EarlyNameCheck(pcm) => {
@@ -228,6 +229,7 @@ impl SessionIo for RunnerIo {
         let pipeline = self.pipeline.clone();
         let now = self.now_wall();
         let _ = std::thread::Builder::new().name("AriCapture".into()).spawn(move || {
+            thread_started(&pipeline);
             let (what, samples, saved) = match &capture {
                 Capture::Wake { pcm, raw, hook } => (hook.slug(), pcm.len(), save_wake_capture(&dir, pcm, raw, *hook, now)),
                 Capture::Utterance { pcm, capture } => {
@@ -259,7 +261,24 @@ impl RunnerIo {
     }
 }
 
-fn engine_worker(rx: Receiver<(EngineCall, u64)>, slot: Arc<EngineSlot>, tx: Sender<Msg>, host: Arc<dyn SessionHost>) {
+/// The pipeline host's [`thread_started`](crate::pipeline::VoiceHost::thread_started),
+/// first thing on a thread the session starts.
+fn thread_started(pipeline: &Weak<VoicePipeline>) {
+    if let Some(p) = pipeline.upgrade() {
+        p.host().thread_started();
+    }
+}
+
+fn engine_worker(
+    rx: Receiver<(EngineCall, u64)>,
+    slot: Arc<EngineSlot>,
+    tx: Sender<Msg>,
+    host: Arc<dyn SessionHost>,
+    pipeline: Weak<VoicePipeline>,
+) {
+    // The engine calls the frontend's providers from here, as the voice
+    // session's turns run on this thread rather than one of the frontend's.
+    thread_started(&pipeline);
     for (call, epoch) in rx {
         match call {
             EngineCall::Respond { input, alternative, stream } => {
@@ -325,9 +344,10 @@ impl SessionRunner {
             let slot = Arc::clone(&pipeline.engine);
             let tx = tx.clone();
             let host = Arc::clone(&host);
+            let weak = Arc::downgrade(pipeline);
             std::thread::Builder::new()
                 .name("AriEngineCalls".into())
-                .spawn(move || engine_worker(engine_rx, slot, tx, host))
+                .spawn(move || engine_worker(engine_rx, slot, tx, host, weak))
                 .expect("the session's engine thread");
         }
         let io = RunnerIo {
@@ -341,6 +361,7 @@ impl SessionRunner {
         std::thread::Builder::new()
             .name("AriVoiceSession".into())
             .spawn(move || {
+                thread_started(&io.pipeline);
                 let mut core = Core::new();
                 loop {
                     let msg = match core.next_deadline() {

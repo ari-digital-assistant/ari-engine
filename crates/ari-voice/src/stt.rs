@@ -405,10 +405,13 @@ impl VoicePipeline {
         }
         let pipeline = Arc::clone(self);
         let listen = Listen { pipeline, id, cancelled, feed, label, params };
-        let spawned = std::thread::Builder::new().name("AriListen".into()).spawn(move || match kind {
-            ListenKind::Online(recognizer) => listen.online(recognizer),
-            ListenKind::Offline(recognizer) => listen.buffered(Transcriber::Offline(recognizer)),
-            ListenKind::Cloud => listen.buffered(Transcriber::Cloud),
+        let spawned = std::thread::Builder::new().name("AriListen".into()).spawn(move || {
+            listen.pipeline.host().thread_started();
+            match kind {
+                ListenKind::Online(recognizer) => listen.online(recognizer),
+                ListenKind::Offline(recognizer) => listen.buffered(Transcriber::Offline(recognizer)),
+                ListenKind::Cloud => listen.buffered(Transcriber::Cloud),
+            }
         });
         if spawned.is_err() {
             self.host().log(LogLevel::Warn, "could not start a listen thread");
