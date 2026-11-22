@@ -1,0 +1,10 @@
+# microWakeWord detections on oww_parity.wav in 480-sample reads, reset_on_detection off:
+# model cutoff window: read indices. Recorded from ari-android's MicroWakeWordEngine.cpp
+# (main 1ca2b7f, before step 2 moved it) built on x86_64 Linux with clang.
+ok_ari 0.3 5: 278 279 280 281 282 283 284 285 286 287 288 289
+ok_ari 0.5 5: 279 280 281 282 283 284 285 286 287 288 289
+ok_ari 0.7 5: 279 280 281 282 283 284 285
+ok_ari 0.9 5: 280 281 282 283
+ok_ari 0.95 5: 281 282
+ok_ari 0.985 10:
+hey_jarvis 0.5 5:

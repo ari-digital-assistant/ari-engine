@@ -11,6 +11,12 @@
 //! wraps it for Kotlin.
 
 pub mod cloud_stt;
+pub mod detector;
 pub mod ladder;
+pub mod native;
+pub mod pipeline;
+pub mod ring;
+pub mod speech_check;
+pub mod wake_log;
 pub mod wake_model;
 pub mod wake_phrase;

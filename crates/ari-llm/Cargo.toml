@@ -7,5 +7,5 @@ license = "MIT"
 
 [dependencies]
 ari-core = { path = "../ari-core" }
-libloading = "0.9.1"
+ari-native = { path = "../ari-native" }
 serde_json = { workspace = true }

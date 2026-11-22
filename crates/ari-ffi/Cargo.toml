@@ -21,3 +21,7 @@ ari-voice = { path = "../ari-voice" }
 serde_json = { workspace = true }
 thiserror = "2.0.18"
 uniffi = { workspace = true, features = ["cli"] }
+
+# The JNI entry point for the microphone's audio (voice_pipeline.rs).
+[target.'cfg(target_os = "android")'.dependencies]
+jni-sys = "0.3"

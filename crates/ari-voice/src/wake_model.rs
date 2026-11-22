@@ -64,6 +64,15 @@ impl WakeSensitivity {
             _ => Self::DEFAULT,
         }
     }
+
+    /// The name [`from_name`](Self::from_name) reads, and the wake log writes.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::High => "HIGH",
+            Self::Medium => "MEDIUM",
+            Self::Low => "LOW",
+        }
+    }
 }
 
 /// A wake word model bundled with the app.

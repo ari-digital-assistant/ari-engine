@@ -40,7 +40,8 @@ in **[docs/architecture.md](docs/architecture.md)**.
 | `ari-skill-validate` | The registry's validator, a thin binary over the loader |
 | `ari-sign-bundle` | Ed25519 signing for published skill bundles |
 | `ari-llm` | On-device LLM, lazy-loaded and idle-evicted |
-| `ari-voice` | The voice pipeline every frontend shares, moving in from ari-android: wake phrase rules, wake word models and ladders, cloud speech-to-text |
+| `ari-voice` | The voice pipeline every frontend shares, moving in from ari-android: wake word detection and its speech check, the wake log, wake phrase rules, wake word models and ladders, cloud speech-to-text |
+| `ari-native` | Binds the C libraries Ari opens at run time rather than links |
 | `ari-ffi` | The UniFFI boundary the frontends link against |
 | `ari-cli` | A terminal harness for the whole thing |
 
@@ -53,6 +54,14 @@ actually run the skill.
 ```bash
 cargo build --workspace
 cargo test --workspace
+```
+
+`ari-voice`'s tests run the wake engines, which are C++ in `native/voice/`.
+Build them for your machine first (Linux x86_64, with cmake and clang; it
+fetches TFLite Micro and ONNX Runtime the first time):
+
+```bash
+native/voice/build-host.sh
 ```
 
 `ari-llm` opens LiteRT-LM's `liblitert-lm.so` at run time rather than linking

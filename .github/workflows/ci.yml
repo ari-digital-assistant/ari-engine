@@ -50,6 +50,12 @@ jobs:
       - name: Check out ari-skills (the keyword oracle's manifests)
         run: git clone --depth 1 https://github.com/ari-digital-assistant/ari-skills.git "$(dirname "$GITHUB_WORKSPACE")/ari-skills"
 
+      # ari-voice's parity tests run the wake engines and the VAD through
+      # libari_voice_native, so it is built for the runner first. The runner
+      # images carry cmake and clang.
+      - name: Build the voice engines for the runner
+        run: native/voice/build-host.sh
+
       - name: Run tests
         run: cargo test --workspace
 
