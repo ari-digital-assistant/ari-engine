@@ -9,7 +9,7 @@
 //! While the coroutine was busy with a turn it read no speech-to-text state;
 //! here those events wait in a queue until the turn has handed back.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
 use super::captures::{UtteranceCapture, UtteranceOutcome, UtteranceTurn, WakeCaptureHook};
@@ -21,7 +21,7 @@ use super::rules::{
 };
 use super::{
     ActionOutcome, CaptureMode, EngineReply, Intercepted, LoggedReply, LoggedTurn, Phrase, SessionConfig,
-    SessionError, SessionHost, SessionState,
+    SessionError, SessionHost, SessionState, TypedFinish,
 };
 use crate::pipeline::LogLevel;
 use crate::stt::{DEFAULT_REWIND_SECONDS, ListenEnded, ListenParams, SttEvent};
@@ -74,6 +74,10 @@ pub(crate) const CORRECTION_FLASH_MS: i64 = 600;
 // start". The old 0.3 was inaudible on the phone.
 pub(crate) const RE_ARM_CUE_VOLUME: f32 = 0.8;
 const READY_CUE_VOLUME: f32 = 1.0;
+// How long a spoken typed turn (dictated into the chat) waits on the engine
+// before Ari says "one moment": not over a fast answer, but the only cue there
+// is when the screen isn't being watched.
+const STILL_WORKING_DELAY_MS: i64 = 4_000;
 // How long an error stays on the overlay before it closes.
 const ERROR_SHOWN_MS: i64 = 2_500;
 const SILENCE_POLL_MS: i64 = 1_000;
@@ -121,7 +125,7 @@ pub(crate) enum Finished {
     Intercepted(Intercepted),
     ActionHandled(ActionOutcome),
     Responded(EngineReply, bool),
-    AnswerText(String),
+    AnswerText(String, Option<String>),
     AnswerSentence(String),
     /// The work failed: a host callback or the engine threw.
     Failed(String),
@@ -131,6 +135,14 @@ pub(crate) enum Finished {
 pub(crate) enum Capture {
     Wake { pcm: Vec<i16>, raw: String, hook: WakeCaptureHook },
     Utterance { pcm: Vec<i16>, capture: UtteranceCapture },
+}
+
+/// Whose work a job or engine call is: the voice session in a given epoch,
+/// or a typed turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tag {
+    Voice(u64),
+    Typed(u64),
 }
 
 /// The session's side effects.
@@ -147,8 +159,8 @@ pub(crate) trait SessionIo {
     fn wake_outcome(&self, outcome: WakeOutcome, hidden: bool);
     fn listen_ended(&self, ended: ListenEnded);
     fn early_name(&self, result: EarlyNameCheck, after_ms: i64, in_time: bool);
-    fn run(&self, job: Job, epoch: u64);
-    fn engine(&self, call: EngineCall, epoch: u64);
+    fn run(&self, job: Job, tag: Tag);
+    fn engine(&self, call: EngineCall, tag: Tag);
     fn capture(&self, dir: PathBuf, capture: Capture);
 }
 
@@ -195,6 +207,9 @@ enum TimerKind {
     ErrorDismiss,
     CorrectionFlash,
     Dwell { cards: bool },
+    /// A typed turn's "one moment". Outlives a dismiss: typed turns aren't
+    /// the voice session's.
+    StillWorking { turn: u64 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -262,6 +277,19 @@ impl Turn {
             skill_id: None,
         }
     }
+}
+
+/// A typed turn from the chat, on its way through the engine.
+struct Typed {
+    text: String,
+    /// Dictated rather than typed: Ari says the answer.
+    spoken: bool,
+    /// The answer was shown while it was written.
+    streamed: bool,
+    /// A sentence of it was spoken while it was written.
+    sentence_spoken: bool,
+    reply: Option<EngineReply>,
+    skill_id: Option<String>,
 }
 
 pub(crate) struct Core {
@@ -345,6 +373,8 @@ pub(crate) struct Core {
     awaiting_speech: Option<(u64, AfterSpeech)>,
     pending_stt: VecDeque<(u64, SttEvent)>,
     turn: Option<Turn>,
+    typed: BTreeMap<u64, Typed>,
+    next_typed: u64,
 }
 
 impl Core {
@@ -383,6 +413,8 @@ impl Core {
             awaiting_speech: None,
             pending_stt: VecDeque::new(),
             turn: None,
+            typed: BTreeMap::new(),
+            next_typed: 0,
         }
     }
 
@@ -392,6 +424,10 @@ impl Core {
 
     pub(crate) fn is_active(&self) -> bool {
         self.active
+    }
+
+    fn tag(&self) -> Tag {
+        Tag::Voice(self.epoch)
     }
 
     fn set_state(&mut self, io: &dyn SessionIo, state: SessionState) {
@@ -432,7 +468,9 @@ impl Core {
                 .map(|(i, _)| i);
             let Some(index) = due else { return };
             let timer = self.timers.remove(index);
-            if timer.epoch == self.epoch {
+            if let TimerKind::StillWorking { turn } = timer.kind {
+                self.still_working(io, turn);
+            } else if timer.epoch == self.epoch {
                 self.on_timer(io, timer.kind);
             }
         }
@@ -445,6 +483,7 @@ impl Core {
             TimerKind::ErrorDismiss => self.dismiss(io, false),
             TimerKind::CorrectionFlash => self.present(io),
             TimerKind::Dwell { cards } => self.dismiss(io, cards),
+            TimerKind::StillWorking { .. } => {}
         }
     }
 
@@ -479,7 +518,7 @@ impl Core {
         self.wake_preroll = verify_wake.then(|| io.peek_recent(PREROLL_CAPTURE_SECONDS));
         // A fresh wake cancels any reply the engine was still waiting on from
         // a previous turn: the user has clearly moved on.
-        io.engine(EngineCall::CancelPendingReply, self.epoch);
+        io.engine(EngineCall::CancelPendingReply, self.tag());
         self.awaiting_reply = false;
         self.talk_mode = false;
         // The first state goes out before this returns, so the overlay never
@@ -513,7 +552,7 @@ impl Core {
             let id = self.speech_id();
             io.host().speak(id, &wait, false);
             self.flow = Flow::ColdLoading;
-            io.run(Job::LoadSpeechModel, self.epoch);
+            io.run(Job::LoadSpeechModel, self.tag());
         }
         true
     }
@@ -544,7 +583,7 @@ impl Core {
             && let Some(clip) = &self.wake_preroll
         {
             self.early_check = Some((self.armed_generation, io.now()));
-            io.run(Job::EarlyNameCheck(clip.clone()), self.epoch);
+            io.run(Job::EarlyNameCheck(clip.clone()), self.tag());
         }
 
         // The streaming recogniser asks on every partial instead, and a wake
@@ -860,7 +899,7 @@ impl Core {
         // a skill's question, the engine holds the pending reply and is
         // authoritative, so the card shortcut is skipped and the answer flows
         // back through the engine.
-        io.run(Job::Intercept { text, cards: !self.awaiting_reply }, self.epoch);
+        io.run(Job::Intercept { text, cards: !self.awaiting_reply }, self.tag());
     }
 
     fn turn_mut(&mut self) -> &mut Turn {
@@ -868,7 +907,11 @@ impl Core {
     }
 
     /// A worker's or the engine's result, from epoch `epoch`.
-    pub(crate) fn finished(&mut self, io: &dyn SessionIo, epoch: u64, result: Finished) {
+    pub(crate) fn finished(&mut self, io: &dyn SessionIo, tag: Tag, result: Finished) {
+        let epoch = match tag {
+            Tag::Voice(epoch) => epoch,
+            Tag::Typed(turn) => return self.typed_result(io, turn, result),
+        };
         if epoch != self.epoch || !self.active {
             return;
         }
@@ -884,7 +927,7 @@ impl Core {
         let Some(stage) = self.turn.as_ref().map(|t| t.stage) else { return };
         match (stage, result) {
             (Stage::Intercept, Finished::Intercepted(intercepted)) => self.on_intercepted(io, intercepted),
-            (Stage::Respond, Finished::AnswerText(so_far)) => {
+            (Stage::Respond, Finished::AnswerText(so_far, _)) => {
                 self.set_state(io, SessionState::Responding { text: so_far, cards: false });
             }
             (Stage::Respond, Finished::AnswerSentence(sentence)) => {
@@ -931,20 +974,24 @@ impl Core {
     }
 
     fn on_intercepted(&mut self, io: &dyn SessionIo, intercepted: Intercepted) {
+        let heard = self.turn_mut().text.clone();
         match intercepted {
             Intercepted::Alert => {
                 self.turn_mut().outcome = UtteranceOutcome::Alert;
+                io.host().turn_logged(LoggedTurn { clear: false, heard, reply: None });
                 self.dismiss(io, false);
             }
             Intercepted::CardSilent => {
                 self.turn_mut().outcome = UtteranceOutcome::Card;
+                io.host().turn_logged(LoggedTurn { clear: false, heard, reply: None });
                 self.dismiss(io, false);
             }
-            Intercepted::CardSpoken { text, cards } => {
+            Intercepted::CardSpoken { text, cards, attachments } => {
                 let turn = self.turn_mut();
                 turn.outcome = UtteranceOutcome::Card;
                 // A fresh reply: nothing was spoken a sentence at a time.
                 turn.sentence = None;
+                io.host().turn_logged(LoggedTurn { clear: false, heard, reply: card_reply(&text, attachments) });
                 self.set_state(io, SessionState::Responding { text: text.clone(), cards });
                 self.speak_then_dismiss(io, &text, cards);
             }
@@ -962,7 +1009,7 @@ impl Core {
                 // stream's "remind me to buy milk" found the reminders skill.
                 let alternative = turn.parallel.clone().filter(|p| !p.trim().is_empty() && *p != turn.text);
                 let call = EngineCall::Respond { input: turn.text.clone(), alternative, stream: true };
-                io.engine(call, self.epoch);
+                io.engine(call, self.tag());
             }
         }
     }
@@ -994,7 +1041,7 @@ impl Core {
         if let Some(parallel) = parallel.filter(|p| not_understood && !used_alternative && !p.trim().is_empty() && *p != text) {
             io.log(LogLevel::Info, &format!("NotUnderstood for '{text}' — retrying with parallel '{parallel}'"));
             self.turn_mut().stage = Stage::RetryParallel;
-            io.engine(EngineCall::Respond { input: parallel, alternative: None, stream: false }, self.epoch);
+            io.engine(EngineCall::Respond { input: parallel, alternative: None, stream: false }, self.tag());
             return;
         }
         self.offline_retry(io);
@@ -1011,7 +1058,7 @@ impl Core {
         {
             io.log(LogLevel::Info, &format!("Parallel also failed — running offline retry ({} samples)", audio.len()));
             self.turn_mut().stage = Stage::Redecode;
-            io.run(Job::Redecode(audio), self.epoch);
+            io.run(Job::Redecode(audio), self.tag());
             return;
         }
         self.conclude(io);
@@ -1027,7 +1074,7 @@ impl Core {
         {
             io.log(LogLevel::Info, &format!("Offline produced '{offline}' — retrying engine"));
             turn.stage = Stage::RetryOffline;
-            io.engine(EngineCall::Respond { input: offline, alternative: None, stream: false }, self.epoch);
+            io.engine(EngineCall::Respond { input: offline, alternative: None, stream: false }, self.tag());
             return;
         }
         self.conclude(io);
@@ -1062,7 +1109,7 @@ impl Core {
                 // unattributable, so a report on one names no skill.
                 turn.skill_id = Some(skill_id.clone()).filter(|s| !s.trim().is_empty());
                 turn.stage = Stage::Action;
-                io.run(Job::HandleAction { json, skill_id }, self.epoch);
+                io.run(Job::HandleAction { json, skill_id }, self.tag());
                 return;
             }
             EngineReply::Binary { mime, len } => turn.response_text = format!("[Binary: {mime}, {len} bytes]"),
@@ -1121,7 +1168,7 @@ impl Core {
 
         if enter {
             self.talk_mode = true;
-            io.engine(EngineCall::SetConversationActive(true), self.epoch);
+            io.engine(EngineCall::SetConversationActive(true), self.tag());
             self.barge_in_active = barge_in_effective(self.config.barge_in_enabled, self.config.echo_canceller);
             if self.barge_in_active {
                 self.set_capture_mode(io, CaptureMode::Conversation);
@@ -1243,7 +1290,7 @@ impl Core {
                 self.talk_mode = false;
                 self.barge_in_active = false;
                 self.set_capture_mode(io, CaptureMode::Normal);
-                io.engine(EngineCall::SetConversationActive(false), self.epoch);
+                io.engine(EngineCall::SetConversationActive(false), self.tag());
                 self.dismiss(io, false);
             }
             AfterSpeech::Rearm => {
@@ -1452,6 +1499,145 @@ impl Core {
         self.capture_utterance(io, turn.audio, capture);
     }
 
+    // ── Typed turns ─────────────────────────────────────────────────────
+
+    /// A turn typed into the chat, or dictated into it (`spoken`: Ari says
+    /// the answer). The chat has already shown the words. Runs beside the
+    /// voice session, never in it.
+    pub(crate) fn submit_text(&mut self, io: &dyn SessionIo, text: String, spoken: bool) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.next_typed += 1;
+        let turn = self.next_typed;
+        self.typed.insert(
+            turn,
+            Typed { text: text.clone(), spoken, streamed: false, sentence_spoken: false, reply: None, skill_id: None },
+        );
+        // A word that stops a sounding alert, or names a button on the card
+        // on screen, answers that rather than going to the engine.
+        io.run(Job::Intercept { text, cards: true }, Tag::Typed(turn));
+    }
+
+    /// The chat was reset: typed turns in flight say and log nothing more.
+    pub(crate) fn cancel_typed(&mut self) {
+        self.typed.clear();
+        self.timers.retain(|t| !matches!(t.kind, TimerKind::StillWorking { .. }));
+    }
+
+    fn typed_result(&mut self, io: &dyn SessionIo, turn: u64, result: Finished) {
+        let Some(typed) = self.typed.get_mut(&turn) else { return };
+        match result {
+            Finished::Intercepted(Intercepted::No) => {
+                io.host().typed_thinking(turn);
+                if typed.spoken {
+                    self.next_timer += 1;
+                    let at = io.now() + STILL_WORKING_DELAY_MS;
+                    self.timers.push(Timer { at, seq: self.next_timer, epoch: self.epoch, kind: TimerKind::StillWorking { turn } });
+                }
+                let call = EngineCall::Respond { input: typed.text.clone(), alternative: None, stream: true };
+                io.engine(call, Tag::Typed(turn));
+            }
+            Finished::Intercepted(Intercepted::Alert | Intercepted::CardSilent) => {
+                self.typed.remove(&turn);
+                io.host().typed_finished(turn, TypedFinish { clear: false, reply: None });
+            }
+            Finished::Intercepted(Intercepted::CardSpoken { text, attachments, .. }) => {
+                let spoken = typed.spoken;
+                self.typed.remove(&turn);
+                io.host().typed_finished(turn, TypedFinish { clear: false, reply: card_reply(&text, attachments) });
+                if spoken && !text.trim().is_empty() {
+                    self.speak_after(io, &text);
+                }
+            }
+            Finished::AnswerText(so_far, markdown) => {
+                typed.streamed = true;
+                io.host().answer_text(turn, &so_far, markdown.as_deref());
+            }
+            Finished::AnswerSentence(sentence) => {
+                if typed.spoken {
+                    typed.sentence_spoken = true;
+                    self.end_still_working(turn);
+                    self.speak_after(io, &sentence);
+                }
+            }
+            Finished::Responded(reply, _) => {
+                self.end_still_working(turn);
+                // Before anything else, so a turn that both remembers and
+                // fails further on still keeps the fact.
+                if should_persist_facts(&reply) {
+                    io.host().facts_changed();
+                }
+                let typed = self.typed.get_mut(&turn).expect("checked");
+                typed.reply = Some(reply.clone());
+                match reply {
+                    EngineReply::Action { json, skill_id, .. } => {
+                        // Only action replies carry an id; a plain text
+                        // answer is unattributable, and a report on one says
+                        // so rather than guessing.
+                        typed.skill_id = Some(skill_id.clone()).filter(|s| !s.trim().is_empty());
+                        io.run(Job::HandleAction { json, skill_id }, Tag::Typed(turn));
+                    }
+                    EngineReply::Text { body, .. } | EngineReply::NotUnderstood { body } => {
+                        self.finish_typed(io, turn, body, false, None);
+                    }
+                    EngineReply::Binary { mime, len } => {
+                        self.finish_typed(io, turn, format!("[Binary: {mime}, {len} bytes]"), false, None);
+                    }
+                }
+            }
+            Finished::ActionHandled(outcome) => {
+                self.finish_typed(io, turn, outcome.text, outcome.attachments, outcome.display_text);
+            }
+            Finished::Failed(message) => {
+                io.log(LogLevel::Warn, &format!("Typed turn failed: {message}"));
+                self.end_still_working(turn);
+                self.typed.remove(&turn);
+                io.host().typed_finished(turn, TypedFinish { clear: false, reply: None });
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_typed(&mut self, io: &dyn SessionIo, turn: u64, text: String, attachments: bool, bubble: Option<String>) {
+        let Some(typed) = self.typed.remove(&turn) else { return };
+        let Some(reply) = typed.reply else { return };
+        let markdown = match &reply {
+            EngineReply::Text { markdown, .. } => markdown.clone(),
+            _ => None,
+        };
+        // An answer shown while it was written always takes its final form.
+        // Otherwise an empty one logs nothing: a silent envelope (the first
+        // half of an assistant round trip) would flash a ghost bubble.
+        let logged = (typed.streamed || !text.trim().is_empty() || attachments).then(|| LoggedReply {
+            text: bubble.unwrap_or_else(|| text.clone()),
+            markdown,
+            skill_id: typed.skill_id,
+        });
+        io.host().typed_finished(turn, TypedFinish { clear: should_clear_conversation(&reply), reply: logged });
+        // Read out unless its sentences already were.
+        if typed.spoken && !typed.sentence_spoken && !text.trim().is_empty() && !matches!(reply, EngineReply::Binary { .. }) {
+            self.speak_after(io, &text);
+        }
+    }
+
+    fn end_still_working(&mut self, turn: u64) {
+        self.timers.retain(|t| !matches!(t.kind, TimerKind::StillWorking { turn: t2 } if t2 == turn));
+    }
+
+    fn still_working(&mut self, io: &dyn SessionIo, turn: u64) {
+        if self.typed.contains_key(&turn) {
+            let phrase = io.host().phrase(Phrase::PleaseWait);
+            self.speak_after(io, &phrase);
+        }
+    }
+
+    /// Say `text` after whatever is playing. Nothing waits for it.
+    fn speak_after(&mut self, io: &dyn SessionIo, text: &str) {
+        let id = self.speech_id();
+        io.host().speak(id, text, false);
+    }
+
     // ── Dictation ───────────────────────────────────────────────────────
 
     /// In-place dictation: speech-to-text only. No engine, no speech, no
@@ -1536,8 +1722,8 @@ impl Core {
         // Drop any reply the engine was still waiting on. A no-op on the
         // normal path; covers a tap to dismiss, the silence timeout and the
         // frontend going away.
-        io.engine(EngineCall::SetConversationActive(false), self.epoch);
-        io.engine(EngineCall::CancelPendingReply, self.epoch);
+        io.engine(EngineCall::SetConversationActive(false), self.tag());
+        io.engine(EngineCall::CancelPendingReply, self.tag());
         self.awaiting_reply = false;
         self.verify_wake_pending = false;
         self.wake_preroll = None;
@@ -1548,7 +1734,7 @@ impl Core {
             self.capture_turn(io, turn);
         }
         self.epoch += 1;
-        self.timers.clear();
+        self.timers.retain(|t| matches!(t.kind, TimerKind::StillWorking { .. }));
         self.watcher = None;
         self.awaiting_speech = None;
         self.pending_stt.clear();
@@ -1558,4 +1744,10 @@ impl Core {
         self.dictation = false;
         self.set_state(io, SessionState::Idle { keep_cards });
     }
+}
+
+/// A card's answer to log: its words, unless it had neither words nor
+/// attachments.
+fn card_reply(text: &str, attachments: bool) -> Option<LoggedReply> {
+    (!text.trim().is_empty() || attachments).then(|| LoggedReply { text: text.to_string(), markdown: None, skill_id: None })
 }

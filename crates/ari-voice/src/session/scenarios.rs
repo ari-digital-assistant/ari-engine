@@ -6,10 +6,11 @@ use std::sync::Mutex;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-use super::core::{Capture, Core, EngineCall, Finished, Job, SessionIo, SttStatus};
+use super::core::{Capture, Core, EngineCall, Finished, Job, SessionIo, SttStatus, Tag};
 use super::{
     ActionOutcome, CaptureMode, EngineReply, Intercepted, LoggedReply, LoggedTurn, Phrase, ReplyFlags,
-    SessionConfig, SessionError, SessionHost, SessionState, UtteranceOutcome, UtteranceTurn, WakeCaptureHook,
+    SessionConfig, SessionError, SessionHost, SessionState, TypedFinish, UtteranceOutcome, UtteranceTurn,
+    WakeCaptureHook,
 };
 use crate::cloud_stt::CloudSttFailure;
 use crate::endpoint::ListenEnd;
@@ -36,6 +37,9 @@ enum Ev {
     FactsChanged,
     FalseWake,
     Dictated(String),
+    TypedThinking(u64),
+    AnswerText(u64, String, Option<String>),
+    TypedFinished(u64, TypedFinish),
 }
 
 struct Fake {
@@ -45,8 +49,8 @@ struct Fake {
     stt: Mutex<SttStatus>,
     next_listen: Mutex<u64>,
     listen: Mutex<u64>,
-    jobs: Mutex<VecDeque<(Job, u64)>>,
-    engine: Mutex<VecDeque<(EngineCall, u64)>>,
+    jobs: Mutex<VecDeque<(Job, Tag)>>,
+    engine: Mutex<VecDeque<(EngineCall, Tag)>>,
 }
 
 const PREROLL: [i16; 4] = [1, 2, 3, 4];
@@ -104,6 +108,15 @@ impl SessionHost for Fake {
     fn dictated(&self, text: &str) {
         self.push(Ev::Dictated(text.into()));
     }
+    fn typed_thinking(&self, turn: u64) {
+        self.push(Ev::TypedThinking(turn));
+    }
+    fn answer_text(&self, turn: u64, so_far: &str, markdown: Option<&str>) {
+        self.push(Ev::AnswerText(turn, so_far.into(), markdown.map(str::to_string)));
+    }
+    fn typed_finished(&self, turn: u64, finish: TypedFinish) {
+        self.push(Ev::TypedFinished(turn, finish));
+    }
 }
 
 impl SessionIo for Fake {
@@ -150,11 +163,11 @@ impl SessionIo for Fake {
     fn early_name(&self, result: EarlyNameCheck, after_ms: i64, in_time: bool) {
         self.push(Ev::EarlyName(result, after_ms, in_time));
     }
-    fn run(&self, job: Job, epoch: u64) {
-        self.jobs.lock().unwrap().push_back((job, epoch));
+    fn run(&self, job: Job, tag: Tag) {
+        self.jobs.lock().unwrap().push_back((job, tag));
     }
-    fn engine(&self, call: EngineCall, epoch: u64) {
-        self.engine.lock().unwrap().push_back((call, epoch));
+    fn engine(&self, call: EngineCall, tag: Tag) {
+        self.engine.lock().unwrap().push_back((call, tag));
     }
     fn capture(&self, dir: PathBuf, capture: Capture) {
         assert_eq!(dir, PathBuf::from("/captures"));
@@ -259,7 +272,7 @@ impl S {
         { let v = target; *self.io.now.lock().unwrap() = v; }
     }
 
-    fn job(&self) -> (Job, u64) {
+    fn job(&self) -> (Job, Tag) {
         self.io.jobs.lock().unwrap().pop_front().expect("a job")
     }
 
@@ -267,12 +280,12 @@ impl S {
         assert_eq!(self.io.jobs.lock().unwrap().front(), None);
     }
 
-    fn finish(&mut self, epoch: u64, result: Finished) {
+    fn finish(&mut self, epoch: Tag, result: Finished) {
         self.core.finished(&self.io, epoch, result);
     }
 
     /// The next engine turn, skipping the bookkeeping calls before it.
-    fn respond_call(&self) -> (String, Option<String>, bool, u64) {
+    fn respond_call(&self) -> (String, Option<String>, bool, Tag) {
         loop {
             let (call, epoch) = self.io.engine.lock().unwrap().pop_front().expect("an engine call");
             if let EngineCall::Respond { input, alternative, stream } = call {
@@ -865,9 +878,9 @@ fn an_on_device_answer_is_shown_and_spoken_as_it_is_written() {
     let (_, epoch) = s.job();
     s.finish(epoch, Finished::Intercepted(Intercepted::No));
     s.take();
-    s.finish(epoch, Finished::AnswerText("Otters are".into()));
+    s.finish(epoch, Finished::AnswerText("Otters are".into(), None));
     s.finish(epoch, Finished::AnswerSentence("Otters are mustelids.".into()));
-    s.finish(epoch, Finished::AnswerText("Otters are mustelids. They".into()));
+    s.finish(epoch, Finished::AnswerText("Otters are mustelids. They".into(), None));
     s.finish(epoch, Finished::AnswerSentence("They hold hands.".into()));
     assert_eq!(
         s.take(),
@@ -959,8 +972,19 @@ fn a_card_button_said_aloud_answers_the_card() {
     s.stt(done("yes", "yes", None));
     let (_, epoch) = s.job();
     s.take();
-    s.finish(epoch, Finished::Intercepted(Intercepted::CardSpoken { text: "Deleted.".into(), cards: false }));
-    assert_eq!(s.take(), [responding("Deleted.", false), Ev::Speak { id: 1, text: "Deleted.".into(), flush: true }]);
+    s.finish(epoch, Finished::Intercepted(Intercepted::CardSpoken { text: "Deleted.".into(), cards: false, attachments: false }));
+    assert_eq!(
+        s.take(),
+        [
+            Ev::Logged(LoggedTurn {
+                clear: false,
+                heard: "yes".into(),
+                reply: Some(LoggedReply { text: "Deleted.".into(), markdown: None, skill_id: None }),
+            }),
+            responding("Deleted.", false),
+            Ev::Speak { id: 1, text: "Deleted.".into(), flush: true },
+        ]
+    );
     assert!(s.io.engine.lock().unwrap().iter().all(|(c, _)| !matches!(c, EngineCall::Respond { .. })));
     s.speech_done(1);
     s.advance(3_000);
@@ -976,6 +1000,7 @@ fn stop_over_a_ringing_alarm_stops_it() {
     s.take();
     s.finish(epoch, Finished::Intercepted(Intercepted::Alert));
     let events = s.take();
+    assert_eq!(events[0], Ev::Logged(LoggedTurn { clear: false, heard: "stop".into(), reply: None }));
     assert_eq!(events.last(), Some(&idle(false)));
     assert_eq!(utterance(&events).map(|c| c.outcome), Some(UtteranceOutcome::Alert));
 }
@@ -1068,4 +1093,203 @@ fn nothing_is_kept_unless_the_user_asked() {
     s.start(true, false);
     s.stt(done("going out", "we're going out", Some(false)));
     assert!(wake_captures(&s.take()).is_empty());
+}
+
+// ── Typed turns ─────────────────────────────────────────────────────────
+
+fn typed(turn: u64) -> Tag {
+    Tag::Typed(turn)
+}
+
+fn finished_with(turn: u64, clear: bool, reply: Option<(&str, Option<&str>)>) -> Ev {
+    Ev::TypedFinished(
+        turn,
+        TypedFinish {
+            clear,
+            reply: reply.map(|(text, skill)| LoggedReply {
+                text: text.into(),
+                markdown: None,
+                skill_id: skill.map(str::to_string),
+            }),
+        },
+    )
+}
+
+#[test]
+fn a_typed_turn_goes_through_the_intercepts_and_the_engine_silently() {
+    let mut s = S::new(streaming(), keep_everything());
+    s.core.submit_text(&s.io, "what time is it".into(), false);
+    let (job, tag) = s.job();
+    assert_eq!((job, tag), (Job::Intercept { text: "what time is it".into(), cards: true }, typed(1)));
+    s.finish(tag, Finished::Intercepted(Intercepted::No));
+    assert_eq!(s.take(), [Ev::TypedThinking(1)]);
+    assert_eq!(s.respond_call(), ("what time is it".into(), None, true, typed(1)));
+    s.finish(tag, Finished::Responded(text("It's 9:41."), false));
+    // Typed, so nothing is said; the chat already shows the question.
+    assert_eq!(s.take(), [finished_with(1, false, Some(("It's 9:41.", None)))]);
+    // No voice session was touched.
+    assert!(!s.core.is_active());
+    s.advance(10_000);
+    assert_eq!(s.take(), []);
+}
+
+#[test]
+fn a_dictated_turn_says_one_moment_when_the_engine_is_slow_then_speaks_as_it_writes() {
+    let mut s = S::new(streaming(), keep_everything());
+    s.core.submit_text(&s.io, "tell me about otters".into(), true);
+    let (_, tag) = s.job();
+    s.finish(tag, Finished::Intercepted(Intercepted::No));
+    s.take();
+    s.advance(3_999);
+    assert_eq!(s.take(), []);
+    s.advance(1);
+    assert_eq!(s.take(), [Ev::Speak { id: 1, text: "One moment.".into(), flush: false }]);
+    s.finish(tag, Finished::AnswerText("Otters".into(), Some("**Otters**".into())));
+    s.finish(tag, Finished::AnswerSentence("Otters are mustelids.".into()));
+    s.finish(tag, Finished::Responded(text("Otters are mustelids."), false));
+    assert_eq!(
+        s.take(),
+        [
+            Ev::AnswerText(1, "Otters".into(), Some("**Otters**".into())),
+            Ev::Speak { id: 2, text: "Otters are mustelids.".into(), flush: false },
+            finished_with(1, false, Some(("Otters are mustelids.", None))),
+        ]
+    );
+}
+
+#[test]
+fn a_first_sentence_in_time_means_no_one_moment() {
+    let mut s = S::new(streaming(), keep_everything());
+    s.core.submit_text(&s.io, "tell me about otters".into(), true);
+    let (_, tag) = s.job();
+    s.finish(tag, Finished::Intercepted(Intercepted::No));
+    s.advance(2_000);
+    s.finish(tag, Finished::AnswerSentence("Otters are mustelids.".into()));
+    s.advance(5_000);
+    assert!(!spoken(&s.take()).iter().any(|(_, t, _)| t == "One moment."));
+}
+
+#[test]
+fn a_dictated_answer_written_all_at_once_is_read_out_after_it_is_logged() {
+    let mut s = S::new(streaming(), keep_everything());
+    s.core.submit_text(&s.io, "what time is it".into(), true);
+    let (_, tag) = s.job();
+    s.finish(tag, Finished::Intercepted(Intercepted::No));
+    s.take();
+    s.finish(tag, Finished::Responded(text("It's 9:41."), false));
+    assert_eq!(
+        s.take(),
+        [finished_with(1, false, Some(("It's 9:41.", None))), Ev::Speak { id: 1, text: "It's 9:41.".into(), flush: false }]
+    );
+}
+
+#[test]
+fn a_typed_action_is_run_and_logged_as_the_skill_words_it() {
+    let mut s = S::new(streaming(), keep_everything());
+    s.core.submit_text(&s.io, "clear history".into(), false);
+    let (_, tag) = s.job();
+    s.finish(tag, Finished::Intercepted(Intercepted::No));
+    s.take();
+    s.finish(
+        tag,
+        Finished::Responded(
+            EngineReply::Action {
+                json: "{}".into(),
+                skill_id: "dev.heyari.memory".into(),
+                flags: ReplyFlags { facts_changed: true, clear_conversation: true, ..ReplyFlags::default() },
+            },
+            false,
+        ),
+    );
+    assert_eq!(s.take(), [Ev::FactsChanged]);
+    let (job, tag) = s.job();
+    assert_eq!(job, Job::HandleAction { json: "{}".into(), skill_id: "dev.heyari.memory".into() });
+    s.finish(
+        tag,
+        Finished::ActionHandled(ActionOutcome {
+            text: "Done, fresh start.".into(),
+            display_text: Some("Fresh start".into()),
+            cards: false,
+            attachments: false,
+        }),
+    );
+    assert_eq!(s.take(), [finished_with(1, true, Some(("Fresh start", Some("dev.heyari.memory"))))]);
+}
+
+#[test]
+fn a_silent_envelope_logs_no_reply_unless_its_answer_was_shown() {
+    let silent = || {
+        Finished::Responded(
+            EngineReply::Action { json: "{}".into(), skill_id: "s".into(), flags: ReplyFlags::default() },
+            false,
+        )
+    };
+    let quiet = || {
+        Finished::ActionHandled(ActionOutcome { text: String::new(), display_text: None, cards: false, attachments: false })
+    };
+    let mut s = S::new(streaming(), keep_everything());
+    s.core.submit_text(&s.io, "ask the assistant".into(), false);
+    let (_, tag) = s.job();
+    s.finish(tag, Finished::Intercepted(Intercepted::No));
+    s.finish(tag, silent());
+    let (_, tag) = s.job();
+    s.take();
+    s.finish(tag, quiet());
+    assert_eq!(s.take(), [finished_with(1, false, None)]);
+}
+
+#[test]
+fn a_typed_word_can_answer_a_card_or_stop_an_alert() {
+    let mut s = S::new(streaming(), keep_everything());
+    s.core.submit_text(&s.io, "cancel".into(), true);
+    let (_, tag) = s.job();
+    s.finish(tag, Finished::Intercepted(Intercepted::CardSpoken { text: "Cancelled.".into(), cards: false, attachments: false }));
+    assert_eq!(
+        s.take(),
+        [finished_with(1, false, Some(("Cancelled.", None))), Ev::Speak { id: 1, text: "Cancelled.".into(), flush: false }]
+    );
+    assert!(s.io.engine.lock().unwrap().is_empty());
+
+    s.core.submit_text(&s.io, "stop".into(), false);
+    let (_, tag) = s.job();
+    s.finish(tag, Finished::Intercepted(Intercepted::Alert));
+    assert_eq!(s.take(), [finished_with(2, false, None)]);
+}
+
+#[test]
+fn a_reset_drops_the_typed_turn_in_flight() {
+    let mut s = S::new(streaming(), keep_everything());
+    s.core.submit_text(&s.io, "tell me about otters".into(), true);
+    let (_, tag) = s.job();
+    s.finish(tag, Finished::Intercepted(Intercepted::No));
+    s.take();
+    s.core.cancel_typed();
+    s.finish(tag, Finished::AnswerText("Otters".into(), None));
+    s.finish(tag, Finished::Responded(text("Otters are mustelids."), false));
+    s.advance(10_000);
+    assert_eq!(s.take(), []);
+}
+
+#[test]
+fn a_voice_dismiss_leaves_a_typed_turn_alone() {
+    let mut s = S::new(streaming(), keep_everything());
+    s.core.submit_text(&s.io, "what time is it".into(), true);
+    let (_, tag) = s.job();
+    s.finish(tag, Finished::Intercepted(Intercepted::No));
+    s.start(false, false);
+    s.core.dismiss(&s.io, false);
+    s.take();
+    s.advance(4_000);
+    s.finish(tag, Finished::Responded(text("It's 9:41."), false));
+    let events = s.take();
+    assert_eq!(events[0], Ev::Speak { id: 1, text: "One moment.".into(), flush: false });
+    assert_eq!(events[1], finished_with(1, false, Some(("It's 9:41.", None))));
+}
+
+#[test]
+fn a_blank_typed_turn_does_nothing() {
+    let mut s = S::new(streaming(), keep_everything());
+    s.core.submit_text(&s.io, "  ".into(), false);
+    s.no_job();
+    assert_eq!(s.take(), []);
 }

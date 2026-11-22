@@ -17,7 +17,7 @@ use ari_voice::detector::{OWW_EMBEDDING_FILE, OWW_MELSPECTROGRAM_FILE, WakeDetec
 use ari_voice::pipeline::{self, LogLevel, VoiceHost, VoicePipeline, WakeConfig};
 use ari_voice::session::{
     ActionOutcome, AnswerSink, CaptureMode, EngineReply, Intercepted, LoggedReply, LoggedTurn, Phrase, ReplyFlags,
-    HostHeard, SessionConfig, SessionError, SessionHost, SessionState, TurnEngine,
+    HostHeard, SessionConfig, SessionError, SessionHost, SessionState, TurnEngine, TypedFinish,
 };
 use ari_voice::stt::{ListenParams, SttError, SttModelSpec};
 use ari_voice::wake_log::{WakeLog, WakeOutcome};
@@ -414,6 +414,18 @@ impl FfiVoicePipeline {
         self.inner.is_session_active()
     }
 
+    /// A turn typed into the chat, or dictated into it (`spoken`: Ari says
+    /// the answer). The chat shows the words itself; the rest comes through
+    /// the session host's typed-turn callbacks.
+    pub fn submit_text(&self, text: String, spoken: bool) {
+        self.inner.submit_text(text, spoken);
+    }
+
+    /// The chat was reset: typed turns in flight say and log nothing more.
+    pub fn cancel_typed(&self) {
+        self.inner.cancel_typed();
+    }
+
     /// The listen feed for a reader in the app, or `None` while another holds it.
     pub fn open_feed(&self, rewind_seconds: f32) -> Option<Arc<FfiListenFeed>> {
         let receiver = self.inner.arm(rewind_seconds)?;
@@ -511,14 +523,15 @@ impl From<FfiSessionConfig> for SessionConfig {
     }
 }
 
-/// What the app did with words an alert or a card claimed. It has already
-/// acted and written the conversation log.
+/// What the app did with words an alert or a card claimed. It has acted; the
+/// session writes the log.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum FfiIntercepted {
     No,
     Alert,
     CardSilent,
-    CardSpoken { text: String, cards: bool },
+    /// `attachments`: the answer has any, which the app holds.
+    CardSpoken { text: String, cards: bool, attachments: bool },
 }
 
 /// An action envelope the app ran.
@@ -555,6 +568,16 @@ impl From<LoggedTurn> for FfiLoggedTurn {
             reply: t.reply.map(|r: LoggedReply| FfiLoggedReply { text: r.text, markdown: r.markdown, skill_id: r.skill_id }),
         }
     }
+}
+
+/// How a typed turn ended (`ari_voice::session::TypedFinish`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiTypedFinish {
+    /// Empty the log, request included, before the reply.
+    pub clear: bool,
+    /// In place of the answer shown while it was written, if there was one,
+    /// else added; with the attachments the app holds from this turn.
+    pub reply: Option<FfiLoggedReply>,
 }
 
 /// A listen for the app's own transcriber.
@@ -595,6 +618,13 @@ pub trait FfiSessionHost: Send + Sync {
     fn dictated(&self, text: String);
     /// The engine finished a call.
     fn engine_turn_finished(&self);
+    /// Typed turn `turn` has gone to the engine.
+    fn typed_thinking(&self, turn: u64);
+    /// An on-device answer to typed turn `turn` while it is written, each
+    /// call replacing the last.
+    fn answer_text(&self, turn: u64, so_far: String, markdown: Option<String>);
+    /// Typed turn `turn` is over.
+    fn typed_finished(&self, turn: u64, finish: FfiTypedFinish);
 }
 
 struct ForeignSessionHost(Arc<dyn FfiSessionHost>);
@@ -641,7 +671,7 @@ impl SessionHost for ForeignSessionHost {
             FfiIntercepted::No => Intercepted::No,
             FfiIntercepted::Alert => Intercepted::Alert,
             FfiIntercepted::CardSilent => Intercepted::CardSilent,
-            FfiIntercepted::CardSpoken { text, cards } => Intercepted::CardSpoken { text, cards },
+            FfiIntercepted::CardSpoken { text, cards, attachments } => Intercepted::CardSpoken { text, cards, attachments },
         }
     }
     fn handle_action(&self, json: &str, skill_id: &str) -> ActionOutcome {
@@ -662,6 +692,16 @@ impl SessionHost for ForeignSessionHost {
     }
     fn engine_turn_finished(&self) {
         self.0.engine_turn_finished();
+    }
+    fn typed_thinking(&self, turn: u64) {
+        self.0.typed_thinking(turn);
+    }
+    fn answer_text(&self, turn: u64, so_far: &str, markdown: Option<&str>) {
+        self.0.answer_text(turn, so_far.to_string(), markdown.map(str::to_string));
+    }
+    fn typed_finished(&self, turn: u64, finish: TypedFinish) {
+        let reply = finish.reply.map(|r| FfiLoggedReply { text: r.text, markdown: r.markdown, skill_id: r.skill_id });
+        self.0.typed_finished(turn, FfiTypedFinish { clear: finish.clear, reply });
     }
 }
 

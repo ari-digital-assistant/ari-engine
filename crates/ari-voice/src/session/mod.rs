@@ -1,6 +1,8 @@
 //! The voice session, moved from ari-android's `voice/VoiceSession.kt`: what
 //! a wake, a tap on the mic or a dictation does from the first word to the
 //! last, with the frontend only showing, playing and running what it is told.
+//! Typed turns from the chat run through the same steps: the alert and card
+//! intercepts, the engine, facts, actions, the log and speech.
 //!
 //! One session at a time. It runs on a thread of its own ([`runner`]) as a
 //! plain state machine ([`core`]), so the scenario tests can drive it with a
@@ -91,7 +93,7 @@ pub struct SessionConfig {
 }
 
 /// What the frontend did with words that went to an alert or a card instead
-/// of the engine. It has already acted and written the conversation log.
+/// of the engine. It has acted; the session writes the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intercepted {
     /// Nothing claimed them: on to the engine.
@@ -100,8 +102,9 @@ pub enum Intercepted {
     Alert,
     /// A card's button took them and had nothing to say.
     CardSilent,
-    /// A card's button took them and answered.
-    CardSpoken { text: String, cards: bool },
+    /// A card's button took them and answered. `attachments`: the answer has
+    /// any, which the frontend holds, `cards` among them.
+    CardSpoken { text: String, cards: bool, attachments: bool },
 }
 
 /// An action envelope, run by the frontend.
@@ -126,6 +129,19 @@ pub struct LoggedTurn {
     pub heard: String,
     /// Ari's answer, when there is one to log. The frontend adds the
     /// attachments it holds from this turn's action.
+    pub reply: Option<LoggedReply>,
+}
+
+/// How a typed turn ended, for the chat. Its words are logged by the chat
+/// when they are sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedFinish {
+    /// The user cleared the conversation: empty the log, request included,
+    /// before the reply.
+    pub clear: bool,
+    /// Ari's answer: in place of the answer shown while it was written, if
+    /// there was one, else added. The frontend adds the attachments it holds
+    /// from this turn's action or card.
     pub reply: Option<LoggedReply>,
 }
 
@@ -240,4 +256,20 @@ pub trait SessionHost: Send + Sync {
 
     /// The engine finished a call, whichever turn it was for.
     fn engine_turn_finished(&self) {}
+
+    /// Typed turn `turn` has gone to the engine.
+    fn typed_thinking(&self, turn: u64) {
+        let _ = turn;
+    }
+
+    /// An on-device answer to typed turn `turn` while it is written: the
+    /// words so far, each call replacing the last.
+    fn answer_text(&self, turn: u64, so_far: &str, markdown: Option<&str>) {
+        let _ = (turn, so_far, markdown);
+    }
+
+    /// Typed turn `turn` is over.
+    fn typed_finished(&self, turn: u64, finish: TypedFinish) {
+        let _ = (turn, finish);
+    }
 }

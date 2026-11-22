@@ -17,7 +17,7 @@ use std::time::Duration;
 use chrono::Local;
 
 use super::captures::{save_utterance_capture, save_wake_capture};
-use super::core::{Capture, Core, EngineCall, Finished, Job, SessionIo, SttStatus};
+use super::core::{Capture, Core, EngineCall, Finished, Job, SessionIo, SttStatus, Tag};
 use super::{AnswerSink, SessionConfig, SessionHost, TurnEngine};
 use crate::pipeline::{LogLevel, VoicePipeline};
 use crate::stt::{ListenEnded, ListenParams, SttEvent};
@@ -44,7 +44,9 @@ enum Msg {
     SpeechFinished(u64),
     Stt { listen: u64, event: SttEvent },
     HostStt(SttEvent),
-    Finished { epoch: u64, result: Finished },
+    Finished { tag: Tag, result: Finished },
+    SubmitText { text: String, spoken: bool },
+    CancelTyped,
     Configure(SessionConfig),
     Shutdown,
 }
@@ -98,16 +100,17 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
 
 struct PostingSink {
     tx: Sender<Msg>,
-    epoch: u64,
+    tag: Tag,
 }
 
 impl AnswerSink for PostingSink {
-    fn text(&self, so_far: &str, _markdown: Option<&str>) {
-        let _ = self.tx.send(Msg::Finished { epoch: self.epoch, result: Finished::AnswerText(so_far.into()) });
+    fn text(&self, so_far: &str, markdown: Option<&str>) {
+        let result = Finished::AnswerText(so_far.into(), markdown.map(str::to_string));
+        let _ = self.tx.send(Msg::Finished { tag: self.tag, result });
     }
 
     fn sentence(&self, text: &str) {
-        let _ = self.tx.send(Msg::Finished { epoch: self.epoch, result: Finished::AnswerSentence(text.into()) });
+        let _ = self.tx.send(Msg::Finished { tag: self.tag, result: Finished::AnswerSentence(text.into()) });
     }
 }
 
@@ -115,7 +118,7 @@ struct RunnerIo {
     pipeline: Weak<VoicePipeline>,
     host: Arc<dyn SessionHost>,
     tx: Sender<Msg>,
-    engine_tx: Sender<(EngineCall, u64)>,
+    engine_tx: Sender<(EngineCall, Tag)>,
     /// The listen the host is transcribing, which its events belong to.
     host_listen: Cell<Option<u64>>,
 }
@@ -197,7 +200,7 @@ impl SessionIo for RunnerIo {
         }
     }
 
-    fn run(&self, job: Job, epoch: u64) {
+    fn run(&self, job: Job, tag: Tag) {
         let tx = self.tx.clone();
         let host = Arc::clone(&self.host);
         let pipeline = self.pipeline.clone();
@@ -214,15 +217,15 @@ impl SessionIo for RunnerIo {
                 Job::HandleAction { json, skill_id } => Finished::ActionHandled(host.handle_action(&json, &skill_id)),
             }))
             .unwrap_or_else(|panic| Finished::Failed(panic_message(panic)));
-            let _ = tx.send(Msg::Finished { epoch, result });
+            let _ = tx.send(Msg::Finished { tag, result });
         });
         if let Err(e) = spawned {
-            let _ = failed.send(Msg::Finished { epoch, result: Finished::Failed(format!("could not start a job: {e}")) });
+            let _ = failed.send(Msg::Finished { tag, result: Finished::Failed(format!("could not start a job: {e}")) });
         }
     }
 
-    fn engine(&self, call: EngineCall, epoch: u64) {
-        let _ = self.engine_tx.send((call, epoch));
+    fn engine(&self, call: EngineCall, tag: Tag) {
+        let _ = self.engine_tx.send((call, tag));
     }
 
     fn capture(&self, dir: PathBuf, capture: Capture) {
@@ -270,7 +273,7 @@ fn thread_started(pipeline: &Weak<VoicePipeline>) {
 }
 
 fn engine_worker(
-    rx: Receiver<(EngineCall, u64)>,
+    rx: Receiver<(EngineCall, Tag)>,
     slot: Arc<EngineSlot>,
     tx: Sender<Msg>,
     host: Arc<dyn SessionHost>,
@@ -279,11 +282,11 @@ fn engine_worker(
     // The engine calls the frontend's providers from here, as the voice
     // session's turns run on this thread rather than one of the frontend's.
     thread_started(&pipeline);
-    for (call, epoch) in rx {
+    for (call, tag) in rx {
         match call {
             EngineCall::Respond { input, alternative, stream } => {
                 let engine = slot.wait();
-                let sink = stream.then(|| Arc::new(PostingSink { tx: tx.clone(), epoch }) as Arc<dyn AnswerSink>);
+                let sink = stream.then(|| Arc::new(PostingSink { tx: tx.clone(), tag }) as Arc<dyn AnswerSink>);
                 let result = match catch_unwind(AssertUnwindSafe(|| engine.respond(&input, alternative.as_deref(), sink))) {
                     Ok((reply, used_alternative)) => {
                         host.engine_turn_finished();
@@ -291,7 +294,7 @@ fn engine_worker(
                     }
                     Err(panic) => Finished::Failed(panic_message(panic)),
                 };
-                let _ = tx.send(Msg::Finished { epoch, result });
+                let _ = tx.send(Msg::Finished { tag, result });
             }
             EngineCall::CancelPendingReply => {
                 if let Some(engine) = slot.peek() {
@@ -328,7 +331,9 @@ fn handle(core: &mut Core, io: &RunnerIo, active: &AtomicBool, msg: Msg) -> bool
                 core.stt_event(io, listen, event);
             }
         }
-        Msg::Finished { epoch, result } => core.finished(io, epoch, result),
+        Msg::Finished { tag, result } => core.finished(io, tag, result),
+        Msg::SubmitText { text, spoken } => core.submit_text(io, text, spoken),
+        Msg::CancelTyped => core.cancel_typed(),
         Msg::Configure(config) => core.configure(config),
         Msg::Shutdown => return false,
     }
@@ -491,6 +496,19 @@ impl VoicePipeline {
             HostHeard::Failed(error) => SttEvent::Error(error),
         };
         self.send(Msg::HostStt(event));
+    }
+
+    /// A turn typed into the chat, or dictated into it (`spoken`: Ari says
+    /// the answer), through the same steps as a spoken one. The chat shows
+    /// the words itself; what follows comes through the session host's
+    /// typed-turn callbacks.
+    pub fn submit_text(&self, text: String, spoken: bool) {
+        self.send(Msg::SubmitText { text, spoken });
+    }
+
+    /// The chat was reset: typed turns in flight say and log nothing more.
+    pub fn cancel_typed(&self) {
+        self.send(Msg::CancelTyped);
     }
 
     pub fn is_session_active(&self) -> bool {
