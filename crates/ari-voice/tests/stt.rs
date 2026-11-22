@@ -78,8 +78,9 @@ impl Run {
 
     /// `audio` as the phone delivers it: its first 2 s in the ring before the
     /// listen arms, the rest in 30 ms reads with the clock moving, then
-    /// silence until the listen ends. Waits for the listen thread to keep up,
-    /// so the clock means what it would on the phone.
+    /// silence until the listen ends. In real time: the listen reads the clock
+    /// as it processes each chunk, so a feed that ran ahead of it would make
+    /// time jump and end listens early, which the phone never sees.
     fn listen_to(&self, audio: &[i16], params: ListenParams) -> SttEvent {
         let (preroll, live) = audio.split_at(audio.len().min(32_000));
         for read in preroll.chunks(READ) {
@@ -94,7 +95,7 @@ impl Run {
             }
             self.clock.fetch_add(READ_MS, Ordering::Relaxed);
             self.pipeline.push_audio(reads.next().unwrap());
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(READ_MS as u64));
         }
         for _ in 0..2_000 {
             if let Some(end) = self.finished() {

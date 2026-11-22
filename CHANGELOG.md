@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Speech-to-text in `ari-voice`, moved from ari-android: sherpa-onnx's streaming
+  recogniser (Kroko, Nemotron) with its stability endpoint and VAD veto, the parallel
+  stream and the retry decode; the buffered path for Whisper, Parakeet and the cloud; and
+  the listen feed from the pipeline's ring. sherpa-onnx is reached through its C API,
+  opened at run time, with struct bindings generated from 2.0.1's header; any other
+  version is refused. `FfiVoicePipeline` gains `load_stt`, `start_listen` and the rest,
+  with events through `FfiVoiceHost::stt_event`.
 - Wake word detection in `ari-voice`, moved from ari-android. The frontend pushes its
   microphone's audio through `ari_voice_push_audio`, and `VoicePipeline` runs the wake
   word, the 4-second debounce and the speech check, then tells the frontend through

@@ -278,7 +278,12 @@ impl VoicePipeline {
         let from = head.saturating_sub(rewind);
         let preroll = capture.ring.snapshot(from, head);
         let (sender, receiver) = mpsc::channel();
-        let slices = preroll.chunks(PREROLL_SLICE_SAMPLES).map(|slice| sender.send(slice.to_vec())).count();
+        let mut slices = 0;
+        for slice in preroll.chunks(PREROLL_SLICE_SAMPLES) {
+            // The receiver is still in hand, so this cannot fail.
+            let _ = sender.send(slice.to_vec());
+            slices += 1;
+        }
         capture.feed = Some(sender);
         self.host.log(
             LogLevel::Info,
