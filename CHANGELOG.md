@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Wake word detection in `ari-voice`, moved from ari-android. The frontend pushes its
+  microphone's audio through `ari_voice_push_audio`, and `VoicePipeline` runs the wake
+  word, the 4-second debounce and the speech check, then tells the frontend through
+  `FfiVoiceHost`. The engines are C++ in `native/voice/` (`libari_voice_native.so`):
+  openWakeWord and microWakeWord as ari-android had them, and a Silero VAD that matches
+  sherpa-onnx's scores. The wake log (`wake_log.rs`) writes the same lines as before.
+  The models and their licences moved to `assets/voice/`.
+- `ari-native`, which binds a C library opened at run time; LiteRT-LM's binding now
+  uses it too.
 - `ari-voice`, the voice pipeline every frontend shares, moving out of ari-android a step
   at a time (`docs/superpowers/plans/2026-11-22-audio-in-engine.md`). It starts with the
   rules and tables: finding the wake phrase in a transcript and the name checks on it,

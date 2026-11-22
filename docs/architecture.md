@@ -8,7 +8,7 @@ How a user utterance becomes a response, from wake word to output.
 User speaks
     │
     ▼
-1. Wake word detection (microWakeWord, always listening)
+1. Wake word detection (openWakeWord or microWakeWord, always listening)
     │
     ▼
 2. Speech to text (on-device sherpa-onnx, or a cloud Whisper endpoint)
@@ -61,14 +61,24 @@ User speaks
 
 ### 1. Wake word detection
 
-microWakeWord runs continuously on a foreground service (`WakeWordService`),
-processing audio from a single `AudioRecord` via `CaptureBus`. The same mic
-feed is shared with STT — no handover, no gap.
+The frontend opens the microphone and pushes every 30 ms read into the engine
+with `ari_voice_push_audio`, a plain C call (on Android, a JNI entry point in
+`libari_ffi.so`). `ari-voice`'s `VoicePipeline` runs the wake word on it, treats
+detections within 4 seconds of each other as one, and with the speech check on
+lets a detection through only if Silero VAD heard speech in the second before
+it. A wake goes back to the frontend through `FfiVoiceHost::wake_detected`, and
+every wake, drop and listening spell goes into the wake log.
 
-Three bundled wake word models: `hey_ari` (default), `ok_ari`, `hey_jarvis`.
-User picks one in Settings. The model runs TFLite inference every 30ms on
-int8-quantised audio features from the `micro_speech` C preprocessor.
+The engines are C++ in `native/voice/`, built as `libari_voice_native.so` and
+opened at run time: openWakeWord on ONNX Runtime for `hey_ari_oww` (the
+default), microWakeWord on TFLite Micro for `ok_ari` and `hey_jarvis`, and
+Silero VAD for the speech check. The models and their licences are in
+`assets/voice/`; the frontend reads them and hands the engine the bytes. User
+picks a wake word in Settings.
 
+On Android the microphone belongs to a foreground service (`WakeWordService`),
+and `CaptureBus` still keeps its own 2-second ring for speech-to-text until
+that moves too. The same mic feed is shared with STT — no handover, no gap.
 When the wake word fires, `CaptureBus` arms the STT channel and slices the
 2-second ring buffer (pre-roll) into the STT stream. The voice overlay
 activity launches over the lock screen via the SYSTEM_ALERT_WINDOW BAL
@@ -286,7 +296,10 @@ before it could cancel.
 
 | Component | Location |
 |-----------|----------|
-| Wake word detection | `ari-android/.../wakeword/` (C++/JNI + Kotlin) |
+| Wake word detection, debounce, speech check | `ari-engine/crates/ari-voice/src/pipeline.rs`, `detector.rs`, `speech_check.rs` |
+| Wake engines and VAD (C++) | `ari-engine/native/voice/` |
+| Wake log | `ari-engine/crates/ari-voice/src/wake_log.rs` |
+| Microphone and wake handling | `ari-android/.../wakeword/WakeWordService.kt` |
 | Audio pipeline | `ari-android/.../audio/CaptureBus.kt`, `AudioRingBuffer.kt` |
 | STT | `ari-android/.../stt/SpeechRecognizer.kt` (sherpa-onnx) |
 | Cloud STT | `ari-engine/crates/ari-voice/src/cloud_stt.rs` |
