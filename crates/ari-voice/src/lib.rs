@@ -12,6 +12,7 @@
 
 pub mod cloud_stt;
 pub mod detector;
+pub mod endpoint;
 pub mod ladder;
 pub mod native;
 pub mod pipeline;
