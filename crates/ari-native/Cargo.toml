@@ -1,0 +1,9 @@
+[package]
+name = "ari-native"
+version = "0.1.0"
+edition = "2024"
+description = "Binds C libraries that Ari opens at run time rather than links"
+license = "MIT"
+
+[dependencies]
+libloading = "0.9.1"

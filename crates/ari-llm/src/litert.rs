@@ -47,31 +47,9 @@ type Status = c_int;
 type Handle = *mut c_void;
 type StreamCallback = unsafe extern "C" fn(data: *mut c_void, chunk: *const c_void);
 
-/// Declares the C functions used here and loads them all at once. Each
-/// field is the C name without its `litert_lm_` prefix.
-macro_rules! c_api {
-    ($($name:ident: fn($($arg:ty),*) $(-> $ret:ty)?;)*) => {
-        struct Api {
-            $($name: unsafe extern "C" fn($($arg),*) $(-> $ret)?,)*
-            _library: libloading::Library,
-        }
-
-        impl Api {
-            /// SAFETY: `library` must be LiteRT-LM's C API at major version
-            /// [`API_MAJOR`], whose functions have the signatures above.
-            unsafe fn bind(library: libloading::Library) -> Result<Self, String> {
-                $(
-                    let $name = *library
-                        .get::<unsafe extern "C" fn($($arg),*) $(-> $ret)?>(concat!("litert_lm_", stringify!($name)))
-                        .map_err(|e| format!("liblitert-lm.so has no litert_lm_{}: {e}", stringify!($name)))?;
-                )*
-                Ok(Api { $($name,)* _library: library })
-            }
-        }
-    };
-}
-
-c_api! {
+ari_native::c_api! {
+    /// LiteRT-LM's C API, each field its C name without the `litert_lm_` prefix.
+    struct Api in "liblitert-lm.so", prefix "litert_lm_" {
     get_api_version: fn(*mut c_int, *mut c_int, *mut c_int) -> Status;
     get_last_error_message: fn() -> *const c_char;
     engine_settings_create: fn(*const c_char, *const c_char, *const c_char, *const c_char, *mut Handle) -> Status;
@@ -104,6 +82,7 @@ c_api! {
     stream_chunk_get_text: fn(*const c_void, *mut *const c_char) -> Status;
     stream_chunk_get_error: fn(*const c_void, *mut *const c_char) -> Status;
     stream_chunk_is_final: fn(*const c_void, *mut bool) -> Status;
+    }
 }
 
 /// The library, opened once per process. The error says why it couldn't be.
@@ -112,7 +91,7 @@ fn api() -> Result<&'static Api, String> {
     API.get_or_init(|| {
         // SAFETY: loading runs the library's initialisers, which have no
         // preconditions; the version check below comes before any other call.
-        let library = unsafe { libloading::Library::new("liblitert-lm.so") }
+        let library = unsafe { ari_native::libloading::Library::new("liblitert-lm.so") }
             .map_err(|e| format!("can't open liblitert-lm.so: {e}"))?;
         // SAFETY: every major-1 library exports these signatures.
         let api = unsafe { Api::bind(library) }?;

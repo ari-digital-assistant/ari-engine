@@ -114,8 +114,15 @@ name = "ari-llm"
 version = "0.1.0"
 dependencies = [
  "ari-core",
- "libloading",
+ "ari-native",
  "serde_json",
+]
+
+[[package]]
+name = "ari-native"
+version = "0.1.0"
+dependencies = [
+ "libloading",
 ]
 
 [[package]]
