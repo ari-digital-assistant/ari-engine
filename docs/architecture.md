@@ -2,6 +2,23 @@
 
 How a user utterance becomes a response, from wake word to output.
 
+## The boundary
+
+Audio goes in, events come out. The frontend opens the microphone and pushes
+its audio into the engine; the engine detects the wake word, transcribes, and
+runs the voice session, telling the frontend what to show, what to play and
+say, and which actions to run. Typed input from a chat takes the same steps
+without the audio. What stays in each frontend is what each OS does its own
+way: the microphone and its source, the overlay and all UI, speech output,
+running action envelopes (cards, alerts, intents), the conversation log,
+settings storage, model downloads, and user-facing strings.
+
+A frontend implements two callback interfaces in `ari-ffi`: `FfiVoiceHost`
+(model files, wakes, locale, the cloud service, logs) and `FfiSessionHost` (the
+session's state for the overlay, cues and speech, actions, alert and card
+intercepts, the log, typed turns' answers). Android's are `VoiceEngine.kt` and
+`VoiceSession.kt`.
+
 ## The pipeline
 
 ```
@@ -67,7 +84,8 @@ with `ari_voice_push_audio`, a plain C call (on Android, a JNI entry point in
 detections within 4 seconds of each other as one, and with the speech check on
 lets a detection through only if Silero VAD heard speech in the second before
 it. A wake goes back to the frontend through `FfiVoiceHost::wake_detected`, and
-every wake, drop and listening spell goes into the wake log.
+every wake, drop and listening spell goes into the wake log. The frontend
+decides whether it can show itself, then starts a turn with `start_turn`.
 
 The engines are C++ in `native/voice/`, built as `libari_voice_native.so` and
 opened at run time: openWakeWord on ONNX Runtime for `hey_ari_oww` (the
@@ -117,10 +135,34 @@ the 71 MB Kroko: identical input, "how's the weather" → "how's the weat"
 versus the full phrase. Run the bench before changing pipeline code to chase a
 transcription bug.
 
+### The voice session
+
+`ari-voice`'s `session` module runs a voice turn from start to finish, on a
+thread of its own (`session/runner.rs`) driving a plain state machine
+(`session/core.rs`). A wake turn is verified first: the whole transcript must
+hold an "Ari"-ish name, or the wake is turned away and counted as a false wake.
+A quiet wake (every wake the wake service starts) shows nothing until a name
+check passes: on a streaming partial, on the cloud's early check of the 2
+seconds ending at the wake, or on the whole transcript. A cold start says "one
+moment", loads the model and asks the user to say it again. After an answer the
+session re-arms the mic for a skill's follow-up question or a "let's talk" turn,
+or closes after a short dwell; with barge-in on and an echo canceller present
+it listens while Ari speaks. Silence closes a wake turn after 8 seconds and any
+other after 30. Dictation is a listen whose transcript goes to the chat instead
+of the engine.
+
+The session also keeps the debug captures the user opted into (wake and
+utterance audio with their transcripts, `session/captures.rs`) and decides what
+counts as a false wake; the frontend stores the count and raises the warning.
+
+Its scenarios (`session/scenarios.rs`) drive the core against a fake host and a
+manual clock, one per behaviour the Kotlin session had on the phone.
+
 ### 3. Input normalisation
 
-The transcript goes to `AriEngine.processInput()` via FFI. The engine
-normalises it:
+The transcript goes to the engine's `process_input` through the session's
+`TurnEngine` (`AriEngine` implements it). Typed input arrives the same way,
+through `submit_text`. The engine normalises it:
 - Lowercase
 - Expand contractions ("what's" → "what is", "don't" → "do not", etc.)
 - Strip punctuation (except math operators `+-*/.%^`)
@@ -234,13 +276,18 @@ Settings > Assistant.
 
 ### 7. STT retry
 
-If the engine returns `NotUnderstood` (no skill matched and no assistant
-answered), the Android host retries the speech-to-text pipeline with
-different audio processing:
+The streaming recogniser runs a second, **clean-start parallel stream** beside
+the main one: it skips the pre-roll and decodes only live audio with a fresh
+encoder state, so different token commits may yield a different transcript.
+The engine is handed both. When the main transcript finds no skill and the
+parallel one does, the engine acts on the parallel one at the point it would
+otherwise reach the assistant ("reminded me to buy milk" against "remind me to
+buy milk").
 
-1. **Clean-start parallel stream** — skips the pre-roll, uses only live
-   audio with a fresh encoder state. Different token commits may yield a
-   different transcript.
+If the engine still returns `NotUnderstood` (no skill matched and no assistant
+answered), the voice session retries:
+
+1. **Parallel transcript** — the parallel stream's transcript on its own.
 2. **Offline full-buffer** — fresh stream, entire captured PCM in one
    `acceptWaveform` + `inputFinished`. Maximum decoder context.
 
@@ -298,7 +345,10 @@ before it could cancel.
 | Wake word detection, debounce, speech check | `ari-engine/crates/ari-voice/src/pipeline.rs`, `detector.rs`, `speech_check.rs` |
 | Wake engines and VAD (C++) | `ari-engine/native/voice/` |
 | Wake log | `ari-engine/crates/ari-voice/src/wake_log.rs` |
-| Microphone and wake handling | `ari-android/.../wakeword/WakeWordService.kt` |
+| Microphone, and whether a wake can show itself | `ari-android/.../wakeword/WakeWordService.kt` |
+| Voice session (turns, wake verification, re-arm, barge-in, dictation, typed turns) | `ari-engine/crates/ari-voice/src/session/` |
+| Debug captures, false-wake rules | `ari-engine/crates/ari-voice/src/session/captures.rs`, `false_wake.rs` |
+| Session host: overlay state, cue, speech, actions, log | `ari-android/.../voice/VoiceSession.kt` |
 | Audio ring and listen feed | `ari-engine/crates/ari-voice/src/pipeline.rs`, `ring.rs` |
 | STT (sherpa-onnx's C API, cloud) | `ari-engine/crates/ari-voice/src/stt.rs`, `sherpa/`, `endpoint.rs` |
 | Android's system speech service | `ari-android/.../stt/SpeechRecognizer.kt` |
@@ -309,9 +359,9 @@ before it could cancel.
 | Keyword scoring | `ari-engine/crates/ari-skills/src/*.rs` (built-in), `ari-skill-loader` (community) |
 | Phrase matching | `ari-engine/crates/ari-core/src/lib.rs` (`phrase_matches`), `ari-skill-loader/src/scoring.rs` |
 | Assistant fallback | `ari-engine/crates/ari-llm/src/lib.rs` (builtin LLM), `ari-skill-loader/src/assistant.rs` (API adapter) |
-| STT retry | `ari-android/.../voice/VoiceSession.kt` |
+| STT retry | `ari-engine/crates/ari-voice/src/session/core.rs`, `ari-engine/src/lib.rs` (`set_alternative_transcript`) |
 | Engine orchestration | `ari-engine/crates/ari-engine/src/lib.rs` (`process_input_traced`) |
-| FFI boundary | `ari-engine/crates/ari-ffi/src/lib.rs` |
+| FFI boundary | `ari-engine/crates/ari-ffi/src/lib.rs`, `voice_pipeline.rs` (`FfiVoicePipeline`, `FfiSessionHost`) |
 
 ## What each layer catches
 
