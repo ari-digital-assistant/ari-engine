@@ -394,6 +394,13 @@ impl VoicePipeline {
                 return id;
             }
         };
+        // A listen that has sent its last event releases the feed a moment
+        // later, on its own thread, and the session can start the next one
+        // inside that moment. It is this pipeline's own, so end it now; a feed
+        // held by anyone else (the tuner) is still refused.
+        if self.stt().state().listen.is_some() {
+            self.stop_listen();
+        }
         let Some(feed) = self.arm(params.rewind_seconds) else {
             self.host().log(LogLevel::Warn, "CaptureBus already armed — refusing to start listening");
             self.stt_event(id, SttEvent::Error(SttError::Busy));

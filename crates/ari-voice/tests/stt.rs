@@ -123,6 +123,21 @@ fn a_listen_while_the_feed_is_taken_says_it_is_busy() {
     assert_eq!(vec![SttEvent::Error(SttError::Busy)], run.events());
 }
 
+#[test]
+fn a_new_listen_replaces_the_pipeline_s_own_unfinished_one() {
+    // The session starts the next listen as soon as it hears the last one's
+    // final event, which can be before that listen has let go of the feed.
+    let run = pipeline();
+    run.pipeline.set_cloud_mode(true);
+    let first = run.pipeline.start_listen(ListenParams::default());
+    assert!(run.pipeline.is_armed());
+    let second = run.pipeline.start_listen(ListenParams { rewind_seconds: 0.0, ..ListenParams::default() });
+    assert_ne!(first, second);
+    assert!(!run.events().contains(&SttEvent::Error(SttError::Busy)), "{:?}", run.events());
+    assert!(run.pipeline.is_armed());
+    run.pipeline.stop_listen();
+}
+
 /// A one-request stand-in for a Whisper server: answers `text`, and hands
 /// back the body it was sent.
 fn whisper_server(text: &'static str) -> (String, std::thread::JoinHandle<Vec<u8>>) {
