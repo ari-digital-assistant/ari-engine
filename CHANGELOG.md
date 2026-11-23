@@ -17,13 +17,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The voice session in `ari-voice`, moved from ari-android: a voice turn from the wake
+  to the answer, with wake verification and quiet wakes, the early name check, the
+  cold start, the retries, follow-up questions, "let's talk" and barge-in, dictation,
+  the silence timeouts, the debug captures and the false-wake decision. Typed turns
+  from a chat take the same steps (`submit_text`). A frontend implements
+  `FfiSessionHost` to show, play and run what the session decides, starts turns with
+  `start_turn`, and hands the engine over with `attach_engine`. The host's own
+  transcriber (Android's system speech service) reports through `host_heard`, and the
+  engine judges its words for the wake phrase.
 - Speech-to-text in `ari-voice`, moved from ari-android: sherpa-onnx's streaming
   recogniser (Kroko, Nemotron) with its stability endpoint and VAD veto, the parallel
   stream and the retry decode; the buffered path for Whisper, Parakeet and the cloud; and
   the listen feed from the pipeline's ring. sherpa-onnx is reached through its C API,
   opened at run time, with struct bindings generated from 2.0.1's header; any other
-  version is refused. `FfiVoicePipeline` gains `load_stt`, `start_listen` and the rest,
-  with events through `FfiVoiceHost::stt_event`.
+  version is refused. `FfiVoicePipeline` gains `load_stt`, `unload_stt` and
+  `set_cloud_mode`; the voice session starts and ends the listens.
 - Wake word detection in `ari-voice`, moved from ari-android. The frontend pushes its
   microphone's audio through `ari_voice_push_audio`, and `VoicePipeline` runs the wake
   word, the 4-second debounce and the speech check, then tells the frontend through
@@ -37,15 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at a time (`docs/superpowers/plans/2026-11-22-audio-in-engine.md`). It starts with the
   rules and tables: finding the wake phrase in a transcript and the name checks on it,
   the bundled wake word models and their sensitivity ladders, ladders tuned on the phone,
-  the false-wake remedy and the tuning fit. `ari-ffi` exports them (`match_wake_phrase`,
-  `wake_word_models`, `fit_tuned_ladder` and the rest), and ari-android no longer keeps
-  its own copies.
+  the false-wake remedy and the tuning fit. `ari-ffi` exports the ones the app still
+  asks for (`wake_word_models`, `fit_tuned_ladder` and the rest), and ari-android no
+  longer keeps its own copies.
 - Cloud speech-to-text in `ari-voice::cloud_stt`, moved from ari-android: any
   OpenAI-compatible `/audio/transcriptions` endpoint, OpenAI's own or a self-hosted
-  Whisper server. `ari-ffi` exports `cloud_transcribe` and `cloud_transcribe_wake_clip`,
-  and a failure comes back as an `FfiCloudSttError` naming its cause. Plain `http://`
-  endpoints work, and HTTPS is checked against the bundled Mozilla roots, as it is for
-  skills and assistants.
+  Whisper server, with each failure named by its cause. Plain `http://` endpoints work,
+  and HTTPS is checked against the bundled Mozilla roots, as it is for skills and
+  assistants.
 - Assistant answers keep the markdown they were written in, for a host that renders it.
   `FfiResponse::Text` has a `markdown` field, set when an assistant answer formats
   anything, and `FfiAnswerSink::text` gets the markdown so far alongside the words.
@@ -133,9 +141,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `process_spoken_input` takes a second transcript of a spoken turn (the streaming
-  recogniser's parallel stream) and acts on it instead when the first finds no skill and
-  it does, before the assistant tier; the result says which it acted on.
+- A spoken turn can carry a second transcript (the streaming recogniser's parallel
+  stream, `Engine::set_alternative_transcript`). The engine acts on it instead when the
+  first finds no skill and it does, before the assistant tier, and says which it acted
+  on.
 - Every on-device prompt has the model answer populations, sizes and other figures from
   what it knows, with an example, instead of calling them live information it can't
   reach ("I don't have live population data" for Australia). A model that copies the

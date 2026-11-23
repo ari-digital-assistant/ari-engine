@@ -9,8 +9,9 @@
 //!   but English on Kroko.
 //!
 //! Each listen runs on a thread of its own, which owns its sherpa streams and
-//! frees them itself. Its events go to the host through
-//! [`VoiceHost::stt_event`](crate::pipeline::VoiceHost::stt_event).
+//! frees them itself. Its events go to the voice session, or to the host
+//! through [`VoiceHost::stt_event`](crate::pipeline::VoiceHost::stt_event)
+//! when there is none.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,6 +79,11 @@ pub enum SttError {
     Busy,
     /// The cloud request failed this way.
     Cloud(CloudSttFailure),
+    /// The host's own transcriber (Android's system speech service) refused
+    /// the request: no permission, or it will not run for this app.
+    HostRefused,
+    /// The host's own transcriber failed.
+    HostFailed,
 }
 
 /// What a listen tells the host, in order: `Listening`, maybe `Transcribing`,
@@ -356,8 +362,10 @@ impl VoicePipeline {
 
     /// Start listening: the last `rewind_seconds` of the ring and what
     /// follows, through the cloud if selected, else the loaded model. Sends
-    /// `Listening` at once, or an `Error`.
-    pub fn start_listen(self: &Arc<Self>, params: ListenParams) {
+    /// `Listening` at once, or an `Error`. Returns the listen's id, which
+    /// tags every event it sends.
+    pub fn start_listen(self: &Arc<Self>, params: ListenParams) -> u64 {
+        let id = self.next_listen_id();
         let (cloud, loaded) = {
             let state = self.stt().state();
             let loaded = match &state.loaded {
@@ -376,39 +384,48 @@ impl VoicePipeline {
             (false, Some(Loaded::Offline(r, _))) => ("offline", ListenKind::Offline(r)),
             (false, None) => {
                 self.host().log(LogLevel::Warn, "startListening called but no model loaded");
-                self.host().stt_event(SttEvent::Error(SttError::NoModel));
-                return;
+                self.stt_event(id, SttEvent::Error(SttError::NoModel));
+                return id;
             }
         };
         let Some(feed) = self.arm(params.rewind_seconds) else {
             self.host().log(LogLevel::Warn, "CaptureBus already armed — refusing to start listening");
-            self.host().stt_event(SttEvent::Error(SttError::Busy));
-            return;
+            self.stt_event(id, SttEvent::Error(SttError::Busy));
+            return id;
         };
-        self.host().stt_event(SttEvent::Listening { partial: String::new(), name_matched: Some(false) });
+        self.stt_event(id, SttEvent::Listening { partial: String::new(), name_matched: Some(false) });
         self.info(&format!("STT ({label}) listening started (rewindSeconds={})", params.rewind_seconds));
 
         let cancelled = Arc::new(AtomicBool::new(false));
-        let id = {
+        {
             let mut state = self.stt().state();
-            state.next_listen += 1;
-            let id = state.next_listen;
             if let Some(previous) = state.listen.replace(ListenHandle { id, cancelled: Arc::clone(&cancelled) }) {
                 previous.cancelled.store(true, Ordering::Relaxed);
             }
-            id
-        };
+        }
         let pipeline = Arc::clone(self);
         let listen = Listen { pipeline, id, cancelled, feed, label, params };
-        let spawned = std::thread::Builder::new().name("AriListen".into()).spawn(move || match kind {
-            ListenKind::Online(recognizer) => listen.online(recognizer),
-            ListenKind::Offline(recognizer) => listen.buffered(Transcriber::Offline(recognizer)),
-            ListenKind::Cloud => listen.buffered(Transcriber::Cloud),
+        let spawned = std::thread::Builder::new().name("AriListen".into()).spawn(move || {
+            listen.pipeline.host().thread_started();
+            match kind {
+                ListenKind::Online(recognizer) => listen.online(recognizer),
+                ListenKind::Offline(recognizer) => listen.buffered(Transcriber::Offline(recognizer)),
+                ListenKind::Cloud => listen.buffered(Transcriber::Cloud),
+            }
         });
         if spawned.is_err() {
             self.host().log(LogLevel::Warn, "could not start a listen thread");
             self.stop_listen_owned(Some(id));
         }
+        id
+    }
+
+    /// A fresh listen id, for a listen this pipeline runs or one the host
+    /// transcribes.
+    pub(crate) fn next_listen_id(&self) -> u64 {
+        let mut state = self.stt().state();
+        state.next_listen += 1;
+        state.next_listen
     }
 
     /// Stop whatever is listening and close its feed. Its sherpa streams are
@@ -542,7 +559,7 @@ impl Listen {
     /// Hand `event` over unless this listen has been stopped meanwhile.
     fn emit(&self, event: SttEvent) {
         if self.live() {
-            self.pipeline.host().stt_event(event);
+            self.pipeline.stt_event(self.id, event);
         }
     }
 

@@ -348,7 +348,7 @@ fn kotlin_float(f: f32) -> String {
 
 /// `at` as Java's `ISO_OFFSET_DATE_TIME` writes it: seconds always, the
 /// fraction only when there is one and without trailing zeros, `Z` for UTC.
-fn iso_offset_date_time<Tz: TimeZone>(at: i64, zone: &Tz) -> String {
+pub(crate) fn iso_offset_date_time<Tz: TimeZone>(at: i64, zone: &Tz) -> String {
     let Some(time) = zone.timestamp_millis_opt(at).single() else { return at.to_string() };
     let mut out = time.naive_local().format("%Y-%m-%dT%H:%M:%S").to_string();
     let millis = at.rem_euclid(1000);

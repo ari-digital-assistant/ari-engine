@@ -1,118 +1,14 @@
-//! UniFFI wrapper around [`ari_voice`]: the wake phrase rules, the wake word
-//! models and their ladders, and cloud speech-to-text.
+//! UniFFI wrapper around [`ari_voice`]'s rules the app still asks for: the
+//! wake word models and their ladders, the cloud speech-to-text services, and
+//! when false wakes are worth a warning.
 //!
 //! A thin shim, like `skill_registry.rs`. The rules live in `ari-voice`; this
 //! file mirrors its types as UniFFI records and enums and converts between
 //! them.
 
-use ari_voice::cloud_stt::{self, CloudSttError, CloudSttFailure, CloudSttService};
+use ari_voice::cloud_stt::CloudSttService;
 use ari_voice::ladder::{self, FalseWakeRemedy, LadderFit, TunedLadder, TunedSession};
 use ari_voice::wake_model::{self, OperatingPoint, WakeEngine, WakeSensitivity, WakeWordModel};
-use ari_voice::wake_phrase::{self, EarlyNameCheck, StreamingPartial, WakeMatch};
-
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct FfiWakeMatch {
-    pub text: String,
-    pub name_matched: bool,
-}
-
-impl From<WakeMatch> for FfiWakeMatch {
-    fn from(m: WakeMatch) -> Self {
-        Self {
-            text: m.text,
-            name_matched: m.name_matched,
-        }
-    }
-}
-
-impl From<FfiWakeMatch> for WakeMatch {
-    fn from(m: FfiWakeMatch) -> Self {
-        Self {
-            text: m.text,
-            name_matched: m.name_matched,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum FfiEarlyNameCheck {
-    Pass,
-    Miss,
-    None,
-}
-
-impl From<EarlyNameCheck> for FfiEarlyNameCheck {
-    fn from(c: EarlyNameCheck) -> Self {
-        match c {
-            EarlyNameCheck::Pass => Self::Pass,
-            EarlyNameCheck::Miss => Self::Miss,
-            EarlyNameCheck::None => Self::None,
-        }
-    }
-}
-
-impl From<FfiEarlyNameCheck> for EarlyNameCheck {
-    fn from(c: FfiEarlyNameCheck) -> Self {
-        match c {
-            FfiEarlyNameCheck::Pass => Self::Pass,
-            FfiEarlyNameCheck::Miss => Self::Miss,
-            FfiEarlyNameCheck::None => Self::None,
-        }
-    }
-}
-
-#[uniffi::export]
-impl FfiEarlyNameCheck {
-    /// The wake log's name for this result.
-    pub fn slug(&self) -> String {
-        EarlyNameCheck::from(*self).slug().to_string()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct FfiStreamingPartial {
-    pub text: String,
-    pub name_matched: Option<bool>,
-}
-
-impl From<StreamingPartial> for FfiStreamingPartial {
-    fn from(p: StreamingPartial) -> Self {
-        Self {
-            text: p.text,
-            name_matched: p.name_matched,
-        }
-    }
-}
-
-/// See [`wake_phrase::match_wake_phrase`].
-#[uniffi::export]
-pub fn match_wake_phrase(text: String, locale: String) -> FfiWakeMatch {
-    wake_phrase::match_wake_phrase(&text, &locale).into()
-}
-
-/// See [`wake_phrase::strip_wake_phrase`].
-#[uniffi::export]
-pub fn strip_wake_phrase(text: String, locale: String) -> String {
-    wake_phrase::strip_wake_phrase(&text, &locale)
-}
-
-/// See [`wake_phrase::wake_verdict`].
-#[uniffi::export]
-pub fn wake_verdict(wake_match: FfiWakeMatch, locale: String) -> Option<bool> {
-    wake_phrase::wake_verdict(&wake_match.into(), &locale)
-}
-
-/// See [`wake_phrase::early_name_check`].
-#[uniffi::export]
-pub fn early_name_check(transcript: String, locale: String) -> FfiEarlyNameCheck {
-    wake_phrase::early_name_check(&transcript, &locale).into()
-}
-
-/// See [`wake_phrase::streaming_partial`].
-#[uniffi::export]
-pub fn streaming_partial(wake_match: FfiWakeMatch, locale: String) -> Option<FfiStreamingPartial> {
-    wake_phrase::streaming_partial(&wake_match.into(), &locale).map(Into::into)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
 pub struct FfiOperatingPoint {
@@ -442,62 +338,21 @@ impl From<FfiCloudSttService> for CloudSttService {
     }
 }
 
-/// A failed cloud transcription, one variant per [`CloudSttFailure`] so the
-/// host can tell the user which wall they hit. `reason` is for the log.
-#[derive(Debug, thiserror::Error, uniffi::Error)]
-pub enum FfiCloudSttError {
-    #[error("{reason}")]
-    NotConfigured { reason: String },
-    #[error("{reason}")]
-    Network { reason: String },
-    #[error("{reason}")]
-    Auth { reason: String },
-    #[error("{reason}")]
-    Server { reason: String },
-    #[error("{reason}")]
-    Empty { reason: String },
-}
-
-impl From<CloudSttError> for FfiCloudSttError {
-    fn from(e: CloudSttError) -> Self {
-        let reason = e.message;
-        match e.failure {
-            CloudSttFailure::NotConfigured => Self::NotConfigured { reason },
-            CloudSttFailure::Network => Self::Network { reason },
-            CloudSttFailure::Auth => Self::Auth { reason },
-            CloudSttFailure::Server => Self::Server { reason },
-            CloudSttFailure::Empty => Self::Empty { reason },
-        }
-    }
-}
-
-/// See [`cloud_stt::transcribe`]. Blocking: call it off the main thread.
+/// False wakes in `timestamps` still on the books at `now`
+/// (`ari_voice::false_wake::prune`).
 #[uniffi::export]
-pub fn cloud_transcribe(
-    service: FfiCloudSttService,
-    api_key: Option<String>,
-    wav: Vec<u8>,
-    locale: String,
-) -> Result<String, FfiCloudSttError> {
-    Ok(cloud_stt::transcribe(
-        &service.into(),
-        api_key.as_deref(),
-        &wav,
-        &locale,
-    )?)
+pub fn false_wake_prune(timestamps: Vec<i64>, now: i64) -> Vec<i64> {
+    ari_voice::false_wake::prune(&timestamps, now)
 }
 
-/// See [`cloud_stt::transcribe_wake_clip`]. `None` where the early check does
-/// not run. Blocking: call it off the main thread.
+/// Whether `recent`, already pruned, is a burst worth telling the user about.
 #[uniffi::export]
-pub fn cloud_transcribe_wake_clip(
-    service: FfiCloudSttService,
-    api_key: Option<String>,
-    wav: Vec<u8>,
-    locale: String,
-) -> Result<Option<String>, FfiCloudSttError> {
-    Ok(
-        cloud_stt::transcribe_wake_clip(&service.into(), api_key.as_deref(), &wav, &locale)
-            .transpose()?,
-    )
+pub fn false_wake_burst_due(recent: Vec<i64>, notified_at: i64) -> bool {
+    ari_voice::false_wake::burst_due(&recent, notified_at)
+}
+
+/// How many hours a false wake stays on the books.
+#[uniffi::export]
+pub fn false_wake_window_hours() -> i64 {
+    ari_voice::false_wake::WINDOW_MS / 3_600_000
 }
