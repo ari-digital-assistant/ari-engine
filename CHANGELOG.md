@@ -166,7 +166,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - In a "let's talk" session with barge-in, a transcript made while Ari was speaking that
   the speech detector heard no speech in is ignored, and the session keeps listening. It
   was Ari's own voice through the echo canceller, taken as the user's reply. A listen's
-  `SttEvent::Done` says whether the detector heard speech (`speech_heard`).
+  `SttEvent::Done` says whether the detector heard speech (`speech_heard`). While Ari
+  answers, the overlay keeps the answer rather than showing partials, and the chime, the
+  listening state and the reply's silence window wait until Ari has finished.
 - A personality no longer talks the assistants out of formatting their answers. With
   "Be funny." set, the on-device model wrote lists as plain "•" lines with no bold. The
   personality block now says a personality changes how Ari sounds, not how a reply is

@@ -1329,14 +1329,8 @@ fn ari_heard_through_the_echo_canceller_is_not_a_reply() {
     let mut s = talking_with_barge_in();
     s.stt(partial("a spirit of", None));
     s.stt(heard("a spirit of speak of", Some(false)));
-    assert_eq!(
-        s.take(),
-        [
-            listening("a spirit of"),
-            listening(""),
-            Ev::Listen { id: 3, rewind: 0.0, give_up: None, limit: None },
-        ]
-    );
+    // Ari's answer stays on the overlay: neither its words nor "listening".
+    assert_eq!(s.take(), [Ev::Listen { id: 3, rewind: 0.0, give_up: None, limit: None }]);
     s.no_job();
     assert!(s.logs().contains(&"Ignored 'a spirit of speak of' while Ari spoke: no speech in it".to_string()));
     // Still listening, and a real reply over Ari's voice still cuts it off.
@@ -1374,4 +1368,29 @@ fn a_detector_that_did_not_run_never_drops_a_barge() {
     s.stt(heard("what's the weather", None));
     assert_eq!(s.take()[0], Ev::StopSpeaking);
     s.job();
+}
+
+#[test]
+fn with_barge_in_the_chime_waits_until_ari_has_finished_answering() {
+    let config = SessionConfig { barge_in_enabled: true, echo_canceller: true, ..keep_everything() };
+    let mut s = S::new(streaming(), config);
+    s.start(false, false);
+    s.stt(done("let's talk", "let's talk", None));
+    s.take();
+    s.answer(flagged("Okay, I'm listening.", ReplyFlags { enter_conversation: true, ..ReplyFlags::default() }));
+    let events = s.take();
+    // The mic is open under the answer, which stays on the overlay.
+    assert!(events.contains(&Ev::Listen { id: 2, rewind: 0.0, give_up: None, limit: None }));
+    assert!(!events.iter().any(|e| matches!(e, Ev::Cue(_))));
+    assert_eq!(events.iter().rfind(|e| matches!(e, Ev::State(_))), Some(&responding("Okay, I'm listening.", false)));
+    // A long answer doesn't run the reply's silence window down.
+    s.advance(40_000);
+    s.stt(partial("why is the", None));
+    assert!(!s.take().iter().any(|e| matches!(e, Ev::State(_))));
+    s.speech_done(1);
+    assert_eq!(s.take(), [listening(""), Ev::Cue(0.8)]);
+    s.advance(30_000);
+    assert_eq!(s.take(), []);
+    s.advance(1_000);
+    assert_eq!(s.take().last(), Some(&idle(false)));
 }

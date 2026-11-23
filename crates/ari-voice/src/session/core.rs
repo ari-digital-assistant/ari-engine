@@ -353,6 +353,9 @@ pub(crate) struct Core {
     speaking: bool,
     // The barge-in turn's speech, which a barge cuts off.
     tts_job: Option<u64>,
+    // The mic opened for a reply while Ari was still answering (barge-in):
+    // the overlay shows listening, with the chime, once Ari stops.
+    listening_owed: bool,
     // The listen now open started while Ari was speaking in a barge-in turn,
     // so Ari's own voice may be in it. Stays set when the speech ends: the
     // listen's transcript can still be the tail of Ari's answer.
@@ -403,6 +406,7 @@ impl Core {
             barge_in_active: false,
             speaking: false,
             tts_job: None,
+            listening_owed: false,
             echo_risk: false,
             turn_generation: 0,
             armed_generation: 0,
@@ -646,7 +650,9 @@ impl Core {
 
     fn on_silence_poll(&mut self, io: &dyn SessionIo, id: u64) {
         let Some(watcher) = self.watcher.filter(|w| w.id == id) else { return };
-        if io.now() - self.last_activity_at <= watcher.timeout_ms {
+        // The reply's window starts when Ari stops answering, not when the
+        // mic opened under it.
+        if self.listening_owed || io.now() - self.last_activity_at <= watcher.timeout_ms {
             self.schedule(io, watcher.poll_ms, TimerKind::SilencePoll { watcher: id });
             return;
         }
@@ -738,7 +744,11 @@ impl Core {
                     self.reveal(io);
                     self.ready_cue(io);
                 }
-                self.set_state(io, SessionState::Listening { partial });
+                // While Ari is still answering, its answer stays on the
+                // overlay: these partials are as likely Ari's own voice.
+                if !self.listening_owed {
+                    self.set_state(io, SessionState::Listening { partial });
+                }
             }
             SttEvent::Transcribing => {
                 // A buffered decode could take seconds: show Ari is working,
@@ -819,7 +829,9 @@ impl Core {
                 LogLevel::Info,
                 &format!("Ignored '{}' while Ari spoke: no speech in it", raw.as_deref().unwrap_or(&text)),
             );
-            self.set_state(io, SessionState::Listening { partial: String::new() });
+            if !self.listening_owed {
+                self.set_state(io, SessionState::Listening { partial: String::new() });
+            }
             self.start_listening(io, ListenParams { rewind_seconds: 0.0, ..ListenParams::default() });
             self.echo_risk = self.speaking;
             self.launch_watcher(io, SILENCE_TIMEOUT_MS);
@@ -831,6 +843,7 @@ impl Core {
             io.host().stop_speaking();
             self.speaking = false;
             self.tts_job = None;
+            self.listening_owed = false;
         }
         if is_stale_turn(final_generation, self.turn_generation) {
             // A straggler from a superseded turn: ignore it so it can't fire
@@ -1202,7 +1215,7 @@ impl Core {
             // voice from the capture) and speak at the same time. A final
             // while speaking cuts Ari off. The re-arm opens the mic with zero
             // rewind and bumps the turn generation.
-            self.rearm_for_reply(io);
+            self.open_mic_for_reply(io);
             self.speaking = true;
             let speech = self.reply_speech(io, &response_text);
             self.tts_job = speech;
@@ -1210,6 +1223,14 @@ impl Core {
                 self.speaking = false;
             }
             self.echo_risk = self.speaking;
+            // The answer stays on the overlay, and the chime waits, until Ari
+            // has finished saying it: a chime over Ari's own voice, and Ari's
+            // words shown as the user's, read as Ari listening to itself.
+            if self.speaking {
+                self.listening_owed = true;
+            } else {
+                self.show_listening_for_reply(io);
+            }
             self.finish_turn(io);
         } else if rearm {
             // Turn-based (a skill's question, or talk mode without an echo
@@ -1276,6 +1297,9 @@ impl Core {
     pub(crate) fn speech_finished(&mut self, io: &dyn SessionIo, id: u64) {
         if owns_speaking_flag(self.tts_job, id) {
             self.speaking = false;
+            if std::mem::take(&mut self.listening_owed) {
+                self.show_listening_for_reply(io);
+            }
         }
         if let Some(turn) = self.turn.as_mut()
             && turn.sentence == Some(id)
@@ -1354,19 +1378,29 @@ impl Core {
     /// Re-arm the mic for a skill's follow-up question without a second
     /// wake word.
     fn rearm_for_reply(&mut self, io: &dyn SessionIo) {
+        self.show_listening_for_reply(io);
+        self.open_mic_for_reply(io);
+    }
+
+    /// The mic half of a re-arm: a fresh listen for the reply.
+    fn open_mic_for_reply(&mut self, io: &dyn SessionIo) {
         // Re-arming supersedes the turn just finished: bump the generation and
         // snapshot it so any late final from the previous turn reads as stale.
         self.turn_generation += 1;
         self.armed_generation = self.turn_generation;
         self.awaiting_reply = true;
-        // A full fresh silence window for the reply.
-        self.last_activity_at = io.now();
-        self.set_state(io, SessionState::Listening { partial: String::new() });
-        io.host().play_cue(RE_ARM_CUE_VOLUME);
         // Zero rewind: a follow-up answer comes after the prompt, so there's
         // no pre-roll worth keeping, and a rewind would replay the tail of
         // Ari's question and cue into the recogniser.
         self.start_listening(io, ListenParams { rewind_seconds: 0.0, ..ListenParams::default() });
+    }
+
+    /// What the user sees and hears of a re-arm: the overlay listening and
+    /// the softer chime, and a full fresh silence window for the reply.
+    fn show_listening_for_reply(&mut self, io: &dyn SessionIo) {
+        self.last_activity_at = io.now();
+        self.set_state(io, SessionState::Listening { partial: String::new() });
+        io.host().play_cue(RE_ARM_CUE_VOLUME);
     }
 
     /// The chime the user was waiting for, and a fresh listen for the
@@ -1739,6 +1773,7 @@ impl Core {
         self.turn_generation += 1;
         self.speaking = false;
         self.tts_job = None;
+        self.listening_owed = false;
         self.talk_mode = false;
         self.barge_in_active = false;
         self.set_capture_mode(io, CaptureMode::Normal);
