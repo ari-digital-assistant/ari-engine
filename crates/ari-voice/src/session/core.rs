@@ -353,6 +353,10 @@ pub(crate) struct Core {
     speaking: bool,
     // The barge-in turn's speech, which a barge cuts off.
     tts_job: Option<u64>,
+    // The listen now open started while Ari was speaking in a barge-in turn,
+    // so Ari's own voice may be in it. Stays set when the speech ends: the
+    // listen's transcript can still be the tail of Ari's answer.
+    echo_risk: bool,
     // Bumped whenever a turn is superseded (fresh arm or dismiss);
     // snapshotted at arm time into armed_generation. A final whose
     // armed_generation no longer matches turn_generation is a straggler from
@@ -399,6 +403,7 @@ impl Core {
             barge_in_active: false,
             speaking: false,
             tts_job: None,
+            echo_risk: false,
             turn_generation: 0,
             armed_generation: 0,
             armed_at: 0,
@@ -559,6 +564,7 @@ impl Core {
 
     fn start_listening(&mut self, io: &dyn SessionIo, params: ListenParams) {
         self.listen = Some(io.start_listen(params, self.config.host_transcribes));
+        self.echo_risk = false;
     }
 
     /// What follows arming the opening listen, warm or after a cold start.
@@ -740,8 +746,8 @@ impl Core {
                 self.cancel_watcher();
                 self.set_state(io, SessionState::Thinking);
             }
-            SttEvent::Done { text, parallel, audio, raw, name_matched, listen_end } => {
-                self.on_final(io, text, parallel, audio, raw, name_matched, listen_end)
+            SttEvent::Done { text, parallel, audio, raw, name_matched, listen_end, speech_heard } => {
+                self.on_final(io, text, parallel, audio, raw, name_matched, listen_end, speech_heard)
             }
             SttEvent::Error(error) => {
                 // A quiet wake shows itself for an error: the failed request
@@ -800,9 +806,25 @@ impl Core {
         raw: Option<String>,
         name_matched: Option<bool>,
         listen_end: Option<ListenEnded>,
+        speech_heard: Option<bool>,
     ) {
         let final_generation = self.armed_generation;
         self.cancel_watcher();
+        if self.echo_risk && speech_heard == Some(false) {
+            // Ari's own answer, through the echo canceller: the recogniser
+            // made words of it, the speech detector heard nobody, and taken as
+            // the user's reply it had Ari answer itself ("A spirit of speak
+            // of", "Nice", 2026-11-22). Keep listening; Ari isn't cut off.
+            io.log(
+                LogLevel::Info,
+                &format!("Ignored '{}' while Ari spoke: no speech in it", raw.as_deref().unwrap_or(&text)),
+            );
+            self.set_state(io, SessionState::Listening { partial: String::new() });
+            self.start_listening(io, ListenParams { rewind_seconds: 0.0, ..ListenParams::default() });
+            self.echo_risk = self.speaking;
+            self.launch_watcher(io, SILENCE_TIMEOUT_MS);
+            return;
+        }
         if should_cut_tts(self.speaking, self.barge_in_active) {
             // The user barged in: stop Ari at once. This utterance becomes the
             // next turn: a barge does NOT bump the generation, so it isn't stale.
@@ -1187,6 +1209,7 @@ impl Core {
             if speech.is_none() {
                 self.speaking = false;
             }
+            self.echo_risk = self.speaking;
             self.finish_turn(io);
         } else if rearm {
             // Turn-based (a skill's question, or talk mode without an echo

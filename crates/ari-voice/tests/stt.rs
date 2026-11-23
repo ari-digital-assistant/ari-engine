@@ -166,10 +166,11 @@ fn a_cloud_listen_ends_on_silence_and_transcribes_the_whole_utterance() {
     let audio = wav("oww_parity.wav");
     let end = run.listen_to(&audio, ListenParams::default());
 
-    let SttEvent::Done { text, raw, name_matched, audio: heard, listen_end, parallel } = end else {
+    let SttEvent::Done { text, raw, name_matched, audio: heard, listen_end, parallel, speech_heard } = end else {
         panic!("{end:?}");
     };
     assert_eq!("what time is it?", text);
+    assert_eq!(Some(true), speech_heard);
     assert_eq!(Some("Hey Ari, what time is it?".into()), raw);
     assert_eq!(Some(true), name_matched);
     assert_eq!(None, parallel);
@@ -221,9 +222,10 @@ fn kroko_streams_a_listen_with_partials_and_a_parallel_opinion() {
     run.pipeline.load_stt(&kroko()).unwrap();
     assert!(run.pipeline.stt_streaming());
     let end = run.listen_to(&wav("oww_parity.wav"), ListenParams::default());
-    let SttEvent::Done { raw, audio, .. } = &end else { panic!("{end:?}") };
+    let SttEvent::Done { raw, audio, speech_heard, .. } = &end else { panic!("{end:?}") };
     println!("Kroko listen: {end:?}");
     assert!(raw.as_deref().unwrap().contains("Bad news travels fast"));
+    assert_eq!(Some(true), *speech_heard);
     let partials = run.events().iter().filter(|e| matches!(e, SttEvent::Listening { .. })).count();
     assert!(partials > 5, "{partials} partials");
     // The retry decodes the same audio again, whole.

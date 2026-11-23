@@ -490,6 +490,7 @@ impl VoicePipeline {
                     audio: Some(audio),
                     raw: Some(text),
                     listen_end: None,
+                    speech_heard: None,
                 }
             }
             HostHeard::NoSpeech { audio } => SttEvent::NoSpeech { audio: Some(audio), listen_end: None },

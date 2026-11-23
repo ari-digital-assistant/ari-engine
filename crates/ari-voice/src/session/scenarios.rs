@@ -225,6 +225,7 @@ fn done(text: &str, raw: &str, name_matched: Option<bool>) -> SttEvent {
         raw: Some(raw.into()),
         name_matched,
         listen_end: None,
+        speech_heard: None,
     }
 }
 
@@ -476,6 +477,7 @@ fn the_early_check_shows_a_quiet_wake_and_its_verdict_stands() {
         raw: Some("Hayori navigate to McDonald's".into()),
         name_matched: Some(false),
         listen_end: Some(ListenEnded { end: ListenEnd::Endpoint, after_ms: 2_400 }),
+        speech_heard: None,
     });
     let events = s.take();
     assert_eq!(events[..3], [
@@ -795,6 +797,7 @@ fn the_parallel_transcript_rescues_a_turn_and_is_flashed() {
         raw: Some("whats the leather".into()),
         name_matched: None,
         listen_end: None,
+        speech_heard: None,
     });
     let (_, epoch) = s.job();
     s.finish(epoch, Finished::Intercepted(Intercepted::No));
@@ -825,6 +828,7 @@ fn the_engine_acting_on_the_parallel_transcript_needs_no_retry() {
         raw: None,
         name_matched: None,
         listen_end: None,
+        speech_heard: None,
     });
     let (_, epoch) = s.job();
     s.finish(epoch, Finished::Intercepted(Intercepted::No));
@@ -1292,4 +1296,82 @@ fn a_blank_typed_turn_does_nothing() {
     s.core.submit_text(&s.io, "  ".into(), false);
     s.no_job();
     assert_eq!(s.take(), []);
+}
+
+// ── Barge-in and Ari's own voice ────────────────────────────────────────
+
+fn heard(text: &str, speech_heard: Option<bool>) -> SttEvent {
+    SttEvent::Done {
+        text: text.into(),
+        parallel: None,
+        audio: Some(UTTERANCE.to_vec()),
+        raw: Some(text.into()),
+        name_matched: None,
+        listen_end: None,
+        speech_heard,
+    }
+}
+
+/// A "let's talk" session with barge-in, Ari now saying its first answer
+/// (speech 1) with the mic open (listen 2).
+fn talking_with_barge_in() -> S {
+    let config = SessionConfig { barge_in_enabled: true, echo_canceller: true, ..keep_everything() };
+    let mut s = S::new(streaming(), config);
+    s.start(false, false);
+    s.stt(done("let's talk", "let's talk", None));
+    s.answer(flagged("Okay, I'm listening.", ReplyFlags { enter_conversation: true, ..ReplyFlags::default() }));
+    s.take();
+    s
+}
+
+#[test]
+fn ari_heard_through_the_echo_canceller_is_not_a_reply() {
+    let mut s = talking_with_barge_in();
+    s.stt(partial("a spirit of", None));
+    s.stt(heard("a spirit of speak of", Some(false)));
+    assert_eq!(
+        s.take(),
+        [
+            listening("a spirit of"),
+            listening(""),
+            Ev::Listen { id: 3, rewind: 0.0, give_up: None, limit: None },
+        ]
+    );
+    s.no_job();
+    assert!(s.logs().contains(&"Ignored 'a spirit of speak of' while Ari spoke: no speech in it".to_string()));
+    // Still listening, and a real reply over Ari's voice still cuts it off.
+    s.stt(heard("what's the weather", Some(true)));
+    assert_eq!(s.take()[0], Ev::StopSpeaking);
+    let (job, _) = s.job();
+    assert_eq!(job, Job::Intercept { text: "what's the weather".into(), cards: false });
+}
+
+#[test]
+fn the_tail_of_ari_s_answer_is_ignored_after_it_finishes_too() {
+    let mut s = talking_with_barge_in();
+    s.speech_done(1);
+    s.stt(heard("nice", Some(false)));
+    assert_eq!(s.take().last(), Some(&Ev::Listen { id: 3, rewind: 0.0, give_up: None, limit: None }));
+    s.no_job();
+    // The listen opened after Ari finished heard no Ari: what it hears counts.
+    s.stt(heard("tell me a joke", Some(false)));
+    let (job, _) = s.job();
+    assert_eq!(job, Job::Intercept { text: "tell me a joke".into(), cards: false });
+}
+
+#[test]
+fn without_barge_in_a_transcript_counts_whatever_the_detector_says() {
+    let mut s = S::new(streaming(), keep_everything());
+    s.start(false, false);
+    s.stt(heard("what time is it", Some(false)));
+    let (job, _) = s.job();
+    assert_eq!(job, Job::Intercept { text: "what time is it".into(), cards: true });
+}
+
+#[test]
+fn a_detector_that_did_not_run_never_drops_a_barge() {
+    let mut s = talking_with_barge_in();
+    s.stt(heard("what's the weather", None));
+    assert_eq!(s.take()[0], Ev::StopSpeaking);
+    s.job();
 }

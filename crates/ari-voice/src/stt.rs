@@ -107,6 +107,12 @@ pub enum SttEvent {
         raw: Option<String>,
         name_matched: Option<bool>,
         listen_end: Option<ListenEnded>,
+        /// Whether the speech detector heard speech anywhere in the listen;
+        /// `None` when it didn't run (it failed to load, or the host
+        /// transcribed). The recogniser makes words of sounds the detector
+        /// knows aren't speech, Ari's own voice through an echo canceller
+        /// among them.
+        speech_heard: Option<bool>,
     },
     /// Nothing was said: a quiet wake that heard no speech, or a cloud
     /// transcript that came back empty. `audio` is what was heard.
@@ -722,6 +728,7 @@ impl Listen {
                 audio: Some(audio),
                 raw: Some(final_raw),
                 listen_end: None,
+                speech_heard: gate.as_ref().map(|g| g.ms_since_last_speech(now) != i64::MAX),
             });
             break;
         }
@@ -745,6 +752,7 @@ impl Listen {
         let mut endpoint =
             BufferedEndpoint::new(started_at, self.params.give_up_without_speech_ms, self.params.limit_ms);
         let mut ended = None;
+        let mut speech_heard = gate.as_ref().map(|_| false);
         while self.live() {
             let Ok(incoming) = self.feed.recv() else { break };
             if incoming.is_empty() {
@@ -759,10 +767,14 @@ impl Listen {
                     // Carry on by loudness alone, as before the detector was here.
                     self.log(LogLevel::Warn, &format!("{}: speech detector failed, listening by loudness alone: {e}", self.label));
                     gate = None;
+                    speech_heard = None;
                     false
                 }
                 None => false,
             };
+            if heard {
+                speech_heard = Some(true);
+            }
             if let Some(end) = endpoint.next(now, loud, heard, audio.len()) {
                 let after_ms = now - started_at;
                 self.log(
@@ -779,15 +791,21 @@ impl Listen {
                 self.emit(SttEvent::NoSpeech { audio: Some(audio), listen_end: Some(listen_end) });
             } else {
                 match transcriber {
-                    Transcriber::Offline(recognizer) => self.decode_offline(&recognizer, audio, listen_end),
-                    Transcriber::Cloud => self.transcribe_cloud(audio, listen_end),
+                    Transcriber::Offline(recognizer) => self.decode_offline(&recognizer, audio, listen_end, speech_heard),
+                    Transcriber::Cloud => self.transcribe_cloud(audio, listen_end, speech_heard),
                 }
             }
         }
         self.finish();
     }
 
-    fn decode_offline(&self, recognizer: &Arc<OfflineRecognizer>, audio: Vec<i16>, listen_end: ListenEnded) {
+    fn decode_offline(
+        &self,
+        recognizer: &Arc<OfflineRecognizer>,
+        audio: Vec<i16>,
+        listen_end: ListenEnded,
+        speech_heard: Option<bool>,
+    ) {
         // Posted before the decode, so the host can show it is thinking
         // rather than still listening for the whole decode window.
         self.emit(SttEvent::Transcribing);
@@ -810,10 +828,11 @@ impl Listen {
             audio: Some(audio),
             raw: Some(transcript),
             listen_end: Some(listen_end),
+            speech_heard,
         });
     }
 
-    fn transcribe_cloud(&self, audio: Vec<i16>, listen_end: ListenEnded) {
+    fn transcribe_cloud(&self, audio: Vec<i16>, listen_end: ListenEnded, speech_heard: Option<bool>) {
         self.emit(SttEvent::Transcribing);
         let locale = self.pipeline.host().locale();
         let Some((service, key)) = self.pipeline.host().cloud_stt() else {
@@ -833,6 +852,7 @@ impl Listen {
                     audio: Some(audio),
                     raw: Some(transcript),
                     listen_end: Some(listen_end),
+                    speech_heard,
                 });
             }
             Err(e) => {
