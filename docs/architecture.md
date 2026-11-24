@@ -15,16 +15,18 @@ settings storage, model downloads, and user-facing strings.
 
 A frontend implements two callback interfaces in `ari-ffi`: `FfiVoiceHost`
 (model files, wakes, locale, the cloud service, logs) and `FfiSessionHost` (the
-session's state for the overlay, cues and speech, actions, alert and card
-intercepts, the log, typed turns' answers). Android's are `VoiceEngine.kt` and
-`VoiceSession.kt`.
+session's state for the overlay, cues and speech, actions, the alerts and cards
+a spoken or typed answer can reach, the log, typed turns' answers). Android's
+are `VoiceEngine.kt` and `VoiceSession.kt`. A frontend written in Rust skips
+`ari-ffi`: it builds an `ari_runtime::Runtime` with its platform providers and
+implements `ari_voice`'s `VoiceHost` and `SessionHost` itself.
 
 ### Where new code goes
 
 Every feature is placed against this boundary before it is written. The test:
 would a second frontend have to do this the same way? Then it belongs in the
-engine, and frontends reach it through `ari-ffi`. If each OS does it its own
-way, it stays in the frontend.
+engine, and frontends reach it through `ari-ffi` or, from Rust, directly. If
+each OS does it its own way, it stays in the frontend.
 
 - Decision logic in a frontend (what a reply means, whether to listen, how to
   match what was said) is the sign that code sits on the wrong side.
@@ -377,6 +379,8 @@ before it could cancel.
 | Assistant fallback | `ari-engine/crates/ari-llm/src/lib.rs` (builtin LLM), `ari-skill-loader/src/assistant.rs` (API adapter) |
 | STT retry | `ari-engine/crates/ari-voice/src/session/core.rs`, `ari-engine/src/lib.rs` (`set_alternative_transcript`) |
 | Engine orchestration | `ari-engine/crates/ari-engine/src/lib.rs` (`process_input_traced`) |
+| Engine assembly, skill reloads, settings calls, turn replies | `ari-engine/crates/ari-runtime/src/lib.rs` (`Runtime`) |
+| Skill store and registry, assistants on offer, skill settings | `ari-engine/crates/ari-runtime/src/skills.rs`, `assistants.rs`, `settings.rs` |
 | FFI boundary | `ari-engine/crates/ari-ffi/src/lib.rs`, `voice_pipeline.rs` (`FfiVoicePipeline`, `FfiSessionHost`) |
 
 ## What each layer catches

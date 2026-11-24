@@ -16,15 +16,15 @@ use ari_voice::cloud_stt::{CloudSttFailure, CloudSttService};
 use ari_voice::detector::{OWW_EMBEDDING_FILE, OWW_MELSPECTROGRAM_FILE, WakeDetector};
 use ari_voice::pipeline::{self, LogLevel, VoiceHost, VoicePipeline, WakeConfig};
 use ari_voice::session::{
-    ActionOutcome, AnswerSink, CaptureMode, EngineReply, Intercepted, LoggedReply, LoggedTurn, Phrase, ReplyFlags,
-    HostHeard, SessionConfig, SessionError, SessionHost, SessionState, TurnEngine, TypedFinish,
+    ActionOutcome, AlertTarget, CaptureMode, CardButton, CardPressed, CardTarget, InterceptTargets, LoggedReply,
+    LoggedTurn, Phrase, HostHeard, SessionConfig, SessionError, SessionHost, SessionState, TypedFinish,
 };
 use ari_voice::stt::{ListenParams, SttError, SttModelSpec};
 use ari_voice::wake_log::{WakeLog, WakeOutcome};
 use ari_voice::wake_model::WakeEngine;
 
 use crate::voice::{FfiCloudSttService, FfiOperatingPoint, FfiWakeSensitivity, FfiWakeWordModel};
-use crate::{AriEngine, FfiLogLevel, FfiResponse};
+use crate::{AriEngine, FfiLogLevel};
 
 /// How a wake the user could see ended (`ari_voice::wake_log::WakeOutcome`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -369,7 +369,7 @@ impl FfiVoicePipeline {
     /// The engine voice turns go to, once it is built. A turn that reaches it
     /// sooner waits.
     pub fn attach_engine(&self, engine: Arc<AriEngine>) {
-        self.inner.attach_engine(engine);
+        self.inner.attach_engine(engine.runtime.clone());
     }
 
     /// The settings the session acts on. Again whenever one changes.
@@ -446,7 +446,7 @@ pub enum FfiSessionState {
     Preparing { message: String },
     Listening { partial: String },
     Thinking,
-    /// `cards`: show the cards the last `handle_action` or `intercept` made.
+    /// `cards`: show the cards the last `handle_action` or `press_card_button` made.
     Responding { text: String, cards: bool },
     Error { error: FfiSessionError },
 }
@@ -523,15 +523,59 @@ impl From<FfiSessionConfig> for SessionConfig {
     }
 }
 
-/// What the app did with words an alert or a card claimed. It has acted; the
-/// session writes the log.
+/// What words can answer instead of the engine
+/// (`ari_voice::session::InterceptTargets`): the sounding alerts, and the
+/// cards on screen, oldest first.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiInterceptTargets {
+    pub alerts: Vec<FfiAlertTarget>,
+    pub cards: Vec<FfiCardTarget>,
+}
+
+/// `stop_label`: the label of the alert's Stop button.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAlertTarget {
+    pub id: String,
+    pub stop_label: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCardTarget {
+    pub id: String,
+    pub buttons: Vec<FfiCardButton>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCardButton {
+    pub id: String,
+    pub label: String,
+}
+
+impl From<FfiInterceptTargets> for InterceptTargets {
+    fn from(t: FfiInterceptTargets) -> Self {
+        Self {
+            alerts: t.alerts.into_iter().map(|a| AlertTarget { id: a.id, stop_label: a.stop_label }).collect(),
+            cards: t
+                .cards
+                .into_iter()
+                .map(|c| CardTarget {
+                    id: c.id,
+                    buttons: c.buttons.into_iter().map(|b| CardButton { id: b.id, label: b.label }).collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// What pressing a card's button did. The app has acted; the session writes
+/// the log.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
-pub enum FfiIntercepted {
-    No,
-    Alert,
-    CardSilent,
+pub enum FfiCardPressed {
+    /// The card has gone: the words go to the engine.
+    Gone,
+    Silent,
     /// `attachments`: the answer has any, which the app holds.
-    CardSpoken { text: String, cards: bool, attachments: bool },
+    Spoken { text: String, cards: bool, attachments: bool },
 }
 
 /// An action envelope the app ran.
@@ -608,8 +652,13 @@ pub trait FfiSessionHost: Send + Sync {
     /// Transcribe a listen, reporting through `host_heard`.
     fn host_listen(&self, params: FfiListenParams);
     fn host_stop_listen(&self);
-    /// Blocking: give the words to a sounding alert or, when `cards`, the card on screen.
-    fn intercept(&self, text: String, cards: bool) -> FfiIntercepted;
+    /// Blocking: the sounding alerts and the cards on screen, which the
+    /// session matches what was said against.
+    fn intercept_targets(&self) -> FfiInterceptTargets;
+    /// Stop sounding alert `alert_id`: its stop was said.
+    fn stop_alert(&self, alert_id: String);
+    /// Blocking: press `button_id` on card `card_id`, as a tap would.
+    fn press_card_button(&self, card_id: String, button_id: String) -> FfiCardPressed;
     /// Blocking: run an action envelope.
     fn handle_action(&self, json: String, skill_id: String) -> FfiActionOutcome;
     fn turn_logged(&self, turn: FfiLoggedTurn);
@@ -666,12 +715,17 @@ impl SessionHost for ForeignSessionHost {
     fn host_stop_listen(&self) {
         self.0.host_stop_listen();
     }
-    fn intercept(&self, text: &str, cards: bool) -> Intercepted {
-        match self.0.intercept(text.to_string(), cards) {
-            FfiIntercepted::No => Intercepted::No,
-            FfiIntercepted::Alert => Intercepted::Alert,
-            FfiIntercepted::CardSilent => Intercepted::CardSilent,
-            FfiIntercepted::CardSpoken { text, cards, attachments } => Intercepted::CardSpoken { text, cards, attachments },
+    fn intercept_targets(&self) -> InterceptTargets {
+        self.0.intercept_targets().into()
+    }
+    fn stop_alert(&self, alert_id: &str) {
+        self.0.stop_alert(alert_id.to_string());
+    }
+    fn press_card_button(&self, card_id: &str, button_id: &str) -> CardPressed {
+        match self.0.press_card_button(card_id.to_string(), button_id.to_string()) {
+            FfiCardPressed::Gone => CardPressed::Gone,
+            FfiCardPressed::Silent => CardPressed::Silent,
+            FfiCardPressed::Spoken { text, cards, attachments } => CardPressed::Spoken { text, cards, attachments },
         }
     }
     fn handle_action(&self, json: &str, skill_id: &str) -> ActionOutcome {
@@ -702,55 +756,6 @@ impl SessionHost for ForeignSessionHost {
     fn typed_finished(&self, turn: u64, finish: TypedFinish) {
         let reply = finish.reply.map(|r| FfiLoggedReply { text: r.text, markdown: r.markdown, skill_id: r.skill_id });
         self.0.typed_finished(turn, FfiTypedFinish { clear: finish.clear, reply });
-    }
-}
-
-/// An answer the engine writes, handed on to the session.
-struct VoiceAnswerSink(Arc<dyn AnswerSink>);
-
-impl ari_engine::AnswerSink for VoiceAnswerSink {
-    fn text(&self, so_far: &str, markdown: Option<&str>) {
-        self.0.text(so_far, markdown);
-    }
-    fn sentence(&self, text: &str) {
-        self.0.sentence(text);
-    }
-}
-
-fn engine_reply(response: FfiResponse) -> EngineReply {
-    match response {
-        FfiResponse::Text { body, markdown, rearm, enter_conversation, exit_conversation, facts_changed, clear_conversation } => {
-            EngineReply::Text {
-                body,
-                markdown,
-                flags: ReplyFlags { rearm, enter_conversation, exit_conversation, facts_changed, clear_conversation },
-            }
-        }
-        FfiResponse::Action { json, skill_id, rearm, enter_conversation, exit_conversation, facts_changed, clear_conversation } => {
-            EngineReply::Action {
-                json,
-                skill_id,
-                flags: ReplyFlags { rearm, enter_conversation, exit_conversation, facts_changed, clear_conversation },
-            }
-        }
-        FfiResponse::Binary { mime, data } => EngineReply::Binary { mime, len: data.len() },
-        FfiResponse::NotUnderstood { body } => EngineReply::NotUnderstood { body },
-    }
-}
-
-impl TurnEngine for AriEngine {
-    fn respond(&self, input: &str, alternative: Option<&str>, answer: Option<Arc<dyn AnswerSink>>) -> (EngineReply, bool) {
-        let answer = answer.map(|a| Arc::new(VoiceAnswerSink(a)) as Arc<dyn ari_engine::AnswerSink>);
-        let (response, used_alternative) = self.respond_with(input.to_string(), alternative.map(str::to_string), answer);
-        (engine_reply(response), used_alternative)
-    }
-
-    fn cancel_pending_reply(&self) {
-        AriEngine::cancel_pending_reply(self);
-    }
-
-    fn set_conversation_active(&self, active: bool) {
-        AriEngine::set_conversation_active(self, active);
     }
 }
 

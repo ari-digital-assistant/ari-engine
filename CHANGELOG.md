@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ari-runtime`, the engine as a frontend runs it, moved out of `ari-ffi`: the engine
+  with its built-in and community skills, the platform providers (`Providers`),
+  settings-time skill calls, the model catalog, the on-device model, and the replies
+  turns get, as the voice session's `TurnEngine`; the skill store and registry
+  (`skills::SkillRegistry`), the assistants on offer (`assistants::AssistantRegistry`)
+  and skill settings (`settings::SettingsStore`), with the grants every install and
+  reload loads with (`load_options`). A frontend written in Rust links it without
+  `ari-ffi`. `AriEngine`, `SkillRegistry`, `AssistantRegistry` and
+  `SkillSettingsStore` wrap them and their Kotlin API is unchanged;
+  `build_engine_with_builtins` and `register_community_skills` are `ari_runtime`'s now.
 - The voice session in `ari-voice`, moved from ari-android: a voice turn from the wake
   to the answer, with wake verification and quiet wakes, the early name check, the
   cold start, the retries, follow-up questions, "let's talk" and barge-in, dictation,
@@ -141,6 +151,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The voice session decides which words answer what is on screen: "stop" (or the
+  alert's own Stop label) over a sounding alert, and a button's id or label on the
+  newest card with buttons, with the endings speech recognition adds to it. The
+  per-language stop phrases and endings moved here from ari-android.
+  `FfiSessionHost.intercept` is replaced by `intercept_targets`, which lists the alerts
+  and cards, and `stop_alert` and `press_card_button`, which act on the match.
 - A spoken turn can carry a second transcript (the streaming recogniser's parallel
   stream, `Engine::set_alternative_transcript`). The engine acts on it instead when the
   first finds no skill and it does, before the assistant tier, and says which it acted

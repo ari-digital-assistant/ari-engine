@@ -10,6 +10,7 @@
 
 mod core;
 pub mod captures;
+mod intercept;
 pub mod rules;
 pub mod runner;
 
@@ -22,6 +23,7 @@ use std::sync::Arc;
 use crate::stt::{ListenParams, SttError};
 
 pub use captures::{UtteranceCapture, UtteranceOutcome, UtteranceTurn, WakeCaptureHook};
+pub use intercept::{AlertTarget, CardButton, CardPressed, CardTarget, InterceptTargets};
 pub use runner::HostHeard;
 
 /// What the overlay shows.
@@ -35,8 +37,8 @@ pub enum SessionState {
     Listening { partial: String },
     Thinking,
     /// `cards`: the answer has cards, which the frontend holds from the
-    /// [`SessionHost::handle_action`] or [`SessionHost::intercept`] call that
-    /// made them.
+    /// [`SessionHost::handle_action`] or [`SessionHost::press_card_button`]
+    /// call that made them.
     Responding { text: String, cards: bool },
     Error(SessionError),
 }
@@ -236,9 +238,15 @@ pub trait SessionHost: Send + Sync {
 
     fn host_stop_listen(&self) {}
 
-    /// Give the words to a sounding alert or the card on screen, if one
-    /// claims them (`cards`: the card may). Blocking.
-    fn intercept(&self, text: &str, cards: bool) -> Intercepted;
+    /// What words can answer instead of the engine: the sounding alerts, and
+    /// the cards on screen with their buttons. Blocking.
+    fn intercept_targets(&self) -> InterceptTargets;
+
+    /// Stop sounding alert `alert_id`: its stop was said.
+    fn stop_alert(&self, alert_id: &str);
+
+    /// Press `button_id` on card `card_id`, as a tap would. Blocking.
+    fn press_card_button(&self, card_id: &str, button_id: &str) -> CardPressed;
 
     /// Run an action envelope. Blocking.
     fn handle_action(&self, json: &str, skill_id: &str) -> ActionOutcome;

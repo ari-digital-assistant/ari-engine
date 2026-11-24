@@ -12,6 +12,7 @@ members = [
     "crates/ari-llm",
     "crates/ari-native",
     "crates/ari-voice",
+    "crates/ari-runtime",
 ]
 
 [workspace.dependencies]

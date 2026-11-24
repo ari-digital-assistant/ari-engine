@@ -18,6 +18,7 @@ use chrono::Local;
 
 use super::captures::{save_utterance_capture, save_wake_capture};
 use super::core::{Capture, Core, EngineCall, Finished, Job, SessionIo, SttStatus, Tag};
+use super::intercept::intercept;
 use super::{AnswerSink, SessionConfig, SessionHost, TurnEngine};
 use crate::pipeline::{LogLevel, VoicePipeline};
 use crate::stt::{ListenEnded, ListenParams, SttEvent};
@@ -213,7 +214,10 @@ impl SessionIo for RunnerIo {
                     Finished::NameChecked(pipeline.upgrade().and_then(|p| p.check_name_early(&pcm)))
                 }
                 Job::Redecode(pcm) => Finished::Redecoded(pipeline.upgrade().and_then(|p| p.transcribe_again(&pcm))),
-                Job::Intercept { text, cards } => Finished::Intercepted(host.intercept(&text, cards)),
+                Job::Intercept { text, cards } => {
+                    let locale = pipeline.upgrade().map_or_else(|| "en".into(), |p| p.host().locale());
+                    Finished::Intercepted(intercept(&*host, &text, cards, &locale))
+                }
                 Job::HandleAction { json, skill_id } => Finished::ActionHandled(host.handle_action(&json, &skill_id)),
             }))
             .unwrap_or_else(|panic| Finished::Failed(panic_message(panic)));
