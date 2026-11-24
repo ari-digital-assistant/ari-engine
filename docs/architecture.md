@@ -19,6 +19,22 @@ session's state for the overlay, cues and speech, actions, alert and card
 intercepts, the log, typed turns' answers). Android's are `VoiceEngine.kt` and
 `VoiceSession.kt`.
 
+### Where new code goes
+
+Every feature is placed against this boundary before it is written. The test:
+would a second frontend have to do this the same way? Then it belongs in the
+engine, and frontends reach it through `ari-ffi`. If each OS does it its own
+way, it stays in the frontend.
+
+- Decision logic in a frontend (what a reply means, whether to listen, how to
+  match what was said) is the sign that code sits on the wrong side.
+- Engine logic is never copied into a frontend. A missing hook is added to
+  `FfiVoiceHost` or `FfiSessionHost`, and a change to the session gets a
+  scenario in `ari-voice/src/session/scenarios.rs`.
+- Logic moves with its tests. JVM unit tests can't call the engine, so a rule
+  tested in Kotlin is a rule that lives in Kotlin.
+- A change that spans both sides lands in the engine first.
+
 ## The pipeline
 
 ```
