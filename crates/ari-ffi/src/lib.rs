@@ -2,21 +2,16 @@
 
 use ari_engine::{AnswerSink, ConversationLength, ConversationMemory, EnvelopeSink};
 use ari_runtime::{Providers, Reply, Runtime};
-use ari_skill_loader::assistant::MemoryConfigStore;
 use ari_skill_loader::{
     AuthorizeInput, AuthorizeOutput, AuthorizeProvider, Calendar,
     CalendarEventRow, CalendarProvider, Capability, Contact, ContactChannel, ContactsProvider,
-    LiveConversationsProvider,
-    EnglishLocaleProvider, HostCapabilities,
-    HttpConfig, InsertCalendarEventParams, InsertTaskParams, LoadOptions, LocalClock,
+    LiveConversationsProvider, HostCapabilities,
+    InsertCalendarEventParams, InsertTaskParams, LoadOptions, LocalClock,
     LocalTimeComponents, LocaleProvider, LocationProvider, LocationResult, LocationStatus, LogLevel,
-    LogSink, NullAuthorizeProvider, NullCalendarProvider, NullLocationProvider,
-    NullContactsProvider, NullLiveConversationsProvider, NullLogSink, MediaServicesProvider,
-    NullMediaServicesProvider,
-    NullSettingWriter, NullTasksProvider,
-    SettingWriter, StorageConfig, TaskList, TaskRow, TasksProvider, UtcLocalClock,
+    LogSink, MediaServicesProvider,
+    SettingWriter, TaskList, TaskRow, TasksProvider,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 mod assistant_registry;
@@ -33,15 +28,9 @@ pub use skill_registry::{
     FfiBrowseEntry, FfiInstalledSkill, FfiRegistryError, FfiSkillUpdate, SkillRegistry,
 };
 
-/// Build the [`LoadOptions`] the Android host uses for every install and
-/// every reload. Grants `pure_frontend` caps (frontend-mediated actions),
-/// `http` (backed by reqwest with bundled webpki-roots — see `tls.rs`),
-/// and `storage_kv` (backed by per-skill JSON files under `storage_dir`).
-///
-/// Keep this in one place so every loader entry point in the FFI crate
-/// sees the same grants. A mismatch — e.g. install granting `http` but
-/// reload not — would let a skill install cleanly and then silently drop
-/// off the conversation engine on the next app start.
+/// The [`LoadOptions`] the Android host uses for every install and every
+/// reload (see [`ari_runtime::load_options`]): Android grants every
+/// capability there is.
 pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
     let host_caps = HostCapabilities::pure_frontend()
         .with(Capability::Http)
@@ -53,29 +42,7 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
         .with(Capability::MediaServices)
         .with(Capability::Contacts)
         .with(Capability::Reply);
-    LoadOptions {
-        log_sink: Arc::new(NullLogSink),
-        host_capabilities: host_caps,
-        http_config: HttpConfig::strict(),
-        storage_config: StorageConfig::new(PathBuf::from(storage_dir)),
-        tasks_provider: Arc::new(NullTasksProvider),
-        calendar_provider: Arc::new(NullCalendarProvider),
-        location_provider: Arc::new(NullLocationProvider),
-        media_services_provider: Arc::new(NullMediaServicesProvider),
-        contacts_provider: Arc::new(NullContactsProvider),
-        live_conversations_provider: Arc::new(NullLiveConversationsProvider),
-        local_clock: Arc::new(UtcLocalClock),
-        config_store: Arc::new(MemoryConfigStore::new()),
-        locale_provider: Arc::new(EnglishLocaleProvider),
-        setting_writer: Arc::new(NullSettingWriter),
-        authorize_provider: Arc::new(NullAuthorizeProvider),
-        // Persist cranelift output so skill compilation is a one-time cost
-        // per skill version, not a per-launch one. Without this, every
-        // process start recompiled every installed WASM skill on the main
-        // thread — the root of the startup ANR. The dir sits under the
-        // app-private storage root the host already hands us.
-        compile_cache_dir: Some(PathBuf::from(storage_dir).join("wasm-cache")),
-    }
+    ari_runtime::load_options(Path::new(storage_dir), host_caps)
 }
 
 uniffi::setup_scaffolding!();

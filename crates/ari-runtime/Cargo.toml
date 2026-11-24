@@ -15,3 +15,4 @@ ari-skills = { path = "../ari-skills" }
 ari-skill-loader = { path = "../ari-skill-loader" }
 ari-voice = { path = "../ari-voice" }
 serde_json = { workspace = true }
+thiserror = "2.0.18"

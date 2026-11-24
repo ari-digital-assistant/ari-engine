@@ -380,6 +380,7 @@ before it could cancel.
 | STT retry | `ari-engine/crates/ari-voice/src/session/core.rs`, `ari-engine/src/lib.rs` (`set_alternative_transcript`) |
 | Engine orchestration | `ari-engine/crates/ari-engine/src/lib.rs` (`process_input_traced`) |
 | Engine assembly, skill reloads, settings calls, turn replies | `ari-engine/crates/ari-runtime/src/lib.rs` (`Runtime`) |
+| Skill store and registry, assistants on offer, skill settings | `ari-engine/crates/ari-runtime/src/skills.rs`, `assistants.rs`, `settings.rs` |
 | FFI boundary | `ari-engine/crates/ari-ffi/src/lib.rs`, `voice_pipeline.rs` (`FfiVoicePipeline`, `FfiSessionHost`) |
 
 ## What each layer catches

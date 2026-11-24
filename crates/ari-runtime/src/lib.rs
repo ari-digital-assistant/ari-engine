@@ -11,14 +11,39 @@ use ari_core::{Response, SettingsQueryResult, Skill};
 use ari_engine::{Engine, EnvelopeSink, FALLBACK_RESPONSE, fallback_response_for};
 use ari_skill_loader::assistant::{ConfigStore, MemoryConfigStore};
 use ari_skill_loader::{
-    AuthorizeProvider, CalendarProvider, ContactsProvider, EnglishLocaleProvider, HostCapabilities,
+    AuthorizeProvider, CalendarProvider, ContactsProvider, EnglishLocaleProvider, HostCapabilities, HttpConfig,
     LiveConversationsProvider, LoadOptions, LocalClock, LocaleProvider, LocationProvider, LogLevel, LogSink,
     MediaServicesProvider, ModelCatalog, NullAuthorizeProvider, NullCalendarProvider, NullContactsProvider,
     NullLiveConversationsProvider, NullLocationProvider, NullLogSink, NullMediaServicesProvider, NullSettingWriter,
-    NullTasksProvider, SettingWriter, TasksProvider, UtcLocalClock, load_skill_directory_with,
+    NullTasksProvider, SettingWriter, StorageConfig, TasksProvider, UtcLocalClock, load_skill_directory_with,
 };
 use ari_skills::{CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill};
 use ari_voice::session::{AnswerSink, EngineReply, ReplyFlags, TurnEngine};
+
+pub mod assistants;
+pub mod settings;
+pub mod skills;
+
+/// The [`LoadOptions`] for a frontend granting `host_capabilities`, with
+/// skills' `storage_kv` files under `storage_dir`. Every install and every
+/// reload must load with the same grants: a mismatch (install granting
+/// `http`, reload not) lets a skill install cleanly and then silently drop
+/// off the engine on the next start. The providers are the Null ones;
+/// [`Runtime::reload_community_skills`] puts the runtime's in.
+pub fn load_options(storage_dir: &Path, host_capabilities: HostCapabilities) -> LoadOptions {
+    LoadOptions {
+        host_capabilities,
+        http_config: HttpConfig::strict(),
+        storage_config: StorageConfig::new(storage_dir.to_path_buf()),
+        // Persist cranelift output so skill compilation is a one-time cost
+        // per skill version, not a per-launch one. Without this, every
+        // process start recompiled every installed WASM skill on the main
+        // thread — the root of the startup ANR. The dir sits under the
+        // app-private storage root the host already hands us.
+        compile_cache_dir: Some(storage_dir.join("wasm-cache")),
+        ..LoadOptions::default()
+    }
+}
 
 /// The 6 built-in Rust skills, freshly constructed. Kept in one place so the
 /// initial engine build and every `reload_community_skills` register exactly
