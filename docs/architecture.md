@@ -15,8 +15,8 @@ settings storage, model downloads, and user-facing strings.
 
 A frontend implements two callback interfaces in `ari-ffi`: `FfiVoiceHost`
 (model files, wakes, locale, the cloud service, logs) and `FfiSessionHost` (the
-session's state for the overlay, cues and speech, actions, alert and card
-intercepts, the log, typed turns' answers). Android's are `VoiceEngine.kt` and
+session's state for the overlay, cues and speech, actions, the alerts and cards
+a spoken or typed answer can reach, the log, typed turns' answers). Android's are `VoiceEngine.kt` and
 `VoiceSession.kt`.
 
 ### Where new code goes

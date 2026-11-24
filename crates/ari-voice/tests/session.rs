@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use ari_voice::cloud_stt::CloudSttService;
 use ari_voice::pipeline::{LogLevel, VoiceHost, VoicePipeline};
 use ari_voice::session::{
-    ActionOutcome, AnswerSink, CaptureMode, EngineReply, Intercepted, LoggedTurn, Phrase, ReplyFlags,
-    SessionConfig, SessionHost, SessionState, TurnEngine,
+    ActionOutcome, AnswerSink, CaptureMode, CardButton, CardPressed, CardTarget, EngineReply, InterceptTargets,
+    LoggedTurn, Phrase, ReplyFlags, SessionConfig, SessionHost, SessionState, TurnEngine,
 };
 use ari_voice::wake_log::{WakeLog, WakeOutcome};
 use common::{asset, use_host_library, wav};
@@ -47,7 +47,7 @@ impl VoiceHost for Host {
 struct Overlay {
     states: Mutex<Vec<SessionState>>,
     spoken: Mutex<Vec<(u64, String)>>,
-    intercepted: Mutex<Vec<(String, bool)>>,
+    targets_asked: Mutex<usize>,
     logged: Mutex<Vec<LoggedTurn>>,
 }
 
@@ -68,9 +68,16 @@ impl SessionHost for Overlay {
     fn load_speech_model(&self) -> bool {
         false
     }
-    fn intercept(&self, text: &str, cards: bool) -> Intercepted {
-        self.intercepted.lock().unwrap().push((text.into(), cards));
-        Intercepted::No
+    fn intercept_targets(&self) -> InterceptTargets {
+        *self.targets_asked.lock().unwrap() += 1;
+        let cancel = CardButton { id: "cancel".into(), label: "Cancel".into() };
+        InterceptTargets { alerts: vec![], cards: vec![CardTarget { id: "timer".into(), buttons: vec![cancel] }] }
+    }
+    fn stop_alert(&self, _alert_id: &str) {
+        unreachable!("no alert rings")
+    }
+    fn press_card_button(&self, _card_id: &str, _button_id: &str) -> CardPressed {
+        unreachable!("the words name no button")
     }
     fn handle_action(&self, _json: &str, _skill_id: &str) -> ActionOutcome {
         unreachable!("a text reply")
@@ -168,7 +175,7 @@ fn a_cloud_wake_runs_through_the_session_threads() {
     let mut reads = live.chunks(READ).chain(std::iter::repeat(&silence[..]));
     let mut attached = false;
     wait_for("the answer to be spoken", || {
-        if !attached && !overlay.intercepted.lock().unwrap().is_empty() {
+        if !attached && *overlay.targets_asked.lock().unwrap() > 0 {
             pipeline.attach_engine(engine.clone());
             attached = true;
         }
@@ -178,7 +185,7 @@ fn a_cloud_wake_runs_through_the_session_threads() {
         !overlay.spoken.lock().unwrap().is_empty()
     });
 
-    assert_eq!(*overlay.intercepted.lock().unwrap(), [("what time is it?".to_string(), true)]);
+    assert_eq!(*overlay.targets_asked.lock().unwrap(), 1);
     assert_eq!(*engine.inputs.lock().unwrap(), [("what time is it?".to_string(), None)]);
     assert_eq!(overlay.logged.lock().unwrap()[0].heard, "what time is it?");
     let states = overlay.states.lock().unwrap().clone();

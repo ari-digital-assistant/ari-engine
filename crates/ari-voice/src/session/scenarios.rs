@@ -8,7 +8,8 @@ use std::path::PathBuf;
 
 use super::core::{Capture, Core, EngineCall, Finished, Job, SessionIo, SttStatus, Tag};
 use super::{
-    ActionOutcome, CaptureMode, EngineReply, Intercepted, LoggedReply, LoggedTurn, Phrase, ReplyFlags,
+    ActionOutcome, CaptureMode, CardPressed, EngineReply, InterceptTargets, Intercepted, LoggedReply, LoggedTurn, Phrase,
+    ReplyFlags,
     SessionConfig, SessionError, SessionHost, SessionState, TypedFinish, UtteranceOutcome, UtteranceTurn,
     WakeCaptureHook,
 };
@@ -90,7 +91,13 @@ impl SessionHost for Fake {
     fn load_speech_model(&self) -> bool {
         unreachable!("a job")
     }
-    fn intercept(&self, _text: &str, _cards: bool) -> Intercepted {
+    fn intercept_targets(&self) -> InterceptTargets {
+        unreachable!("a job")
+    }
+    fn stop_alert(&self, _alert_id: &str) {
+        unreachable!("a job")
+    }
+    fn press_card_button(&self, _card_id: &str, _button_id: &str) -> CardPressed {
         unreachable!("a job")
     }
     fn handle_action(&self, _json: &str, _skill_id: &str) -> ActionOutcome {

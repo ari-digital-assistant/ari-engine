@@ -141,6 +141,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The voice session decides which words answer what is on screen: "stop" (or the
+  alert's own Stop label) over a sounding alert, and a button's id or label on the
+  newest card with buttons, with the endings speech recognition adds to it. The
+  per-language stop phrases and endings moved here from ari-android.
+  `FfiSessionHost.intercept` is replaced by `intercept_targets`, which lists the alerts
+  and cards, and `stop_alert` and `press_card_button`, which act on the match.
 - A spoken turn can carry a second transcript (the streaming recogniser's parallel
   stream, `Engine::set_alternative_transcript`). The engine acts on it instead when the
   first finds no skill and it does, before the assistant tier, and says which it acted
