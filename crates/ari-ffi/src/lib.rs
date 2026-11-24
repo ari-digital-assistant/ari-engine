@@ -4,7 +4,6 @@ use ari_core::Skill;
 use ari_engine::{
     fallback_response_for, ConversationLength, ConversationMemory, Engine, EnvelopeSink, FALLBACK_RESPONSE,
 };
-#[cfg(feature = "llm")]
 use ari_engine::AnswerSink;
 use ari_skill_loader::assistant::{ConfigStore, MemoryConfigStore};
 use ari_skill_loader::{
