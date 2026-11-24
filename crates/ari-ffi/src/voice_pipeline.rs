@@ -16,16 +16,15 @@ use ari_voice::cloud_stt::{CloudSttFailure, CloudSttService};
 use ari_voice::detector::{OWW_EMBEDDING_FILE, OWW_MELSPECTROGRAM_FILE, WakeDetector};
 use ari_voice::pipeline::{self, LogLevel, VoiceHost, VoicePipeline, WakeConfig};
 use ari_voice::session::{
-    ActionOutcome, AlertTarget, AnswerSink, CaptureMode, CardButton, CardPressed, CardTarget, EngineReply,
-    InterceptTargets, LoggedReply, LoggedTurn, Phrase, ReplyFlags, HostHeard, SessionConfig, SessionError,
-    SessionHost, SessionState, TurnEngine, TypedFinish,
+    ActionOutcome, AlertTarget, CaptureMode, CardButton, CardPressed, CardTarget, InterceptTargets, LoggedReply,
+    LoggedTurn, Phrase, HostHeard, SessionConfig, SessionError, SessionHost, SessionState, TypedFinish,
 };
 use ari_voice::stt::{ListenParams, SttError, SttModelSpec};
 use ari_voice::wake_log::{WakeLog, WakeOutcome};
 use ari_voice::wake_model::WakeEngine;
 
 use crate::voice::{FfiCloudSttService, FfiOperatingPoint, FfiWakeSensitivity, FfiWakeWordModel};
-use crate::{AriEngine, FfiLogLevel, FfiResponse};
+use crate::{AriEngine, FfiLogLevel};
 
 /// How a wake the user could see ended (`ari_voice::wake_log::WakeOutcome`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -370,7 +369,7 @@ impl FfiVoicePipeline {
     /// The engine voice turns go to, once it is built. A turn that reaches it
     /// sooner waits.
     pub fn attach_engine(&self, engine: Arc<AriEngine>) {
-        self.inner.attach_engine(engine);
+        self.inner.attach_engine(engine.runtime.clone());
     }
 
     /// The settings the session acts on. Again whenever one changes.
@@ -757,55 +756,6 @@ impl SessionHost for ForeignSessionHost {
     fn typed_finished(&self, turn: u64, finish: TypedFinish) {
         let reply = finish.reply.map(|r| FfiLoggedReply { text: r.text, markdown: r.markdown, skill_id: r.skill_id });
         self.0.typed_finished(turn, FfiTypedFinish { clear: finish.clear, reply });
-    }
-}
-
-/// An answer the engine writes, handed on to the session.
-struct VoiceAnswerSink(Arc<dyn AnswerSink>);
-
-impl ari_engine::AnswerSink for VoiceAnswerSink {
-    fn text(&self, so_far: &str, markdown: Option<&str>) {
-        self.0.text(so_far, markdown);
-    }
-    fn sentence(&self, text: &str) {
-        self.0.sentence(text);
-    }
-}
-
-fn engine_reply(response: FfiResponse) -> EngineReply {
-    match response {
-        FfiResponse::Text { body, markdown, rearm, enter_conversation, exit_conversation, facts_changed, clear_conversation } => {
-            EngineReply::Text {
-                body,
-                markdown,
-                flags: ReplyFlags { rearm, enter_conversation, exit_conversation, facts_changed, clear_conversation },
-            }
-        }
-        FfiResponse::Action { json, skill_id, rearm, enter_conversation, exit_conversation, facts_changed, clear_conversation } => {
-            EngineReply::Action {
-                json,
-                skill_id,
-                flags: ReplyFlags { rearm, enter_conversation, exit_conversation, facts_changed, clear_conversation },
-            }
-        }
-        FfiResponse::Binary { mime, data } => EngineReply::Binary { mime, len: data.len() },
-        FfiResponse::NotUnderstood { body } => EngineReply::NotUnderstood { body },
-    }
-}
-
-impl TurnEngine for AriEngine {
-    fn respond(&self, input: &str, alternative: Option<&str>, answer: Option<Arc<dyn AnswerSink>>) -> (EngineReply, bool) {
-        let answer = answer.map(|a| Arc::new(VoiceAnswerSink(a)) as Arc<dyn ari_engine::AnswerSink>);
-        let (response, used_alternative) = self.respond_with(input.to_string(), alternative.map(str::to_string), answer);
-        (engine_reply(response), used_alternative)
-    }
-
-    fn cancel_pending_reply(&self) {
-        AriEngine::cancel_pending_reply(self);
-    }
-
-    fn set_conversation_active(&self, active: bool) {
-        AriEngine::set_conversation_active(self, active);
     }
 }
 

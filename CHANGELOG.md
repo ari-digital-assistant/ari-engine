@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ari-runtime`, the engine as a frontend runs it, moved out of `ari-ffi`: the engine
+  with its built-in and community skills, the platform providers (`Providers`),
+  settings-time skill calls, the model catalog, the on-device model, and the replies
+  turns get, as the voice session's `TurnEngine`. A frontend written in Rust links it
+  without `ari-ffi`. `AriEngine` wraps a `Runtime` and its Kotlin API is unchanged;
+  `build_engine_with_builtins` and `register_community_skills` are `ari_runtime`'s now.
 - The voice session in `ari-voice`, moved from ari-android: a voice turn from the wake
   to the answer, with wake verification and quiet wakes, the early name check, the
   cold start, the retries, follow-up questions, "let's talk" and barge-in, dictation,

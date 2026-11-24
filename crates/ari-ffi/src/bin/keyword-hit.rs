@@ -18,7 +18,7 @@
 //! win them outright in production. Omitting the flag preserves the
 //! builtin-only behaviour exactly.
 
-use ari_ffi::register_community_skills;
+use ari_runtime::register_community_skills;
 use std::path::{Path, PathBuf};
 
 /// Parsed command line.
@@ -53,7 +53,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
 
 /// Answer the keyword question for each line, preserving order and count.
 fn run(locale: &str, skills_dir: Option<&Path>, texts: &[String]) -> Result<Vec<bool>, String> {
-    let mut engine = ari_ffi::build_engine_with_builtins();
+    let mut engine = ari_runtime::build_engine_with_builtins();
     engine.set_locale(locale.to_string());
     if let Some(root) = skills_dir {
         let loaded = register_community_skills(&mut engine, root)?;
@@ -418,7 +418,7 @@ mod tests {
         let mut poached = Vec::new();
 
         for locale in ["en", "it"] {
-            let mut engine = ari_ffi::build_engine_with_builtins();
+            let mut engine = ari_runtime::build_engine_with_builtins();
             engine.set_locale(locale.to_string());
             // The host pushes this during engine construction, before any
             // input is processed. Without it `open` falls back to "any target

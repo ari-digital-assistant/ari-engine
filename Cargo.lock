@@ -101,6 +101,7 @@ dependencies = [
  "ari-core",
  "ari-engine",
  "ari-llm",
+ "ari-runtime",
  "ari-skill-loader",
  "ari-skills",
  "ari-voice",
@@ -124,6 +125,19 @@ name = "ari-native"
 version = "0.1.0"
 dependencies = [
  "libloading",
+]
+
+[[package]]
+name = "ari-runtime"
+version = "0.1.0"
+dependencies = [
+ "ari-core",
+ "ari-engine",
+ "ari-llm",
+ "ari-skill-loader",
+ "ari-skills",
+ "ari-voice",
+ "serde_json",
 ]
 
 [[package]]

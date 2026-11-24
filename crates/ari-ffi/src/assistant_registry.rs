@@ -267,7 +267,7 @@ impl AssistantRegistry {
 
         let named = self.build_named_bindings();
 
-        let mut engine_inner = engine.inner.lock().expect("engine mutex poisoned");
+        let mut engine_inner = engine.runtime.engine();
         engine_inner.set_active_assistant(assistant);
         engine_inner.set_named_assistants(named);
     }

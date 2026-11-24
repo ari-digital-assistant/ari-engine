@@ -1,26 +1,20 @@
 #![allow(clippy::new_without_default)]
 
-use ari_core::Skill;
-use ari_engine::{
-    fallback_response_for, ConversationLength, ConversationMemory, Engine, EnvelopeSink, FALLBACK_RESPONSE,
-};
-use ari_engine::AnswerSink;
-use ari_skill_loader::assistant::{ConfigStore, MemoryConfigStore};
+use ari_engine::{AnswerSink, ConversationLength, ConversationMemory, EnvelopeSink};
+use ari_runtime::{Providers, Reply, Runtime};
+use ari_skill_loader::assistant::MemoryConfigStore;
 use ari_skill_loader::{
-    load_skill_directory_with, AuthorizeInput, AuthorizeOutput, AuthorizeProvider, Calendar,
+    AuthorizeInput, AuthorizeOutput, AuthorizeProvider, Calendar,
     CalendarEventRow, CalendarProvider, Capability, Contact, ContactChannel, ContactsProvider,
     LiveConversationsProvider,
     EnglishLocaleProvider, HostCapabilities,
     HttpConfig, InsertCalendarEventParams, InsertTaskParams, LoadOptions, LocalClock,
     LocalTimeComponents, LocaleProvider, LocationProvider, LocationResult, LocationStatus, LogLevel,
-    LogSink, ModelCatalog, NullAuthorizeProvider, NullCalendarProvider, NullLocationProvider,
+    LogSink, NullAuthorizeProvider, NullCalendarProvider, NullLocationProvider,
     NullContactsProvider, NullLiveConversationsProvider, NullLogSink, MediaServicesProvider,
     NullMediaServicesProvider,
     NullSettingWriter, NullTasksProvider,
     SettingWriter, StorageConfig, TaskList, TaskRow, TasksProvider, UtcLocalClock,
-};
-use ari_skills::{
-    CalculatorSkill, CurrentTimeSkill, DateSkill, GreetingSkill, OpenSkill, SearchSkill,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -821,18 +815,6 @@ pub struct FfiSettingsQueryResult {
 /// Convert an engine-side [`ari_core::SettingsQueryResult`] into the
 /// UniFFI-exportable [`FfiSettingsQueryResult`]. The engine's
 /// `SettingsOption` only carries `value`/`label`; the richer
-/// The error result both settings entry points return for an id that isn't
-/// loaded. Was inline in the engine before the skill lookup moved out here.
-pub(crate) fn skill_not_loaded(skill_id: &str) -> ari_core::SettingsQueryResult {
-    ari_core::SettingsQueryResult {
-        ok: false,
-        error: Some(format!("skill not loaded: {skill_id}")),
-        options: Vec::new(),
-        message: None,
-        refresh: false,
-    }
-}
-
 /// `FfiSelectOption` download fields don't apply to query results, so
 /// they're `None`.
 pub(crate) fn map_settings_result(
@@ -955,120 +937,8 @@ impl AriEngineBuilder {
 
 #[derive(uniffi::Object)]
 pub struct AriEngine {
-    // Wrapped in Mutex because `reload_community_skills` mutates the
-    // skill set after construction. `process_input` only needs a shared
-    // lock in practice but the Engine trait takes `&self` anyway.
-    pub(crate) inner: Mutex<Engine>,
-    // Log sink handed to every WASM skill loaded via `reload_community_skills`.
-    // Defaults to NullLogSink for callers that use the no-arg constructor
-    // (tests, CLI). The Android host passes a real sink via `with_log_sink`
-    // so skill `ari::log(...)` calls surface in `adb logcat`.
-    pub(crate) log_sink: Arc<dyn LogSink>,
-    // Platform capability providers. Defaults to the Null/UTC impls
-    // from ari_skill_loader for callers that don't supply real ones
-    // (tests, CLI). The Android host supplies real implementations
-    // via [`AriEngine::with_platform_providers`].
-    pub(crate) tasks_provider: Arc<dyn TasksProvider>,
-    pub(crate) calendar_provider: Arc<dyn CalendarProvider>,
-    pub(crate) location_provider: Arc<dyn LocationProvider>,
-    pub(crate) media_services_provider: Arc<dyn MediaServicesProvider>,
-    pub(crate) contacts_provider: Arc<dyn ContactsProvider>,
-    pub(crate) live_conversations_provider: Arc<dyn LiveConversationsProvider>,
-    pub(crate) local_clock: Arc<dyn LocalClock>,
-    /// Locale source of truth — engine reads through this whenever it
-    /// needs to dispatch on language. Defaults to [`EnglishLocaleProvider`]
-    /// for callers that don't supply a real one (CLI, tests). The
-    /// Android host wires a real provider that reads the user's
-    /// chosen language from the frontend DataStore.
-    pub(crate) locale_provider: Arc<dyn LocaleProvider>,
-    /// Config store backing `ari::setting_get` in WASM skills.
-    /// Defaults to an empty in-memory map; the Android host passes
-    /// the shared `SkillSettingsStore`'s inner map so skills see
-    /// live UI-written values.
-    pub(crate) config_store: Arc<dyn ConfigStore>,
-    /// Setting writer backing `ari::setting_set` in WASM skills.
-    /// Defaults to [`NullSettingWriter`] (no-op) for callers that don't
-    /// supply a real one (CLI, tests). The Android host wires a writer
-    /// that persists durably and updates the in-memory settings mirror.
-    pub(crate) setting_writer: Arc<dyn SettingWriter>,
-    /// Authorize provider backing `ari::authorize` in WASM skills.
-    /// Defaults to [`NullAuthorizeProvider`] (no browser) for callers that
-    /// don't supply a real one (CLI, tests). The Android host wires a
-    /// provider that opens the system browser and returns callback params.
-    pub(crate) authorize_provider: Arc<dyn AuthorizeProvider>,
-}
-
-/// Build an [`Engine`] with the full set of built-in skills registered — the
-/// same catalogue used at runtime. Exposed so tooling can exercise the real
-/// skill catalogue without duplicating the skill list.
-/// The 6 built-in Rust skills, freshly constructed. Kept in one place so the
-/// initial engine build and every `reload_community_skills` register exactly
-/// the same set — a reload that forgot one would silently drop that skill.
-fn builtin_skills() -> Vec<Box<dyn Skill>> {
-    vec![
-        Box::new(CurrentTimeSkill::new()),
-        Box::new(DateSkill::new()),
-        Box::new(CalculatorSkill::new()),
-        Box::new(GreetingSkill::new()),
-        Box::new(OpenSkill::new()),
-        Box::new(SearchSkill::new()),
-    ]
-}
-
-pub fn build_engine_with_builtins() -> Engine {
-    let mut engine = Engine::new();
-    for skill in builtin_skills() {
-        engine.register_skill(skill);
-    }
-    engine
-}
-
-/// Load every skill under `root` and register it alongside the built-ins,
-/// returning the number registered.
-///
-/// Shared by the `keyword-hit` oracle and its poaching test, which both ask
-/// "does the keyword scorer already claim this utterance?" and so must ask it
-/// against the same skill catalogue. Two copies of this logic could drift, and
-/// a drifted gate reports a silently inflated score.
-///
-/// Grants [`HostCapabilities::all`] deliberately. Both callers only ever read
-/// `matching.patterns` and `specificity` through `Skill::score` /
-/// `Skill::specificity` — they never execute a skill, so the runtime caveat on
-/// `all()` (unresolvable WASM imports) cannot bite here. Loading with the
-/// default `pure_frontend()` set instead would reject every skill declaring
-/// `http`, `location`, `storage_kv`, `authorize` or `media_services` —
-/// weather, home-assistant, music, counter and github-zen among them — and a
-/// rejected skill takes its patterns with it, which is precisely the silent
-/// under-count this exists to fix.
-///
-/// A per-skill load failure is fatal for the same reason: a missing skill
-/// means missing patterns, and missing patterns mean the caller quietly treats
-/// keyword-hits as keyword-misses. Better to stop than to emit verdicts that
-/// are wrong in the direction nobody would notice.
-pub fn register_community_skills(engine: &mut Engine, root: &Path) -> Result<usize, String> {
-    let options = LoadOptions {
-        host_capabilities: HostCapabilities::all(),
-        ..LoadOptions::default()
-    };
-    let report = load_skill_directory_with(root, &options)
-        .map_err(|e| format!("--skills-dir {}: {e}", root.display()))?;
-
-    if !report.failures.is_empty() {
-        let details: Vec<String> = report.failures.iter().map(|f| f.to_string()).collect();
-        return Err(format!(
-            "{} skill(s) under {} failed to load, so their patterns are missing and \
-             every verdict below them would be silently wrong:\n  {}",
-            report.failures.len(),
-            root.display(),
-            details.join("\n  ")
-        ));
-    }
-
-    let loaded = report.skills.len();
-    for skill in report.skills {
-        engine.register_skill(skill);
-    }
-    Ok(loaded)
+    // An Arc: the voice pipeline holds the runtime too, as its TurnEngine.
+    pub(crate) runtime: Arc<Runtime>,
 }
 
 /// Internal assembler shared by [`AriEngineBuilder::build`]. NOT a UniFFI
@@ -1093,101 +963,66 @@ fn assemble_with_providers(
     contacts: Option<Arc<dyn FfiContactsProvider>>,
     live_conversations: Option<Arc<dyn FfiLiveConversationsProvider>>,
 ) -> AriEngine {
-    let log_sink: Arc<dyn LogSink> = match sink {
-        Some(s) => Arc::new(ForeignLogSinkAdapter(s)),
-        None => Arc::new(NullLogSink),
+    let defaults = Providers::default();
+    let providers = Providers {
+        log_sink: match sink {
+            Some(s) => Arc::new(ForeignLogSinkAdapter(s)),
+            None => defaults.log_sink,
+        },
+        tasks: match tasks {
+            Some(t) => Arc::new(ForeignTasksProviderAdapter(t)),
+            None => defaults.tasks,
+        },
+        calendar: match calendar {
+            Some(c) => Arc::new(ForeignCalendarProviderAdapter(c)),
+            None => defaults.calendar,
+        },
+        location: match location {
+            Some(l) => Arc::new(ForeignLocationProviderAdapter(l)),
+            None => defaults.location,
+        },
+        media_services: match media_services {
+            Some(p) => Arc::new(ForeignMediaServicesProviderAdapter(p)),
+            None => defaults.media_services,
+        },
+        contacts: match contacts {
+            Some(p) => Arc::new(ForeignContactsProviderAdapter(p)),
+            None => defaults.contacts,
+        },
+        live_conversations: match live_conversations {
+            Some(p) => Arc::new(ForeignLiveConversationsProviderAdapter(p)),
+            None => defaults.live_conversations,
+        },
+        local_clock: match clock {
+            Some(c) => Arc::new(ForeignLocalClockAdapter(c)),
+            None => defaults.local_clock,
+        },
+        locale: match locale {
+            Some(l) => Arc::new(ForeignLocaleProviderAdapter(l)),
+            None => defaults.locale,
+        },
+        config_store: match settings {
+            Some(s) => s.as_config_store(),
+            None => defaults.config_store,
+        },
+        setting_writer: match setting_writer {
+            Some(w) => Arc::new(ForeignSettingWriterAdapter(w)),
+            None => defaults.setting_writer,
+        },
+        authorize: match authorize {
+            Some(a) => Arc::new(ForeignAuthorizeProviderAdapter(a)),
+            None => defaults.authorize,
+        },
+        envelope_sink: envelope_sink.map(|es| Arc::new(ForeignEnvelopeSinkAdapter(es)) as Arc<dyn EnvelopeSink>),
     };
-    let tasks_provider: Arc<dyn TasksProvider> = match tasks {
-        Some(t) => Arc::new(ForeignTasksProviderAdapter(t)),
-        None => Arc::new(NullTasksProvider),
-    };
-    let calendar_provider: Arc<dyn CalendarProvider> = match calendar {
-        Some(c) => Arc::new(ForeignCalendarProviderAdapter(c)),
-        None => Arc::new(NullCalendarProvider),
-    };
-    let location_provider: Arc<dyn LocationProvider> = match location {
-        Some(l) => Arc::new(ForeignLocationProviderAdapter(l)),
-        None => Arc::new(NullLocationProvider),
-    };
-    let local_clock: Arc<dyn LocalClock> = match clock {
-        Some(c) => Arc::new(ForeignLocalClockAdapter(c)),
-        None => Arc::new(UtcLocalClock),
-    };
-    let locale_provider: Arc<dyn LocaleProvider> = match locale {
-        Some(l) => Arc::new(ForeignLocaleProviderAdapter(l)),
-        None => Arc::new(EnglishLocaleProvider),
-    };
-    let config_store: Arc<dyn ConfigStore> = match settings {
-        Some(s) => s.as_config_store(),
-        None => Arc::new(MemoryConfigStore::new()),
-    };
-    let setting_writer: Arc<dyn SettingWriter> = match setting_writer {
-        Some(w) => Arc::new(ForeignSettingWriterAdapter(w)),
-        None => Arc::new(NullSettingWriter),
-    };
-    let authorize_provider: Arc<dyn AuthorizeProvider> = match authorize {
-        Some(a) => Arc::new(ForeignAuthorizeProviderAdapter(a)),
-        None => Arc::new(NullAuthorizeProvider),
-    };
-    let media_services_provider: Arc<dyn MediaServicesProvider> = match media_services {
-        Some(p) => Arc::new(ForeignMediaServicesProviderAdapter(p)),
-        None => Arc::new(NullMediaServicesProvider),
-    };
-    let contacts_provider: Arc<dyn ContactsProvider> = match contacts {
-        Some(p) => Arc::new(ForeignContactsProviderAdapter(p)),
-        None => Arc::new(NullContactsProvider),
-    };
-    let live_conversations_provider: Arc<dyn LiveConversationsProvider> = match live_conversations {
-        Some(p) => Arc::new(ForeignLiveConversationsProviderAdapter(p)),
-        None => Arc::new(NullLiveConversationsProvider),
-    };
-    let adapted_envelope_sink: Option<Arc<dyn EnvelopeSink>> = envelope_sink
-        .map(|es| Arc::new(ForeignEnvelopeSinkAdapter(es)) as Arc<dyn EnvelopeSink>);
-    let mut engine = build_engine_with_builtins();
-    engine.set_log_sink(Some(log_sink.clone()));
-    engine.set_config_store(Some(config_store.clone()));
-    if let Some(ref es) = adapted_envelope_sink {
-        engine.set_envelope_sink(Some(es.clone()));
-    }
-    AriEngine {
-        inner: Mutex::new(engine),
-        log_sink,
-        tasks_provider,
-        calendar_provider,
-        location_provider,
-        media_services_provider,
-        contacts_provider,
-        live_conversations_provider,
-        local_clock,
-        locale_provider,
-        config_store,
-        setting_writer,
-        authorize_provider,
-    }
+    AriEngine { runtime: Arc::new(Runtime::new(providers)) }
 }
 
 #[uniffi::export]
 impl AriEngine {
     #[uniffi::constructor]
     pub fn new() -> Self {
-        let config_store: Arc<dyn ConfigStore> = Arc::new(MemoryConfigStore::new());
-        let mut engine = build_engine_with_builtins();
-        engine.set_config_store(Some(config_store.clone()));
-        Self {
-            inner: Mutex::new(engine),
-            log_sink: Arc::new(NullLogSink),
-            tasks_provider: Arc::new(NullTasksProvider),
-            calendar_provider: Arc::new(NullCalendarProvider),
-            location_provider: Arc::new(NullLocationProvider),
-            media_services_provider: Arc::new(NullMediaServicesProvider),
-            contacts_provider: Arc::new(NullContactsProvider),
-            live_conversations_provider: Arc::new(NullLiveConversationsProvider),
-            local_clock: Arc::new(UtcLocalClock),
-            locale_provider: Arc::new(EnglishLocaleProvider),
-            config_store,
-            setting_writer: Arc::new(NullSettingWriter),
-            authorize_provider: Arc::new(NullAuthorizeProvider),
-        }
+        Self { runtime: Arc::new(Runtime::new(Providers::default())) }
     }
 
     /// Construct with a host-supplied log sink for WASM skill output.
@@ -1197,25 +1032,7 @@ impl AriEngine {
     #[uniffi::constructor]
     pub fn with_log_sink(sink: Arc<dyn FfiLogSink>) -> Self {
         let log_sink: Arc<dyn LogSink> = Arc::new(ForeignLogSinkAdapter(sink));
-        let config_store: Arc<dyn ConfigStore> = Arc::new(MemoryConfigStore::new());
-        let mut engine = build_engine_with_builtins();
-        engine.set_log_sink(Some(log_sink.clone()));
-        engine.set_config_store(Some(config_store.clone()));
-        Self {
-            inner: Mutex::new(engine),
-            log_sink,
-            tasks_provider: Arc::new(NullTasksProvider),
-            calendar_provider: Arc::new(NullCalendarProvider),
-            location_provider: Arc::new(NullLocationProvider),
-            media_services_provider: Arc::new(NullMediaServicesProvider),
-            contacts_provider: Arc::new(NullContactsProvider),
-            live_conversations_provider: Arc::new(NullLiveConversationsProvider),
-            local_clock: Arc::new(UtcLocalClock),
-            locale_provider: Arc::new(EnglishLocaleProvider),
-            config_store,
-            setting_writer: Arc::new(NullSettingWriter),
-            authorize_provider: Arc::new(NullAuthorizeProvider),
-        }
+        Self { runtime: Arc::new(Runtime::new(Providers { log_sink, ..Providers::default() })) }
     }
 
     /// Construct with the full set of host-supplied platform
@@ -1232,7 +1049,7 @@ impl AriEngine {
     /// Cheap to call — DataStore-backed implementations cache the
     /// latest value and read it without blocking.
     pub fn current_locale(&self) -> String {
-        self.locale_provider.current_locale()
+        self.runtime.current_locale()
     }
 
     /// Load the cached tier→model catalog written by
@@ -1247,33 +1064,7 @@ impl AriEngine {
     /// way, since a catalog that stops loading is otherwise invisible: the
     /// skills keep working, just on ageing pinned models.
     pub fn load_model_catalog(&self, path: String) -> bool {
-        let outcome = std::fs::read(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|bytes| ModelCatalog::from_json_bytes(&bytes).map_err(|e| e.to_string()));
-
-        match outcome {
-            Ok(catalog) => {
-                let mut engine = self.inner.lock().expect("engine mutex poisoned");
-                engine.set_model_catalog(Some(Arc::new(catalog)));
-                self.log_sink.log(
-                    "ari-ffi",
-                    LogLevel::Info,
-                    &format!("model catalog loaded from {path}"),
-                );
-                true
-            }
-            Err(message) => {
-                self.log_sink.log(
-                    "ari-ffi",
-                    LogLevel::Warn,
-                    &format!(
-                        "no model catalog from {path} ({message}) — \
-                         cloud assistants will use their pinned models"
-                    ),
-                );
-                false
-            }
-        }
+        self.runtime.load_model_catalog(&path)
     }
 
     /// Where the store caches the registry index
@@ -1283,7 +1074,7 @@ impl AriEngine {
     /// (ari-android#44). The file is read again whenever it changes; until
     /// it exists, nothing is suggested.
     pub fn set_skill_suggestions_path(&self, path: String) {
-        let mut engine = self.inner.lock().expect("engine mutex poisoned");
+        let mut engine = self.runtime.engine();
         engine.set_skill_suggestions_path(path);
     }
 
@@ -1298,32 +1089,7 @@ impl AriEngine {
         field: String,
         values: std::collections::HashMap<String, String>,
     ) -> FfiSettingsQueryResult {
-        // The UI masks `secret` fields as a bullet placeholder and never
-        // round-trips their real value across the FFI (see
-        // `SkillRegistry::get_skill_settings`). So `values` carries
-        // "••••••••" for a token, which the skill would otherwise forward
-        // upstream verbatim and get rejected. Resolve each dep from the
-        // shared config store — the same source `ari::setting_get` and the
-        // execute path read — so settings-time queries see the real
-        // committed values. UI-passed values stay as a fallback for keys
-        // not yet persisted to the store.
-        let mut merged = values;
-        for (key, slot) in merged.iter_mut() {
-            if let Some(real) = self.config_store.get(&skill_id, key.as_str()) {
-                *slot = real;
-            }
-        }
-        let values_json = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".to_string());
-        // Same reasoning as `settings_action` below — a dynamic_select does
-        // HTTP, so it can hang for a while too, just not for minutes.
-        let skill = {
-            let engine = self.inner.lock().expect("engine mutex poisoned");
-            engine.skill_by_id(&skill_id)
-        };
-        match skill {
-            Some(skill) => map_settings_result(skill.settings_query(&field, &values_json)),
-            None => map_settings_result(skill_not_loaded(&skill_id)),
-        }
+        map_settings_result(self.runtime.query_skill_setting(&skill_id, &field, values))
     }
 
     /// Effectful settings-time skill invocation: run `skill_id`'s `settings_action`
@@ -1337,32 +1103,7 @@ impl AriEngine {
         action: String,
         values: std::collections::HashMap<String, String>,
     ) -> FfiSettingsQueryResult {
-        let mut merged = values;
-        for (key, slot) in merged.iter_mut() {
-            if let Some(real) = self.config_store.get(&skill_id, key.as_str()) {
-                *slot = real;
-            }
-        }
-        let values_json = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".to_string());
-        // Resolve the skill under the lock, then let go of it before calling.
-        //
-        // This one waits on a human: the Home Assistant sign-in blocks on the
-        // OAuth callback for up to five minutes. Every entry point here shares
-        // this mutex, `process_input` among them, so holding it across the call
-        // left Ari deaf to everything for the duration — and reopening the app
-        // did not help, because the process and the held lock survived.
-        //
-        // Nothing about the call needs exclusivity. `Skill::settings_action`
-        // takes `&self`, each WASM invocation builds a fresh store, and holding
-        // the Arc keeps the skill alive even if the set is replaced mid-call.
-        let skill = {
-            let engine = self.inner.lock().expect("engine mutex poisoned");
-            engine.skill_by_id(&skill_id)
-        };
-        match skill {
-            Some(skill) => map_settings_result(skill.settings_action(&action, &values_json)),
-            None => map_settings_result(skill_not_loaded(&skill_id)),
-        }
+        map_settings_result(self.runtime.settings_action(&skill_id, &action, values))
     }
 
     pub fn process_input(&self, input: String) -> FfiResponse {
@@ -1382,7 +1123,7 @@ impl AriEngine {
     /// by the host when the re-armed mic times out, the user dismisses, or a
     /// fresh wake word starts a new session. No-op when nothing is pending.
     pub fn cancel_pending_reply(&self) {
-        let engine = self.inner.lock().expect("engine mutex poisoned");
+        let engine = self.runtime.engine();
         engine.clear_pending_turn();
     }
 
@@ -1393,9 +1134,8 @@ impl AriEngine {
     /// ends the mode instead of routing to a skill) and records skill turns
     /// into the conversation buffer.
     pub fn set_conversation_active(&self, active: bool) {
-        self.inner
-            .lock()
-            .expect("engine mutex poisoned")
+        self.runtime
+            .engine()
             .set_conversation_active(active);
     }
 
@@ -1405,9 +1145,8 @@ impl AriEngine {
     /// When `false` the engine retains no conversation buffer and refuses
     /// "let's talk" entry (guiding the user to the toggle instead).
     pub fn set_conversation_memory_enabled(&self, enabled: bool) {
-        self.inner
-            .lock()
-            .expect("engine mutex poisoned")
+        self.runtime
+            .engine()
             .set_conversation_memory_enabled(enabled);
     }
 
@@ -1415,9 +1154,8 @@ impl AriEngine {
     /// frontend calls this when the user clears the chat by other means, so
     /// the assistant doesn't answer follow-ups about what was just cleared.
     pub fn clear_conversation(&self) {
-        self.inner
-            .lock()
-            .expect("engine mutex poisoned")
+        self.runtime
+            .engine()
             .clear_conversation();
     }
 
@@ -1425,9 +1163,8 @@ impl AriEngine {
     /// so the chat can say when it has been forgotten (ari-android#51).
     /// Reading it doesn't keep the conversation alive.
     pub fn conversation_memory(&self) -> FfiConversationMemory {
-        self.inner
-            .lock()
-            .expect("engine mutex poisoned")
+        self.runtime
+            .engine()
             .conversation_memory()
             .into()
     }
@@ -1436,9 +1173,8 @@ impl AriEngine {
     /// the Android `conversationLength` setting; hydrated at engine build and
     /// written through when the user changes it.
     pub fn set_conversation_length(&self, length: FfiConversationLength) {
-        self.inner
-            .lock()
-            .expect("engine mutex poisoned")
+        self.runtime
+            .engine()
             .set_conversation_length(length.into());
     }
 
@@ -1446,9 +1182,8 @@ impl AriEngine {
     /// Ari's own voice. Mirrors the Android `personality` setting; hydrated
     /// at engine build and written through when the user edits it.
     pub fn set_personality(&self, personality: String) {
-        self.inner
-            .lock()
-            .expect("engine mutex poisoned")
+        self.runtime
+            .engine()
             .set_personality(&personality);
     }
 
@@ -1456,9 +1191,8 @@ impl AriEngine {
     /// when it doesn't know. Mirrors the Android `handoffEnabled` setting;
     /// hydrated at engine build and written through when the user toggles it.
     pub fn set_handoff_enabled(&self, enabled: bool) {
-        self.inner
-            .lock()
-            .expect("engine mutex poisoned")
+        self.runtime
+            .engine()
             .set_handoff_enabled(enabled);
     }
 
@@ -1466,26 +1200,23 @@ impl AriEngine {
     /// those with an API key, the one it would offer first leading. Empty
     /// means the handoff setting can't do anything yet.
     pub fn handoff_assistants(&self) -> Vec<String> {
-        self.inner
-            .lock()
-            .expect("engine mutex poisoned")
+        self.runtime
+            .engine()
             .handoff_assistants()
     }
 
     /// The cloud assistant that answered last, for the frontend to persist
     /// after a turn: a handoff offers it first.
     pub fn last_cloud_assistant(&self) -> Option<String> {
-        self.inner
-            .lock()
-            .expect("engine mutex poisoned")
+        self.runtime
+            .engine()
             .last_cloud_assistant()
     }
 
     /// Hydrate [`Self::last_cloud_assistant`] at engine build.
     pub fn set_last_cloud_assistant(&self, skill_id: Option<String>) {
-        self.inner
-            .lock()
-            .expect("engine mutex poisoned")
+        self.runtime
+            .engine()
             .set_last_cloud_assistant(skill_id);
     }
 
@@ -1493,18 +1224,16 @@ impl AriEngine {
     /// persisted store; hydrated at engine build and written through after a
     /// settings-screen edit.
     pub fn set_remembered_facts(&self, facts: Vec<String>) {
-        self.inner
-            .lock()
-            .expect("engine mutex poisoned")
+        self.runtime
+            .engine()
             .set_remembered_facts(facts);
     }
 
     /// Replace the engine's snapshot of installed launchable apps. The frontend
     /// pushes this at build time and refreshes it on app install/uninstall.
     pub fn set_installed_apps(&self, apps: Vec<FfiAppEntry>) {
-        self.inner
-            .lock()
-            .expect("engine mutex poisoned")
+        self.runtime
+            .engine()
             .set_installed_apps(apps.into_iter().map(Into::into).collect());
     }
 
@@ -1513,9 +1242,8 @@ impl AriEngine {
     /// whenever the underlying set changes. Push an empty `values` when the
     /// user has none — phrases naming that vocabulary then match nothing.
     pub fn set_vocabulary(&self, name: String, values: Vec<String>) {
-        self.inner
-            .lock()
-            .expect("engine mutex poisoned")
+        self.runtime
+            .engine()
             .set_vocabulary(name, values);
     }
 
@@ -1523,9 +1251,8 @@ impl AriEngine {
     /// frontend reads this after a turn that signalled `facts_changed` and
     /// persists the result.
     pub fn remembered_facts(&self) -> Vec<String> {
-        self.inner
-            .lock()
-            .expect("engine mutex poisoned")
+        self.runtime
+            .engine()
             .remembered_facts()
     }
 
@@ -1552,50 +1279,7 @@ impl AriEngine {
         skill_store_dir: String,
         storage_dir: String,
     ) -> u32 {
-        // Start from the shared default LoadOptions (host caps, HTTP, storage)
-        // and override the log sink with whatever the host installed at
-        // construction time. Install/validation paths elsewhere keep the
-        // NullLogSink default — those paths don't execute skills, so the
-        // sink there only ever sees load-time diagnostics the loader
-        // currently doesn't emit.
-        let mut options = android_load_options(&storage_dir);
-        options.log_sink = self.log_sink.clone();
-        options.tasks_provider = self.tasks_provider.clone();
-        options.calendar_provider = self.calendar_provider.clone();
-        options.location_provider = self.location_provider.clone();
-        options.media_services_provider = self.media_services_provider.clone();
-        options.contacts_provider = self.contacts_provider.clone();
-        options.live_conversations_provider = self.live_conversations_provider.clone();
-        options.local_clock = self.local_clock.clone();
-        options.config_store = self.config_store.clone();
-        options.locale_provider = self.locale_provider.clone();
-        options.setting_writer = self.setting_writer.clone();
-        options.authorize_provider = self.authorize_provider.clone();
-        // Load the community skills from disk BEFORE touching the live engine,
-        // so a whole-directory read failure leaves the current set intact
-        // rather than half-swapped.
-        let community = match load_skill_directory_with(&PathBuf::from(&skill_store_dir), &options)
-        {
-            Ok(report) => report.skills,
-            Err(_) => Vec::new(),
-        };
-        let loaded = community.len() as u32;
-
-        // Swap the skill set IN PLACE. We deliberately do NOT build a fresh
-        // Engine: that discarded every other field — remembered facts (and the
-        // first later "remember" then clobbered the on-disk list), the
-        // conversation-memory toggle, the on-device LLM, the
-        // pending turn, let's-talk state and the conversation buffer — none of
-        // which the frontend re-applies after a reload. `replace_skills`
-        // touches only the skills; the engine's sinks/providers were installed
-        // once at construction and persist. Built-ins lead the community set.
-        let mut skills = builtin_skills();
-        skills.extend(community);
-        self.inner
-            .lock()
-            .expect("engine mutex poisoned")
-            .replace_skills(skills);
-        loaded
+        self.runtime.reload_community_skills(Path::new(&skill_store_dir), android_load_options(&storage_dir))
     }
 }
 
@@ -1603,78 +1287,34 @@ impl AriEngine {
     /// The body of [`Self::process_input`], with an on-device answer going to
     /// `answer` while it's written, when there is one.
     fn respond(&self, input: String, answer: Option<Arc<dyn AnswerSink>>) -> FfiResponse {
-        self.respond_with(input, None, answer).0
+        self.runtime.reply(&input, None, answer).0.into()
     }
+}
 
-    /// [`Self::respond`], with a second transcript of the turn the engine may
-    /// act on instead; also says whether it did. The voice session's turns
-    /// come through here (`TurnEngine`).
-    pub(crate) fn respond_with(
-        &self,
-        input: String,
-        alternative: Option<String>,
-        answer: Option<Arc<dyn AnswerSink>>,
-    ) -> (FfiResponse, bool) {
-        // Refresh the engine's locale on every call so per-locale
-        // skill scorers and responses pick up live changes from the
-        // frontend's settings store. The locale provider's read is a
-        // synchronous AtomicReference lookup on Android (see
-        // AriFfiLocaleProvider), so this is essentially free.
-        let locale = self.locale_provider.current_locale();
-        let mut engine = self.inner.lock().expect("engine mutex poisoned");
-        engine.set_locale(locale.clone());
-        #[cfg(feature = "llm")]
-        engine.set_answer_sink(answer);
-        // Without the on-device assistant there are no answers to stream.
-        #[cfg(not(feature = "llm"))]
-        drop(answer);
-        engine.set_alternative_transcript(alternative);
-        let (response, skill_id) = engine.process_input_with_skill(&input);
-        let used_alternative = engine.take_used_alternative();
-        #[cfg(feature = "llm")]
-        engine.set_answer_sink(None);
-        let rearm = engine.has_pending_turn();
-        let enter_conversation = engine.take_enter_signal();
-        let exit_conversation = engine.take_exit_signal();
-        let facts_changed = engine.take_facts_changed_signal();
-        let clear_conversation = engine.take_clear_signal();
-        let markdown = engine.take_answer_markdown();
-        let response = match response {
-            ari_core::Response::Text(s) => {
-                // The engine's fallback text is locale-specific
-                // (Phase 5 step 2). Compare against the locale-
-                // appropriate version so the Android NotUnderstood
-                // retry path fires for Italian / French / etc.
-                // users too — not just English.
-                let is_fallback =
-                    s == fallback_response_for(&locale) || s == FALLBACK_RESPONSE;
-                if is_fallback {
-                    // A fallback never re-arms.
-                    FfiResponse::NotUnderstood { body: s }
-                } else {
-                    FfiResponse::Text {
-                        body: s,
-                        markdown,
-                        rearm,
-                        enter_conversation,
-                        exit_conversation,
-                        facts_changed,
-                        clear_conversation,
-                    }
-                }
-            }
-            ari_core::Response::Action(v) => FfiResponse::Action {
-                json: serde_json::to_string(&v).unwrap_or_default(),
-                skill_id: skill_id.unwrap_or_default(),
-                rearm,
-                enter_conversation,
-                exit_conversation,
-                facts_changed,
-                clear_conversation,
+impl From<Reply> for FfiResponse {
+    fn from(reply: Reply) -> Self {
+        match reply {
+            Reply::Text { body, markdown, flags } => FfiResponse::Text {
+                body,
+                markdown,
+                rearm: flags.rearm,
+                enter_conversation: flags.enter_conversation,
+                exit_conversation: flags.exit_conversation,
+                facts_changed: flags.facts_changed,
+                clear_conversation: flags.clear_conversation,
             },
-            ari_core::Response::Binary { mime, data } => FfiResponse::Binary { mime, data },
-        };
-        (response, used_alternative)
+            Reply::Action { json, skill_id, flags } => FfiResponse::Action {
+                json,
+                skill_id,
+                rearm: flags.rearm,
+                enter_conversation: flags.enter_conversation,
+                exit_conversation: flags.exit_conversation,
+                facts_changed: flags.facts_changed,
+                clear_conversation: flags.clear_conversation,
+            },
+            Reply::Binary { mime, data } => FfiResponse::Binary { mime, data },
+            Reply::NotUnderstood { body } => FfiResponse::NotUnderstood { body },
+        }
     }
 }
 
@@ -1711,15 +1351,7 @@ impl AriEngine {
     /// Returns `true` if the path exists, `false` otherwise.
     /// Call at app startup if a model file is available on disk.
     pub fn load_llm_model(&self, model_path: String, use_gpu: bool) -> bool {
-        let path = std::path::Path::new(&model_path);
-        if !path.is_file() {
-            return false;
-        }
-        let accelerator = if use_gpu { ari_llm::Accelerator::Gpu } else { ari_llm::Accelerator::Cpu };
-        let lazy = ari_llm::LazyLlmFallback::new(path, accelerator);
-        let mut engine = self.inner.lock().expect("engine mutex poisoned");
-        engine.set_llm(std::sync::Arc::new(lazy));
-        true
+        self.runtime.load_llm_model(Path::new(&model_path), use_gpu)
     }
 
     /// Remove the LLM fallback. If a model is currently loaded in RAM,
@@ -1728,7 +1360,7 @@ impl AriEngine {
     /// this is for switching or deleting models: to free memory, use
     /// [`Self::release_llm_memory`].
     pub fn unload_llm_model(&self) {
-        let mut engine = self.inner.lock().expect("engine mutex poisoned");
+        let mut engine = self.runtime.engine();
         engine.set_llm_none();
     }
 
@@ -1736,7 +1368,7 @@ impl AriEngine {
     /// loads it again. Blocks until any answer in progress finishes, so
     /// don't call it on the main thread.
     pub fn release_llm_memory(&self) {
-        let engine = self.inner.lock().expect("engine mutex poisoned");
+        let engine = self.runtime.engine();
         engine.release_llm_memory();
     }
 
@@ -1914,106 +1546,6 @@ mod uniffi_twin_guard {
 mod tests {
     use super::*;
 
-    /// A skill whose settings action parks inside the call until released, so
-    /// a test can ask what the rest of the engine can do meanwhile.
-    struct BlockingSkill {
-        entered: std::sync::Arc<std::sync::Barrier>,
-        release: std::sync::Arc<std::sync::Barrier>,
-    }
-
-    impl ari_core::Skill for BlockingSkill {
-        fn id(&self) -> &str {
-            "test.blocking"
-        }
-        fn specificity(&self) -> ari_core::Specificity {
-            ari_core::Specificity::Low
-        }
-        fn score(&self, _input: &str, _ctx: &ari_core::SkillContext) -> f32 {
-            0.0
-        }
-        fn execute(&self, _input: &str, _ctx: &ari_core::SkillContext) -> ari_core::Response {
-            ari_core::Response::Text(String::new())
-        }
-        fn settings_action(&self, _action: &str, _values: &str) -> ari_core::SettingsQueryResult {
-            self.entered.wait();
-            self.release.wait();
-            ari_core::SettingsQueryResult {
-                ok: true,
-                error: None,
-                options: Vec::new(),
-                message: None,
-                refresh: false,
-            }
-        }
-    }
-
-    /// A settings action can wait on a person — the Home Assistant sign-in
-    /// blocks on an OAuth callback for up to five minutes. It used to do that
-    /// holding the engine mutex, which every entry point here takes, so Ari
-    /// went deaf to everything until it gave up.
-    ///
-    /// The wait is on another thread with a deadline rather than inline: a
-    /// regression should fail this test, not hang it.
-    #[test]
-    fn a_blocked_settings_action_does_not_stop_the_engine_answering() {
-        use std::sync::{mpsc, Arc, Barrier};
-        use std::time::Duration;
-
-        let engine = Arc::new(AriEngine::new());
-        let entered = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        {
-            let mut inner = engine.inner.lock().expect("engine mutex poisoned");
-            inner.replace_skills(vec![Box::new(BlockingSkill {
-                entered: Arc::clone(&entered),
-                release: Arc::clone(&release),
-            })]);
-        }
-
-        let acting = {
-            let engine = Arc::clone(&engine);
-            std::thread::spawn(move || {
-                engine.settings_action(
-                    "test.blocking".to_string(),
-                    "sign_in".to_string(),
-                    std::collections::HashMap::new(),
-                )
-            })
-        };
-        entered.wait();
-
-        let (tx, rx) = mpsc::channel();
-        {
-            let engine = Arc::clone(&engine);
-            std::thread::spawn(move || {
-                let _ = tx.send(engine.process_input("hello".to_string()));
-            });
-        }
-        let answered = rx.recv_timeout(Duration::from_secs(5));
-
-        release.wait();
-        let action = acting.join().expect("settings action thread panicked");
-
-        assert!(
-            answered.is_ok(),
-            "process_input blocked behind a settings action that was waiting on the user",
-        );
-        assert!(action.ok, "the settings action itself should still succeed");
-    }
-
-    #[test]
-    fn a_settings_action_for_an_unloaded_skill_still_reports_it() {
-        // The not-loaded branch moved out of the engine when the lookup did.
-        let engine = AriEngine::new();
-        let r = engine.settings_action(
-            "nobody.here".to_string(),
-            "sign_in".to_string(),
-            std::collections::HashMap::new(),
-        );
-        assert!(!r.ok);
-        assert_eq!(r.error.as_deref(), Some("skill not loaded: nobody.here"));
-    }
-
     struct OkWriter;
     impl FfiSettingWriter for OkWriter {
         fn set_value(&self, _skill_id: String, _key: String, _value: String, _is_secret: bool) -> bool { true }
@@ -2051,46 +1583,6 @@ mod tests {
         });
         assert_eq!(out.ok, false);
         assert_eq!(out.error.as_deref(), Some("cancelled"));
-    }
-
-    #[test]
-    fn reload_community_skills_preserves_facts_and_keeps_builtins() {
-        // An empty store dir → zero community skills. The reload must still
-        // re-register the built-ins AND leave runtime state (here: remembered
-        // facts) untouched. Rebuilding a fresh Engine — the old approach —
-        // discarded the facts, which is the P0 this guards against.
-        let base = std::env::temp_dir()
-            .join(format!("ari_reload_test_{}", std::process::id()));
-        let store = base.join("skills");
-        let storage = base.join("storage");
-        std::fs::remove_dir_all(&base).ok();
-        std::fs::create_dir_all(&store).expect("store dir");
-        std::fs::create_dir_all(&storage).expect("storage dir");
-
-        let engine = AriEngine::new();
-        engine.set_remembered_facts(vec!["my name is Keith".to_string()]);
-
-        let community = engine.reload_community_skills(
-            store.to_string_lossy().into_owned(),
-            storage.to_string_lossy().into_owned(),
-        );
-        assert_eq!(community, 0, "empty store dir yields no community skills");
-
-        assert_eq!(
-            engine.remembered_facts(),
-            vec!["my name is Keith".to_string()],
-            "reload_community_skills discarded remembered facts",
-        );
-
-        // Built-ins must survive the reload: the calculator still answers.
-        match engine.process_input("2 + 2".to_string()) {
-            FfiResponse::Text { body, .. } => {
-                assert_eq!(body, "4", "calculator built-in lost after reload")
-            }
-            _ => panic!("expected the calculator built-in to answer with text"),
-        }
-
-        std::fs::remove_dir_all(&base).ok();
     }
 
     struct DeniedLocation;
@@ -2132,68 +1624,6 @@ mod tests {
         assert_eq!(f.ok, true);
         assert_eq!(f.options[0].value, "v");
         assert_eq!(f.options[0].label, "L");
-    }
-
-    #[test]
-    fn engine_creates_and_responds_to_greeting() {
-        let engine = AriEngine::new();
-        let resp = engine.process_input("hello".to_string());
-        match resp {
-            FfiResponse::Text { body, .. } => {
-                assert!(!body.is_empty());
-                assert_ne!(body, "Sorry, I didn't understand that.");
-            }
-            _ => panic!("expected Text response for greeting"),
-        }
-    }
-
-    #[test]
-    fn engine_returns_time() {
-        let engine = AriEngine::new();
-        let resp = engine.process_input("what time is it".to_string());
-        match resp {
-            FfiResponse::Text { body, .. } => {
-                assert!(body.starts_with("It's "), "response was: {body}");
-            }
-            _ => panic!("expected Text response for time"),
-        }
-    }
-
-    #[test]
-    fn engine_returns_calculation() {
-        let engine = AriEngine::new();
-        let resp = engine.process_input("calculate 5 + 3".to_string());
-        match resp {
-            FfiResponse::Text { body, .. } => assert_eq!(body, "8"),
-            _ => panic!("expected Text response for calculation"),
-        }
-    }
-
-    #[test]
-    fn engine_returns_action_for_open() {
-        let engine = AriEngine::new();
-        let resp = engine.process_input("open spotify".to_string());
-        match resp {
-            FfiResponse::Action { json, skill_id, .. } => {
-                let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-                assert_eq!(parsed["v"], 1);
-                assert_eq!(parsed["launch_app"], "spotify");
-                assert_eq!(skill_id, "open");
-            }
-            _ => panic!("expected Action response for open"),
-        }
-    }
-
-    #[test]
-    fn engine_returns_not_understood_for_gibberish() {
-        let engine = AriEngine::new();
-        let resp = engine.process_input("asdfghjkl".to_string());
-        match resp {
-            FfiResponse::NotUnderstood { body } => {
-                assert_eq!(body, "Sorry, I didn't understand that.");
-            }
-            _ => panic!("expected NotUnderstood fallback"),
-        }
     }
 
     #[test]

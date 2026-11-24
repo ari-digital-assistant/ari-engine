@@ -9,12 +9,13 @@ name = "ari_ffi"
 
 [features]
 default = ["llm"]
-llm = ["ari-engine/llm", "dep:ari-llm"]
+llm = ["ari-engine/llm", "ari-runtime/llm", "dep:ari-llm"]
 
 [dependencies]
 ari-core = { path = "../ari-core" }
 ari-engine = { path = "../ari-engine" }
 ari-llm = { path = "../ari-llm", optional = true }
+ari-runtime = { path = "../ari-runtime", default-features = false }
 ari-skills = { path = "../ari-skills" }
 ari-skill-loader = { path = "../ari-skill-loader" }
 ari-voice = { path = "../ari-voice" }
