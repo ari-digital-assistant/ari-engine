@@ -13,6 +13,7 @@
 //! on the phone each time it fetches it, so suggesting works offline and costs
 //! no network round trip.
 
+use crate::host_capabilities::HostCapabilities;
 use crate::registry::{Index, IndexEntry};
 use ari_core::{normalize_phrase, phrase_matches_in, SkillContext};
 use std::collections::HashMap;
@@ -37,17 +38,19 @@ struct Candidate {
 }
 
 /// The suggestible skills in one registry index: regular skills (never
-/// assistants) that list suggest phrases in some language.
+/// assistants) that list suggest phrases in some language, and that the host
+/// could run once installed.
 pub struct SkillSuggester {
     candidates: Vec<Candidate>,
 }
 
 impl SkillSuggester {
-    pub fn from_index(index: &Index) -> Self {
+    pub fn from_index(index: &Index, host: &HostCapabilities) -> Self {
         let candidates = index
             .skills
             .iter()
             .filter(|e| e.skill_type == "skill")
+            .filter(|e| e.missing_capabilities(host).is_empty())
             .filter_map(candidate)
             .collect();
         SkillSuggester { candidates }
@@ -155,12 +158,14 @@ fn candidate(entry: &IndexEntry) -> Option<Candidate> {
 /// that won't parse, means no suggestions.
 pub struct CachedSkillSuggester {
     path: PathBuf,
+    host: HostCapabilities,
     loaded: Mutex<(Option<SystemTime>, Option<SkillSuggester>)>,
 }
 
 impl CachedSkillSuggester {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        CachedSkillSuggester { path: path.into(), loaded: Mutex::new((None, None)) }
+    /// Suggests only skills `host` could run.
+    pub fn new(path: impl Into<PathBuf>, host: HostCapabilities) -> Self {
+        CachedSkillSuggester { path: path.into(), host, loaded: Mutex::new((None, None)) }
     }
 
     /// [`SkillSuggester::suggest`] over the cached index as it is now.
@@ -176,7 +181,7 @@ impl CachedSkillSuggester {
             loaded.1 = modified
                 .and_then(|_| std::fs::read(&self.path).ok())
                 .and_then(|bytes| serde_json::from_slice::<Index>(&bytes).ok())
-                .map(|index| SkillSuggester::from_index(&index));
+                .map(|index| SkillSuggester::from_index(&index, &self.host));
             loaded.0 = modified;
         }
         loaded.1.as_ref()?.suggest(normalised, ctx, installed)
@@ -210,7 +215,7 @@ mod tests {
 
     fn suggester(skills: &str) -> SkillSuggester {
         let index: Index = serde_json::from_str(&index_json(skills)).unwrap();
-        SkillSuggester::from_index(&index)
+        SkillSuggester::from_index(&index, &HostCapabilities::all())
     }
 
     fn reminder_index() -> SkillSuggester {
@@ -284,6 +289,19 @@ mod tests {
     }
 
     #[test]
+    fn a_skill_the_host_cannot_run_is_never_suggested() {
+        use crate::manifest::Capability;
+        let message = r#"{"id": "dev.heyari.message", "version": "1.0.0", "name": "message", "description": "",
+                          "type": "skill", "capabilities": ["send_message", "contacts"],
+                          "bundle": "b", "signature": "s", "sha256": "h",
+                          "suggest": {"en": ["text {name}"]}}"#;
+        let index: Index = serde_json::from_str(&index_json(message)).unwrap();
+        let laptop = HostCapabilities::pure_frontend().without(Capability::SendMessage);
+        assert!(SkillSuggester::from_index(&index, &laptop).is_empty());
+        assert_eq!(SkillSuggester::from_index(&index, &HostCapabilities::all()).len(), 1);
+    }
+
+    #[test]
     fn an_old_index_without_suggest_suggests_nothing() {
         let old = r#"{"id": "dev.heyari.reminder", "version": "1", "name": "reminder", "description": "",
                       "bundle": "b", "signature": "s", "sha256": "h"}"#;
@@ -298,7 +316,7 @@ mod tests {
     fn real_index_suggestions() {
         let Ok(path) = std::env::var("SUGGEST_INDEX") else { return };
         let index: Index = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        let s = SkillSuggester::from_index(&index);
+        let s = SkillSuggester::from_index(&index, &HostCapabilities::all());
         let said = [
             ("en", "remind me"), ("en", "remind me to buy milk"), ("en", "Remind me tomorrow to call Mum"),
             ("en", "tell me a joke"), ("en", "tell me about the roman empire"), ("en", "why is the sky blue"),
@@ -326,7 +344,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ari-suggest-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("index.json");
-        let cached = CachedSkillSuggester::new(&path);
+        let cached = CachedSkillSuggester::new(&path, HostCapabilities::all());
         assert_eq!(cached.suggest("remind me", &ctx("en"), |_| false), None);
 
         let mut f = std::fs::File::create(&path).unwrap();

@@ -21,6 +21,7 @@
 //! provides is: fetch, diff, install. Nothing more.
 
 use crate::bundle::{install_from_bytes, BundleError};
+use crate::host_capabilities::{parse_capability, HostCapabilities};
 use crate::loader::LoadOptions;
 use crate::signature::TrustRoot;
 use crate::store::{compare_versions, InstalledSkill, SkillStore};
@@ -244,6 +245,21 @@ pub struct LocalizedDisplay {
 }
 
 impl IndexEntry {
+    /// The capabilities this skill declares that `host` doesn't provide, by
+    /// name: empty when it would load there. An assistant needs none, as the
+    /// loader checks none for one. A name this build doesn't know is one no
+    /// host provides.
+    pub fn missing_capabilities(&self, host: &HostCapabilities) -> Vec<String> {
+        if self.skill_type == "assistant" {
+            return Vec::new();
+        }
+        self.capabilities
+            .iter()
+            .filter(|name| parse_capability(name).is_none_or(|cap| !host.provides(cap)))
+            .cloned()
+            .collect()
+    }
+
     /// Resolve `(name, description)` for the user's active locale.
     /// Returns the entry's `localizations[locale]` when present; falls
     /// back to the canonical English `name` + `description` otherwise.
@@ -832,6 +848,45 @@ metadata:
         let parsed = client.fetch_index().unwrap();
         assert_eq!(parsed.index_version, 1);
         assert!(parsed.skills.is_empty());
+    }
+
+    fn entry_needing(kind: &str, capabilities: &str) -> IndexEntry {
+        serde_json::from_str(&format!(
+            r#"{{"id": "dev.heyari.x", "version": "1.0.0", "name": "x", "description": "", "type": "{kind}",
+                "capabilities": {capabilities}, "bundle": "b", "signature": "s", "sha256": "h"}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_capability_the_host_lacks_is_missing() {
+        use crate::manifest::Capability;
+        let laptop = HostCapabilities::pure_frontend()
+            .with(Capability::Http)
+            .without(Capability::SendMessage);
+        let message = entry_needing("skill", r#"["send_message", "http", "contacts"]"#);
+        assert_eq!(message.missing_capabilities(&laptop), ["send_message", "contacts"]);
+    }
+
+    #[test]
+    fn nothing_is_missing_when_the_host_provides_it_all() {
+        use crate::manifest::Capability;
+        let host = HostCapabilities::none().with(Capability::Http).with(Capability::StorageKv);
+        let weatherish = entry_needing("skill", r#"["http", "storage_kv"]"#);
+        assert!(weatherish.missing_capabilities(&host).is_empty());
+        assert!(entry_needing("skill", "[]").missing_capabilities(&HostCapabilities::none()).is_empty());
+    }
+
+    #[test]
+    fn an_assistant_misses_nothing_as_the_loader_checks_none() {
+        let chatgpt = entry_needing("assistant", r#"["http"]"#);
+        assert!(chatgpt.missing_capabilities(&HostCapabilities::none()).is_empty());
+    }
+
+    #[test]
+    fn a_capability_this_build_does_not_know_is_missing() {
+        let future = entry_needing("skill", r#"["teleport"]"#);
+        assert_eq!(future.missing_capabilities(&HostCapabilities::all()), ["teleport"]);
     }
 
     #[test]

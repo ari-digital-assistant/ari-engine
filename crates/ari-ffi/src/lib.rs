@@ -28,11 +28,9 @@ pub use skill_registry::{
     FfiBrowseEntry, FfiInstalledSkill, FfiRegistryError, FfiSkillUpdate, SkillRegistry,
 };
 
-/// The [`LoadOptions`] the Android host uses for every install and every
-/// reload (see [`ari_runtime::load_options`]): Android grants every
-/// capability there is.
-pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
-    let host_caps = HostCapabilities::pure_frontend()
+/// What Android can run: every capability there is.
+fn android_host_capabilities() -> HostCapabilities {
+    HostCapabilities::pure_frontend()
         .with(Capability::Http)
         .with(Capability::StorageKv)
         .with(Capability::Tasks)
@@ -41,8 +39,13 @@ pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
         .with(Capability::Authorize)
         .with(Capability::MediaServices)
         .with(Capability::Contacts)
-        .with(Capability::Reply);
-    ari_runtime::load_options(Path::new(storage_dir), host_caps)
+        .with(Capability::Reply)
+}
+
+/// The [`LoadOptions`] the Android host uses for every install and every
+/// reload (see [`ari_runtime::load_options`]).
+pub(crate) fn android_load_options(storage_dir: &str) -> LoadOptions {
+    ari_runtime::load_options(Path::new(storage_dir), android_host_capabilities())
 }
 
 uniffi::setup_scaffolding!();
@@ -1042,7 +1045,7 @@ impl AriEngine {
     /// it exists, nothing is suggested.
     pub fn set_skill_suggestions_path(&self, path: String) {
         let mut engine = self.runtime.engine();
-        engine.set_skill_suggestions_path(path);
+        engine.set_skill_suggestions_path(path, android_host_capabilities());
     }
 
     /// Settings-time skill invocation: run `skill_id`'s `settings_query` for

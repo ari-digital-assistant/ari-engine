@@ -1360,12 +1360,17 @@ impl Engine {
     }
 
     /// Where the store caches the registry index, whose trigger patterns
-    /// let Ari suggest a skill that isn't installed (ari-android#44). The
+    /// let Ari suggest a skill that isn't installed (ari-android#44), and
+    /// what the host can run, so a skill it can't is never suggested. The
     /// file is read again whenever it changes; until it exists, nothing is
     /// suggested.
-    pub fn set_skill_suggestions_path(&mut self, path: impl Into<std::path::PathBuf>) {
+    pub fn set_skill_suggestions_path(
+        &mut self,
+        path: impl Into<std::path::PathBuf>,
+        host: ari_skill_loader::HostCapabilities,
+    ) {
         self.skill_suggester = Some(Arc::new(
-            ari_skill_loader::suggest::CachedSkillSuggester::new(path),
+            ari_skill_loader::suggest::CachedSkillSuggester::new(path, host),
         ));
     }
 
@@ -6361,7 +6366,7 @@ mod tests {
     #[test]
     fn suggests_a_store_skill_nothing_installed_handles() {
         let mut engine = Engine::new();
-        engine.set_skill_suggestions_path(suggestion_index());
+        engine.set_skill_suggestions_path(suggestion_index(), ari_skill_loader::HostCapabilities::all());
         let (resp, trace) = engine.process_input_traced("Remind me to call Mum");
         match resp {
             Response::Action(v) => {
@@ -6378,7 +6383,7 @@ mod tests {
     fn does_not_suggest_an_installed_skill() {
         let mut engine = Engine::new();
         engine.register_skill(Box::new(QuietSkill("dev.heyari.reminder")));
-        engine.set_skill_suggestions_path(suggestion_index());
+        engine.set_skill_suggestions_path(suggestion_index(), ari_skill_loader::HostCapabilities::all());
         let (resp, _) = engine.process_input_traced("remind me to call mum");
         assert!(matches!(resp, Response::Text(ref t) if t == fallback_response_for("en")), "got {resp:?}");
     }
@@ -6386,11 +6391,14 @@ mod tests {
     #[test]
     fn suggests_nothing_without_a_cached_index_or_a_match() {
         let mut engine = Engine::new();
-        engine.set_skill_suggestions_path(std::env::temp_dir().join("ari-no-such-dir/index.json"));
+        engine.set_skill_suggestions_path(
+            std::env::temp_dir().join("ari-no-such-dir/index.json"),
+            ari_skill_loader::HostCapabilities::all(),
+        );
         let (resp, _) = engine.process_input_traced("remind me to call mum");
         assert!(matches!(resp, Response::Text(_)), "got {resp:?}");
 
-        engine.set_skill_suggestions_path(suggestion_index());
+        engine.set_skill_suggestions_path(suggestion_index(), ari_skill_loader::HostCapabilities::all());
         let (resp, _) = engine.process_input_traced("why is the sky blue");
         assert!(matches!(resp, Response::Text(_)), "got {resp:?}");
     }

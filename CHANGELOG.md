@@ -151,6 +151,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A store skill the frontend can't run is no longer suggested or offered: a frontend that
+  can't send texts never suggests the message skill. `Engine::set_skill_suggestions_path`
+  takes the host's capabilities, `IndexEntry::missing_capabilities` says what a registry
+  skill needs that a host lacks, and `BrowseEntry::missing_capabilities` carries it to Browse.
 - The voice session decides which words answer what is on screen: "stop" (or the
   alert's own Stop label) over a sounding alert, and a button's id or label on the
   newest card with buttons, with the endings speech recognition adds to it. The

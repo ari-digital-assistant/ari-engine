@@ -87,6 +87,9 @@ pub struct BrowseEntry {
     pub author: Option<String>,
     pub homepage: Option<String>,
     pub capabilities: Vec<String>,
+    /// What this frontend can't provide of `capabilities`: the skill wouldn't
+    /// load here, so it isn't offered. Empty when it would.
+    pub missing_capabilities: Vec<String>,
     pub languages: Vec<String>,
     /// Display strings per ISO 639-1 code, from every `SKILL.{locale}.md`.
     /// English is absent: `name` and `description` carry it. Frontends fall
@@ -311,7 +314,7 @@ impl SkillRegistry {
     }
 
     /// Every skill the registry carries, sorted by id, marked when it is
-    /// installed.
+    /// installed and with what this frontend can't provide for it.
     pub fn browse_registry(&self) -> Result<Vec<BrowseEntry>, SkillRegistryError> {
         let index = self.fetch_index(&RegistryClient::new())?;
         let store = self.store();
@@ -319,6 +322,7 @@ impl SkillRegistry {
             .skills
             .into_iter()
             .map(|entry| BrowseEntry {
+                missing_capabilities: entry.missing_capabilities(&self.options.host_capabilities),
                 installed: store.get(&entry.id).is_some(),
                 id: entry.id,
                 version: entry.version,
