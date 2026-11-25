@@ -1,3 +1,5 @@
+pub mod envelope;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

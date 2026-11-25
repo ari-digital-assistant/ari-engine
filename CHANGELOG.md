@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ari_core::envelope`: a skill's presentation envelope parsed into types (cards, alerts,
+  notifications and every action slot), with the defaults and leniency Android's
+  `PresentationEnvelope.kt` had, which it replaces. `ari-ffi` exposes it as
+  `parse_presentation_envelope`.
 - `ari-runtime`, the engine as a frontend runs it, moved out of `ari-ffi`: the engine
   with its built-in and community skills, the platform providers (`Providers`),
   settings-time skill calls, the model catalog, the on-device model, and the replies
