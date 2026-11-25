@@ -3,10 +3,40 @@
 //! itself.
 
 use ari_core::envelope::{
-    Accent, AlarmAction, AlertAction, AlertSpec, ButtonStyle, Card, CardAction, Confidence, IconText, Importance,
+    Accent, AlarmAction, AlertAction, AlertSpec, ButtonStyle, Card, CardAction, CardPress, Confidence, IconText, Importance,
     ListCard, ListRow, MediaAction, MessageAction, NavigateAction, NotificationAction, NotificationSpec, OnComplete,
-    PresentationEnvelope, ReplyAction, SkillSuggestion, Stat, Urgency,
+    PresentationEnvelope, ReplyAction, SkillSuggestion, Stat, Urgency, card_press,
 };
+
+/// What pressing a card's button does ([`ari_core::envelope::card_press`]):
+/// the button's `id`, `utterance` and `speak`, and the card's `on_cancel`
+/// and the id of the alert it rings when it ends, None for a card that has
+/// gone.
+#[uniffi::export]
+pub fn resolve_card_press(
+    id: String,
+    utterance: Option<String>,
+    speak: Option<String>,
+    on_cancel: Option<String>,
+    alert_id: Option<String>,
+) -> FfiCardPress {
+    match card_press(&id, utterance.as_deref(), speak.as_deref(), on_cancel.as_deref(), alert_id.as_deref()) {
+        CardPress::StopAlert { alert_id } => FfiCardPress::StopAlert { alert_id },
+        CardPress::NoAlert => FfiCardPress::NoAlert,
+        CardPress::Cancel { on_cancel, speak } => FfiCardPress::Cancel { on_cancel, speak },
+        CardPress::Run { utterance } => FfiCardPress::Run { utterance },
+        CardPress::Dismiss { speak } => FfiCardPress::Dismiss { speak },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiCardPress {
+    StopAlert { alert_id: String },
+    NoAlert,
+    Cancel { on_cancel: String, speak: Option<String> },
+    Run { utterance: String },
+    Dismiss { speak: Option<String> },
+}
 
 /// The envelope in `json` from skill `skill_id`, or None when it isn't one
 /// this engine reads.
@@ -481,6 +511,18 @@ mod tests {
         assert_eq!(env.cards[0].countdown_to_ts_ms, Some(5));
         assert_eq!(env.cards[0].actions[0].style, FfiButtonStyle::Destructive);
         assert_eq!(env.confidence, FfiConfidence::High);
+    }
+
+    #[test]
+    fn a_card_press_crosses_as_the_engine_resolved_it() {
+        assert_eq!(
+            resolve_card_press("cancel".into(), Some("cancel my timer".into()), None, Some(r#"{"v":1}"#.into()), None),
+            FfiCardPress::Cancel { on_cancel: r#"{"v":1}"#.into(), speak: None }
+        );
+        assert_eq!(
+            resolve_card_press("stop_alert".into(), None, None, None, Some("alert_t".into())),
+            FfiCardPress::StopAlert { alert_id: "alert_t".into() }
+        );
     }
 
     #[test]

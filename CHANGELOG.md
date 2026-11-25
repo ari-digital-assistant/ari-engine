@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   notifications and every action slot), with the defaults and leniency Android's
   `PresentationEnvelope.kt` had, which it replaces. `ari-ffi` exposes it as
   `parse_presentation_envelope`.
+- `ari_core::envelope::card_press` (and `Card::press`): what pressing a card's button
+  does, by the envelope's rules (`stop_alert`, `cancel` with the card's `on_cancel` first,
+  then the button's words or a plain dismissal), moved from Android's
+  `CardActionDispatcher.kt`. `ari-ffi` exposes it as `resolve_card_press`.
 - `ari-runtime`, the engine as a frontend runs it, moved out of `ari-ffi`: the engine
   with its built-in and community skills, the platform providers (`Providers`),
   settings-time skill calls, the model catalog, the on-device model, and the replies

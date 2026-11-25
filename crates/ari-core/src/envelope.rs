@@ -370,6 +370,63 @@ impl PresentationEnvelope {
     }
 }
 
+/// What pressing a card's button does, by the envelope's rules, for every
+/// way a button gets pressed: a tap, or words the voice session matched to
+/// it. Moved from ari-android's `CardActionDispatcher.kt`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CardPress {
+    /// `stop_alert`: stop the alert the card rings when it ends. The card
+    /// stays.
+    StopAlert { alert_id: String },
+    /// `stop_alert` on a card that rings no alert: nothing happens.
+    NoAlert,
+    /// `cancel` on a card with an `on_cancel` envelope: take the card away
+    /// and run it. When it sends an utterance on (`run_utterance`), the
+    /// answer to that is what's said; otherwise `speak`.
+    Cancel { on_cancel: String, speak: Option<String> },
+    /// Take the card away and send the button's words to the engine; the
+    /// answer is what's said.
+    Run { utterance: String },
+    /// Take the card away, saying `speak` if there is one.
+    Dismiss { speak: Option<String> },
+}
+
+impl Card {
+    /// What pressing `action`, one of this card's buttons, does.
+    pub fn press(&self, action: &CardAction) -> CardPress {
+        let alert_id = self.on_complete.as_ref().and_then(|c| c.alert.as_ref()).map(|a| a.id.as_str());
+        card_press(&action.id, action.utterance.as_deref(), action.speak.as_deref(), self.on_cancel.as_deref(), alert_id)
+    }
+}
+
+/// [`Card::press`] from the parts, for a frontend holding the card in its
+/// own types: the button's `id`, `utterance` and `speak`, and the card's
+/// `on_cancel` and the id of the alert it rings when it ends. A card that
+/// has gone has neither.
+pub fn card_press(
+    id: &str,
+    utterance: Option<&str>,
+    speak: Option<&str>,
+    on_cancel: Option<&str>,
+    alert_id: Option<&str>,
+) -> CardPress {
+    let words = utterance.filter(|u| !u.trim().is_empty());
+    let speak = speak.filter(|s| !s.trim().is_empty()).map(str::to_string);
+    match (id, on_cancel) {
+        ("stop_alert", _) => match alert_id {
+            Some(alert_id) => CardPress::StopAlert { alert_id: alert_id.to_string() },
+            None => CardPress::NoAlert,
+        },
+        // The card's own on_cancel comes first: it is how a skill gets a
+        // clean round trip (`run_utterance`) without a primitive of its own.
+        ("cancel", Some(on_cancel)) => CardPress::Cancel { on_cancel: on_cancel.to_string(), speak },
+        _ => match words {
+            Some(utterance) => CardPress::Run { utterance: utterance.to_string() },
+            None => CardPress::Dismiss { speak },
+        },
+    }
+}
+
 fn card(o: &Map<String, Value>, skill_id: &str) -> Option<Card> {
     Some(Card {
         id: string(o, "id")?,
@@ -968,5 +1025,61 @@ mod tests {
         assert_eq!((partial.confidence, partial.unparsed.as_deref()), (Confidence::Partial, Some("tomorrow-ish")));
         assert_eq!(parse(r#"{"v":1,"confidence":"low"}"#).confidence, Confidence::Low);
         assert_eq!(parse(r#"{"v":1,"confidence":"unsure"}"#).confidence, Confidence::High);
+    }
+
+    fn timer_card(json_extra: &str) -> Card {
+        let json = format!(
+            r#"{{"v":1,"cards":[{{"id":"card_t","title":"Timer",
+                "actions":[{{"id":"cancel","label":"Cancel","utterance":"aricanceltimer t_1"}},
+                           {{"id":"stop_alert","label":"Stop"}},
+                           {{"id":"keep","label":"Keep","speak":"Kept."}},
+                           {{"id":"yes","label":"Yes","utterance":"yes please"}}]{json_extra}}}]}}"#
+        );
+        parse(&json).cards.remove(0)
+    }
+
+    fn button<'a>(card: &'a Card, id: &str) -> &'a CardAction {
+        card.actions.iter().find(|a| a.id == id).unwrap()
+    }
+
+    #[test]
+    fn stop_stops_the_card_s_alert_and_does_nothing_when_it_has_none() {
+        let ringing = timer_card(r#","on_complete":{"alert":{"id":"alert_t","title":"Done"}}"#);
+        assert_eq!(ringing.press(button(&ringing, "stop_alert")), CardPress::StopAlert { alert_id: "alert_t".into() });
+        let quiet = timer_card("");
+        assert_eq!(quiet.press(button(&quiet, "stop_alert")), CardPress::NoAlert);
+    }
+
+    #[test]
+    fn cancel_runs_the_card_s_on_cancel_before_the_button_s_words() {
+        let card = timer_card(r#","on_cancel":{"v":1,"run_utterance":"aricancelreminder tasks 1"}"#);
+        match card.press(button(&card, "cancel")) {
+            CardPress::Cancel { on_cancel, speak } => {
+                let env = PresentationEnvelope::parse(&on_cancel, SKILL_ID).unwrap();
+                assert_eq!(env.run_utterance.as_deref(), Some("aricancelreminder tasks 1"));
+                assert_eq!(speak, None);
+            }
+            other => panic!("expected the on_cancel envelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_without_on_cancel_runs_its_words() {
+        let card = timer_card("");
+        assert_eq!(card.press(button(&card, "cancel")), CardPress::Run { utterance: "aricanceltimer t_1".into() });
+    }
+
+    #[test]
+    fn any_other_button_runs_its_words_or_just_takes_the_card_away() {
+        let card = timer_card(r#","on_cancel":{"v":1}"#);
+        assert_eq!(card.press(button(&card, "yes")), CardPress::Run { utterance: "yes please".into() });
+        assert_eq!(card.press(button(&card, "keep")), CardPress::Dismiss { speak: Some("Kept.".into()) });
+    }
+
+    #[test]
+    fn a_card_that_has_gone_falls_back_to_the_button_alone() {
+        assert_eq!(card_press("cancel", Some("cancel my timer"), None, None, None), CardPress::Run { utterance: "cancel my timer".into() });
+        assert_eq!(card_press("cancel", Some("  "), Some(""), None, None), CardPress::Dismiss { speak: None });
+        assert_eq!(card_press("stop_alert", None, None, None, None), CardPress::NoAlert);
     }
 }
