@@ -305,6 +305,14 @@ impl SkillRegistry {
         self.inner.list_installed().into_iter().map(Into::into).collect()
     }
 
+    /// The file an envelope's `asset:<path>` reference from skill `skill_id`
+    /// names, or None when there's no such asset. See
+    /// [`skills::SkillRegistry::asset_path`].
+    pub fn asset_path(&self, skill_id: String, reference: String) -> Option<String> {
+        let path = self.inner.asset_path(&skill_id, &reference)?;
+        Some(path.to_string_lossy().into_owned())
+    }
+
     /// Fetch the registry index and return the updates available for
     /// already-installed skills. An empty list means "up to date".
     ///

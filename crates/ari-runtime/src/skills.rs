@@ -415,6 +415,22 @@ impl SkillRegistry {
         })
     }
 
+    /// The file an envelope's `asset:<path>` reference from skill `skill_id`
+    /// names: `<path>` under the skill's `assets` directory. None when
+    /// `reference` isn't an asset, the skill isn't installed (built-in
+    /// skills have no assets), the path would leave the directory, or there's
+    /// no such file. Moved from ari-android's `AssetResolver.kt`.
+    pub fn asset_path(&self, skill_id: &str, reference: &str) -> Option<PathBuf> {
+        let path = Path::new(reference.strip_prefix("asset:")?);
+        let inside = path.components().next().is_some()
+            && path.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !inside {
+            return None;
+        }
+        let file = self.store().get(skill_id)?.install_dir.join("assets").join(path);
+        file.is_file().then_some(file)
+    }
+
     /// Walk the skill's per-locale manifest set and pick `locale`'s variant.
     /// The set's invariants guarantee a canonical English entry and that
     /// every variant agrees with it on `id`, `type`, `capabilities` and
@@ -599,6 +615,33 @@ Says hello.
             registry.get_skill_settings("nobody.here", "en"),
             Err(SkillRegistryError::NotInstalled { id: "nobody.here".into() })
         );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    #[test]
+    fn an_asset_reference_names_a_file_in_the_skill_s_assets() {
+        let (registry, root, storage) = with_greet_installed();
+        let assets = root.join("greet").join("assets");
+        std::fs::create_dir_all(assets.join("icons")).unwrap();
+        std::fs::write(assets.join("icons").join("wave.png"), b"png").unwrap();
+        std::fs::write(root.join("greet").join("secret.txt"), b"not an asset").unwrap();
+        let id = "dev.heyari.test.greet";
+
+        assert_eq!(registry.asset_path(id, "asset:icons/wave.png"), Some(assets.join("icons").join("wave.png")));
+        // Not an asset reference, a file that isn't there, a directory.
+        assert_eq!(registry.asset_path(id, "icons/wave.png"), None);
+        assert_eq!(registry.asset_path(id, "system.alarm"), None);
+        assert_eq!(registry.asset_path(id, "asset:icons/missing.png"), None);
+        assert_eq!(registry.asset_path(id, "asset:icons"), None);
+        assert_eq!(registry.asset_path(id, "asset:"), None);
+        // Out of the assets directory, even to a file that's there.
+        assert_eq!(registry.asset_path(id, "asset:../secret.txt"), None);
+        assert_eq!(registry.asset_path(id, "asset:icons/../../secret.txt"), None);
+        assert_eq!(registry.asset_path(id, "asset:/etc/hostname"), None);
+        // A built-in skill, or one that isn't installed.
+        assert_eq!(registry.asset_path("current_time", "asset:icons/wave.png"), None);
+        assert_eq!(registry.asset_path("", "asset:icons/wave.png"), None);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&storage);
     }

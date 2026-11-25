@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does, by the envelope's rules (`stop_alert`, `cancel` with the card's `on_cancel` first,
   then the button's words or a plain dismissal), moved from Android's
   `CardActionDispatcher.kt`. `ari-ffi` exposes it as `resolve_card_press`.
+- `SkillRegistry::asset_path`: the file an envelope's `asset:<path>` reference names in
+  the skill's `assets` directory, refusing paths that leave it, moved from Android's
+  `AssetResolver.kt`. It finds the skill's directory from the store rather than guessing
+  it from the id.
 - `ari-runtime`, the engine as a frontend runs it, moved out of `ari-ffi`: the engine
   with its built-in and community skills, the platform providers (`Providers`),
   settings-time skill calls, the model catalog, the on-device model, and the replies
