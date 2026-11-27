@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 mod assistant_registry;
 mod envelope;
+mod models;
 mod settings_store;
 mod skill_registry;
 mod voice;

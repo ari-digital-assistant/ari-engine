@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the skill's `assets` directory, refusing paths that leave it, moved from Android's
   `AssetResolver.kt`. It finds the skill's directory from the store rather than guessing
   it from the id.
+- `ari_voice::stt_models`: the on-device speech-to-text models on offer (Kroko, Parakeet
+  Ultra, Whisper Turbo), which serve which language and which are retired, and
+  `ari_core::model_manifest`, the manifest a model is downloaded by. Moved from Android's
+  `SttModel.kt` and `ModelManifest.kt`; `ari-ffi` exposes them as `stt_models`,
+  `stt_on_device_choices`, `stt_on_device_for`, `stt_retired_ids` and
+  `parse_model_manifest`.
 - `ari-runtime`, the engine as a frontend runs it, moved out of `ari-ffi`: the engine
   with its built-in and community skills, the platform providers (`Providers`),
   settings-time skill calls, the model catalog, the on-device model, and the replies

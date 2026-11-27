@@ -1,4 +1,5 @@
 pub mod envelope;
+pub mod model_manifest;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
